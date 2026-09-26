@@ -126,6 +126,24 @@ export function isTooLarge(sizeBytes: number | null | undefined, max = MAX_PLAY_
   return typeof sizeBytes === "number" && Number.isFinite(sizeBytes) && sizeBytes > max;
 }
 
+/**
+ * Whether a resolved URL is an **object URL we created** (a `blob:` URL), i.e. whether
+ * revoking it is ours to do.
+ *
+ * This is not cosmetic: since a large item resolves to a **stream** URL (`amos-media://…`)
+ * instead of a blob, the cleanup path must not hand that URL to `URL.revokeObjectURL` —
+ * the player would be "releasing" a resource it never created. One predicate, used by the
+ * cleanup, keeps "we made it" and "we release it" the same statement.
+ */
+export function isObjectUrl(url: string): boolean {
+  return url.startsWith("blob:");
+}
+
+/** Whether a resolved URL is a **host-streamed** one rather than in-memory bytes. */
+export function isStreamUrl(url: string): boolean {
+  return url !== "" && !isObjectUrl(url);
+}
+
 /** One queued, playable track (origin-agnostic view for the playlist). */
 export interface PlayerTrack {
   /** Stable dedupe key (`<origin>:<native id>`). */

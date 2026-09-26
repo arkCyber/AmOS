@@ -19,7 +19,9 @@
 |------|------|------|----------|------|
 | `AMOS_BACKEND` | enum | (启动探测) | `→ mock` | 推理后端选择:`mock`/`api`/`ollama`/`hermes`/`ggml`。非 mock 后端若不可达 ⇒ 记 `degraded` 而**不**假装 mock |
 | `AMOS_MODEL` | string | (后端相关) | `→ backend-default` | 模型标识(如 `gpt-4o-mini`、`deepseek-chat`) |
-| `AMOS_MODEL_PATH` | path | - | `→ ggml-skip` | GGML 模型文件路径 |
+| `AMOS_MODEL_PATH` | path | - | `→ ggml-skip` | GGML 模型文件路径(模型解析链**第一**顺位:操作者覆盖) |
+| `AMOS_BUNDLE_ASSETS_DIR` | path | (none) | `→ 内置根回退` | 随镜像打包的资源根;模型解析链**第二**顺位(`{dir}/models/<file>`)。未设时回退到固定内置根 `/data/amos`、`/system/share/amos`、`/system/etc/amos` |
+| `AMOS_USER_MODELS_DIR` | path | (none) | `→ ~/.amos/models` | 用户安装模型目录;解析链**第三**顺位(`{dir}/<file>`)。未设时回退 `~/.amos/models`。任一 env 值超过 `MAX_MODEL_PATH_BYTES = 4096` 或为空白 ⇒ 记 warn 并**忽略**(不截断成意外路径) |
 | `AMOS_GGML_BIN` | path | - | `→ ggml-skip` | GGML 二进制路径 |
 | `AMOS_GGML_MODEL` | path | - | `→ ggml-skip` | GGML 模型 |
 | `AMOS_GGML_STRICT` | bool | `0` | `→ best-effort` | 设为 `1` 时,真实引擎不可用即**拒绝启动**,不降级到 mock |
@@ -82,10 +84,10 @@
 | `AMOS_ENERGY_LEVEL_PCT` | int | (none) | `→ probe` | 电池电量阈值(%) |
 | `AMOS_ENERGY_POWER_MW` | int | (none) | `→ probe` | 功率阈值(mW) |
 | `AMOS_ENERGY_TEMP_C` | int | (none) | `→ probe` | 温度阈值(°C) |
-| `AMOS_ENERGY_CHARGING` | bool | (none) | `→ probe` | 是否在充电 |
-| `AMOS_ENERGY_SCREEN_ON` | bool | (none) | `→ probe` | 屏幕是否点亮 |
-| `AMOS_ENERGY_FOREGROUND_HEAVY` | bool | (none) | `→ probe` | 是否前台重负载 |
-| `AMOS_ENERGY_INFERENCE_ACTIVE` | bool | (none) | `→ probe` | 是否正在推理 |
+| `AMOS_ENERGY_CHARGING` | bool | `false`(保守) | `→ on-battery` | 是否在充电。**严格读**：`1`/`true`/`yes`/`on`=真,`0`/`false`/`no`/`off`=假,**其余(含空串与笔误)一律视为未设置**并 `WARN` 一次(REQ-A533) |
+| `AMOS_ENERGY_SCREEN_ON` | bool | `true`(保守) | `→ screen-on` | 屏幕是否点亮。同上的严格读;`AMOS_SCREEN_STATE_PATH` 的文件契约优先于本开关 |
+| `AMOS_ENERGY_FOREGROUND_HEAVY` | bool | `false` | `→ no-hint` | 是否前台重负载。同上的严格读 |
+| `AMOS_ENERGY_INFERENCE_ACTIVE` | bool | `false` | `→ no-hint` | 是否正在推理。同上的严格读 |
 
 ---
 
@@ -152,6 +154,7 @@
 | `AMOS_ANDROID_LAUNCH_TIMEOUT` | duration | `30s` | `→ 30s` | APK 启动超时 |
 | `AMOS_ANDROID_LIST_TIMEOUT` | duration | `30s` | `→ 30s` | APK 列表超时 |
 | `AMOS_DEVCARE_ROOT` | path | (none) | `→ refuse-clean` | DevCare 主机根目录(root 部署时) |
+| `AMOS_HOST_FS_ROOT` | path | (none) | `→ refuse-all` | `host_fs_*` 命令允许的根目录(启动期取一次、强校验)。未设/空 ⇒ 每个命令都 `amos.host_fs.root_not_configured`(最常见的失败,不是「路径太短」);设置了但不存在 ⇒ `root_not_found`;设置成非目录 ⇒ `root_not_a_dir` |
 | `AMOS_SCREEN_STATE_PATH` | path | (none) | `→ in-memory` | 屏幕状态文件(amoS-display) |
 | `AMOS_STATE_FILE` | path | (none) | `→ in-memory` | 通用状态文件 |
 | `AMOS_GUEST_CLIPBOARD_SOCKET` | path | (none) | `→ no-guest-link` | 容器剪贴板通道 |
@@ -166,6 +169,7 @@
 | `AMOS_APPSTORE_CATALOG` | path | (none) | `→ no-catalog` | 本地 catalog JSON |
 | `AMOS_APPSTORE_INSTALL_DIR` | path | (none) | `→ refuse-install` | APK 安装目录 |
 | `AMOS_PWA_INDEX_DIR` | path | (none) | `→ no-pwa` | PWA 索引目录 |
+| `AMOS_PWA_REMOTE_ALLOW` | list | (none) | `→ refuse-remote` | 远程 PWA 清单允许的主机白名单（逗号分隔、全限定小写、无通配符；未设 = 不放行任何主机） |
 | `AMOS_EXPORT_DIR` | path | (none) | `→ refuse-export` | F-Droid 导出目录 |
 
 ---
@@ -180,6 +184,14 @@
 | `AMOS_ROOT` | path | (none) | `→ cwd` | 应用根目录 |
 | `AMOS_DESKTOP_SHORTCUTS` | enum | `enabled` | `→ enabled` | 系统快捷键(`⌘W` / `⌘M` / `⌘H` / `⌘,`)作用于焦点窗口的开关:`enabled`(默认)/`disabled`(也接受 `shortcuts` 列表写法)。`disabled` ⇒ `DesktopShell.handleSystemShortcut` 与 `DesktopWindowKeys` 直接返回,焦点窗口仍可关,但**前端不抢键**(适合 WebView/宿主 OS 已经接管的场景,如 macOS 真机上的 `⌘H`)。**读取方是宿主**(`crates/amos-tauri/src/desktop_features.rs`,启动时解析并在 boot 日志里如实上报);UI 侧的答案缓存是 **per-WebView 的模块状态**,所以**每一个桌面壳面各自取一次**(启动器 `DesktopShell`、应用窗口 `DesktopAppWindow` —— REQ-A453 修掉的就是「只有启动器问过」⇒ 该开关在应用窗口里曾经完全不生效) —— WebView 里没有环境变量可读(REQ-A287),每个变量只管自己那一个能力,把另一个能力键写进来不会生效但在 boot 日志里有 warning | 
 | `AMOS_DOCK_CONTEXT_MENU` | enum | `enabled` | `→ enabled` | Dock 右键菜单开关:`enabled`(默认)/`disabled`(也接受 `dock-context-menu` 列表写法)。`disabled` ⇒ Dock 的 `oncontextmenu` 不弹 `DockContextMenu`(调试 / 自动化截图时用)。读取方/上报方式同上(REQ-A287) |
+| `AMOS_WEBMAN_DOWNLOAD_DIR` | path | (none) | `→ 平台 Downloads` | WebMan(浏览器)下载落盘目录覆盖。空串按**未设置**处理(不落 `""`);未设时 `dirs::download_dir()` → `$HOME/Downloads` → `temp_dir/amos-downloads`。读取点:`crates/amos-tauri/src/webman_download.rs::download_dir` |
+| `AMOS_WEBMAN_PROFILE` | path | (none) | `→ 平台 data_dir/amos/webman` | WebMan cookie jar 持久化目录覆盖。空串按**未设置**处理;未设时 `dirs::data_dir()/amos/webman` → `temp_dir/amos-webman`。读取点:`crates/amos-tauri/src/webman_download.rs::profile_dir` |
+| `AMOS_OTA_MANIFEST_PATH` | path | (none) | `→ unconfigured` | 系统更新(OTA)清单 JSON 文件路径。**未设置 ⇒ 桥接处于未配置态**,`ota_check` 如实返回 `kind:"unconfigured"`(不是伪造的"已是最新");文件不可读/超 4 MiB/非法 JSON ⇒ `kind:"unreachable"`。读取点:`crates/amos-tauri/src/ota.rs::Source::from_env` |
+| `AMOS_OTA_CHANNEL` | enum | `stable` | `→ stable` | 更新通道:`stable`/`beta`(未知值按 `stable`)。决定策略(`UpdatePolicy`)与清单里可选的包。读取点:`crates/amos-tauri/src/ota.rs::channel_from_env` |
+| `AMOS_OTA_DEVICE_ID` | string | `amos-device` | `→ amos-device` | 本机灰度 id(cohort 分桶)。空串/未设 ⇒ 用确定性的默认 id。读取点:`crates/amos-tauri/src/ota.rs::device_id_from_env` |
+| `AMOS_OTA_IMAGE_PATH` | path | (none) | `→ failed("no update image configured …")` | 本机可**下载并校验**的更新镜像文件路径(REQ-A1455)。未设置 ⇒ `ota_install` 不伪造成功:状态落 `failed`、`fail_reason` 点名本变量。文件不可读/超过包体积上界(8 GiB) ⇒ 同上 `failed`。镜像实长与清单 `size_bytes` 不符 ⇒ 如实区分「截断」与「超长」两种原因。**落点是 `staged`(已下载并校验,重启后生效),不是「已安装」**——写入镜像与重启仍由运行时负责。读取点:`crates/amos-tauri/src/ota.rs::Source::from_env` / `FileUpdateProvider::fetch_package` |
+| `AMOS_OTA_TRUST_KEYS` | list | (none) | `→ 全不信任` | 本机信任的签名 key id,逗号分隔(REQ-A1455)。仅用于记录签名结论;**不是**安装闸门——是否要求签名由清单策略(`require_signature`)决定。**这是弱的一半**:只有 id ⇒ 走策略型校验(`TrustingVerifier`,只比对 id 与签名形状、**不做密码学**)。读取点:`crates/amos-tauri/src/ota.rs::trust_from_env` → `TrustConfig::parse` |
+| `AMOS_OTA_TRUST_KEY_HEX` | list | (none) | `→ 退化为仅按 id 匹配` | 受信 Ed25519 **公钥**,`key_id:公钥hex` 逗号分隔(REQ-A1496)。**设了 ≥1 对 ⇒ 真验签**(RFC 8032),`OtaSignatureReport.verified_by` 报 `ed25519`;否则报 `policy`(只比对 id、无密码学,`amos-ota` 明写 not a security boundary)。`trusted` 的含义随此字段而变,故它随裁决一起上信道。格式错(无冒号/hex 非法)⇒ 安装落 `idle` 并在 `detail` 点名本变量,**绝不**静默退化到 `policy`——那正是本变量要防住的过度声称。读取点:`crates/amos-tauri/src/ota.rs::trust_from_env` → `TrustConfig::{parse,verifier}` |
 
 ---
 

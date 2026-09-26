@@ -12,11 +12,12 @@
   // from this push-to-talk mic or from the always-on native device mic — renders
   // exactly once (no double bubbles), and DeviceMicButton never has to depend on
   // this button being mounted.
-  import { assistantVoiceEnd, assistantVoiceFeed, assistantVoiceStart, assistantVoiceStop } from "../lib/backend";
+  import { assistantVoiceEnd, assistantVoiceFeed, assistantVoiceStart, assistantVoiceStop, bridgeDiag } from "../lib/backend";
   import { pcmToAssistantChunk } from "../lib/voice";
   import { loadLedger, capSet, type Capability } from "../lib/permissions";
   import { grantCapability, revokeCapability } from "./osPermissions";
   import { t } from "./locale.svelte";
+  import StoreErrorBar from "./StoreErrorBar.svelte";
   import { onDestroy } from "svelte";
 
   const MIC: Capability = "microphone";
@@ -24,6 +25,7 @@
     online,
     session,
     onStart,
+    onError,
     disabled = false,
   }: {
     online: boolean;
@@ -31,12 +33,17 @@
      * speaking) — never call a side-effecting getter during render. */
     session: () => string;
     onStart?: () => void;
+    /** The host refused a unit-returning voice command (by name); the screen that renders
+     *  this button owns the status line, so the reason is reported there, not swallowed. */
+    onError?: (command: string) => void;
     disabled?: boolean;
   } = $props();
 
   let recording = $state(false);
   let micGranted = $state(capSet(loadLedger(), "ai", MIC));
   let ask = $state(false);
+  /** The ledger write's refusal, shown inside the still-open prompt (`StoreErrorBar`). */
+  let storeErr = $state("");
   /** True once the host opened a resident listener we must later cancel. */
   let sessionOpen = false;
 
@@ -91,10 +98,20 @@
     const media = navigator.mediaDevices;
     if (!media?.getUserMedia) return;
     recording = true;
-    onStart?.();
     try {
       const sid = session();
       await assistantVoiceStart(sid);
+      // `assistant_voice_start` returns `Result<(), AmosError>`: the host's `Ok(())` reaches the
+      // bridge as the very same `null` a refusal does (REQ-A297). Unread, a listener the host
+      // never opened looked exactly like one it had — local capture started, every frame went to
+      // nothing, no reply ever came, and the parent had already been told the user spoke.
+      if (!bridgeDiag("assistant_voice_start").ok) {
+        recording = false;
+        onError?.("assistant_voice_start");
+        return;
+      }
+      // The daemon is listening now, so the parent's "you spoke" bubble is no longer premature.
+      onStart?.();
       // From here on the daemon holds a resident listener: even if the local
       // capture fails below, teardown must cancel it.
       sessionOpen = true;
@@ -140,6 +157,10 @@
     recording = false;
     // Force-finalize the utterance so the daemon answers now (push-to-talk).
     await assistantVoiceEnd();
+    // `assistant_voice_end` is `Result<(), String>`, so success and refusal arrive as the same
+    // `null`; a refusal means the utterance was never finalized and no reply is coming, which
+    // must be said rather than left as silence (REQ-A297).
+    if (!bridgeDiag("assistant_voice_end").ok) onError?.("assistant_voice_end");
   }
 
   // `assistant_voice_start` opens a **resident** daemon listener (a long-lived
@@ -152,32 +173,57 @@
   onDestroy(() => {
     if (!sessionOpen) return; // never opened one → nothing to cancel
     sessionOpen = false;
-    try {
-      void assistantVoiceStop().catch(() => {
-        /* offline / already stopped */
-      });
-    } catch {
-      /* ignore */
-    }
+    // Fire-and-forget, and here that is a fact about the host rather than a hope:
+    // `invoke` cannot reject (REQ-A296), so both the `try`/`catch` and the `.catch()`
+    // this used to carry were unreachable code; and the whole host path cannot refuse —
+    // `assistant_voice_stop` (`crates/amos-tauri/src/assistant_voice.rs:368`) returns
+    // `Ok(())` unconditionally, and `VoiceSession::stop` (`:287`) discards even the mpsc
+    // send's result (`let _ =`). So the only failure left is having no usable bridge —
+    // the same condition under which no listener was ever opened. Nothing to render
+    // either way: this runs while the component is being destroyed. `invoke` still
+    // records the outcome in the per-command diagnosis
+    // (`bridgeDiag("assistant_voice_stop")`), which is where a future reader of a real
+    // refusal would find it.
+    void assistantVoiceStop();
   });
 
+  // `micGranted` is seeded from the persisted ledger (`capSet(loadLedger(), …)`), so it is a
+  // *display of* `amos.permissions` — the ledger every OS capability gate reads back. The
+  // prompt's answer must adopt the write's own verdict, not the intent: on a refused write
+  // `grantCapability`/`revokeCapability` answer the ledger the store still holds, and the adopted
+  // value decides whether the prompt may close. The refused revoke is the dangerous direction —
+  // the user believes the mic was withdrawn while `loadLedger()` still grants it.
   const allowMic = () => {
-    grantCapability("ai", MIC);
-    micGranted = true;
+    const res = grantCapability("ai", MIC);
+    micGranted = capSet(res.ledger, "ai", MIC);
+    if (!micGranted) {
+      storeErr = t("common.storeWriteFailed");
+      return;
+    }
+    storeErr = "";
     ask = false;
     void start();
   };
   const denyMic = () => {
-    revokeCapability("ai", MIC);
-    micGranted = false;
+    const res = revokeCapability("ai", MIC);
+    micGranted = capSet(res.ledger, "ai", MIC);
+    if (micGranted) {
+      storeErr = t("common.storeWriteFailed");
+      return;
+    }
+    storeErr = "";
     ask = false;
   };
 </script>
 
 <span class="relative inline-flex shrink-0">
+  <!-- Push-to-talk: the ● glyph and the red class are the only "capturing" signals, and the static
+       `aria-label` overrides that glyph for the accessible name — so the mic announced the same
+       name while held down as while idle. `aria-pressed` reports the hold (REQ-A1001 / F-SH-322). -->
   <button
     type="button"
     aria-label={t("a11y.streamingVoiceInput")}
+    aria-pressed={recording}
     onpointerdown={(e) => {
       e.preventDefault();
       if (!recording) void start();
@@ -202,10 +248,13 @@
       (disabled || !online ? " opacity-40" : "")}
   >{recording ? "●" : "🎙️"}</button>
   {#if ask}
-    <span class="absolute bottom-full right-0 z-30 mb-2 flex items-center gap-2 whitespace-nowrap rounded-xl bg-white px-2.5 py-1.5 text-xs shadow ring-1 ring-black/10 dark:bg-neutral-800 dark:ring-white/10">
-      <span class="opacity-80">{t("perm.micAsk")}</span>
-      <button type="button" onclick={allowMic} class="rounded-full bg-accent px-2 py-0.5 text-white">{t("perm.allow")}</button>
-      <button type="button" onclick={denyMic} class="rounded-full bg-neutral-200 px-2 py-0.5 dark:bg-neutral-700">{t("perm.deny")}</button>
+    <span class="absolute bottom-full right-0 z-30 mb-2 flex flex-col gap-1 rounded-xl bg-white px-2.5 py-1.5 text-xs shadow ring-1 ring-black/10 dark:bg-neutral-800 dark:ring-white/10">
+      <span class="flex items-center gap-2 whitespace-nowrap">
+        <span class="opacity-80">{t("perm.micAsk")}</span>
+        <button type="button" onclick={allowMic} class="rounded-full bg-accent px-2 py-0.5 text-white">{t("perm.allow")}</button>
+        <button type="button" onclick={denyMic} class="rounded-full bg-neutral-200 px-2 py-0.5 dark:bg-neutral-700">{t("perm.deny")}</button>
+      </span>
+      <StoreErrorBar message={storeErr} />
     </span>
   {/if}
 </span>

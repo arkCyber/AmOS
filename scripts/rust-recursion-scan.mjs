@@ -65,6 +65,8 @@
 import { readFileSync, writeFileSync, readdirSync, existsSync } from "node:fs";
 import { join, dirname, relative } from "node:path";
 import { fileURLToPath } from "node:url";
+// REQ-A530: the shared "production part of a Rust file" (strips `#[cfg(test)]` items).
+import { stripTestRegions } from "./tauri-reply-scan.mjs";
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const cratesDir = join(repoRoot, "crates");
@@ -109,8 +111,11 @@ const rustFiles = readdirSync(cratesDir, { withFileTypes: true })
 
 /** Drop everything from the first `#[cfg(test)]` (test modules hold code too). */
 function stripTestModules(src) {
-  const i = src.indexOf("#[cfg(test)]");
-  return i < 0 ? src : src.slice(0, i);
+  // REQ-A530: strip the test **items** (shared implementation) instead of truncating at the first
+  // `#[cfg(test)]` — a file with an inline test helper above production code used to lose everything
+  // below it (`wm.rs`: helper at line 816, real code to 2 600+). Comments are kept; this scan masks
+  // them itself.
+  return stripTestRegions(src);
 }
 
 /**
@@ -351,10 +356,40 @@ function traitOf(header) {
  * some other value, `other.run()`, cannot be resolved by name alone), so the analysis can
  * miss a cycle but never invent one — the same contract as the direct-recursion check.
  */
-function calleesOfDetailed(masked, fn, index) {
+/**
+ * The body of `fn`, **clamped so it cannot swallow the next declaration** (REQ-A530).
+ *
+ * Why this guard exists: a body computed from a desynchronised brace count runs on for hundreds of
+ * lines past its own closing brace, and every call belonging to the functions below gets attributed
+ * to this one — fabricated call edges, hence fabricated "recursion". That was observed for real on
+ * 2026-09-19: `crates/amos-ai/src/server.rs`'s `build_backend_from_env` (lines 901–999) came back as
+ * **1 478 lines** and swallowed `serve_with_log_sink(<…>)` calls that live at line 1765, which the
+ * workspace pass then glued into a cycle. The raw source proves the edge does not exist:
+ * `serve_with_log_sink` appears only at 1765/1780/1787.
+ *
+ * What actually made it vanish is *not* this function, and the honest record says so: the runaway was
+ * observed while the scanner was being fed a **comment-stripped** source (the shared helper's older
+ * form, `stripTestRegions(stripComments(src))`) — while the masker below expects raw Rust and blanks
+ * comments itself, and the comment stripper is regex-based, so a `/*` or `//` inside a string literal
+ * could swallow real code and unbalance the braces. Measured both ways: with comments kept
+ * (`stripTestRegions` alone) the scan reports 0 cycles **with or without** this clamp. So the clamp is
+ * a guard, not the fix: it can only ever **shrink** a body, so it cannot hide a real call — a
+ * function's own calls always sit above the next `fn` in a file the parser could read.
+ */
+function bodySlice(masked, fn, fns) {
+  const body = bodyOf(masked, fn.bodyOpen);
+  let end = fn.bodyOpen + 1 + body.length;
+  for (const other of fns) {
+    if (other === fn || other.declAt <= fn.bodyOpen) continue;
+    if (other.declAt < end) end = other.declAt;
+  }
+  return masked.slice(fn.bodyOpen + 1, end);
+}
+
+function calleesOfDetailed(masked, fn, index, fns = []) {
   const resolved = new Set(); // keys *this file* defines — the per-file graph's edges
   const unresolved = new Set(); // candidate keys only the workspace pass can resolve
-  const body = bodyOf(masked, fn.bodyOpen);
+  const body = bodySlice(masked, fn, fns);
   // A call this file resolves becomes an edge here; one it cannot carries its *candidate* key
   // (`Type::name`, or a bare name) so `scanWorkspace` can still use it when the whole workspace
   // defines that key exactly once.
@@ -409,8 +444,8 @@ function calleesOfDetailed(masked, fn, index) {
  * so `scanMasked` reads exactly as before; the workspace pass (`scanWorkspace`) uses the
  * detailed form, which also carries the candidates only a whole-workspace index can resolve.
  */
-function calleesOf(masked, fn, index) {
-  return calleesOfDetailed(masked, fn, index).resolved;
+function calleesOf(masked, fn, index, fns = []) {
+  return calleesOfDetailed(masked, fn, index, fns).resolved;
 }
 
 /** Every function in one masked source, keyed as the graph needs it. */
@@ -475,7 +510,7 @@ function resolveMethod(index, type, name) {
 function scanMasked(masked) {
   const fns = functionsOf(masked);
   const index = indexFunctions(fns);
-  const graph = new Map(fns.map((f) => [f.key, calleesOf(masked, f, index)]));
+  const graph = new Map(fns.map((f) => [f.key, calleesOf(masked, f, index, fns)]));
   const keys = index.all;
   const lineOfKey = new Map(fns.map((f) => [f.key, f.line]));
 
@@ -563,7 +598,7 @@ function scanWorkspace(parsed) {
     for (const f of pf.fns) {
       const id = pf.node(f.key);
       nodeInfo.set(id, { path: pf.path, key: f.key, line: f.line });
-      const { resolved, unresolved } = calleesOfDetailed(pf.masked, f, pf.index);
+      const { resolved, unresolved } = calleesOfDetailed(pf.masked, f, pf.index, pf.fns);
       const edges = new Set();
       for (const k of resolved) {
         const target = pf.localNode.get(k);

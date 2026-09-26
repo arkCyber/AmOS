@@ -231,21 +231,66 @@ typedef struct amos_link_federation_task {
 
 #define AMLK_MAGIC { 65, 77, 76, 75, }
 
+/**
+ * # Safety
+ *
+ * `id` must be a NUL-terminated UTF-8 C string (a null pointer is answered with an error code,
+ * never undefined behaviour).
+ */
 int32_t amos_link_peer_id_validate(const char *id);
 
+/**
+ * # Safety
+ *
+ * `id` must be a NUL-terminated UTF-8 C string (a null pointer is answered with an error code,
+ * never undefined behaviour); `out` must be writable for `AMLK_MAX_PEER_ID_LEN + 1` bytes.
+ */
 int32_t amos_link_peer_id_new(const char *id, char *out);
 
+/**
+ * # Safety
+ *
+ * `expr` must be a NUL-terminated UTF-8 C string (a null pointer is answered with an error code,
+ * never undefined behaviour).
+ */
 int32_t amos_link_topic_validate(const char *expr);
 
+/**
+ * # Safety
+ *
+ * `expr` must be a NUL-terminated UTF-8 C string (a null pointer is answered with an error code,
+ * never undefined behaviour).
+ */
 int32_t amos_link_topic_validate_pattern(const char *expr);
 
+/**
+ * # Safety
+ *
+ * `peer` and `name` must be a NUL-terminated UTF-8 C string (a null pointer is answered with an
+ * error code, never undefined behaviour); `out` must be writable for `AMLK_MAX_TOPIC_LEN + 1`
+ * bytes.
+ */
 int32_t amos_link_topic_channel(const char *peer,
                                 amos_link_channel channel,
                                 const char *name,
                                 char *out);
 
+/**
+ * # Safety
+ *
+ * `peer` must be a NUL-terminated UTF-8 C string (a null pointer is answered with an error code,
+ * never undefined behaviour); `out` must be writable for `AMLK_MAX_TOPIC_LEN + 1` bytes.
+ */
 int32_t amos_link_topic_peer_pattern(const char *peer, char *out);
 
+/**
+ * # Safety
+ *
+ * `topic` and `pattern` must be live pointers to this crate's `#[repr(C)]` mirror of `Topic` (null
+ * answers `false`). NOTE: no entry point hands a `Topic` out yet, so a C caller cannot obtain a
+ * valid argument — this function is unreachable until a constructor exists (recorded in
+ * `CHANGELOG.md`, REQ-A388).
+ */
 bool amos_link_topic_matches(const Topic *topic, const Topic *pattern);
 
 struct Qos amos_link_qos_new(amos_link_reliability reliability,
@@ -278,6 +323,12 @@ bool amos_link_timestamp_is_valid(struct Timestamp stamp);
 
 /**
  * Encode a bincode payload into a full wire frame synchronously.
+ * # Safety
+ *
+ * `topic_str` and `peer_id_str` must be a NUL-terminated UTF-8 C string (a null pointer is
+ * answered with an error code, never undefined behaviour); `payload` must point to `payload_len`
+ * readable bytes (`NULL, 0` is the empty payload, `NULL, n>0` is refused); `frame_out` must be
+ * writable for `frame_out_cap` bytes.
  */
 uintptr_t amos_link_frame_encode(const char *topic_str,
                                  const char *peer_id_str,
@@ -290,6 +341,11 @@ uintptr_t amos_link_frame_encode(const char *topic_str,
 
 /**
  * Decode only the frame header (payload slice is borrowed, not copied).
+ * # Safety
+ *
+ * `frame` must point to `frame_len` readable bytes — this function does **not** check for null or
+ * zero, it decodes immediately; `h` must be a caller-owned `amos_link_frame_header` whose
+ * `topic`/`peer_id` arrays use the header's sizes (`AMLK_MAX_TOPIC_LEN` / `AMLK_MAX_PEER_ID_LEN`).
  */
 int32_t amos_link_frame_decode_header(const uint8_t *frame,
                                       uintptr_t frame_len,
@@ -297,6 +353,11 @@ int32_t amos_link_frame_decode_header(const uint8_t *frame,
 
 /**
  * Decode a wire frame and return its payload bytes.
+ * # Safety
+ *
+ * `frame` must point to `frame_len` readable bytes (null/0 is refused with an error);
+ * `payload_out` must be writable for `payload_cap` bytes — a payload that does not fit is refused,
+ * not truncated.
  */
 int32_t amos_link_frame_decode_payload(const uint8_t *frame,
                                        uintptr_t frame_len,
@@ -305,100 +366,299 @@ int32_t amos_link_frame_decode_payload(const uint8_t *frame,
 
 /**
  * CRC32 of a single buffer.
+ * # Safety
+ *
+ * `data` must point to `len` readable bytes (`NULL`/`0` returns `0`).
  */
 uint32_t amos_link_crc32(const uint8_t *data, uintptr_t len);
 
 /**
  * CRC32 of header || payload combined.
+ * # Safety
+ *
+ * `header`/`payload` must each point to their `_len` readable bytes; a null or zero-length part is
+ * skipped.
  */
 uint32_t amos_link_crc32_combine(const uint8_t *header,
                                  uintptr_t h_len,
                                  const uint8_t *payload,
                                  uintptr_t p_len);
 
+/**
+ * # Safety
+ *
+ * `peer_id` must be a NUL-terminated UTF-8 C string (a null pointer is answered with an error
+ * code, never undefined behaviour). The returned handle owns a `Box<Arc<LinkNode>>` and must be
+ * released with `amos_link_node_drop` (each clone counts separately).
+ */
 struct amos_link_node *amos_link_node_new(const char *peer_id, amos_link_node_kind kind);
 
+/**
+ * # Safety
+ *
+ * `node` must be a live handle from `amos_link_node_new`/`amos_link_node_clone` that has not been
+ * dropped. The returned handle is a new owned reference and must be dropped too.
+ */
 struct amos_link_node *amos_link_node_clone(const struct amos_link_node *node);
 
+/**
+ * # Safety
+ *
+ * `node` must be a handle from `amos_link_node_new`/`_clone` that has **not** been dropped: this
+ * takes ownership back. Using the handle afterwards (including a second drop) is undefined
+ * behaviour. A null pointer is ignored.
+ */
 void amos_link_node_drop(struct amos_link_node *node);
 
+/**
+ * # Safety
+ *
+ * `node` must be a live handle (see `amos_link_node_drop`); `buf` must be writable for `cap`
+ * bytes.
+ */
 int32_t amos_link_node_peer_id(const struct amos_link_node *node, char *buf, uintptr_t cap);
 
+/**
+ * # Safety
+ *
+ * `node` must be a live handle (see `amos_link_node_drop`); null answers `NodeTool`.
+ */
 amos_link_node_kind amos_link_node_get_kind(const struct amos_link_node *node);
 
+/**
+ * # Safety
+ *
+ * `node` must be a live handle (see `amos_link_node_drop`); null answers `0`.
+ */
 uint64_t amos_link_node_uptime_ms(const struct amos_link_node *node);
 
 const char *amos_link_version(void);
 
+/**
+ * # Safety
+ *
+ * `node` must be a live handle (see `amos_link_node_drop`); `buf` must be writable for
+ * `AMLK_MAX_TOPIC_LEN + 1` bytes.
+ */
 int32_t amos_link_node_heartbeat_topic(const struct amos_link_node *node, char *buf);
 
+/**
+ * # Safety
+ *
+ * `node` must be a live handle (see `amos_link_node_drop`); `topic_str` must be a NUL-terminated
+ * UTF-8 C string (a null pointer is answered with an error code, never undefined behaviour). The
+ * returned publisher must be released with `amos_link_publisher_drop` **before** the node it was
+ * built from.
+ */
 struct amos_link_publisher *amos_link_publisher_new(const struct amos_link_node *node,
                                                     const char *topic_str);
 
+/**
+ * # Safety
+ *
+ * `pubr` must be a publisher from `amos_link_publisher_new` that has not been dropped; this takes
+ * ownership back (a second drop, or publishing afterwards, is undefined behaviour). A null pointer
+ * is ignored.
+ */
 void amos_link_publisher_drop(struct amos_link_publisher *pubr);
 
+/**
+ * # Safety
+ *
+ * `pubr` must be a live publisher handle; `payload` must point to `payload_len` readable bytes
+ * (`NULL, 0` publishes an empty payload, `NULL, n>0` is refused).
+ */
 int32_t amos_link_publisher_publish(const struct amos_link_publisher *pubr,
                                     const uint8_t *payload,
                                     uintptr_t payload_len);
 
+/**
+ * # Safety
+ *
+ * `pubr` must be a live publisher handle; `buf` must be writable for `cap` bytes.
+ */
 int32_t amos_link_publisher_topic(const struct amos_link_publisher *pubr, char *buf, uintptr_t cap);
 
+/**
+ * # Safety
+ *
+ * `node` must be a live handle (see `amos_link_node_drop`); `pattern_str` must be a NUL-terminated
+ * UTF-8 C string (a null pointer is answered with an error code, never undefined behaviour). The
+ * returned subscriber owns a background thread and must be released with
+ * `amos_link_subscriber_drop`.
+ */
 struct amos_link_subscriber *amos_link_subscriber_new(const struct amos_link_node *node,
                                                       const char *pattern_str,
                                                       struct Qos qos);
 
+/**
+ * # Safety
+ *
+ * `sub` must be a subscriber from `amos_link_subscriber_new` that has not been dropped; this takes
+ * ownership back and stops its background thread. A second drop, or polling afterwards, is
+ * undefined behaviour. A null pointer is ignored.
+ */
 void amos_link_subscriber_drop(struct amos_link_subscriber *sub);
 
+/**
+ * # Safety
+ *
+ * `sub` must be a live subscriber handle; `received` must be a caller-owned `amos_link_received`
+ * with the header's array sizes; `payload_buf` must be writable for `payload_cap` bytes.
+ */
 amos_link_poll amos_link_subscriber_poll(const struct amos_link_subscriber *sub,
                                          struct amos_link_received *received,
                                          uint8_t *payload_buf,
                                          uintptr_t payload_cap);
 
+/**
+ * # Safety
+ *
+ * `sub` must be a live subscriber handle; `received` must be a caller-owned `amos_link_received`
+ * with the header's array sizes; `payload_buf` must be writable for `payload_cap` bytes.
+ */
 amos_link_poll amos_link_subscriber_recv(const struct amos_link_subscriber *sub,
                                          struct amos_link_received *received,
                                          uint8_t *payload_buf,
                                          uintptr_t payload_cap);
 
+/**
+ * Fill `stats` with this subscriber's running counters (REQ-A609).
+ *
+ * * `received` — frames the background reader accepted from the subscription;
+ * * `decode_errors` — frames it rejected as undecodable (it then keeps reading);
+ * * `dropped` — always `0`, because the reader→caller handoff is an unbounded channel
+ *   and genuinely never discards a frame (see the body).
+ *
+ * `received` counts what reached the subscriber, not what the C caller has polled:
+ * a frame sitting in the handoff channel is already received.
+ *
+ * # Safety
+ *
+ * `sub` must be a live subscriber handle; `stats` must be a caller-owned, writable
+ * `amos_link_sub_stats`.
+ */
 int32_t amos_link_subscriber_stats(const struct amos_link_subscriber *sub,
                                    struct amos_link_sub_stats *stats);
 
+/**
+ * # Safety
+ *
+ * `sub` must be a live subscriber handle; null answers `false`.
+ */
 bool amos_link_subscriber_has_pending(const struct amos_link_subscriber *sub);
 
+/**
+ * # Safety
+ *
+ * `node` must be a live handle (see `amos_link_node_drop`); `metrics` must be a caller-owned,
+ * writable `amos_link_metrics`.
+ */
 int32_t amos_link_node_metrics(const struct amos_link_node *node,
                                struct amos_link_metrics *metrics);
 
+/**
+ * # Safety
+ *
+ * `m` must point to a readable `amos_link_metrics` — normally the struct a caller filled through
+ * `amos_link_node_metrics` or `amos_link_evaluate_health`; null answers `0`.
+ */
 uint32_t amos_link_metrics_delivery_ratio(const struct amos_link_metrics *m);
 
+/**
+ * # Safety
+ *
+ * `metrics` must point to a readable `amos_link_metrics`; `peers` must point to `num_peers`
+ * `amos_link_peer_view` values whose `id` arrays are NUL-terminated (a null pointer or `0` counts
+ * as an empty peer list).
+ */
 struct amos_link_health amos_link_evaluate_health(const struct amos_link_metrics *metrics,
                                                   const struct amos_link_peer_view *peers,
                                                   uintptr_t num_peers,
                                                   bool clock_synced);
 
+/**
+ * # Safety
+ *
+ * `node` must be a live handle (see `amos_link_node_drop`); `peers_out` must be writable for
+ * `max_peers` `amos_link_peer_view` values (fewer are written if there are fewer).
+ */
 uintptr_t amos_link_node_peers(const struct amos_link_node *node,
                                struct amos_link_peer_view *peers_out,
                                uintptr_t max_peers);
 
+/**
+ * # Safety
+ *
+ * `node` must be a live handle (see `amos_link_node_drop`); `topics_out` must be writable for
+ * `max_topics` `amos_link_topic_entry` values (fewer are written if there are fewer).
+ */
 uintptr_t amos_link_node_topics(const struct amos_link_node *node,
                                 struct amos_link_topic_entry *topics_out,
                                 uintptr_t max_topics);
 
+/**
+ * # Safety
+ *
+ * `node` must be a live handle (see `amos_link_node_drop`). The returned heartbeat owns a
+ * `Box<Heartbeat>` and must be released with `amos_link_heartbeat_drop`.
+ */
 struct amos_link_heartbeat *amos_link_node_heartbeat(const struct amos_link_node *node);
 
-int32_t amos_link_heartbeat_encode(const struct amos_link_heartbeat *beat, uint8_t *frame_out);
+/**
+ * # Safety
+ *
+ * `beat` must be a live heartbeat handle; `frame_out` must be writable for `AMLK_MAX_FRAME_BYTES`
+ * bytes — the signature carries no capacity parameter, so that constant *is* the capacity contract
+ * (a heartbeat frame is far smaller in practice; see the `CHANGELOG.md` note, REQ-A388).
+ */
+int32_t amos_link_heartbeat_encode(const struct amos_link_heartbeat *beat,
+                                   uint8_t *frame_out);
 
+/**
+ * # Safety
+ *
+ * `beat` must be a heartbeat from `amos_link_node_heartbeat` that has not been dropped; this takes
+ * ownership back. A null pointer is ignored.
+ */
 void amos_link_heartbeat_drop(struct amos_link_heartbeat *beat);
 
+/**
+ * # Safety
+ *
+ * `frame` must point to `frame_len` readable bytes; `fields` must be a caller-owned, writable
+ * `amos_link_heartbeat_fields` with the header's array sizes.
+ */
 int32_t amos_link_heartbeat_decode(const uint8_t *frame,
                                    uintptr_t frame_len,
                                    struct amos_link_heartbeat_fields *fields);
 
+/**
+ * # Safety
+ *
+ * `node` must be a live handle (see `amos_link_node_drop`). The returned task must be stopped with
+ * `amos_link_federation_stop`.
+ */
 struct amos_link_federation_task *amos_link_node_spawn_federation(const struct amos_link_node *node,
                                                                   uint64_t period_ms);
 
+/**
+ * # Safety
+ *
+ * `node` must be a live handle (see `amos_link_node_drop`); `endpoint` must be a NUL-terminated
+ * UTF-8 C string (a null pointer is answered with an error code, never undefined behaviour). The
+ * returned task must be stopped with `amos_link_federation_stop`.
+ */
 struct amos_link_federation_task *amos_link_node_spawn_federation_advertising(const struct amos_link_node *node,
                                                                               uint64_t period_ms,
                                                                               const char *endpoint);
 
+/**
+ * # Safety
+ *
+ * `task` must be a task handle from `amos_link_node_spawn_federation*` that has not been stopped;
+ * any use afterwards is undefined behaviour. A null pointer is ignored.
+ */
 void amos_link_federation_stop(struct amos_link_federation_task *task);
 
 const char *amos_link_last_error(void);

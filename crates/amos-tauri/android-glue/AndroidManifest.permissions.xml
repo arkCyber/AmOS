@@ -22,9 +22,21 @@
     <uses-feature android:name="android.hardware.camera.any" android:required="true" />
     <uses-feature android:name="android.hardware.camera.flash" android:required="false" />
 
-    <!-- On-device assistant voice: NDK AAudio mic (amos-audio/aaudio). -->
+    <!-- On-device assistant voice: NDK AAudio mic (amos-audio/aaudio). Also the runtime
+         permission call recording needs (AmosInCallService's MediaRecorder). -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+
+    <!-- Two-sided call recording (AmosInCallService.setRecording, REQ-A1579 / F-TEL-038).
+         AudioSource.VOICE_CALL — the mixed call stream — is gated by CAPTURE_AUDIO_OUTPUT,
+         a **signature|privileged** permission a normally-installed app can never hold; only a
+         platform-signed build (AmOS as the OS vendor) is granted it. It is declared so the
+         requirement stays visible, and the recorder checks it at runtime: granted ⇒ VOICE_CALL
+         (two-sided), otherwise it falls back to AudioSource.VOICE_COMMUNICATION, which needs
+         only RECORD_AUDIO and captures the near end (this device's microphone). The source
+         actually used is recorded in the ledger so the list never claims the far end was
+         captured when it was not. -->
+    <uses-permission android:name="android.permission.CAPTURE_AUDIO_OUTPUT" />
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
@@ -165,5 +177,129 @@
          is for; without the declaration the ring is silently absent — the one failure this path
          cannot tolerate. -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!-- Location (REQ-A772 / F-SH-228). **Both** were undeclared until this round, which made
+         `LocationManager#getLastKnownLocation("gps")` — the real GNSS read behind the sensor
+         snapshot's `gnss` field (`crates/amos-sensor/src/android.rs`) — throw `SecurityException`
+         on every device, so the fix was permanently empty and the Maps "定位" button, which went
+         through the WebView `navigator.geolocation`, was auto-denied for the same reason (its
+         runtime prompt in the generated `RustWebChromeClient` asks for a permission the package
+         never declared). Two location paths, both dead, and every gate green — the same shape as
+         REQ-A185, and for the same reason: a permission is an install/runtime fact, not a
+         compile-time one.
+
+         They are a **runtime** (dangerous) pair and are requested together: the user's choice is
+         "precise" vs "approximate", and the native read works with either — declaring only
+         ACCESS_FINE_LOCATION would leave the approximate grant, the one most users give, as an
+         untracked state of the world. `LocationPermissionGlue` posts the dialog, because the native
+         `LocationManager` read — unlike the WebView path — triggers no OS dialog of its own. -->
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+
+    <!-- NFC (REQ-A774 / F-AND-006). `NfcGlue.kt` wraps `NfcAdapter` +
+         `Ndef` (+ the per-tag `TagTechnology` handles) for foreground dispatch and
+         NDEF read/write, reached from six Rust commands in
+         `crates/amos-tauri/src/ble.rs` (`nfc_status`, `nfc_start_dispatch`,
+         `nfc_stop_dispatch`, `nfc_format_tag`, `nfc_write_message`,
+         `nfc_read_bytes`) and from a full WebView screen (`NfcApp.svelte`,
+         `lib/nfc.ts`).
+
+         It is a **normal** (install-time) permission, so the declaration *is* the
+         whole grant — there is no runtime dialog to post and nothing for a glue to
+         request. That is what makes the omission silent: nothing in the tree has to
+         name the permission in order for the feature to be built and shipped, so
+         nothing notices it is missing.
+
+         This was declared **nowhere tracked** until REQ-A774. The only declaration
+         in the tree was a hand-added line in
+         `crates/amos-tauri/gen/android/app/src/main/AndroidManifest.xml` — the
+         git-ignored, `cargo tauri android init`-regenerated file that REQ-A409's
+         own delivery note names as the place NFC was wired up. On a clean checkout
+         the app builds, installs, opens the NFC screen and cannot read a tag, and
+         `nfc_status` reports `no_hardware` (see REQ-A775 / F-AND-007) either way:
+         the two defects are indistinguishable from the outside, which is why they
+         are fixed together.
+
+         `android.hardware.nfc` is `required="false"`: AmOS must install on a device
+         without NFC (the screen then honestly says so). -->
+    <uses-permission android:name="android.permission.NFC" />
+    <uses-feature android:name="android.hardware.nfc" android:required="false" />
+
+    <!-- Biometric authentication (REQ-A774 / F-AND-006). `BiometricGlue.kt` uses
+         AndroidX `BiometricPrompt` / `BiometricManager`; the **use** permission
+         hierarchy comes from the `androidx.biometric` artifact's own manifest and is
+         merged in by the manifest merger (`USE_BIOMETRIC` / `USE_FINGERPRINT` both
+         appear in the merged manifest and neither is declared by this app) — so
+         unlike NFC there is no permission to declare here. What must be tracked is
+         the pair of `<uses-feature>` entries, because those decide installability:
+         absent, an NFC-only / no-fingerprint device could be filtered out of Play.
+         `required="false"` on both is the honest declaration — the biometric screen
+         reports "no hardware / not enrolled" and nothing is faked. -->
+    <uses-feature android:name="android.hardware.fingerprint" android:required="false" />
+    <uses-feature android:name="android.hardware.biometrics" android:required="false" />
+
+    <!-- Default-dialer / in-call control (REQ-A774 / F-AND-006). These four are what
+         the tracked component fragment's `AmosInCallService` needs to actually bind
+         and run:
+
+           * FOREGROUND_SERVICE / FOREGROUND_SERVICE_PHONE_CALL — the service is
+             registered with `android:foregroundServiceType="phoneCall"`, and on
+             API 34+ starting a foreground service of that type throws
+             `SecurityException` without the type's permission. Unlike the other
+             entries here this one is required by a **tracked** declaration
+             (`AndroidManifest.components.xml`) — the two fragments have to agree,
+             which is precisely what no gate checked before REQ-A774.
+           * READ_PHONE_STATE / MANAGE_OWN_CALLS — read live call state and drive
+             answer/end through `TelecomManager`, granted together with
+             `ROLE_DIALER` when the user makes AmOS the default phone app
+             (docs/telephony.md §"ROLE_DIALER + InCallService"). Both are
+             install-time for a default dialer; without them the in-call UI binds
+             and then cannot report the call it was bound for.
+
+         `android.software.telephony` is `required="false"`: AmOS ships the dialer
+         screens on Wi-Fi-only tablets too, where they honestly report that there is
+         no telephony stack. -->
+    <uses-permission android:name="android.permission.READ_PHONE_STATE" />
+    <uses-permission android:name="android.permission.MANAGE_OWN_CALLS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_PHONE_CALL" />
+
+    <!-- The screen-recording foreground service (REQ-A1582 / F-DEV-141).
+         `ScreenRecordService` is registered with
+         `android:foregroundServiceType="mediaProjection"` because that type is not
+         optional: `MediaProjectionManager#getMediaProjection` is only legal while a
+         service of that type is running, and on API 34+ starting it without this
+         permission throws `SecurityException`. So a normally-installed build has no
+         recording at all without the declaration — the same install-time-permission
+         shape REQ-A185 and REQ-A774 both were.
+
+         Like `FOREGROUND_SERVICE_PHONE_CALL` above, this is required by a *tracked*
+         component declaration (`AndroidManifest.components.xml`), which is what
+         `scripts/android-permission-scan.mjs`'s `screen-record` family keeps in step. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <uses-feature android:name="android.software.telephony" android:required="false" />
+
+    <!-- Health & Fitness (REQ-A1454). The wellness pair the Health app draws —
+         cumulative step count and heart rate — is produced by `SensorGlue`
+         (`TYPE_STEP_COUNTER` / `TYPE_HEART_RATE`, pushed through
+         `recordVitals`). Both are **runtime/dangerous** permissions, so the
+         declaration is not the grant: `MainActivity.Wiring.kt` has to ask the
+         user (and a declared-but-unrequested permission is reported by
+         `android-permission-scan`). The version gates are real:
+
+           * ACTIVITY_RECOGNITION — API 29+. Without it `registerListener` for
+             `TYPE_STEP_COUNTER` throws `SecurityException` on some ROMs; the glue
+             guards the registration, so a refusal degrades to an absent reading
+             (null, printed as —), never a fabricated 0.
+           * BODY_SENSORS — API 31+. The heart-rate sensor's own grant.
+
+         The `<uses-feature>` pair is `required="false"`: AmOS ships the Health
+         screen on hardware with neither sensor, where each reading is honestly
+         absent. Declaring them required would filter such devices out of Play
+         for a feature that already degrades correctly. -->
+    <uses-permission android:name="android.permission.ACTIVITY_RECOGNITION" />
+    <uses-permission android:name="android.permission.BODY_SENSORS" />
+    <uses-feature android:name="android.hardware.sensor.stepcounter" android:required="false" />
+    <uses-feature android:name="android.hardware.sensor.heartrate" android:required="false" />
 
 </manifest>

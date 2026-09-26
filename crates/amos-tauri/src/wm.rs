@@ -14,16 +14,57 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use amos_wm::display::{Display, DisplaySet};
 use amos_wm::form::{
-    resolve_hint, FormFactor, HintSource, LayoutPolicy, ShellFit, FORM_FACTOR_ENV,
+    resolve_hint, resolve_runtime, FormFactor, HintSource, LayoutPolicy, ShellFit, FORM_FACTOR_ENV,
 };
+use amos_wm::identity::{self, WindowIdentity};
 use amos_wm::layout::{Bounds, Size, SplitAxis};
+use amos_wm::snap::{snap_bounds, SnapZone};
 use amos_wm::split::SplitScreen;
 use amos_wm::{WindowId, WindowKind, WindowManager, WmEvent};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, Runtime, State, WebviewUrl, WebviewWindowBuilder};
 
+use crate::error::{AmosError, AmosResult, ErrorCode, IntoAmosError};
 use crate::store::{SharedStore, APP_FOCUSED_KEY};
+use crate::window_background;
+use crate::window_state;
+
+/// Why a window-manager call refused in words the OS / platform gives verbatim.
+///
+/// Wave A (REQ-A462 typed-envelope migration) covers `normalize_shell_title` and
+/// the split family; the helper is kept locally so every platform call can name
+/// the platform-side message in `cause[0]` without dropping it through `format!`
+/// (a typed envelope's whole point).
+fn platform_failed(platform_message: impl std::fmt::Display) -> AmosError {
+    platform_message.into_envelope(ErrorCode::WmPlatformWindowFailed)
+}
+
+fn window_not_registered(label: &str) -> AmosError {
+    format!("window '{label}' is not registered").into_envelope(ErrorCode::WmWindowNotRegistered)
+}
+
+/// A poisoned `WmState::inner` mutex — see [`ErrorCode::WmLockFailed`].
+fn wm_lock_failed(internal: impl std::fmt::Display) -> AmosError {
+    AmosError::with_cause(
+        ErrorCode::WmLockFailed,
+        "window manager state lock is poisoned",
+        internal.to_string(),
+    )
+}
+
+/// The seam where this module's still-`Result<_, String>` layout helpers
+/// ([`layout_core`] ∕ [`WmState::layout_snapshot`] ∕ [`WmState::apply_split_to_real`])
+/// meet the typed command envelope. The internal string rides in `cause[0]` so the
+/// platform detail is not lost through the conversion.
+fn wm_layout_failed(internal: impl std::fmt::Display) -> AmosError {
+    AmosError::with_cause(
+        ErrorCode::WmLayoutFailed,
+        "the layout model could not produce a snapshot",
+        internal.to_string(),
+    )
+}
 
 /// Window area the layout model uses **until the real OS window has been
 /// measured** (`WmState::sync_window_layout`). It is not a claim about the screen:
@@ -50,11 +91,80 @@ pub const SHELL_DEFAULT_WINDOW: Size = LayoutPolicy::of(FormFactor::Phone).initi
 /// surfaces can refresh their geometry without round-tripping a command.
 pub const LAYOUT_EVENT: &str = "layout-changed";
 
+/// Tauri event carrying the whole `WmSnapshot` after the **window list** changes
+/// (REQ-A717): a window opened, closed, hid, showed or took/lost focus.
+///
+/// The desktop chrome (`DesktopShell`'s focused-window chords, `Dock`'s running-app
+/// dots) used to learn this only by re-reading `wm_windows` on a 5 s timer, so up to
+/// five seconds after ⌘W the Dock still showed a dot for a window that was gone — the
+/// exact stale-label case `wm_close`/`wm_zoom` document. The host now pushes the
+/// authoritative snapshot instead, and the poll is demoted to a slow reconciliation
+/// safety net (`frontend-ts/src/lib/wmWindowsPoll.ts`).
+pub const WM_CHANGED_EVENT: &str = "wm-changed";
+
+/// How long the Stage clamp stays quiet after it has moved a window out of the rail
+/// (REQ-A1564).
+///
+/// The clamp and the platform's own drag are two writers of one rectangle, so the rate
+/// matters: a `Moved` event that is answered by a `set_position` produces further `Moved`
+/// events, and a correction issued for each of them is a loop, not a correction. One
+/// correction per window per 120 ms bounds that loop while staying well under the ~1 s a
+/// hand needs to notice — the same order as the 250 ms the geometry store debounces with,
+/// scaled down because this one delays something the user is watching.
+///
+/// It is a **throttle**, not a debounce: the first intruding event in a window of time is
+/// answered immediately (a window dragged behind the rail should not sit there for 120 ms),
+/// and the pace only slows the corrections that follow.
+pub const STAGE_CLAMP_DEBOUNCE_MS: u64 = 120;
+
+/// May the Stage clamp act, given when it last acted on this window?
+///
+/// `last_ms == None` is "never" and is always allowed, so the first correction of a drag is
+/// immediate. The window is exactly `debounce_ms` wide (`>=`, not `>`), and a clock that
+/// went **backwards** (an NTP step, a machine waking from sleep) reads as "long enough"
+/// rather than as a lockout that would silence the clamp until the clock caught up — an
+/// hour, in the step-back case.
+///
+/// Pure and clock-injecting on purpose: the rule is the only part of the clamp that a test
+/// can hold still, and it is the part that decides whether the host and the user's hand
+/// fight over one rectangle.
+pub const fn should_clamp(last_ms: Option<u64>, now_ms: u64, debounce_ms: u64) -> bool {
+    match last_ms {
+        None => true,
+        Some(last) => now_ms < last || now_ms - last >= debounce_ms,
+    }
+}
+
 /// Tauri label of the launcher window (declared in `tauri.conf.json`).
 const LAUNCHER_LABEL: &str = "main";
 
 /// Web path (relative to `frontendDist`) every app window loads.
 const APP_ENTRY: &str = "index.html";
+
+/// The frame colour a **newly created** window should be painted with, or `None` to leave it
+/// to the OS (REQ-A326).
+///
+/// The decision itself is pure and lives in [`crate::window_background`]; this is the thin
+/// adapter that feeds it the two inputs it cannot reach on its own — the user's stored
+/// appearance (`amos-ui.theme`, mirrored into [`SharedStore`] by the frontend's
+/// `themeCore::writeStored`) and the OS's answer, read from the launcher's current theme.
+///
+/// Without this call the module existed but nothing used it: the builder was never told a
+/// colour, so on a dark machine every window flashed the light OS canvas before the page
+/// painted. `None` (nothing stored, OS silent) keeps exactly that old behaviour rather than
+/// inventing a colour.
+#[cfg(desktop)]
+fn new_window_background<R: Runtime>(app: &AppHandle<R>) -> Option<tauri::window::Color> {
+    let mode = app
+        .try_state::<SharedStore>()
+        .and_then(|store| store.get(window_background::THEME_STORE_KEY));
+    let os_dark = app
+        .get_webview_window(LAUNCHER_LABEL)
+        .and_then(|launcher| launcher.theme().ok())
+        .map(|theme| theme == tauri::Theme::Dark);
+    window_background::window_background(mode.as_deref(), os_dark)
+        .map(|(r, g, b)| tauri::window::Color(r, g, b, 255))
+}
 
 /// Maximum bytes in a system-context text entry (selected text for AI injection).
 ///
@@ -81,11 +191,11 @@ pub const MAX_CONTEXT_LABEL_BYTES: usize = 256;
 /// Android (the System UI APK) windows are always fullscreen, and `WebviewWindow`
 /// has no `maximize`, so this is a cross-target no-op that still compiles.
 #[cfg(desktop)]
-fn window_maximize(w: &tauri::WebviewWindow) {
+fn window_maximize<R: Runtime>(w: &tauri::WebviewWindow<R>) {
     let _ = w.maximize();
 }
 #[cfg(not(desktop))]
-fn window_maximize(_w: &tauri::WebviewWindow) {
+fn window_maximize<R: Runtime>(_w: &tauri::WebviewWindow<R>) {
     /* mobile: single always-fullscreen window — nothing to restore */
 }
 
@@ -133,12 +243,17 @@ fn window_toggle_fullscreen(_w: &tauri::WebviewWindow) -> bool {
 
 /// Human-readable title for an app window.
 ///
-/// Falls back to `"Amos"` for unknown labels; the actual names live in
+/// Keyed by the **app id**, never by the window label (REQ-A473): `files_2` is a window of
+/// the Files application and must be titled `Files`, not fall through to the generic
+/// fallback — which is exactly what the label-keyed version did, because it was written
+/// when the two strings were the same thing by construction.
+///
+/// Falls back to `"Amos"` for unknown **app ids**; the actual names live in
 /// the frontend's `APP_META` and would require a cross-process lookup.
 /// Kept as a simple map rather than a dependency to avoid pulling
 /// the frontend metadata into the Rust host.
-fn app_window_title(label: &str) -> &'static str {
-    match label {
+fn app_window_title(app_id: &str) -> &'static str {
+    match app_id {
         "clock" => "Clock",
         "settings" => "Settings",
         "calculator" => "Calculator",
@@ -184,6 +299,18 @@ struct WmCore {
     labels: HashMap<WindowId, String>,
     /// Tauri window label -> WindowId.
     by_label: HashMap<String, WindowId>,
+    /// WindowId -> **which app this window shows and which instance of it** (REQ-A473).
+    ///
+    /// This is the second half of the identity the label used to carry alone: `labels`
+    /// answers "which platform window", this answers "which application, how many-th".
+    /// Only `WindowKind::App` windows have one; the Launcher and external container
+    /// surfaces are absent here (and that absence is what `WindowInfo::app` reports as an
+    /// empty string rather than a fabricated app id).
+    ///
+    /// Kept in step with `labels`/`by_label` by [`WmCore::bind`] / [`WmCore::unbind`] —
+    /// the only two places that touch them — because three maps that must agree are
+    /// exactly how a ledger starts disagreeing.
+    apps: HashMap<WindowId, WindowIdentity>,
     /// WindowId -> human-readable kind ("Launcher" | "App" | "System").
     kinds: HashMap<WindowId, String>,
     /// WindowIds that are *external* surfaces (e.g. a legacy Android APK surface
@@ -203,16 +330,152 @@ struct WmCore {
     screen: Bounds,
     /// Active split-screen session (which two windows share the screen), if any.
     split: Option<SplitScreen>,
-    /// Form-factor policy this host runs under (resolved once at startup).
+    /// Form-factor policy this host runs under. Resolved at startup and, when the
+    /// class is still the build's own to decide, **re-derived from a measured
+    /// screen** (REQ-A512 — a phone and a tablet share one Android target, so only a
+    /// running device can tell them apart).
     ///
     /// The policy owns the split divider/minimum pane (previously two module
     /// constants) and the class-dependent capabilities the shell reads back
     /// (`form`, `columns`, `multi_window`, `free_resize`).
     policy: LayoutPolicy,
+    /// The class the build was compiled for — the base any measured-screen
+    /// re-derivation starts from ([`reclass_for_screen`]).
+    built_for: FormFactor,
+    /// May a **measured** screen still re-class this host (REQ-A512)?
+    ///
+    /// `true` only while the class is the build's own to decide: no honoured
+    /// `AMOS_FORM_FACTOR` hint named it, and no embedder pinned it via
+    /// [`WmState::with_form_factor`]. A pinned class is never re-derived.
+    form_revisable: bool,
     /// A shell-window size this host asked the OS for and has **not yet seen applied**
     /// ([`WmState::fit_shell_window`]); cleared by [`WmState::note_applied_size`] when a
     /// real (post-application) measurement answers it (REQ-A230).
     shell_fit: Option<Size>,
+    /// Is **Stage Manager** on (`stage_set_enabled`; `docs/stage-manager.md`)?
+    ///
+    /// Default **off**, and while it is off every stage-aware path in this file is a
+    /// no-op with zero platform work — so introducing the mode changes no behaviour for
+    /// anyone who never turns it on (the same discipline `LayoutPolicy::of` follows).
+    ///
+    /// The rail width and work-area inset are **not** stored: they are derived from
+    /// `policy` through [`LayoutPolicy::stage_rail_width`] /
+    /// [`LayoutPolicy::stage_work_area`], so the geometry has one definition and it is
+    /// the pure one.
+    stage_enabled: bool,
+    /// When the Stage clamp last moved each label out of the rail, in [`now_ms`] units
+    /// ([`WmState::stage_clamp_moved`]).
+    ///
+    /// A drag is a *storm* of `Moved` events, and the clamp answers each one by asking the
+    /// platform to move the window again — which produces more `Moved` events. Without a
+    /// throttle the two would talk to each other at event-loop speed. The rule is the same
+    /// one `window_state`'s own debounce follows: at most one correction per
+    /// [`STAGE_CLAMP_DEBOUNCE_MS`], and a rect that is already clear of the band never
+    /// reaches here at all.
+    ///
+    /// Keyed by label and cleared in [`WmCore::unbind`], so a closed window's entry cannot
+    /// outlive the window (labels are reused — a stale stamp would silence the first
+    /// correction of a *later* window under the same label).
+    stage_clamp_at: HashMap<String, u64>,
+}
+
+/// The **one** place that binds a window id to its label, kind and identity (REQ-A473).
+///
+/// `labels`, `by_label`, `kinds` and `apps` must agree, and "must agree" is a property
+/// nothing enforces at runtime — so it is enforced by construction instead: these two
+/// methods are the only code in the crate that writes to them. A caller that adds a
+/// window calls [`WmCore::bind`]; a caller that removes one calls [`WmCore::unbind`].
+impl WmCore {
+    /// Record `id` as the window carrying `label`, of `kind`, showing `identity`
+    /// (`None` for surfaces that are not an application: the Launcher, container
+    /// surfaces).
+    fn bind(
+        &mut self,
+        id: WindowId,
+        label: &str,
+        kind: WindowKind,
+        identity: Option<WindowIdentity>,
+    ) {
+        self.labels.insert(id, label.to_string());
+        self.by_label.insert(label.to_string(), id);
+        self.kinds.insert(id, kind.to_string());
+        match identity {
+            Some(identity) => {
+                self.apps.insert(id, identity);
+            }
+            None => {
+                self.apps.remove(&id);
+            }
+        }
+    }
+
+    /// Forget `id` completely, returning the label it had (if it was registered).
+    ///
+    /// Every map is cleared here — including `apps`, which is the record that outlived a
+    /// window for as long as this method forgot about it (a second window of the same app
+    /// would then have been handed a label that was still bound to a dead id, and a
+    /// closed window would keep contributing to that app's cycle ring).
+    fn unbind(&mut self, id: WindowId) -> Option<String> {
+        let label = self.labels.remove(&id);
+        if let Some(label) = label.as_ref() {
+            self.by_label.remove(label);
+            // The labels are reusable, and a stale stamp would throttle the first
+            // correction of whichever window takes this label next (REQ-A1564).
+            self.stage_clamp_at.remove(label);
+        }
+        self.kinds.remove(&id);
+        self.apps.remove(&id);
+        label
+    }
+
+    /// The labels of **one application's** windows, in the ledger.
+    ///
+    /// The order is not part of the contract: [`amos_wm::identity::cycle_target`] sorts
+    /// them itself, so a caller cannot make the ring depend on `HashMap` iteration.
+    fn labels_of_app(&self, app_id: &str) -> Vec<String> {
+        self.apps
+            .iter()
+            .filter(|(_, identity)| identity.app == app_id)
+            .filter_map(|(id, _)| self.labels.get(id).cloned())
+            .collect()
+    }
+
+    /// The app id a registered label belongs to, if that label names an app window.
+    fn app_id_of_label(&self, label: &str) -> Option<String> {
+        let id = self.by_label.get(label)?;
+        self.apps.get(id).map(|identity| identity.app.clone())
+    }
+
+    /// The area an app window may be placed in: the measured screen, minus the Stage
+    /// Manager rail when Stage mode is on.
+    ///
+    /// **Every** placement path goes through here — creation, the instance cascade,
+    /// remembered geometry, re-clamp, snap, split and zoom. The rail is never covered
+    /// because of that one fact, not because each path remembers to inset: a path that
+    /// calls this unconditionally is correct on a phone (no rail), on a desktop with the
+    /// mode off, and on a desktop with it on, because
+    /// [`LayoutPolicy::stage_work_area`] is the identity in the first two cases.
+    ///
+    /// The width and the inset are *derived*, never stored (`WmCore::stage_enabled`'s
+    /// doc): a stored copy is a second answer that a class change or a screen change
+    /// could leave stale.
+    fn work_area(&self) -> Bounds {
+        if self.stage_enabled {
+            self.policy.stage_work_area(self.screen)
+        } else {
+            self.screen
+        }
+    }
+
+    /// How many pixels of the left edge the rail takes out of `screen` right now — `0`
+    /// when there is no rail.
+    ///
+    /// The one definition of the number the shell lays out around: `LayoutSnapshot`'s
+    /// `rail_width` — read by the rail itself and by the desktop-icon inset — is this and
+    /// nothing else, so the two cannot come to disagree about how wide the rail is.
+    fn rail_width(&self) -> u32 {
+        self.screen.width.saturating_sub(self.work_area().width)
+    }
 }
 
 /// The class this build was compiled for — the **only** form-factor fact a
@@ -241,6 +504,22 @@ fn resolve_host_form_factor(
         Ok((form, source)) => (form, source, None),
         Err(message) => (built_for, HintSource::BuildDefault, Some(message)),
     }
+}
+
+/// The class a **measured** screen implies for a build whose class is still its own to
+/// decide, or `None` when the reading settles nothing (REQ-A512).
+///
+/// Delegates to the domain's [`resolve_runtime`] with **no hint** — a caller only asks
+/// this once it has established the class is revisable, i.e. the operator did not name
+/// one — so the "phone vs tablet" rule lives in exactly one place
+/// (`amos_wm::form::TABLET_MIN_SHORT_EDGE`) and this function owns no threshold of its
+/// own. Only a `Phone` build can move (`resolve_runtime` never re-classes a desktop or
+/// a robot, and a tablet stays a tablet), so a desktop host on a wide screen is a
+/// no-op. An unusable reading is `None`, never a guess.
+fn reclass_for_screen(built_for: FormFactor, screen: Bounds) -> Option<FormFactor> {
+    resolve_runtime(None, built_for, Size::new(screen.width, screen.height))
+        .ok()
+        .map(|(form, _source)| form)
 }
 
 /// Upper bound on a believable window edge (px). Beyond this a size is a
@@ -296,6 +575,190 @@ fn logical_screen(width: f64, height: f64, scale: f64, fallback: Bounds) -> Boun
     match logical_size_of(width, height, scale) {
         Some(size) => Bounds::new(fallback.x, fallback.y, size.width, size.height),
         None => fallback,
+    }
+}
+
+/// A `scale` fit to divide by (finite, > 0), or `1.0` — the same "never divide by a
+/// nonsense scale" rule [`logical_size_of`] enforces for the shell window.
+fn sane_scale(scale: f64) -> f64 {
+    if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    }
+}
+
+/// A **physical** global rect (Tauri monitor `position` + `size`) as a logical [`Bounds`].
+///
+/// Every monitor rect Tauri reports is physical; the layout model is logical (see
+/// [`logical_screen`]), so the same division is applied here. The division assumes one
+/// scale factor for the whole rect, which is exact for a monitor (its own scale) — the
+/// *relative* placement of two monitors of different scale is only as good as that
+/// assumption, an honest limit the module documents ([`amos_wm::display`]).
+fn logical_rect(x: i32, y: i32, width: u32, height: u32, scale: f64) -> Bounds {
+    let scale = sane_scale(scale);
+    let px = |v: f64| (v / scale).round() as i32;
+    let pu = |v: f64| (v / scale).round().max(0.0) as u32;
+    Bounds::new(
+        px(f64::from(x)),
+        px(f64::from(y)),
+        pu(f64::from(width)),
+        pu(f64::from(height)),
+    )
+}
+
+/// A platform [`tauri::Monitor`] as the transport-agnostic [`Display`] the domain works
+/// in, in logical space.
+///
+/// `work_area` is taken from the platform verbatim; a platform that reports *no* work area
+/// (a degenerate 0×0 rect) is mapped to `bounds` — "no reserved area" — rather than a
+/// fabricated inset, matching [`Display::work_area`]'s contract.
+fn display_from_monitor(monitor: &tauri::Monitor, primary: bool) -> Display {
+    let scale = sane_scale(monitor.scale_factor());
+    let position = monitor.position();
+    let size = monitor.size();
+    let work = monitor.work_area();
+    let bounds = logical_rect(position.x, position.y, size.width, size.height, scale);
+    let work_area = logical_rect(
+        work.position.x,
+        work.position.y,
+        work.size.width,
+        work.size.height,
+        scale,
+    );
+    let work_area = if work_area.width == 0 || work_area.height == 0 {
+        bounds
+    } else {
+        work_area
+    };
+    Display {
+        bounds,
+        work_area,
+        scale,
+        primary,
+        name: monitor.name().cloned(),
+    }
+}
+
+/// The platform's monitors as a [`DisplaySet`] in logical space.
+///
+/// Read fresh on every call, never cached in [`WmCore`]: the set changes on hot-plug, and a
+/// stale copy is exactly the "ledger that disagrees with the platform" this crate keeps
+/// refusing to keep. An empty result is legal and means "the platform listed nothing" —
+/// every query over it then returns `None` and the caller keeps its measured screen.
+fn display_set(app: &AppHandle) -> Result<DisplaySet, String> {
+    let monitors = app
+        .available_monitors()
+        .map_err(|e| format!("could not enumerate displays: {e}"))?;
+    if monitors.is_empty() {
+        return Ok(DisplaySet::default());
+    }
+    // The primary is identified by matching the primary monitor's own position+name: the
+    // `Monitor` value carries no primary flag, and fields are the only stable identity it
+    // exposes (there is no id). No primary reported ⇒ the first display is the default,
+    // the same rule `DisplaySet::primary` falls back to.
+    let primary = app.primary_monitor().ok().flatten();
+    let displays = monitors
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let is_primary = match &primary {
+                Some(p) => p.position() == m.position() && p.name() == m.name(),
+                None => i == 0,
+            };
+            display_from_monitor(m, is_primary)
+        })
+        .collect();
+    Ok(DisplaySet::new(displays))
+}
+
+/// A window's current frame as a logical [`Bounds`] (physical `outer_position` + `inner_size`,
+/// divided by the window's own scale).
+///
+/// The frame — position *and* size — is needed, not just the size, because which display a
+/// window is on is decided by where its centre is. Reading the platform is the only source
+/// of truth here: the host deliberately keeps no per-window geometry ledger.
+fn window_logical_bounds(window: &tauri::WebviewWindow) -> Result<Bounds, String> {
+    let scale = sane_scale(window.scale_factor().unwrap_or(1.0));
+    let position = window.outer_position().map_err(|e| e.to_string())?;
+    let size = window.inner_size().map_err(|e| e.to_string())?;
+    Ok(logical_rect(
+        position.x,
+        position.y,
+        size.width,
+        size.height,
+        scale,
+    ))
+}
+
+/// The same reading as [`window_logical_bounds`], for the window event handler's
+/// `&tauri::Window<R>` (which is a different type from `&tauri::WebviewWindow`).
+///
+/// The **frames** matter and are not interchangeable: `outer_position` is what
+/// `set_position` writes back and what `window_state::snapshot` stores, while
+/// `inner_size` is what `set_size` writes back. Both siblings in this file compose them
+/// the same way, so a rect read here and a rect applied here are the same rect.
+///
+/// `None` for any unusable reading (a platform error, a garbage scale) — the caller then
+/// leaves the window alone rather than acting on a guess.
+fn logical_window_rect<R: Runtime>(window: &tauri::Window<R>) -> Option<Bounds> {
+    let scale = sane_scale(window.scale_factor().unwrap_or(1.0));
+    let position = window.outer_position().ok()?;
+    let size = window.inner_size().ok()?;
+    Some(logical_rect(
+        position.x,
+        position.y,
+        size.width,
+        size.height,
+        scale,
+    ))
+}
+
+/// The inverse of [`logical_rect`]'s division, for one signed coordinate.
+fn physical_edge(v: i32, scale: f64) -> i32 {
+    let scale = sane_scale(scale);
+    (f64::from(v) * scale).round() as i32
+}
+
+/// [`physical_edge`] for a length, which cannot be negative.
+fn physical_len(v: u32, scale: f64) -> u32 {
+    let scaled = f64::from(v) * sane_scale(scale);
+    if scaled.is_finite() && scaled > 0.0 {
+        (scaled.round() as u64).min(u64::from(u32::MAX)) as u32
+    } else {
+        0
+    }
+}
+
+/// Rewrite the rectangle to remember with the one the clamp applied, in the store's
+/// **physical** units (REQ-A1564).
+///
+/// `rect` is what the window was measured at and `target` is what it was moved to; `scale`
+/// is the window's own. Pure, so the "clamp, **then** remember" rule can be pinned without
+/// a platform — the position is the part that must not be the pre-correction one.
+///
+/// The **size is only written when the clamp changed it.** `logical_window_rect` sizes from
+/// `inner_size` while `window_state::snapshot` stores `outer_size`, so writing an unchanged
+/// size back would silently replace the outer reading with the inner one — and
+/// `restored_geometry` would reopen the window a title bar shorter on every drag the rail
+/// ever corrected. The position has no such mismatch (`outer_position` on both sides),
+/// which is why only the size is conditional.
+///
+/// The fields left alone — `visible`, and `updated_ms` (which the store stamps) — stay as
+/// the platform reported them.
+fn note_clamped_rect(
+    captured: &mut window_state::WindowState,
+    rect: Bounds,
+    target: Bounds,
+    scale: f64,
+) {
+    captured.x = Some(physical_edge(target.x, scale));
+    captured.y = Some(physical_edge(target.y, scale));
+    if target.width != rect.width {
+        captured.width = Some(physical_len(target.width, scale));
+    }
+    if target.height != rect.height {
+        captured.height = Some(physical_len(target.height, scale));
     }
 }
 
@@ -410,12 +873,198 @@ fn sane_signed_edge(v: f64) -> Option<i32> {
     Some(rounded as i32)
 }
 
+/// Should the host apply the **position** the class rule computed, or leave placement to
+/// the OS?
+///
+/// REQ-A478, measured on this machine 2026-09-19: `.position()` was **never** called — the
+/// builder only ever received `opens_at`'s width/height — so every window's position was
+/// whatever macOS chose, which put three Files windows at exactly the same `236,70`. The
+/// class rule's `x`/`y` had therefore never had any effect on a real window.
+///
+/// The rule is deliberately narrow, because applying a position is a visible behaviour
+/// change: **instance 1 keeps the OS's own placement** (unchanged behaviour — "open the app"
+/// places its first window the way the platform does), and from instance 2 on the computed
+/// cascade is applied, because that is the case the platform cannot do for us (macOS places
+/// each window without knowing it belongs to a window we already have).
+fn places_position_at(instance: u32) -> bool {
+    instance >= 2
+}
+
+/// The rectangle a **remembered** window should reopen at, in logical pixels and inside the
+/// current screen — or `None` when this label has no usable history (REQ-A478).
+///
+/// The three things this has to get right, each of them measured elsewhere in this crate:
+///
+/// * **physical → logical.** `window_state::snapshot` stores `outer_position`/`outer_size`,
+///   which are physical; a window is created with logical values. A 2× display would
+///   otherwise reopen every window at twice its offset (the REQ-A218 lesson).
+/// * **the current screen wins.** A saved rectangle may belong to a monitor that is gone (or
+///   to a screen that shrank): the result goes through the class rule's `cascade_from` with
+///   instance 1, i.e. "place here, not below `min_pane`, inside the screen" — one
+///   implementation for every placement, and no saved state can put a window off-screen.
+/// * **`None` is a real answer.** No armed store, no entry, or an entry whose coordinates do
+///   not sanitize ⇒ the class rule's own answer is used, which is the pre-existing behaviour.
+fn restored_geometry(
+    store: Option<&window_state::WindowStateStore>,
+    label: &str,
+    scale: f64,
+    policy: LayoutPolicy,
+    screen: Bounds,
+) -> Option<Bounds> {
+    let saved = store?.load(label)?;
+    if !scale.is_finite() || scale <= 0.0 {
+        // Without a believable scale factor the *physical* saved numbers cannot be turned
+        // into the *logical* ones a window is created with — the honest answer is "no
+        // remembered geometry", not a guess that could double every offset (REQ-A218).
+        return None;
+    }
+    let (x, y) = (saved.x?, saved.y?);
+    let (width, height) = (saved.width?, saved.height?);
+    let x = sane_signed_edge(f64::from(x) / scale)?;
+    let y = sane_signed_edge(f64::from(y) / scale)?;
+    let width = sane_edge(f64::from(width) / scale)?;
+    let height = sane_edge(f64::from(height) / scale)?;
+    Some(policy.cascade_from((x, y), Size::new(width, height), screen, 1))
+}
+
+/// Where the cascade of `app_id` should start: the **outer position** of that application's
+/// first window, in **logical** pixels, or `None` when it cannot be read.
+///
+/// REQ-A478. Why the platform and not the model: the class rule's own base is the screen's
+/// origin (`fit_window` builds at `(0, 0)` and clamps), while the first window of an app is
+/// placed by macOS itself — measured on this machine 2026-09-19, the first Files window sat
+/// at `236,70` and cascading from the domain's origin put the second one in the corner at
+/// `24,24`. This host keeps **no geometry ledger** for the same reason `reclamp_windows`
+/// reads the platform: a ledger the user can move windows behind is a second truth.
+///
+/// The conversion is the one a wrong scale factor would break (a 2× screen's physical
+/// position is twice the logical one, REQ-A218's lesson): `outer_position()` is physical,
+/// `.position()` takes logical, so the window's own `scale_factor()` is applied — and a
+/// non-finite or absurd scale is refused rather than guessed at.
+///
+/// `label` is the window being created (excluded from the search so a re-created label
+/// cannot anchor a cascade to itself) and `app_id` is `None` for a window that shows no app,
+/// in which case there is nothing to cascade from.
+fn anchor_of_window<R: Runtime>(app: &AppHandle<R>, label: &str) -> Option<(i32, i32)> {
+    let window = app.get_webview_window(label)?;
+    let scale = match window.scale_factor() {
+        Ok(s) if s.is_finite() && s > 0.0 => s,
+        other => {
+            tracing::warn!(
+                target: "amos::wm",
+                window = %label,
+                scale = ?other,
+                "could not read a usable scale factor for the cascade anchor; using the class rule's own position"
+            );
+            return None;
+        }
+    };
+    match window.outer_position() {
+        Ok(p) => {
+            let x = sane_signed_edge(f64::from(p.x) / scale)?;
+            let y = sane_signed_edge(f64::from(p.y) / scale)?;
+            Some((x, y))
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "amos::wm",
+                window = %label,
+                error = %e,
+                "could not read the app's first window position; using the class rule's own position"
+            );
+            None
+        }
+    }
+}
+
 /// Is `label` the window that defines the **OS screen area** the layout
 /// sub-divides? Only the Launcher/main window does: app windows (including split
 /// panes) are placed *inside* that area, so a pane resize must never be mistaken
 /// for a screen change — which would also make the pane-writing loop feed itself.
 pub fn is_screen_window(label: &str) -> bool {
     label == LAUNCHER_LABEL
+}
+
+/// Which window a **menu action on "the focused window"** should act on: the
+/// platform's key window when it names one, otherwise the window the window manager
+/// says is focused. The launcher is never a target in either branch (F-SH-008) — it
+/// *is* the desktop.
+///
+/// Two sources, in this order, and the order is the point: the platform's key window is
+/// the OS's own answer to "what is in front", and the model is the **fallback**, not a
+/// tiebreak. REQ-A431 measured why the fallback is needed — a window created a moment
+/// ago is on screen before the OS makes it key, so ⌘W in the first seconds of an app
+/// window's life closed nothing in 3/6 runs. `None` when neither source names an
+/// actionable window, which every consumer must treat as "there is nothing to act on"
+/// rather than substituting a default: a menu item that acts on the *wrong* window is
+/// worse than one that acts on none.
+///
+/// **Pure** (`is_screen_window` is the only thing it reads), so the rule is exercised
+/// without a window server and without a menu — the shape [`Self::minimize_target`]
+/// uses for the same reason. [`focused_app_label`] is the same decision with the two
+/// arguments read off `app`.
+///
+/// Desktop-gated because every consumer is (see [`focused_app_label`]).
+#[cfg(desktop)]
+pub fn focused_target_label(
+    platform_key: Option<&str>,
+    model_focused: Option<&str>,
+) -> Option<String> {
+    let actionable = |label: &str| (!is_screen_window(label)).then(|| label.to_string());
+    platform_key
+        .and_then(actionable)
+        .or_else(|| model_focused.and_then(actionable))
+}
+
+/// The window the **window manager** says is focused, if that state is mounted and readable.
+///
+/// `None` for an external surface: such a surface has no platform window to act on, and
+/// pretending otherwise would act on a neighbour.
+#[cfg(desktop)]
+pub fn model_focused_label<R: Runtime>(app: &AppHandle<R>) -> Option<String> {
+    let state = app.try_state::<WmState>()?;
+    let snapshot = state.snapshot().ok()?;
+    snapshot
+        .windows
+        .iter()
+        .find(|w| w.focused && !w.external)
+        .map(|w| w.label.clone())
+}
+
+/// The focused **app** window, resolved from the running app: the platform's key window
+/// where it names one, the model otherwise. `None` when there is nothing to act on.
+///
+/// **One owner for a question three consumers ask**, which is why it lives here rather
+/// than in any one of them. Until REQ-A869 the rule and its two sources were split
+/// across `menu.rs` (`close_target_label`, `model_focused_label`,
+/// `actionable_window_label`) and every consumer that was not the macOS menu bar had to
+/// either reach into that module or restate the policy. The consumers now:
+///
+/// * ⌘W — `menu::close_key_window` closes the label this returns;
+/// * the window-item sync — `menu::sync_window_items` enables `Minimize` / `Zoom` /
+///   `Enter Full Screen` exactly when this is `Some`;
+/// * ⌘P — [`crate::print::print_document`] prints it.
+///
+/// The name says *what window*, not *which verb*: the old name (`close_target_label`)
+/// claimed the rule was about closing, which is exactly how a second consumer ends up
+/// writing a second copy of a policy instead of calling it.
+///
+/// **This is why the print command takes no window argument.** The WebView must not be
+/// able to name a window to print — printing is an *output* of whatever the user is
+/// looking at, and a label from the WebView would let a background surface print itself.
+/// The host answers the question with its own two sources instead, the same way the
+/// macOS menu bar does.
+///
+/// Desktop-gated: the native menu bar is macOS-only today, and the print *dialog* is a
+/// desktop concept ([`crate::print`] refuses elsewhere by name rather than by `cfg`).
+#[cfg(desktop)]
+pub fn focused_app_label<R: Runtime>(app: &AppHandle<R>) -> Option<String> {
+    let windows = app.webview_windows();
+    let platform_key = windows
+        .iter()
+        .find(|(label, window)| !is_screen_window(label) && window.is_focused().unwrap_or(false))
+        .map(|(label, _)| label.clone());
+    focused_target_label(platform_key.as_deref(), model_focused_label(app).as_deref())
 }
 
 /// Longest title the shell may hand to the OS, in **characters** (not bytes).
@@ -451,18 +1100,26 @@ pub const MAX_SHELL_TITLE_CHARS: usize = 120;
 /// Honest boundary: this is *shape* validation, not sanitization of meaning — the
 /// host cannot know whether "Settings" is the right name; it only guarantees that
 /// the string the OS renders is one line, non-empty and bounded.
-pub fn normalize_shell_title(raw: &str) -> Result<String, String> {
+pub fn normalize_shell_title(raw: &str) -> AmosResult<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
+        // REQ-A462: typed envelope. Wire code `amos.wm.title_invalid`, cause carries
+        // the specific reason ("...may not be empty…"). The frontend i18n file
+        // resolves a single user-facing message for all `WmTitleInvalid` cases and
+        // appends `cause[0]` to the diagnostic, so the resolution above-stays-in-one-
+        // place invariant of the typed envelope is preserved.
         return Err(
-            "a window title may not be empty (the OS draws an empty title bar)".to_string(),
+            "a window title may not be empty (the OS draws an empty title bar)"
+                .to_string()
+                .into_envelope(ErrorCode::WmTitleInvalid),
         );
     }
     if let Some(bad) = trimmed.chars().find(|c| c.is_control()) {
-        return Err(format!(
+        let msg = format!(
             "a window title may not contain a control character (U+{:04X}): the OS renders a title as one line",
             bad as u32
-        ));
+        );
+        return Err(msg.into_envelope(ErrorCode::WmTitleInvalid));
     }
     let mut title: String = trimmed.chars().take(MAX_SHELL_TITLE_CHARS).collect();
     if trimmed.chars().count() > MAX_SHELL_TITLE_CHARS {
@@ -532,25 +1189,38 @@ impl WmState {
                 "unusable form-factor hint; falling back to the build's own class"
             );
         }
+        // A class the operator named is settled; a class the *build* decided may still
+        // be re-derived once a real screen is measured (REQ-A512).
+        let revisable = source == HintSource::BuildDefault;
         tracing::info!(
             form = form.as_str(),
             source = source.as_str(),
             ui = form.has_ui(),
+            revisable,
             "windowing form factor resolved"
         );
-        Self::with_form_factor(form)
+        Self::with_form_origin(form, built_for, revisable)
     }
 
     /// Create a manager for an **explicitly given** class (no environment read, no
     /// guessing). `new()` resolves the hint and delegates here; tests and any
     /// embedder that already knows its class use it directly.
     ///
+    /// An explicit class is **pinned**: it is never re-derived from a measured screen
+    /// (a test that asks for a phone must keep getting a phone on a big display).
+    pub fn with_form_factor(form: FormFactor) -> Self {
+        Self::with_form_origin(form, built_for_form_factor(), false)
+    }
+
+    /// The one constructor: build the state for `form`, remembering the class the
+    /// build was compiled for and whether a measured screen may still change this one.
+    ///
     /// The Launcher is bound to the Tauri main window.
     // `WindowManager::new()` registers the Launcher synchronously, so
     // `launcher()` is always Some here; this single documented invariant-site is
     // allowed (P0-1), everything else in production is gated.
     #[allow(clippy::expect_used)]
-    pub fn with_form_factor(form: FormFactor) -> Self {
+    fn with_form_origin(form: FormFactor, built_for: FormFactor, form_revisable: bool) -> Self {
         let wm = WindowManager::new(); // registers + focuses the Launcher
         let launcher = wm.launcher().expect("launcher always registered");
         let mut labels = HashMap::new();
@@ -565,6 +1235,7 @@ impl WmState {
                 labels,
                 by_label,
                 kinds,
+                apps: HashMap::new(),
                 external: HashSet::new(),
                 // The launcher's page is loaded by the time any app window is created, so it
                 // is never subject to the REQ-A435 deferral.
@@ -572,7 +1243,13 @@ impl WmState {
                 screen: FALLBACK_SCREEN,
                 split: None,
                 policy: LayoutPolicy::of(form),
+                built_for,
+                form_revisable,
                 shell_fit: None,
+                // Stage Manager is opt-in (REQ-A1546): a host that is never asked to
+                // enable it behaves exactly as it did before this field existed.
+                stage_enabled: false,
+                stage_clamp_at: HashMap::new(),
             }),
         }
     }
@@ -606,7 +1283,11 @@ impl WmState {
             .ok_or_else(|| format!("unknown window id {id:?}"))
     }
 
-    fn real_window(&self, app: &AppHandle, id: WindowId) -> Result<tauri::WebviewWindow, String> {
+    fn real_window<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        id: WindowId,
+    ) -> Result<tauri::WebviewWindow<R>, String> {
         let label = self.label_for(id)?;
         app.get_webview_window(&label)
             .ok_or_else(|| format!("window '{label}' does not exist"))
@@ -627,13 +1308,27 @@ impl WmState {
     /// the host is the only place that can ask for it. It is a no-op for a window the platform
     /// does not consider minimized, and asking first keeps the log honest (the read-back rule
     /// `window_toggle_zoom` follows).
-    fn reveal_window(window: &tauri::WebviewWindow) -> Result<(), String> {
+    fn reveal_window<R: Runtime>(window: &tauri::WebviewWindow<R>) -> Result<(), String> {
+        // F-DEV-131: the *miniaturized* state belongs to the desktop OS — macOS's yellow
+        // traffic light and ⌘M, and the same idea on Windows/Linux. Tauri compiles
+        // `WebviewWindow::unminimize` for desktop only (2.11), and a mobile webview has no
+        // such state to be brought back from, so the whole question is desktop-only. Same
+        // shape as `tray::install`'s `not(desktop)` twin: it says why it skipped.
+        #[cfg(desktop)]
         if window.is_minimized().unwrap_or(false) {
             window.unminimize().map_err(|e| e.to_string())?;
             tracing::info!(
                 target: "amos::wm",
                 label = %window.label(),
                 "restored a window the platform had minimized (REQ-A441)"
+            );
+        }
+        #[cfg(not(desktop))]
+        {
+            tracing::debug!(
+                target: "amos::wm",
+                label = %window.label(),
+                "a platform-minimized window is a desktop concept; this build compiles but skips"
             );
         }
         Ok(())
@@ -690,7 +1385,11 @@ impl WmState {
                 .filter_map(|id| core.labels.get(&id).map(|l| (id, l.clone())))
                 .filter(|(_, label)| !is_screen_window(label))
                 .collect();
-            (core.screen, core.policy, targets)
+            // The work area, not the screen: re-clamping is the path that rescues a
+            // window from off-screen, and the rail's strip is off-limits for the same
+            // reason. It is also what turns Stage mode *on* without moving every open
+            // window by hand — `stage_set_enabled` re-clamps.
+            (core.work_area(), core.policy, targets)
         };
 
         let mut moved = 0usize;
@@ -775,8 +1474,27 @@ impl WmState {
         Ok(moved)
     }
 
-    /// Open (create-if-needed + focus) the window addressed by `label`.
-    pub fn open(&self, app: &AppHandle, label: &str) -> Result<Vec<WmEvent>, String> {
+    /// Open (create-if-needed + focus) the **first** window of the app named by `label`.
+    ///
+    /// `label` is an **app id** (REQ-A473): the first window of app `<app>` is labelled
+    /// `<app>`. An already-open app is focused, which is what makes this idempotent — and
+    /// it is also why this command can never mint a second window: that is
+    /// [`WmState::new_window`]'s job, and it reports which instance it made.
+    ///
+    /// An instance label (`files_2`) is **refused** rather than accepted as an app id: it
+    /// names a window, and "the window of a window" has no meaning.
+    pub fn open<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        label: &str,
+    ) -> Result<Vec<WmEvent>, String> {
+        let identity = identity::identity_of_label(label).map_err(|r| r.to_string())?;
+        if !identity.is_first() {
+            return Err(format!(
+                "'{label}' names window instance {} of '{}', not an application: use wm_new_window to add a window (REQ-A473)",
+                identity.instance, identity.app
+            ));
+        }
         let events = {
             let mut core = self.lock()?;
             let (id, mut events) = match core.by_label.get(label) {
@@ -790,9 +1508,7 @@ impl WmState {
                     // on top of that.)
                     Self::check_new_app_window(&core)?;
                     let (id, created) = core.wm.register(WindowKind::App);
-                    core.labels.insert(id, label.to_string());
-                    core.by_label.insert(label.to_string(), id);
-                    core.kinds.insert(id, WindowKind::App.to_string());
+                    core.bind(id, label, WindowKind::App, Some(identity));
                     (id, created)
                 }
             };
@@ -803,8 +1519,166 @@ impl WmState {
         Ok(events)
     }
 
+    /// Show and focus a window **by its label**, without [`Self::open`]'s identity gate.
+    ///
+    /// `open` is the *launch* verb: a label nobody knows is a request to **create** that
+    /// app's window, so it registers one — and to keep that from minting an arbitrary
+    /// window it refuses every label that names an instance other than the first
+    /// (`identity.is_first()`, REQ-A473: "use wm_new_window to add a window").
+    ///
+    /// That rule is right for a Dock tile and wrong for any surface that already *has* the
+    /// window: Stage Manager's rail drew a tile for an app's second window (`notes_2`, which
+    /// `stage.rs::views_of` explicitly makes its own tile) and then answered a click on it by
+    /// calling `open`, so the window could be parked and **never brought back** — refused for
+    /// being a second instance, and reported as a lock failure. This is the verb that pair
+    /// needs: a *registered* label, shown and focused, no creation and no identity gate.
+    ///
+    /// The refusal is [`Self::hide`]'s own wording for an unknown label, so a caller can tell
+    /// "this window is not one of ours" from "the window manager refused".
+    pub fn reveal<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        label: &str,
+    ) -> Result<Vec<WmEvent>, String> {
+        let events = {
+            let mut core = self.lock()?;
+            let id = *core
+                .by_label
+                .get(label)
+                .ok_or_else(|| format!("window '{label}' is not registered"))?;
+            core.wm.open(id)
+        };
+        self.apply(app, &events)?;
+        Ok(events)
+    }
+
+    /// Open **one more** window of `app_id` (macOS's File ▸ New Window / ⌘N).
+    ///
+    /// REQ-A473. Before the identity model this could not exist: one label meant one
+    /// window, so "another window of the app you are looking at" was unrepresentable and
+    /// the menu item had to be renamed to "New Files Window" (`menu.rs`, REQ-A434).
+    ///
+    /// The label comes from [`identity::next_window_label`] — the lowest free instance
+    /// ordinal, so a closed `_2` is reused instead of the numbers running away — bounded
+    /// by [`identity::MAX_WINDOWS_PER_APP`] with a named refusal rather than a silent
+    /// no-op. The class's own cap is asked through the same
+    /// [`WmState::check_new_app_window`] the first window goes through, so a phone (one
+    /// app window) refuses the second window for exactly the reason it refuses a second
+    /// app.
+    ///
+    /// When the app has no window yet, this **is** its first window — which is what ⌘N on
+    /// a not-running app does on macOS — and the returned label says so (it is then the
+    /// bare app id).
+    pub fn new_window<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        app_id: &str,
+    ) -> Result<(Vec<WmEvent>, String), String> {
+        let (events, label) = {
+            let mut core = self.lock()?;
+            let existing = core.labels_of_app(app_id);
+            let label =
+                identity::next_window_label(app_id, &existing).map_err(|r| r.to_string())?;
+            if core.by_label.contains_key(&label) {
+                // Unreachable while `bind`/`unbind` are the only writers — the label was
+                // just computed from this app's own labels — and stated rather than
+                // assumed: handing two live windows the same platform label is the one
+                // failure the OS would then have to arbitrate.
+                return Err(format!(
+                    "internal: the allocated label '{label}' is already bound to a live window (the identity ledger and the label ledger disagree)"
+                ));
+            }
+            // The class cap, the same function the first window asks. Asked *after*
+            // allocation (which is pure and leaves no trace) and **before** any
+            // registration, so a refused window still leaves none.
+            Self::check_new_app_window(&core)?;
+            let identity = identity::identity_of_label(&label).map_err(|r| r.to_string())?;
+            // The `Created` event must be carried into `apply` — it is what builds the
+            // platform window. Dropping it (as this code did for one test run) leaves the
+            // model with a window the OS never got, and the very next `Shown` reports
+            // "window 'files_2' does not exist".
+            let (id, mut events) = core.wm.register(WindowKind::App);
+            core.bind(id, &label, WindowKind::App, Some(identity));
+            events.extend(core.wm.open(id));
+            (events, label)
+        };
+        self.apply(app, &events)?;
+        tracing::info!(
+            target: "amos::wm",
+            app = %app_id,
+            label = %label,
+            "opened an additional window for an application (REQ-A473)"
+        );
+        Ok((events, label))
+    }
+
+    /// Focus the next (or previous) window **of `app_id`** — the decision behind ⌘`.
+    ///
+    /// The ring is [`WmCore::labels_of_app`]'s labels, ordered by the identity domain's
+    /// [`identity::cycle_target`] (deterministic, wrapping, never panicking), and
+    /// `current` is the focused window *if it belongs to this app*: when focus is
+    /// elsewhere the step starts at an end, which is what makes ⌘` usable as "show me
+    /// this app's windows".
+    ///
+    /// `Ok(label)` = the window that was focused. `Err` when there is nothing to cycle
+    /// (the app has no window, or exactly one — a ring of one is a no-op, and the caller
+    /// is told so instead of being handed a "success" that moved nothing).
+    pub fn cycle_app<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        app_id: &str,
+        forward: bool,
+    ) -> Result<String, String> {
+        let target = {
+            let core = self.lock()?;
+            let peers = core.labels_of_app(app_id);
+            if peers.len() < 2 {
+                return Err(format!(
+                    "'{app_id}' has {} window(s): there is nothing to cycle (⌘` needs at least two)",
+                    peers.len()
+                ));
+            }
+            let focused_label = core
+                .wm
+                .focused()
+                .and_then(|id| core.labels.get(&id))
+                .filter(|label| core.app_id_of_label(label).as_deref() == Some(app_id))
+                .cloned();
+            identity::cycle_target(focused_label.as_deref(), &peers, forward)
+                .ok_or_else(|| format!("'{app_id}' has no windows to cycle"))?
+                .to_string()
+        };
+        self.focus(app, &target)?;
+        Ok(target)
+    }
+
+    /// Is `label` one of the two windows in the active split?
+    ///
+    /// Used by the geometry memory (REQ-A478): a pane's rectangle belongs to the split
+    /// session, so it must not be remembered as "where the user put this window" — the same
+    /// reason [`zoomable_window`] refuses a pane. `Ok(false)` for an unknown label (a window
+    /// that is gone is not in a split) and for the Launcher (it is the screen).
+    pub fn is_in_split(&self, label: &str) -> Result<bool, String> {
+        Ok(self
+            .split_labels()?
+            .is_some_and(|(a, b)| a == label || b == label))
+    }
+
+    /// The app id a registered label belongs to, if it names an app window.
+    ///
+    /// Used by the callers that hold a **label** (the focused window, an OS event) and
+    /// need the app for a per-app decision — the app id is what the shell, the store key
+    /// and the native menu are keyed by.
+    pub fn app_id_of(&self, label: &str) -> Result<Option<String>, String> {
+        Ok(self.lock()?.app_id_of_label(label))
+    }
+
     /// Focus an already-registered window.
-    pub fn focus(&self, app: &AppHandle, label: &str) -> Result<Vec<WmEvent>, String> {
+    pub fn focus<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        label: &str,
+    ) -> Result<Vec<WmEvent>, String> {
         let events = {
             let mut core = self.lock()?;
             let id = *core
@@ -818,7 +1692,11 @@ impl WmState {
     }
 
     /// Hide a registered window.
-    pub fn hide(&self, app: &AppHandle, label: &str) -> Result<Vec<WmEvent>, String> {
+    pub fn hide<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        label: &str,
+    ) -> Result<Vec<WmEvent>, String> {
         let events = {
             let mut core = self.lock()?;
             let id = *core
@@ -829,6 +1707,68 @@ impl WmState {
         };
         self.apply(app, &events)?;
         Ok(events)
+    }
+
+    /// The state-half rules for minimizing `label`: it must be registered, and it must
+    /// not be a split pane.
+    ///
+    /// Split out from [`Self::minimize`] so the refusal is exercised **without a window
+    /// server** — the same headless shape the `split_labels` tests use. A pane's
+    /// rectangle belongs to the split session, so minimizing one pane would leave the
+    /// other at half-screen with no split left to explain it: the rule [`wm_zoom`]
+    /// already states for zoom / full screen.
+    pub fn minimize_target(&self, label: &str) -> Result<(), String> {
+        if let Some((a, b)) = self.split_labels()? {
+            if a == label || b == label {
+                return Err(format!(
+                    "window '{label}' is in a split — exit the split before minimizing"
+                ));
+            }
+        }
+        let core = self.lock()?;
+        if !core.by_label.contains_key(label) {
+            return Err(format!("window '{label}' is not registered"));
+        }
+        Ok(())
+    }
+
+    /// Minimize a registered window — the **Minimize** menu row (⌘M).
+    ///
+    /// REQ-A714. This is deliberately **not** [`Self::hide`]. ⌘M used to run `wm_hide`,
+    /// i.e. `window.hide()`: the window left the screen **and** the model, so every
+    /// surface that reads the model reported the app as gone — the Dock's running dot
+    /// went dark (the symptom `docs/DESKTOP_GAP_ANALYSIS_2026_SEP20.md` §2 A1 records as
+    /// "「最小化」其实是「隐藏」"), and there was no macOS-style minimized window to
+    /// return to. macOS's ⌘M *minimizes*: the window drops to the Dock, and the app is
+    /// still visibly running.
+    ///
+    /// So this asks the **platform** to minimize and leaves the model alone. That is the
+    /// state [`Self::reveal_window`] (REQ-A441) already restores — a platform-minimized
+    /// window keeps its model state (`Shown`), so it stays in `wm_windows`, the Dock
+    /// keeps its dot, Mission Control still lists it, and focusing it (the Dock tile, ⌘N)
+    /// un-minimizes it. No third state is invented (`docs/multi-window.md` §"平台还有
+    /// 一个我们没有的状态" states that decision); the window merely goes where macOS's
+    /// own yellow light would put it.
+    pub fn minimize<R: Runtime>(&self, app: &AppHandle<R>, label: &str) -> Result<(), String> {
+        self.minimize_target(label)?;
+        let window = app
+            .get_webview_window(label)
+            .ok_or_else(|| format!("window '{label}' is not registered"))?;
+        // F-DEV-131: `WebviewWindow::minimize` is `#[cfg(desktop)]` in Tauri 2.11 for the same
+        // reason `reveal_window`'s twin is (see there). On mobile the model transition above is
+        // the whole effect — there is no platform state to ask for, and saying so is better
+        // than returning a success that named nothing.
+        #[cfg(desktop)]
+        window.minimize().map_err(|e| e.to_string())?;
+        #[cfg(not(desktop))]
+        {
+            tracing::debug!(
+                target: "amos::wm",
+                label = %window.label(),
+                "no platform minimize on this target; the window-model transition above is the whole effect"
+            );
+        }
+        Ok(())
     }
 
     /// Close a registered window (Launcher is a no-op, as enforced by `amos-wm`) and
@@ -842,7 +1782,11 @@ impl WmState {
     /// the LMK teardown, Mission Control's close) doing *nothing at all* while the command
     /// reported success: the model forgot the window, the window stayed on screen, and the
     /// next ⌘W answered `window 'settings' is not registered` (which nothing displayed).
-    pub fn close(&self, app: &AppHandle, label: &str) -> Result<Vec<WmEvent>, String> {
+    pub fn close<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        label: &str,
+    ) -> Result<Vec<WmEvent>, String> {
         let target = close_target(app, label);
         let (events, split_survivor) = self.close_core(label)?;
         self.apply(app, &events)?;
@@ -906,9 +1850,12 @@ impl WmState {
         // No stale registration: otherwise a later launch of the same label silently
         // no-ops (`focus` on an id the state machine no longer has) and the debug card
         // would keep a name for a window that is gone.
-        core.by_label.remove(label);
-        core.labels.remove(&id);
-        core.kinds.remove(&id);
+        //
+        // REQ-A473: this is `unbind`, the one place that forgets a window, so the
+        // identity record cannot outlive its window either — a leaked identity would keep
+        // a closed window in its app's ⌘` ring forever and would hand a *new* window of
+        // that app a label that was still bound to a dead id.
+        core.unbind(id);
         core.external.remove(&id);
         // REQ-A435: a closed window's page-load record must not outlive it — a label that is
         // re-opened later is a **new** window and owes its own `on_page_load` before it may
@@ -945,9 +1892,7 @@ impl WmState {
                 return Ok(());
             }
             let (id, mut events) = core.wm.register(WindowKind::System);
-            core.labels.insert(id, label.to_string());
-            core.by_label.insert(label.to_string(), id);
-            core.kinds.insert(id, WindowKind::System.to_string());
+            core.bind(id, label, WindowKind::System, None);
             core.external.insert(id);
             events.extend(core.wm.open(id));
         }
@@ -962,7 +1907,14 @@ impl WmState {
     /// host can place, which is exactly what the split rules are about (REQ-A226), so
     /// state-machine tests must not have to borrow that shape to get two windows.
     #[cfg(test)]
-    fn register_app(&self, label: &str) -> Result<(), String> {
+    pub(crate) fn register_app(&self, label: &str) -> Result<(), String> {
+        let identity = identity::identity_of_label(label).map_err(|r| r.to_string())?;
+        if !identity.is_first() {
+            return Err(format!(
+                "'{label}' names window instance {}, not an application (use register_app_instance)",
+                identity.instance
+            ));
+        }
         let mut core = self.lock()?;
         if core.by_label.contains_key(label) {
             return Ok(());
@@ -973,15 +1925,71 @@ impl WmState {
         Self::check_new_app_window(&core)?;
 
         let (id, _created) = core.wm.register(WindowKind::App);
-        core.labels.insert(id, label.to_string());
-        core.by_label.insert(label.to_string(), id);
-        core.kinds.insert(id, WindowKind::App.to_string());
+        core.bind(id, label, WindowKind::App, Some(identity));
         core.wm.open(id);
         Ok(())
     }
 
+    /// Register one **additional** window of `app_id` without an `AppHandle`, allocating
+    /// its label exactly as [`WmState::new_window`] would (tests only).
+    ///
+    /// The allocation goes through the same domain function, so a test cannot observe an
+    /// instance scheme the production host would never produce — the mistake REQ-A227's
+    /// fix was about (`register_app` exists precisely so tests do not have to invent the
+    /// registration shape).
+    #[cfg(test)]
+    pub(crate) fn register_app_instance(&self, app_id: &str) -> Result<String, String> {
+        let mut core = self.lock()?;
+        let existing = core.labels_of_app(app_id);
+        let label = identity::next_window_label(app_id, &existing).map_err(|r| r.to_string())?;
+        Self::check_new_app_window(&core)?;
+        let identity = identity::identity_of_label(&label).map_err(|r| r.to_string())?;
+        let (id, _created) = core.wm.register(WindowKind::App);
+        core.bind(id, &label, WindowKind::App, Some(identity));
+        core.wm.open(id);
+        Ok(label)
+    }
+
+    /// Is this app's **first** window already on screen, and what is its label?
+    ///
+    /// The cascade's anchor (REQ-A478): only the platform knows where macOS put that window,
+    /// so this answers "which window should we measure", and [`anchor_of_window`] does the
+    /// measuring. `Ok(None)` means the app has no window with instance 1 in the ledger —
+    /// then there is nothing to cascade from and the class rule's own position is used.
+    fn first_instance_label(&self, app_id: &str) -> Result<Option<String>, String> {
+        let core = self.lock()?;
+        Ok(core
+            .apps
+            .iter()
+            .find(|(_, identity)| identity.app == app_id && identity.instance == 1)
+            .and_then(|(id, _)| core.labels.get(id).cloned()))
+    }
+
+    /// Where the cascade for `app_id` should start, or `None` when it cannot be established.
+    ///
+    /// Deliberately `None` rather than a guess in three cases, each reported by the caller's
+    /// fallback: the window shows no app; the app's first window is the one being created;
+    /// the platform cannot tell us its position.
+    fn cascade_anchor<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        app_id: Option<&str>,
+        label: &str,
+    ) -> Result<Option<(i32, i32)>, String> {
+        let Some(app_id) = app_id else {
+            return Ok(None);
+        };
+        let Some(first) = self.first_instance_label(app_id)? else {
+            return Ok(None);
+        };
+        if first == label {
+            return Ok(None);
+        }
+        Ok(anchor_of_window(app, &first))
+    }
+
     /// Mirror a batch of state-machine events onto the real windows.
-    fn apply(&self, app: &AppHandle, events: &[WmEvent]) -> Result<(), String> {
+    fn apply<R: Runtime>(&self, app: &AppHandle<R>, events: &[WmEvent]) -> Result<(), String> {
         for e in events {
             match *e {
                 WmEvent::Created(id) => {
@@ -989,27 +1997,79 @@ impl WmState {
                         continue; // external surfaces have no WebviewWindow
                     }
                     let label = self.label_for(id)?;
+                    let (app_id, instance) = {
+                        let core = self.lock()?;
+                        let app = core.app_id_of_label(&label);
+                        let inst = core.apps.get(&id).map(|i| i.instance).unwrap_or(1);
+                        (app, inst)
+                    };
                     if app.get_webview_window(&label).is_none() {
                         // The class decides how big a new app window opens: a PC must
                         // not open a 480×820 handset slab (the value was hard-coded
                         // here before the form-factor domain), and the window never
                         // exceeds the screen it will be drawn on. One lock for both
                         // facts, so they cannot disagree.
+                        // `work_area` — not `screen`: with Stage mode on, a new window
+                        // must not open under the rail, and this is the one seam that
+                        // knows where the stage ends (`WmCore::work_area`).
                         let (policy, screen) = {
                             let core = self.lock()?;
-                            (core.policy, core.screen)
+                            (core.policy, core.work_area())
                         };
-                        let opens_at = policy.initial_window_in(screen);
+                        // REQ-A478: the instance decides the **cascade** — three windows of
+                        // one app used to open at the same 236,70 1024×720 (measured on this
+                        // machine), i.e. stacked exactly on top of each other.
+                        let initial = policy.initial_window_for(screen, instance);
+                        // REQ-A478: **a remembered rectangle wins over every default.** The
+                        // order is: the user's own geometry (REQ-A249, wired this round) →
+                        // the cascade for a later instance → the class's initial window.
+                        // The user's choice is the only one that is *evidence about what
+                        // they want*; the two defaults are our guesses.
+                        //
+                        // `None` for a label with no history (the normal case), and a store
+                        // that is not armed answers `None` too — so this is additive.
+                        //
+                        // The saved numbers are **physical** pixels (`outer_position` /
+                        // `outer_size`) and are converted with the window's own scale factor
+                        // (the REQ-A218 lesson), then bounded by the **current** screen: a
+                        // monitor change must not reopen a window off-screen.
+                        let restored = restored_geometry(
+                            app.try_state::<window_state::WindowStateStore>().as_deref(),
+                            &label,
+                            app.get_webview_window(LAUNCHER_LABEL)
+                                .and_then(|w| w.scale_factor().ok())
+                                .unwrap_or(1.0),
+                            policy,
+                            screen,
+                        );
+                        // The winner supplies **both** the size and (below) the position — and
+                        // it has to be assigned, not merely tested: a first device pass asked
+                        // `if restored.is_some()` while still sizing the builder from `initial`,
+                        // and the window reopened at the domain's origin rect (measured
+                        // 0,29) instead of the spot the user had left it at. A flag that
+                        // gates the branch but not the value is the defect; the assertion in
+                        // `restored_geometry`'s callers is the value itself.
+                        let opens_at = restored.unwrap_or(initial);
+                        // …and the computed position is actually **applied** from instance 2
+                        // on (see `places_position_at`: `.position()` had never been called,
+                        // so the class rule's x/y never reached a real window and every window
+                        // landed wherever the OS put it). Instance 1 keeps the OS's placement,
+                        // so nothing a user already experiences moves.
 
                         // Load the app entry with a `#window=` fragment so the boot
                         // script auto-navigates to that app's screen.
                         let url = WebviewUrl::App(format!("{APP_ENTRY}#window={label}").into());
                         // On desktop, hide the native title bar so the app window
                         // renders edge-to-edge (REQ-A249 / PC_DESKTOP_ARCHITECTURE.md §4.3).
-                        // `mut` is only used by the desktop-gated line below.
+                        // `mut` is used by the desktop-gated line below and by the position.
                         #[cfg_attr(not(desktop), allow(unused_mut))]
                         let mut builder = WebviewWindowBuilder::new(app, label.clone(), url)
-                            .title(app_window_title(&label))
+                            .title(app_window_title(
+                                app_id.as_deref().unwrap_or(label.as_str()),
+                            ))
+                            // REQ-A478: **a remembered rectangle wins over every default** —
+                            // the user's own geometry (REQ-A249, wired this round) first, then
+                            // the cascade for a later instance, then the class's own window.
                             .inner_size(f64::from(opens_at.width), f64::from(opens_at.height))
                             // G5: the class decides whether the user may freely
                             // resize, and how small the window may get.
@@ -1018,6 +2078,40 @@ impl WmState {
                                 f64::from(policy.min_pane.width),
                                 f64::from(policy.min_pane.height),
                             );
+                        // Where to put it: the remembered spot when there is one (it *is* the
+                        // user's choice, and it was already clamped into the current screen);
+                        // otherwise the cascade, which only applies from instance 2 on —
+                        // instance 1 keeps the OS's own placement, so nothing a user already
+                        // experiences moves.
+                        if let Some(saved) = restored {
+                            builder = builder.position(f64::from(saved.x), f64::from(saved.y));
+                        } else if places_position_at(instance) {
+                            // Anchor the cascade at **where the app's first window actually
+                            // is**. The domain cannot know that (`fit_window` builds its rect
+                            // at the screen's origin and clamps) and macOS placed the first
+                            // window itself, so the platform is the only source — the same rule
+                            // `reclamp_windows` follows, for the same reason. A window whose
+                            // position cannot be read falls back to the domain's answer, and
+                            // `anchor_of_window` says so (never a silent guess).
+                            let anchor = self
+                                .cascade_anchor(app, app_id.as_deref(), &label)?
+                                .unwrap_or((opens_at.x, opens_at.y));
+                            let placed = policy.cascade_from(
+                                anchor,
+                                Size::new(opens_at.width, opens_at.height),
+                                screen,
+                                instance,
+                            );
+                            builder = builder.position(f64::from(placed.x), f64::from(placed.y));
+                        }
+                        // REQ-A326: paint the frame before the page does, so a dark machine
+                        // does not flash the light OS canvas on every open. Desktop-only: the
+                        // builder method is absent on the mobile targets (same E0599 lesson as
+                        // `title_bar_style` above).
+                        #[cfg(desktop)]
+                        if let Some(background) = new_window_background(app) {
+                            builder = builder.background_color(background);
+                        }
                         // macOS title-bar overlay (REQ-A249 / PC_DESKTOP_ARCHITECTURE.md
                         // §4.3). `title_bar_style` exists on desktop Tauri only: on
                         // Android/iOS the method is absent, so a *runtime*
@@ -1171,26 +2265,60 @@ impl WmState {
                             "the platform has not confirmed the focus yet"
                         );
                     }
-                    // Write the focused app label to the shared store so the desktop
+                    // Write the focused **app id** to the shared store so the desktop
                     // TopBar can render the active app's menu.  This mirrors the same
                     // pattern the System UI already uses for settings / notifications:
                     // the host owns the authoritative store, not any one WebView.
-                    if let Some(label) = self.lock()?.labels.get(&id).cloned() {
-                        if let Some(store) = app.try_state::<SharedStore>() {
-                            // One source: `SharedStore::set` already broadcasts
-                            // `store-updated` to every window, and the desktop
-                            // TopBar reads the key from there
-                            // (`lib/wm.ts::APP_FOCUSED_KEY` → `createStoreValue`).
-                            // A second, purpose-built `emit` was tried and removed:
-                            // `scripts/tauri-event-scan.mjs` reported it as "emitted
-                            // by the host but no screen subscribes to it" — and it
-                            // was right, the frontend deliberately reads the store.
-                            store.set(app, APP_FOCUSED_KEY, serde_json::json!(&label).to_string());
-                        }
+                    //
+                    // REQ-A473: this used to write the *label*. With instances those are
+                    // no longer the same string — `files_2` is a window, not an app — and a
+                    // TopBar keyed by the label would show nothing for every window after
+                    // the first (the store's value is looked up as an app id). A window
+                    // that shows no app (the Launcher, a container surface) keeps the
+                    // label: the consumers already treat a non-app id as "no app menu".
+                    let app_key = {
+                        let core = self.lock()?;
+                        core.app_id_of_label(&label)
+                            .unwrap_or_else(|| label.clone())
+                    };
+                    if let Some(store) = app.try_state::<SharedStore>() {
+                        // One source: `SharedStore::set` already broadcasts
+                        // `store-updated` to every window, and the desktop
+                        // TopBar reads the key from there
+                        // (`lib/wm.ts::APP_FOCUSED_KEY` → `createStoreValue`).
+                        // A second, purpose-built `emit` was tried and removed:
+                        // `scripts/tauri-event-scan.mjs` reported it as "emitted
+                        // by the host but no screen subscribes to it" — and it
+                        // was right, the frontend deliberately reads the store.
+                        store.set(
+                            app,
+                            APP_FOCUSED_KEY,
+                            serde_json::json!(&app_key).to_string(),
+                        );
                     }
                 }
                 // Nothing focused: leave windowing as-is (Launcher stays visible).
                 WmEvent::FocusChanged(None) => {}
+            }
+        }
+        // REQ-A717: the batch this function just mirrored is exactly what `wm_windows`
+        // reports (every `WmEvent` variant above changes a window's presence or focus),
+        // so it is the one honest choke point to announce the new list from. An empty
+        // batch means the command was a no-op — announcing it would be a spurious frame.
+        if !events.is_empty() {
+            if let Ok(snap) = self.snapshot() {
+                // Power of 10 #7: read the answer back. `Err` here does not mean "no listener" —
+                // Tauri answers `Ok` when nobody is subscribed — it means a **registered** listener
+                // could not be reached, i.e. a screen that asked for `wm-changed` will not learn the
+                // new window list. The desktop UI re-reads `wm_windows` on other triggers, so this is
+                // recoverable, but a silent drop is exactly the failure this repo reports instead.
+                if let Err(e) = app.emit(WM_CHANGED_EVENT, snap) {
+                    tracing::warn!(
+                        target: "amos::wm",
+                        error = %e,
+                        "wm-changed emit failed: a registered listener will not learn the new window list"
+                    );
+                }
             }
         }
         Ok(())
@@ -1207,6 +2335,20 @@ impl WmState {
             .map(|id| WindowInfo {
                 id: id.0,
                 label: core.labels.get(&id).cloned().unwrap_or_default(),
+                // REQ-A473: the identity is *reported*, not re-derived from the label by
+                // the reader. A shell that parsed `a#b` itself would be a second
+                // implementation of the scheme, and the first place it would drift is the
+                // separator.
+                app: core
+                    .apps
+                    .get(&id)
+                    .map(|identity| identity.app.clone())
+                    .unwrap_or_default(),
+                instance: core
+                    .apps
+                    .get(&id)
+                    .map(|identity| identity.instance)
+                    .unwrap_or(0),
                 kind: core
                     .kinds
                     .get(&id)
@@ -1230,6 +2372,172 @@ impl WmState {
     /// The full OS window area the split layout sub-divides (0,0 origin).
     pub fn screen(&self) -> Result<Bounds, String> {
         Ok(self.lock()?.screen)
+    }
+
+    /// This host's resolved [`LayoutPolicy`] (REQ-A1546).
+    ///
+    /// Exposed so the Stage Manager module derives its rail width and work-area inset
+    /// from the **same** policy this host places windows with. A second
+    /// `LayoutPolicy::of(form)` call over there would be a second derivation of the
+    /// geometry the two must agree on.
+    pub fn policy(&self) -> Result<LayoutPolicy, String> {
+        Ok(self.lock()?.policy)
+    }
+
+    /// Is Stage Manager on ([`WmCore::stage_enabled`])?
+    pub fn stage_enabled(&self) -> Result<bool, String> {
+        Ok(self.lock()?.stage_enabled)
+    }
+
+    /// The area an app window may be placed in ([`WmCore::work_area`]).
+    ///
+    /// Exposed for the Stage Manager module, whose "Tidy" lays windows out over exactly
+    /// this rect — a second `policy.stage_work_area(screen)` written there is how the tidy
+    /// grid and the placement inset come to disagree about where the stage ends.
+    pub fn work_area(&self) -> Result<Bounds, String> {
+        Ok(self.lock()?.work_area())
+    }
+
+    /// How many pixels the rail takes out of the left edge ([`WmCore::rail_width`]).
+    pub fn rail_width(&self) -> Result<u32, String> {
+        Ok(self.lock()?.rail_width())
+    }
+
+    /// Turn Stage Manager on or off, answering the state now in effect.
+    ///
+    /// Refused with [`ErrorCode::StageUnsupported`]'s wording on a class whose policy has
+    /// no rail (a phone, a tablet, a headless board): storing `true` there would make
+    /// [`WmState::stage_enabled`] a lie — every reader would believe a rail exists while
+    /// [`LayoutPolicy::stage_rail_width`] keeps returning 0.
+    ///
+    /// A live split is re-fitted to the new work area — the rail appearing narrows the
+    /// rect its two panes share, and the panes were laid out from the same rect
+    /// ([`WmState::enter_split`]). It is [`SplitScreen::set_screen`]'s rule, the same one
+    /// [`WmState::sync_screen`] applies to a screen change: the session survives while its
+    /// divider still leaves both panes at `min`, and **ends** rather than silently
+    /// re-clamping the ratio when it does not. A split left describing the old rect would
+    /// put a pane under the rail — the exact overlap the work-area inset exists to prevent.
+    pub fn set_stage_enabled(&self, enabled: bool) -> Result<bool, String> {
+        let mut core = self.lock()?;
+        if enabled && core.policy.stage_rail_width() == 0 {
+            return Err(format!(
+                "form factor '{}' has no Stage Manager rail, so Stage mode cannot be \
+                 turned on here",
+                core.policy.form
+            ));
+        }
+        core.stage_enabled = enabled;
+        let work = core.work_area();
+        if let Some(s) = core.split.as_mut() {
+            if !s.set_screen(work) {
+                core.split = None;
+            }
+        }
+        Ok(enabled)
+    }
+
+    /// Push a window the user has just dragged into the Stage rail back out of it, and
+    /// rewrite `captured` so **the corrected rectangle is what gets remembered**
+    /// (REQ-A1564).
+    ///
+    /// Why this exists at all: the rail is protected by *geometry* (`WmCore::work_area`),
+    /// so every window the host places starts clear of the band. The one placement the host
+    /// does not control is the user's own drag, and `Moved` is the only report of it. Without
+    /// this, a window dragged over the rail simply covers it — and, worse, the overlap is
+    /// then written to `window_state` and comes back at the next launch, when no drag is
+    /// happening to explain it.
+    ///
+    /// Why **`captured` is rewritten rather than re-read**: the platform applies
+    /// `set_position` asynchronously, so a `window_state::snapshot` taken here can still
+    /// report the pre-correction position — and that is exactly the value that must not be
+    /// persisted. The rect this method applied *is* the truth about what was asked for, so it
+    /// is written directly. `captured`'s other fields (notably `visible`) are left as the
+    /// platform reported them.
+    ///
+    /// Answers `Ok(true)` when the window was moved. `Ok(false)` is the ordinary case and
+    /// covers every "leave it alone" reason, all of them `None` from
+    /// [`WmState::stage_clamp_target`]: Stage mode off, no rail, no overlap, no room to
+    /// reflow into, or inside the throttle window.
+    pub fn stage_clamp_moved<R: Runtime>(
+        &self,
+        window: &tauri::Window<R>,
+        label: &str,
+        captured: &mut window_state::WindowState,
+    ) -> Result<bool, String> {
+        let Some(rect) = logical_window_rect(window) else {
+            tracing::debug!(
+                target: "amos::wm",
+                window = %label,
+                "could not measure a moved window; the Stage rail's exclusion was not applied"
+            );
+            return Ok(false);
+        };
+        let Some(target) = self.stage_clamp_target(label, rect, now_ms())? else {
+            return Ok(false);
+        };
+        let applied = window
+            .set_position(tauri::LogicalPosition::new(
+                f64::from(target.x),
+                f64::from(target.y),
+            ))
+            .and_then(|()| {
+                window.set_size(tauri::LogicalSize::new(
+                    f64::from(target.width),
+                    f64::from(target.height),
+                ))
+            });
+        if let Err(e) = applied {
+            // Reported, not retried: a platform that refused this correction will refuse the
+            // next one too, and re-asking on every `Moved` event is how a clamp becomes a
+            // fight with the user's hand.
+            tracing::warn!(
+                target: "amos::wm",
+                window = %label,
+                error = %e,
+                "the platform refused a window's Stage rail exclusion"
+            );
+            return Ok(false);
+        }
+        let scale = sane_scale(window.scale_factor().unwrap_or(1.0));
+        note_clamped_rect(captured, rect, target, scale);
+        Ok(true)
+    }
+
+    /// The rectangle a moved window must be put at to stop covering the rail — `None` for
+    /// "leave it alone" (the full list is on [`WmState::stage_clamp_moved`]).
+    ///
+    /// Split out from the platform half so the rule is testable without a window, and so
+    /// the throttle stamp is written in the **same** lock acquisition as the decision that
+    /// acted on it: two acquisitions would let a second `Moved` event read an unstamped
+    /// ledger and correct the same drag twice.
+    fn stage_clamp_target(
+        &self,
+        label: &str,
+        rect: Bounds,
+        now_ms: u64,
+    ) -> Result<Option<Bounds>, String> {
+        let mut core = self.lock()?;
+        if !core.stage_enabled {
+            return Ok(None);
+        }
+        let rail = core.rail_width();
+        if !should_clamp(
+            core.stage_clamp_at.get(label).copied(),
+            now_ms,
+            STAGE_CLAMP_DEBOUNCE_MS,
+        ) {
+            return Ok(None);
+        }
+        // Against the **screen**, not the work area: `reflow_out_of_rail` measures the band
+        // from `area.x` and the room beside it from `area.width - rail`. Feeding it the
+        // already-inset rect would subtract the rail twice.
+        let Some(target) =
+            amos_wm::stage::reflow_out_of_rail(rect, core.screen, rail, core.policy.min_pane)
+        else {
+            return Ok(None);
+        };
+        core.stage_clamp_at.insert(label.to_string(), now_ms);
+        Ok(Some(target))
     }
 
     /// Set the full window area used for split layout. If a split is active it is
@@ -1260,6 +2568,23 @@ impl WmState {
                 return Ok(None);
             }
             core.screen = clamped;
+            // REQ-A512: a measured screen may re-class the host (a mobile build defaults
+            // to Phone because phone and tablet share one target). Do it *before* the
+            // split is re-fitted below, so the new class's divider/min-pane rules are the
+            // ones the live split is validated against.
+            if core.form_revisable {
+                if let Some(form) = reclass_for_screen(core.built_for, clamped) {
+                    if form != core.policy.form {
+                        core.policy = LayoutPolicy::of(form);
+                        tracing::info!(
+                            form = form.as_str(),
+                            width = clamped.width,
+                            height = clamped.height,
+                            "form factor re-derived from the measured screen"
+                        );
+                    }
+                }
+            }
             if let Some(s) = core.split.as_mut() {
                 if !s.set_screen(clamped) {
                     core.split = None;
@@ -1427,12 +2752,25 @@ impl WmState {
     ///
     /// A platform failure is an `Err`; "the platform refused to focus" is **not** an error
     /// but a fact the caller must report (see [`LauncherFocus`]).
+    ///
+    /// **`reveal_window` first (REQ-A864).** The rule REQ-A441 established for *app* windows
+    /// — `set_focus()` does not bring back a window the platform considers miniaturized, so
+    /// the platform has to be asked to deminiaturize — was never applied to the launcher,
+    /// because until the system tray existed nothing could ask for the shell to come back
+    /// **after** the platform had put it away: the only caller was boot, where the window is
+    /// freshly created and cannot be minimized. The tray's primary action is precisely that
+    /// later caller, so without this the one control whose whole job is "show the desktop"
+    /// would answer `Refused` — and, worse, would report *why* in a log nobody reads while
+    /// the user watched nothing happen. A `false`/unreadable `is_minimized` is "not
+    /// minimized" (the direction [`Self::reveal_window`] already takes).
     pub fn focus_launcher(&self, app: &AppHandle) -> Result<LauncherFocus, String> {
         let Some(window) = app.get_webview_window(LAUNCHER_LABEL) else {
             return Ok(LauncherFocus::NoWindow);
         };
-        // `show` first: a hidden window would swallow the focus request, and the intent at
-        // boot is "the shell is on screen **and** in front".
+        // Reveal, then `show`: a miniaturized window is restored by the platform's own
+        // word for it, and a hidden one would swallow the focus request. Both orders are
+        // "make it visible"; this one is the pair the platform honours.
+        Self::reveal_window(&window)?;
         window.show().map_err(|e| e.to_string())?;
         window.set_focus().map_err(|e| e.to_string())?;
         // Ask the platform rather than trusting the call.
@@ -1445,31 +2783,36 @@ impl WmState {
     }
 
     /// Enter a split between two registered, distinct, non-Launcher windows.
-    pub fn enter_split(&self, a: &str, b: &str, axis: &str) -> Result<LayoutSnapshot, String> {
-        let mut core = self.lock()?;
+    pub fn enter_split(&self, a: &str, b: &str, axis: &str) -> AmosResult<LayoutSnapshot> {
+        let mut core = self.lock().map_err(wm_lock_failed)?;
         // A class with no user interface has nothing to split: refuse honestly
         // instead of returning a snapshot that implies a screen nobody sees.
         if !core.policy.form.has_ui() {
             return Err(format!(
                 "form factor '{}' has no user interface to split",
                 core.policy.form
-            ));
+            )
+            .into_envelope(ErrorCode::WmFormFactorNoUi));
         }
         let ia = *core
             .by_label
             .get(a)
-            .ok_or_else(|| format!("window '{a}' is not registered"))?;
+            .ok_or_else(|| window_not_registered(a))?;
         let ib = *core
             .by_label
             .get(b)
-            .ok_or_else(|| format!("window '{b}' is not registered"))?;
+            .ok_or_else(|| window_not_registered(b))?;
         if ia == ib {
-            return Err("cannot split a window with itself".to_string());
+            return Err("cannot split a window with itself"
+                .to_string()
+                .into_envelope(ErrorCode::WmSelfSplit));
         }
         if core.kinds.get(&ia).map(String::as_str) == Some("Launcher")
             || core.kinds.get(&ib).map(String::as_str) == Some("Launcher")
         {
-            return Err("the Launcher cannot be split".to_string());
+            return Err("the Launcher cannot be split"
+                .to_string()
+                .into_envelope(ErrorCode::WmLauncherSplit));
         }
         // NOTE (REQ-A226): this accepts **any** two registered, non-Launcher windows —
         // including an external container surface, whose geometry the container owns.
@@ -1481,69 +2824,83 @@ impl WmState {
         // `wm_split_candidates` command *and* the snapshot field) — plus
         // [`WmState::apply_split_to_real`], which now **reports** a pane it cannot place
         // instead of skipping it silently.
+        // The **work area**, not the screen: with Stage mode on the split's panes are two
+        // more placed rectangles, and a pane reaching under the rail would be a split the
+        // user cannot see the left half of. The aspect used to pick an axis comes from the
+        // same rect for the same reason — `stage_work_area` is the identity on a class
+        // with no rail, so this is `screen` wherever it always was.
+        let work = core.work_area();
         let axis = match parse_axis(axis)? {
             Some(explicit) => explicit,
             // `"auto"`: let the policy pick from the screen's aspect instead of
             // making every caller hard-code an orientation (tablet/desktop shells
             // rotate; a phone does not).
-            None => core
-                .policy
-                .split_axis(Size::new(core.screen.width, core.screen.height)),
+            None => core.policy.split_axis(Size::new(work.width, work.height)),
         };
-        let screen = core.screen;
         let policy = core.policy;
-        let sp = SplitScreen::new(ia, ib, screen, axis, policy.divider_gap, policy.min_pane)
-            .ok_or_else(|| "screen too small to split those two windows".to_string())?;
+        let sp = SplitScreen::new(ia, ib, work, axis, policy.divider_gap, policy.min_pane)
+            .ok_or_else(|| {
+                "screen too small to split those two windows"
+                    .to_string()
+                    .into_envelope(ErrorCode::WmSplitRatioInfeasible)
+            })?;
         core.split = Some(sp);
-        layout_core(&core)
+        layout_core(&core).map_err(wm_layout_failed)
     }
 
     /// Set the divider so the primary pane takes `percent` (1..=99).
-    pub fn split_resize(&self, percent: u32) -> Result<LayoutSnapshot, String> {
-        let mut core = self.lock()?;
-        let sp = core
-            .split
-            .as_mut()
-            .ok_or_else(|| "no active split".to_string())?;
+    pub fn split_resize(&self, percent: u32) -> AmosResult<LayoutSnapshot> {
+        let mut core = self.lock().map_err(wm_lock_failed)?;
+        let sp = core.split.as_mut().ok_or_else(|| {
+            "no active split"
+                .to_string()
+                .into_envelope(ErrorCode::WmSplitNotActive)
+        })?;
         if !sp.resize_to(percent) {
             return Err(
-                "that divider share is not feasible at the current minimum size".to_string(),
+                "that divider share is not feasible at the current minimum size"
+                    .to_string()
+                    .into_envelope(ErrorCode::WmSplitRatioInfeasible),
             );
         }
-        layout_core(&core)
+        layout_core(&core).map_err(wm_layout_failed)
     }
 
     /// Move the divider by `delta` percentage points.
-    pub fn split_move(&self, delta: i32) -> Result<LayoutSnapshot, String> {
-        let mut core = self.lock()?;
-        let sp = core
-            .split
-            .as_mut()
-            .ok_or_else(|| "no active split".to_string())?;
+    pub fn split_move(&self, delta: i32) -> AmosResult<LayoutSnapshot> {
+        let mut core = self.lock().map_err(wm_lock_failed)?;
+        let sp = core.split.as_mut().ok_or_else(|| {
+            "no active split"
+                .to_string()
+                .into_envelope(ErrorCode::WmSplitNotActive)
+        })?;
         if !sp.resize_by(delta) {
             return Err(
-                "that divider move is not feasible at the current minimum size".to_string(),
+                "that divider move is not feasible at the current minimum size"
+                    .to_string()
+                    .into_envelope(ErrorCode::WmSplitRatioInfeasible),
             );
         }
-        layout_core(&core)
+        layout_core(&core).map_err(wm_layout_failed)
     }
 
     /// Swap which window is in the primary (first) pane.
-    pub fn split_swap(&self) -> Result<LayoutSnapshot, String> {
-        let mut core = self.lock()?;
-        let sp = core
-            .split
-            .as_mut()
-            .ok_or_else(|| "no active split".to_string())?;
+    pub fn split_swap(&self) -> AmosResult<LayoutSnapshot> {
+        let mut core = self.lock().map_err(wm_lock_failed)?;
+        let sp = core.split.as_mut().ok_or_else(|| {
+            "no active split"
+                .to_string()
+                .into_envelope(ErrorCode::WmSplitNotActive)
+        })?;
         sp.swap();
-        layout_core(&core)
+        layout_core(&core).map_err(wm_layout_failed)
     }
 
     /// End the active split (windows return to fullscreen / previous layout).
-    pub fn split_exit(&self) -> Result<LayoutSnapshot, String> {
-        let mut core = self.lock()?;
+    pub fn split_exit(&self) -> AmosResult<LayoutSnapshot> {
+        let mut core = self.lock().map_err(wm_lock_failed)?;
         core.split = None;
-        layout_core(&core)
+        layout_core(&core).map_err(wm_layout_failed)
     }
 
     /// Apply the active split's pane rects to the **real** Tauri windows: each pane
@@ -1630,6 +2987,148 @@ impl WmState {
         let core = self.lock()?;
         layout_core(&core)
     }
+
+    /// Snap `label` to a named screen region, applying the real geometry and returning the
+    /// frame that was set.
+    ///
+    /// The geometry is [`amos_wm::snap::snap_bounds`] — pure and tested in `amos-wm` — over
+    /// the **work area** this host measures (`core.screen`: the maximized shell window, i.e.
+    /// the screen minus the menu bar and Dock) and the class's minimum pane, so a snap can
+    /// never place a window below the class minimum or off the edge.
+    ///
+    /// Every refusal is by **name**, not a silent no-op, because "the model says snapped and
+    /// the screen did not move" is the exact failure this module keeps refusing to hide:
+    ///
+    /// * an unknown zone, or a label that is not registered;
+    /// * an external container surface (its geometry belongs to the container) and the
+    ///   Launcher (it *is* the screen);
+    /// * a window in an **active split** — snapping one pane would leave the split
+    ///   describing a layout that is no longer on screen; exit the split first;
+    /// * a class whose policy forbids free window geometry (`free_resize == false`): a phone's
+    ///   app window is fullscreen by construction, so a snap there cannot mean anything.
+    pub fn snap_window(&self, app: &AppHandle, label: &str, zone: &str) -> Result<Bounds, String> {
+        let target = {
+            let core = self.lock()?;
+            let work_area = snap_work_area(app, &core, label);
+            snap_plan_in(&core, label, zone, work_area)?
+        };
+        let Some(window) = app.get_webview_window(label) else {
+            return Err(format!("{label:?} has no window to snap"));
+        };
+        window
+            .set_position(tauri::LogicalPosition::new(
+                f64::from(target.x),
+                f64::from(target.y),
+            ))
+            .and_then(|()| {
+                window.set_size(tauri::LogicalSize::new(
+                    f64::from(target.width),
+                    f64::from(target.height),
+                ))
+            })
+            .map_err(|e| format!("could not snap {label:?}: {e}"))?;
+        tracing::info!(
+            window = %label,
+            zone = zone,
+            x = target.x,
+            y = target.y,
+            width = target.width,
+            height = target.height,
+            "a window was snapped to a screen region"
+        );
+        Ok(target)
+    }
+}
+
+/// The work area a snap of `label` should tile within (multi-display, REQ-A690).
+///
+/// With **fewer than two displays** — or when the platform cannot be asked, or the target
+/// window cannot be measured — this is exactly `core.screen`, the measured shell window, so
+/// single-monitor behaviour is byte-for-byte what it was before displays existed. With two or
+/// more, it is the work area of the display whose `bounds` contain the window's **centre**
+/// ([`DisplaySet::work_area_for`]), so a window on a secondary display is tiled within *that*
+/// display instead of being yanked onto the primary.
+///
+/// The centre is sampled from the *real* window frame, read here rather than remembered: the
+/// host keeps no per-window geometry ledger, so the platform is the only honest source.
+/// Falling back to the single screen on any read failure is deliberate and documented — a snap
+/// to the last known screen is better than a snap refused because a monitor query hiccuped.
+///
+/// The single-screen answer is [`WmCore::work_area`], **not** `core.screen`: a snap is a
+/// placement path like any other, so a tile snapped while Stage mode is on must land beside
+/// the rail rather than under it. A window snapped onto a *secondary* display keeps that
+/// display's own work area — the rail is drawn over the primary only, and insetting another
+/// display would reserve a strip for a rail that is not there. (Honest boundary: multi-display
+/// × Stage mode is not verified on this machine — `docs/stage-manager.md`.)
+fn snap_work_area(app: &AppHandle, core: &WmCore, label: &str) -> Bounds {
+    let primary = core.work_area();
+    let Ok(displays) = display_set(app) else {
+        return primary;
+    };
+    if displays.len() < 2 {
+        return primary;
+    }
+    let Some(window) = app.get_webview_window(label) else {
+        return primary;
+    };
+    let Ok(rect) = window_logical_bounds(&window) else {
+        return primary;
+    };
+    displays.work_area_for(rect).unwrap_or(core.screen)
+}
+
+/// The pure half of a snap (REQ-A616): why `label` would be refused, or the frame it would
+/// be given — within the host's single measured screen.
+///
+/// Split out of [`WmState::snap_window`] because applying the frame needs a live
+/// `AppHandle` (and the platform), while the **rules** — which zones exist, which windows may
+/// be snapped, which class allows it — are decisions over the ledger and are unit-tested
+/// directly. `zone` is re-parsed by [`SnapZone::parse`], whose `None` is a refusal, never a
+/// guessed default. This is [`snap_plan_in`] over [`WmCore::work_area`]; the host supplies a
+/// per-display work area through that. Kept as the single-screen entry the pure rule tests
+/// exercise directly — the live host always goes through [`snap_plan_in`] with a work area.
+#[cfg(test)]
+fn snap_plan(core: &WmCore, label: &str, zone: &str) -> Result<Bounds, String> {
+    snap_plan_in(core, label, zone, core.work_area())
+}
+
+/// [`snap_plan`] against an explicit work area. The rules are identical; only the rectangle
+/// the frame is cut from differs, so a window on a secondary display tiles within that
+/// display's usable area (multi-display, REQ-A690).
+fn snap_plan_in(
+    core: &WmCore,
+    label: &str,
+    zone: &str,
+    work_area: Bounds,
+) -> Result<Bounds, String> {
+    let Some(zone) = SnapZone::parse(zone) else {
+        return Err(format!("unknown snap zone {zone:?}"));
+    };
+    let Some(id) = core.by_label.get(label).copied() else {
+        return Err(format!("no window is registered under {label:?}"));
+    };
+    if core.external.contains(&id) {
+        return Err(format!(
+            "{label:?} is an external surface; its geometry is owned elsewhere"
+        ));
+    }
+    if is_screen_window(label) {
+        return Err(format!(
+            "{label:?} is the screen itself; it cannot be snapped"
+        ));
+    }
+    if !core.policy.free_resize {
+        return Err(format!(
+            "the {} class does not allow free window geometry",
+            core.policy.form.as_str()
+        ));
+    }
+    if let Some(sp) = &core.split {
+        if sp.primary == id || sp.secondary == id {
+            return Err(format!("{label:?} is in a split; exit the split first"));
+        }
+    }
+    Ok(snap_bounds(zone, work_area, core.policy.min_pane))
 }
 
 /// Serializable view of a single window (enums aren't ergonomic over IPC).
@@ -1637,6 +3136,20 @@ impl WmState {
 pub struct WindowInfo {
     pub id: u64,
     pub label: String,
+    /// The **app id** this window shows (REQ-A473), or `""` for a window that shows no
+    /// application (the Launcher, an external container surface).
+    ///
+    /// This is what a consumer should key per-app decisions on — the Dock's running dot,
+    /// the TopBar's app name, "is this app already open" — because `label` now differs
+    /// from the app id for every window after the first (`files` vs `files_2`).
+    pub app: String,
+    /// Which instance of `app` this window is: `1` for the first, `2..` for later ones,
+    /// and `0` when there is no app at all (see [`WindowInfo::app`]).
+    ///
+    /// Reported rather than left for the reader to parse out of `label`: the shell renders
+    /// "设置 — 2" for a second window, and a second parser of the label scheme is exactly
+    /// what the identity module exists to prevent.
+    pub instance: u32,
     pub kind: String,
     pub state: String,
     pub focused: bool,
@@ -1645,6 +3158,14 @@ pub struct WindowInfo {
 }
 
 /// Serializable view of the whole windowing state.
+///
+/// The shell reads this and [`WindowInfo`] as `WmWindowsSnapshot` / `WmWindowInfo`
+/// (`lib/wm.ts`). NOTE (REQ-A704): neither side previously read the other — the Rust
+/// structs had no wire-shape pin, and `wm.test.ts` compared `normalizeWindows` to a
+/// TS-local literal. The cross-language binding is `declaredMirrors.test.ts`'s "wm.ts
+/// window-list wire shapes == the amos-tauri::wm serde structs", which reads both
+/// structs' `pub` field names in order (this command is reached through a dynamic
+/// `invoke(command, args)`, so `tauri-reply-scan.mjs` cannot see it).
 #[derive(Serialize, Clone, Debug)]
 pub struct WmSnapshot {
     pub focused: Option<u64>,
@@ -1703,18 +3224,32 @@ pub struct LayoutSnapshot {
     pub free_resize: bool,
     /// Divider width between two split panes (px).
     pub divider_gap: u32,
+    /// Width of the Stage Manager rail the stage loses off its **left edge** (px), or `0`
+    /// when there is no rail — the mode is off, or this class has none, or the screen is
+    /// too narrow to afford one beside a minimum pane (`LayoutPolicy::stage_work_area`'s
+    /// give-way rule).
+    ///
+    /// The one number the shell needs to lay out **around** the rail: the rail's own width,
+    /// and the left inset of the desktop icon grid (`DesktopStage.svelte`), which would
+    /// otherwise be drawn through a translucent strip it cannot be clicked in. It lives
+    /// here rather than on `StageSnapshot` because it is geometry — the same kind of
+    /// policy-derived fact as `divider_gap` and `columns` beside it — and because the
+    /// **layout push** (`onLayoutChanged`) is the channel that already fires when it
+    /// changes (`stage_set_enabled` re-measures), so a shell reads it exactly once.
+    pub rail_width: u32,
 }
 
 /// Parse a `wm_split` axis argument. `Ok(None)` means `"auto"`: the caller lets
 /// the form-factor policy choose from the screen's aspect.
-fn parse_axis(s: &str) -> Result<Option<SplitAxis>, String> {
+fn parse_axis(s: &str) -> AmosResult<Option<SplitAxis>> {
     match s {
         "vertical" | "v" => Ok(Some(SplitAxis::Vertical)),
         "horizontal" | "h" => Ok(Some(SplitAxis::Horizontal)),
         "auto" | "" => Ok(None),
-        other => Err(format!(
-            "unknown split axis: {other:?} (vertical|horizontal|auto)"
-        )),
+        other => Err(
+            format!("unknown split axis: {other:?} (vertical|horizontal|auto)")
+                .into_envelope(ErrorCode::WmSnapZoneUnknown),
+        ),
     }
 }
 
@@ -1748,6 +3283,24 @@ fn pane(label: String, b: Bounds) -> PaneLayout {
         width: b.width,
         height: b.height,
     }
+}
+
+/// The two pane rects a split of `screen` produces under `policy` — the **one** place
+/// the host turns the class policy into split geometry (REQ-A512).
+///
+/// It delegates to `amos_wm::layout::split_panes`, the same rule
+/// [`amos_wm::split::SplitScreen`] itself is built on, so a touch shell that lays two
+/// panes out *inside one WebView* and a desktop that places two real windows cannot
+/// drift apart by a pixel. Pure: no `AppHandle`, no window call — which is exactly what
+/// lets a mobile build (one WebView, no second window to place) ask for pane rects at
+/// all.
+fn pane_rects(
+    policy: LayoutPolicy,
+    screen: Bounds,
+    axis: SplitAxis,
+    percent: u32,
+) -> Option<(Bounds, Bounds)> {
+    amos_wm::layout::split_panes(screen, axis, policy.divider_gap, percent, policy.min_pane)
 }
 
 /// Build a [`LayoutSnapshot`] from an already-locked core (no re-locking).
@@ -1784,6 +3337,7 @@ fn layout_core(core: &WmCore) -> Result<LayoutSnapshot, String> {
         multi_window: core.policy.multi_window,
         free_resize: core.policy.free_resize,
         divider_gap: core.policy.divider_gap,
+        rail_width: core.rail_width(),
     })
 }
 
@@ -1791,7 +3345,11 @@ fn layout_core(core: &WmCore) -> Result<LayoutSnapshot, String> {
 /// the real windows, broadcast a `layout-changed` event with the new snapshot, and
 /// return it. Emitting the *authoritative* reply lets non-initiating surfaces
 /// refresh without their own command round-trip.
-fn finish_layout(
+///
+/// `pub(crate)` because the Stage Manager toggle is a layout mutation too: it moves the
+/// work area (hence any live split's panes) and changes `rail_width`, so it ends with this
+/// same tail rather than a second emitter that could drift from it.
+pub(crate) fn finish_layout(
     app: &AppHandle,
     state: &WmState,
     snap: &LayoutSnapshot,
@@ -1832,9 +3390,9 @@ pub fn wm_split(
     primary: String,
     secondary: String,
     axis: String,
-) -> Result<LayoutSnapshot, String> {
+) -> AmosResult<LayoutSnapshot> {
     let snap = state.enter_split(&primary, &secondary, &axis)?;
-    finish_layout(&app, &state, &snap)
+    finish_layout(&app, &state, &snap).map_err(wm_layout_failed)
 }
 
 /// Set the divider so the primary pane takes `percent` (1..=99), re-applying to
@@ -1844,9 +3402,9 @@ pub fn wm_split_resize(
     app: AppHandle,
     state: State<'_, WmState>,
     percent: u32,
-) -> Result<LayoutSnapshot, String> {
+) -> AmosResult<LayoutSnapshot> {
     let snap = state.split_resize(percent)?;
-    finish_layout(&app, &state, &snap)
+    finish_layout(&app, &state, &snap).map_err(wm_layout_failed)
 }
 
 /// Move the divider by `delta` percentage points, re-applying to the real windows.
@@ -1855,23 +3413,23 @@ pub fn wm_split_move(
     app: AppHandle,
     state: State<'_, WmState>,
     delta: i32,
-) -> Result<LayoutSnapshot, String> {
+) -> AmosResult<LayoutSnapshot> {
     let snap = state.split_move(delta)?;
-    finish_layout(&app, &state, &snap)
+    finish_layout(&app, &state, &snap).map_err(wm_layout_failed)
 }
 
 /// Swap which window is in the primary pane, re-applying to the real windows and
 /// giving the **new primary** window OS focus (input routing follows the swap).
 #[tauri::command]
-pub fn wm_split_swap(app: AppHandle, state: State<'_, WmState>) -> Result<LayoutSnapshot, String> {
+pub fn wm_split_swap(app: AppHandle, state: State<'_, WmState>) -> AmosResult<LayoutSnapshot> {
     let snap = state.split_swap()?;
-    finish_layout(&app, &state, &snap)?;
+    finish_layout(&app, &state, &snap).map_err(wm_layout_failed)?;
     // After a swap, focus the window that is now the primary pane. A refused focus is
     // **reported, not dropped** (REQ-A442, Power of 10 rule #7): every other focus path in this
     // module logs the platform's refusal (`"the platform refused the focus request"` in
     // `WmEvent::FocusChanged`), and a swap whose input routing did not follow the panes is
     // exactly the kind of half-applied layout a reader has to be able to see.
-    if let Some((primary, _)) = state.split_labels()? {
+    if let Some((primary, _)) = state.split_labels().map_err(wm_lock_failed)? {
         if let Some(w) = app.get_webview_window(&primary) {
             if let Err(e) = w.set_focus() {
                 tracing::warn!(
@@ -1889,9 +3447,9 @@ pub fn wm_split_swap(app: AppHandle, state: State<'_, WmState>) -> Result<Layout
 /// End the active split: restore the two windows to fullscreen (maximize them),
 /// clear the split state, and broadcast `layout-changed`.
 #[tauri::command]
-pub fn wm_split_exit(app: AppHandle, state: State<'_, WmState>) -> Result<LayoutSnapshot, String> {
+pub fn wm_split_exit(app: AppHandle, state: State<'_, WmState>) -> AmosResult<LayoutSnapshot> {
     // Remember which windows were split before clearing, so we can restore them.
-    let pair = state.split_labels()?;
+    let pair = state.split_labels().map_err(wm_lock_failed)?;
     let snap = state.split_exit()?;
     if let Some((a, b)) = pair {
         for label in [a, b] {
@@ -1902,7 +3460,39 @@ pub fn wm_split_exit(app: AppHandle, state: State<'_, WmState>) -> Result<Layout
             }
         }
     }
-    finish_layout(&app, &state, &snap)
+    finish_layout(&app, &state, &snap).map_err(wm_layout_failed)
+}
+
+/// Snap an app window to a named screen region (edge-tiling): `left`, `right`, `top`,
+/// `bottom`, `top-left`, `top-right`, `bottom-left`, `bottom-right`, `maximize`.
+///
+/// The geometry is [`amos_wm::snap`] applied to this host's measured **work area**
+/// (the maximized shell window — the screen minus the menu bar and Dock). A refusal
+/// (unknown zone, the Launcher, an external surface, a split pane, or a class without free
+/// window geometry) is an `Err` naming the reason, so the UI tells the operator *why* rather
+/// than showing a snap that did not happen.
+#[tauri::command]
+pub fn wm_snap(
+    app: AppHandle,
+    state: State<'_, WmState>,
+    label: String,
+    zone: String,
+) -> Result<Bounds, String> {
+    state.snap_window(&app, &label, &zone)
+}
+
+/// List the platform's displays (multi-display, REQ-A690): each one's full rect, its
+/// **usable** work area, DPI scale, whether it is the primary, and its name when the platform
+/// gives one.
+///
+/// A dedicated read-only command rather than a field on [`LayoutSnapshot`] on purpose: the
+/// snapshot is the layout *model*'s wire shape (pinned in two languages), while the display
+/// list is a **platform reading** with a different lifetime — it changes on hot-plug, and a
+/// consumer that wants it can ask. An empty list is honest ("the platform listed nothing"),
+/// not an error; a query that fails is an error, never a fabricated single display.
+#[tauri::command]
+pub fn wm_displays(app: AppHandle) -> Result<DisplaySet, String> {
+    display_set(&app)
 }
 
 /// GUI demo entry for the real multi-window host: pick the two front split
@@ -1914,10 +3504,12 @@ pub fn wm_split_exit(app: AppHandle, state: State<'_, WmState>) -> Result<Layout
 pub async fn wm_split_demo(
     app: AppHandle,
     state: State<'_, WmState>,
-) -> Result<LayoutSnapshot, String> {
-    let candidates = state.split_candidates_labels()?;
+) -> AmosResult<LayoutSnapshot> {
+    let candidates = state.split_candidates_labels().map_err(wm_lock_failed)?;
     if candidates.len() < 2 {
-        return Err("need at least two open windows to run the split demo".to_string());
+        return Err("need at least two open windows to run the split demo"
+            .to_string()
+            .into_envelope(ErrorCode::WmSplitNeedsTwoWindows));
     }
     let a = candidates[0].clone();
     let b = candidates[1].clone();
@@ -1927,27 +3519,27 @@ pub async fn wm_split_demo(
     // landscape desktop splits side-by-side, a portrait phone stacks) instead of
     // hard-coding an orientation.
     let mut snap = state.enter_split(&a, &b, "auto")?;
-    finish_layout(&app, &state, &snap)?;
+    finish_layout(&app, &state, &snap).map_err(wm_layout_failed)?;
     tokio::time::sleep(step_ms).await;
 
     snap = state.split_resize(40)?;
-    finish_layout(&app, &state, &snap)?;
+    finish_layout(&app, &state, &snap).map_err(wm_layout_failed)?;
     tokio::time::sleep(step_ms).await;
 
     snap = state.split_swap()?;
-    finish_layout(&app, &state, &snap)?;
+    finish_layout(&app, &state, &snap).map_err(wm_layout_failed)?;
     tokio::time::sleep(step_ms).await;
 
     snap = state.split_resize(60)?;
-    finish_layout(&app, &state, &snap)?;
+    finish_layout(&app, &state, &snap).map_err(wm_layout_failed)?;
     tokio::time::sleep(step_ms).await;
 
     snap = state.split_swap()?;
-    finish_layout(&app, &state, &snap)?;
+    finish_layout(&app, &state, &snap).map_err(wm_layout_failed)?;
     tokio::time::sleep(step_ms).await;
 
     // Restore: maximize the two windows and clear the split.
-    let pair = state.split_labels()?;
+    let pair = state.split_labels().map_err(wm_lock_failed)?;
     snap = state.split_exit()?;
     if let Some((x, y)) = pair {
         for label in [x, y] {
@@ -1956,13 +3548,109 @@ pub async fn wm_split_demo(
             }
         }
     }
-    finish_layout(&app, &state, &snap)
+    finish_layout(&app, &state, &snap).map_err(wm_layout_failed)
 }
 
 /// The window labels the host can offer for entering a split.
 #[tauri::command]
 pub fn wm_split_candidates(state: State<'_, WmState>) -> Result<Vec<String>, String> {
     state.split_candidates_labels()
+}
+
+/// The two pane rectangles a split of `width`×`height` would produce under this host's
+/// class policy — **without touching any window** (REQ-A512).
+///
+/// The touch shell has no second native window to place (Tauri's mobile target is a
+/// single WebView), so it lays two app panes out inside itself. It must not re-implement
+/// the pane geometry to do that, so this exposes the *same* rule the desktop split uses
+/// ([`pane_rects`] → `amos_wm::layout::split_panes`); the frontend holds only the intent
+/// (which two apps, which axis, what divider percent). `axis` accepts
+/// `vertical|horizontal|auto`, where `auto` is the class's own aspect rule — identical
+/// to [`wm_split`]'s `"auto"`.
+///
+/// `Ok(None)` means the screen genuinely cannot host two minimum panes plus the divider:
+/// the caller must leave its previous layout alone rather than invent one. The labels
+/// name *positions* (`"primary"` / `"secondary"`), not windows — this reply places
+/// panes, it does not open any.
+#[tauri::command]
+pub fn wm_pane_rects(
+    state: State<'_, WmState>,
+    axis: String,
+    percent: u32,
+    width: u32,
+    height: u32,
+) -> AmosResult<Option<Vec<PaneLayout>>> {
+    let (policy, screen) = {
+        let core = state.lock().map_err(wm_lock_failed)?;
+        (core.policy, Bounds::new(0, 0, width, height))
+    };
+    let size = Size::new(width, height);
+    let axis = match parse_axis(&axis)? {
+        Some(a) => a,
+        None => policy.split_axis(size),
+    };
+    Ok(pane_rects(policy, screen, axis, percent).map(|(a, b)| {
+        vec![
+            pane("primary".to_string(), a),
+            pane("secondary".to_string(), b),
+        ]
+    }))
+}
+
+/// The rect a floating **Slide Over** panel of `screen` occupies under `policy` — the
+/// **one** place the host turns the class policy into slide-over geometry (REQ-A675).
+///
+/// It delegates to `amos_wm::layout::slide_over_pane`, the same rule
+/// [`amos_wm::slide::SlideOver`] is built on, so a touch shell that paints the panel
+/// *inside one WebView* and any desktop consumer that places a real window cannot
+/// drift apart by a pixel. Pure: no `AppHandle`, no window call.
+fn slide_over_rect(
+    policy: LayoutPolicy,
+    screen: Bounds,
+    axis: SplitAxis,
+    percent: u32,
+) -> Option<Bounds> {
+    amos_wm::layout::slide_over_pane(
+        screen,
+        axis,
+        percent,
+        policy.min_pane,
+        policy.slide_over_margin,
+    )
+}
+
+/// The rectangle a floating **Slide Over** panel of `width`×`height` would occupy
+/// under this host's class policy — **without touching any window** (REQ-A675).
+///
+/// The touch shell has no second native window to place (Tauri's mobile target is a
+/// single WebView), so a floating third pane is painted inside the shell. It must not
+/// re-implement the panel geometry to do that, so this exposes the *same* rule a
+/// desktop would use ([`slide_over_rect`] → `amos_wm::layout::slide_over_pane`); the
+/// frontend holds only the intent (which app, which axis, what share, shown/hidden).
+/// `axis` accepts `vertical|horizontal|auto`, where `auto` is the class's own aspect
+/// rule — identical to [`wm_pane_rects`]'.
+///
+/// `Ok(None)` means the inset rect genuinely cannot hold a minimum panel: the caller
+/// must leave its previous layout alone rather than invent one. The label is
+/// `"slide-over"` — this reply places a panel, it does not open any window.
+#[tauri::command]
+pub fn wm_slide_over_rect(
+    state: State<'_, WmState>,
+    axis: String,
+    percent: u32,
+    width: u32,
+    height: u32,
+) -> AmosResult<Option<PaneLayout>> {
+    let (policy, screen) = {
+        let core = state.lock().map_err(wm_lock_failed)?;
+        (core.policy, Bounds::new(0, 0, width, height))
+    };
+    let size = Size::new(width, height);
+    let axis = match parse_axis(&axis)? {
+        Some(a) => a,
+        None => policy.split_axis(size),
+    };
+    Ok(slide_over_rect(policy, screen, axis, percent).map(|b| pane("slide-over".to_string(), b)))
 }
 
 /// Open (create + focus) the window for `label`; returns the new snapshot.
@@ -1973,6 +3661,48 @@ pub fn wm_open(
     label: String,
 ) -> Result<WmSnapshot, String> {
     state.open(&app, &label)?;
+    state.snapshot()
+}
+
+/// Open **one more** window of the application `app_id` (File ▸ New Window / ⌘N),
+/// returning the new snapshot.
+///
+/// REQ-A473: the per-app "new window" that the identity model makes representable. The
+/// host allocates the instance label itself (lowest free ordinal, bounded) — the caller
+/// names the **app**, never the window, so no UI can mint an arbitrary platform label.
+pub fn wm_new_window_impl(
+    app: &AppHandle,
+    state: &WmState,
+    app_id: &str,
+) -> Result<WmSnapshot, String> {
+    state.new_window(app, app_id)?;
+    state.snapshot()
+}
+
+#[tauri::command]
+pub fn wm_new_window(
+    app: AppHandle,
+    state: State<'_, WmState>,
+    app_id: String,
+) -> Result<WmSnapshot, String> {
+    wm_new_window_impl(&app, &state, &app_id)
+}
+
+/// Focus the next (⌘`) or previous (⌘⇧`) window **of `app_id`**, returning the new
+/// snapshot.
+///
+/// REQ-A473: macOS cycles windows *within the current application*, which needs more than
+/// one window per app to exist at all. Refused (with the reason) when the app has fewer
+/// than two windows — a "successful" cycle that moved nothing is the dead-chord shape
+/// this repository treats as a defect (F-SH-001 family).
+#[tauri::command]
+pub fn wm_cycle_app(
+    app: AppHandle,
+    state: State<'_, WmState>,
+    app_id: String,
+    forward: bool,
+) -> Result<WmSnapshot, String> {
+    state.cycle_app(&app, &app_id, forward)?;
     state.snapshot()
 }
 
@@ -1998,6 +3728,21 @@ pub fn wm_hide(
     state.snapshot()
 }
 
+/// Minimize the window for `label` — the **Minimize** menu row (⌘M).
+///
+/// REQ-A714: distinct from `wm_hide`. See [`WmState::minimize`] for why ⌘M must
+/// *minimize* (the platform's own notion, which the Dock and Mission Control keep
+/// showing) rather than *hide* (which made the app read as closed).
+#[tauri::command]
+pub fn wm_minimize(
+    app: AppHandle,
+    state: State<'_, WmState>,
+    label: String,
+) -> Result<WmSnapshot, String> {
+    state.minimize(&app, &label)?;
+    state.snapshot()
+}
+
 /// Zoom the window for `label` — the Window menu's **Zoom** (maximize ⇄ restore).
 ///
 /// REQ-A415: there was no such command, so `DesktopShell`'s `menu.zoom` branch was an
@@ -2015,8 +3760,70 @@ pub fn wm_zoom(
     label: String,
 ) -> Result<WmSnapshot, String> {
     let w = zoomable_window(&app, &state, &label)?;
-    window_toggle_zoom(&w);
+    zoom_window(&w, &state);
     state.snapshot()
+}
+
+/// One **zoom** gesture — the Window menu's row and the title-bar double-click both come
+/// through here, so the two cannot disagree about what zooming does (REQ-A415/G-α).
+///
+/// With Stage mode on, the platform's own maximize fills the screen and would therefore
+/// cover the rail. So the rect is read back after the zoom and reflowed out of the band
+/// with the **same** pure rule the `Moved` clamp uses ([`reflow_out_of_rail`], from
+/// `amos_wm::stage`): "a real window is intruding into the band" has one answer whether
+/// the platform or the user's hand put it there.
+///
+/// Only on the way **in**. Un-zooming stays the platform's own restore, which puts back
+/// the frame it saved *before* the zoom — so a reflow can never eat the user's geometry.
+///
+/// Honest boundary: this covers the two gestures the host owns. It cannot cover the
+/// **green traffic light**, which AppKit handles without asking this process. Whether
+/// AppKit re-zooms a window that `is_maximized()` reports true and that the process has
+/// since moved is **not verified** on this machine (`docs/stage-manager.md`).
+fn zoom_window(w: &tauri::WebviewWindow, state: &State<'_, WmState>) {
+    let was = w.is_maximized().unwrap_or(false);
+    window_toggle_zoom(w);
+    if was {
+        return;
+    }
+    let (Ok(screen), Ok(rail), Ok(policy)) = (state.screen(), state.rail_width(), state.policy())
+    else {
+        return;
+    };
+    if rail == 0 {
+        return; // no band to protect: the platform's maximize is already correct
+    }
+    let Ok(rect) = window_logical_bounds(w) else {
+        tracing::warn!(
+            target: "amos::wm",
+            label = %w.label(),
+            "could not measure the zoomed window, so the rail's exclusion was not applied"
+        );
+        return;
+    };
+    let Some(fixed) = amos_wm::stage::reflow_out_of_rail(rect, screen, rail, policy.min_pane)
+    else {
+        return; // clear of the band already, or no room to reflow into
+    };
+    if let Err(e) = w
+        .set_position(tauri::LogicalPosition::new(
+            f64::from(fixed.x),
+            f64::from(fixed.y),
+        ))
+        .and_then(|()| {
+            w.set_size(tauri::LogicalSize::new(
+                f64::from(fixed.width),
+                f64::from(fixed.height),
+            ))
+        })
+    {
+        tracing::warn!(
+            target: "amos::wm",
+            label = %w.label(),
+            error = %e,
+            "the platform refused the zoomed window's rail exclusion"
+        );
+    }
 }
 
 /// G-α: title-bar **double-click** = toggle maximize ⇄ restore.
@@ -2024,7 +3831,7 @@ pub fn wm_zoom(
 /// macOS's title-bar double-click is the same gesture as the Window menu's **Zoom**,
 /// and it is what `DesktopAppWindow`'s 28 px overlay header dispatches
 /// (`docs/DESKTOP_TITLEBAR_G_ALPHA.md`). The two commands intentionally share the
-/// implementation (`window_toggle_zoom`) and the same refusal rules — a split pane
+/// implementation ([`zoom_window`]) and the same refusal rules — a split pane
 /// owns its rectangle; a stale label from the 5 s `wm_windows` poll is the normal
 /// reason the host returns `Err`. The frontend treats that as `false`
 /// (`wmMaximize` ⇒ typed-error discipline, REQ-A297 phase-2 §4): a refused double
@@ -2036,7 +3843,7 @@ pub fn wm_maximize(
     label: String,
 ) -> Result<WmSnapshot, String> {
     let w = zoomable_window(&app, &state, &label)?;
-    window_toggle_zoom(&w);
+    zoom_window(&w, &state);
     state.snapshot()
 }
 
@@ -2135,22 +3942,35 @@ impl SystemContext {
     }
 
     /// Record context captured from `source_window`, addressed to `target_window`.
+    ///
+    /// A *poisoned* lock is not a refusal to record. `peek`'s doc states the rule ("a panic in
+    /// another thread is not 'this window has no context'"); this accessor used `if let Ok(..)`
+    /// and silently dropped the write, so the next request fell through
+    /// `ai_bridge::merge_system_selection` to the **clipboard's** newest text — the AI answered
+    /// from a string copied in some other window with nothing saying so. The state is a map of
+    /// owned strings with no cross-field invariant a panic could leave half-updated, which is
+    /// why this lock recovers where `GlobalClipboard`'s writers deliberately refuse poison
+    /// (a `ClipboardCore` *does* carry sequence/history invariants). REQ-A1491 / FMEA F-SH-732.
     pub fn set(&self, target_window: &str, source_window: &str, text: &str) {
         let entry = SystemContextEntry {
             source_window: source_window.to_string(),
             text: text.to_string(),
             timestamp_ms: now_ms(),
         };
-        if let Ok(mut g) = self.inner.lock() {
-            g.insert(target_window.to_string(), entry);
-        }
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(target_window.to_string(), entry);
     }
 
     /// Drop the context addressed to `target_window` (e.g. user cleared it).
+    ///
+    /// Same poisoned-lock rule as [`Self::set`].
     pub fn clear(&self, target_window: &str) {
-        if let Ok(mut g) = self.inner.lock() {
-            g.remove(target_window);
-        }
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(target_window);
     }
 
     /// Peek (without consuming) the context for `target_window`.
@@ -2165,12 +3985,16 @@ impl SystemContext {
     }
 
     /// Take (and consume) the context for `target_window`, if any.
+    ///
+    /// `None` means the window has no context — never "the lock was poisoned". The
+    /// `else { None }` arm this used to carry answered a poisoned lock with exactly the claim
+    /// [`Self::peek`]'s doc forbids, and its consumer reads that `None` as "fall back to the
+    /// clipboard". Same poisoned-lock rule as [`Self::set`] (REQ-A1491).
     pub fn take_for(&self, target_window: &str) -> Option<SystemContextEntry> {
-        if let Ok(mut g) = self.inner.lock() {
-            g.remove(target_window)
-        } else {
-            None
-        }
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(target_window)
     }
 }
 
@@ -2289,11 +4113,11 @@ pub fn wm_set_shell_title(
     window: tauri::WebviewWindow,
     app: AppHandle,
     title: Option<String>,
-) -> Result<String, String> {
+) -> AmosResult<String> {
     let (label, wanted) = resolve_caller_title(&window, &app, title.as_deref())?;
-    window
-        .set_title(&wanted)
-        .map_err(|e| format!("the platform refused the title for `{label}`: {e}"))?;
+    window.set_title(&wanted).map_err(|e| {
+        platform_failed(format!("the platform refused the title for `{label}`: {e}"))
+    })?;
     Ok(wanted)
 }
 
@@ -2309,7 +4133,7 @@ pub(crate) fn resolve_caller_title<R: Runtime>(
     window: &tauri::WebviewWindow<R>,
     app: &AppHandle<R>,
     requested: Option<&str>,
-) -> Result<(String, String), String> {
+) -> AmosResult<(String, String)> {
     let configured = configured_shell_title(app);
     let title = resolved_title(window.label(), requested, &configured)?;
     Ok((window.label().to_string(), title))
@@ -2321,25 +4145,38 @@ pub(crate) fn resolve_caller_title<R: Runtime>(
 ///
 /// `requested == None` means "this surface is the shell itself", and what that *restores*
 /// depends on which window is asking: the launcher goes back to the configured product
-/// title, an app window goes back to the name its label implies (`app_window_title`, the
+/// title, an app window goes back to the name its **app** implies (`app_window_title`, the
 /// same function that named it at creation). Neither is ever the other's title.
+///
+/// Since REQ-A473 the label is not necessarily the app id (`files_2`), so the app is
+/// resolved through the identity domain — the same single implementation that named the
+/// window, rather than a second `split('#')` here.
 pub(crate) fn resolved_title(
     label: &str,
     requested: Option<&str>,
     configured: &str,
-) -> Result<String, String> {
+) -> AmosResult<String> {
     match requested {
         Some(asked) => {
             if asked.len() > MAX_SHELL_TITLE_BYTES {
                 return Err(format!(
                     "title too long: {} bytes (max {MAX_SHELL_TITLE_BYTES})",
                     asked.len()
-                ));
+                )
+                .into_envelope(ErrorCode::WmTitleInvalid));
             }
             normalize_shell_title(asked)
         }
         None if label == LAUNCHER_LABEL => Ok(configured.to_string()),
-        None => Ok(app_window_title(label).to_string()),
+        None => {
+            // An unparseable label cannot be a window this host created, so it gets the
+            // generic title rather than a guessed app name (the same "unknown → the
+            // fallback, never a wrong answer" rule the identity domain follows).
+            let app_id = identity::identity_of_label(label)
+                .map(|identity| identity.app)
+                .unwrap_or_else(|_| label.to_string());
+            Ok(app_window_title(&app_id).to_string())
+        }
     }
 }
 
@@ -2374,7 +4211,135 @@ fn configured_shell_title<R: Runtime>(app: &AppHandle<R>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use amos_wm::form::STAGE_RAIL_WIDTH;
     use std::collections::HashMap;
+
+    /// Write a state file for the tests below and hand back a store pointed at it.
+    fn store_with(
+        state_json: &str,
+        slug: &str,
+    ) -> (window_state::WindowStateStore, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("amos-ws-{slug}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("amos.window-state.json");
+        std::fs::write(&path, state_json).expect("seed state file");
+        (window_state::WindowStateStore::at_path(path.clone()), dir)
+    }
+
+    /// The screen the layout model holds: origin at 0,0 (the snapshot carries only widths), and
+    /// the two numbers a device pass measured on this machine (1496×880 logical).
+    fn desktop_screen() -> Bounds {
+        Bounds::new(0, 0, 1496, 880)
+    }
+
+    #[test]
+    fn a_remembered_rectangle_is_used_not_merely_tested() {
+        // The defect a real-device pass found (REQ-A478): the `Created` branch asked
+        // `if restored.is_some()` but still sized the builder from the class rule, so a window
+        // whose position *had* been remembered reopened at the domain's origin rect (measured
+        // 0,29 on this machine) instead of where the user left it. The saved numbers here are
+        // the ones that pass produced: **physical** pixels at scale 2.
+        let (store, dir) = store_with(
+            r#"{"version":2,"windows":{"files":{"x":840,"y":640,"width":2048,"height":1440}}}"#,
+            "restore",
+        );
+        let got = restored_geometry(
+            Some(&store),
+            "files",
+            2.0,
+            LayoutPolicy::of(FormFactor::Desktop),
+            desktop_screen(),
+        )
+        .expect("a remembered rectangle is returned");
+        // `x` is restored exactly; `y` is **clamped**, and this is the number a real window
+        // produced: a device pass moved the Files window to 420,320 (the OS accepted it) and,
+        // after a relaunch, the window came back at **420,160** — 320 + 720 = 1040 is below the
+        // screen's bottom (880), and 880 − 720 = 160. That is not this feature being clever: it
+        // is the rule `reclamp_windows` applies to a live window, and there is exactly one
+        // definition of "the screen" in this host (`core.screen`, set from the shell window),
+        // so a remembered rectangle obeys it too.
+        assert_eq!(
+            (got.x, got.y),
+            (420, 160),
+            "physical pixels halved, then clamped"
+        );
+        assert_eq!((got.width, got.height), (1024, 720));
+        assert!(got.clamp_into(desktop_screen()) == got, "inside the screen");
+
+        // A label with no history answers `None`, so the class rule keeps deciding.
+        assert!(restored_geometry(
+            Some(&store),
+            "settings",
+            2.0,
+            LayoutPolicy::of(FormFactor::Desktop),
+            desktop_screen()
+        )
+        .is_none());
+
+        // An article of faith that cannot be checked is not used (a zero/NaN scale factor
+        // would double or destroy every offset): the honest answer is "nothing remembered".
+        assert!(restored_geometry(
+            Some(&store),
+            "files",
+            0.0,
+            LayoutPolicy::of(FormFactor::Desktop),
+            desktop_screen()
+        )
+        .is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_remembered_rectangle_from_a_gone_monitor_is_pulled_back_inside() {
+        // Saved while a much larger display was attached: the remembered spot is outside the
+        // screen we now have. The window must reopen **inside** it — a saved rectangle may
+        // never be a reason for a window the user cannot reach (the rule `reclamp_windows`
+        // applies to a live window, applied at creation).
+        let (store, dir) = store_with(
+            r#"{"version":2,"windows":{"files":{"x":7000,"y":5000,"width":2048,"height":1440}}}"#,
+            "gone",
+        );
+        let screen = desktop_screen();
+        let got = restored_geometry(
+            Some(&store),
+            "files",
+            2.0,
+            LayoutPolicy::of(FormFactor::Desktop),
+            screen,
+        )
+        .expect("a remembered rectangle is returned");
+        assert_eq!(
+            got.clamp_into(screen),
+            got,
+            "the saved spot was clamped into the screen we have now"
+        );
+        assert!(got.x + got.width as i32 <= screen.x + screen.width as i32);
+        assert!(got.y + got.height as i32 <= screen.y + screen.height as i32);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unparsable_or_absent_file_means_no_remembered_geometry() {
+        let (store, dir) = store_with("{not json", "broken");
+        assert!(restored_geometry(
+            Some(&store),
+            "files",
+            2.0,
+            LayoutPolicy::of(FormFactor::Desktop),
+            desktop_screen()
+        )
+        .is_none());
+        // …and no store at all (the pre-REQ-A478 state of the world) is the same answer.
+        assert!(restored_geometry(
+            None,
+            "files",
+            2.0,
+            LayoutPolicy::of(FormFactor::Desktop),
+            desktop_screen()
+        )
+        .is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn open_surface_registers_external_system_window() {
@@ -2434,6 +4399,48 @@ mod tests {
             s.split_labels().unwrap(),
             Some(("a".to_string(), "b".to_string())),
             "split registered for the test",
+        );
+    }
+
+    // REQ-A714: minimizing is a **platform** minimize, not `hide`. The state half is
+    // exercised headlessly here (no AppHandle): a registered, unsplit window is
+    // accepted; an unregistered label and a split pane are refused **with the reason**,
+    // the same honest-refusal shape `zoomable_window` uses — a stale 5 s poll label is
+    // the normal case, and a pane's rectangle belongs to the split session.
+    #[test]
+    fn minimize_target_accepts_a_registered_window() {
+        let s = WmState::new();
+        s.register_app("notes").unwrap();
+        assert!(
+            s.minimize_target("notes").is_ok(),
+            "a registered, unsplit window may be minimized",
+        );
+    }
+
+    #[test]
+    fn minimize_target_refuses_an_unregistered_label() {
+        let s = WmState::new();
+        let err = s
+            .minimize_target("ghost")
+            .expect_err("an unknown label must be refused, not silently accepted");
+        assert!(
+            err.contains("ghost") && err.contains("not registered"),
+            "the refusal names the label and the reason, got: {err}",
+        );
+    }
+
+    #[test]
+    fn minimize_target_refuses_a_split_pane() {
+        let s = WmState::new();
+        s.register_app("notes").unwrap();
+        s.register_app("mail").unwrap();
+        s.enter_split("notes", "mail", "vertical").unwrap();
+        let err = s
+            .minimize_target("notes")
+            .expect_err("a split pane must be refused: its rectangle belongs to the split");
+        assert!(
+            err.contains("split"),
+            "the refusal says why (it is in a split), got: {err}",
         );
     }
 
@@ -2619,9 +4626,11 @@ mod tests {
         s.register_app("a").unwrap();
         s.register_app("b").unwrap();
         let err = s.enter_split("a", "b", "diagonal").unwrap_err();
-        assert!(err.contains("unknown split axis"), "{err}");
+        // `Display` renders code + message + cause chain, so this asserts on the
+        // diagnostic text whichever field of the envelope carries it.
+        assert!(err.to_string().contains("unknown split axis"), "{err}");
         assert!(
-            err.contains("auto"),
+            err.to_string().contains("auto"),
             "the message lists every accepted value: {err}"
         );
     }
@@ -2692,6 +4701,152 @@ mod tests {
             .windows
             .iter()
             .all(|w| w.label != "notes"));
+    }
+
+    /// REQ-A1706 — [`WmState::reveal`] is the verb a surface that already *has* a window needs,
+    /// and the one [`WmState::open`] by construction cannot be.
+    ///
+    /// `open` is the launch verb: an unknown label is a request to **create** the app's window,
+    /// so it registers one and — to keep that from minting an arbitrary window — refuses every
+    /// label that is not an app's **first** window (REQ-A473). Stage Manager's rail draws a
+    /// tile for a second instance (`stage.rs::views_of` makes `notes_2` its own tile), so a
+    /// click on that tile ran a command that could never succeed. This pins the whole contrast
+    /// on a live mock app: the same label that `open` refuses is one `reveal` accepts.
+    #[cfg(desktop)]
+    #[test]
+    fn reveal_accepts_a_second_instance_that_open_refuses() {
+        let app = tauri::test::mock_builder()
+            .manage(WmState::new_for_test(FormFactor::Desktop))
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("a mock app builds");
+        let handle = app.handle().clone();
+        let state = handle.state::<WmState>();
+
+        state.register_app("notes").expect("registers notes");
+        let second = state
+            .register_app_instance("notes")
+            .expect("registers notes_2");
+        assert_eq!(second, "notes_2", "the identity scheme's own label");
+        tauri::WebviewWindowBuilder::new(&app, &second, tauri::WebviewUrl::default())
+            .build()
+            .expect("a mock window builds");
+
+        // The launch verb refuses it — and *before* touching the platform, so this assertion
+        // is about the identity gate and not about the mock's window registry.
+        let refused = state
+            .open(&handle, &second)
+            .expect_err("open is the launch verb");
+        assert!(
+            refused.contains("not an application"),
+            "refused by the identity gate: {refused}"
+        );
+
+        // The reveal verb shows the window the label already names.
+        state
+            .reveal(&handle, &second)
+            .expect("reveal shows a registered window whatever its instance");
+        let snap = state.snapshot().expect("snapshot");
+        let w = snap
+            .windows
+            .iter()
+            .find(|w| w.label == second)
+            .expect("still registered");
+        assert_ne!(w.state, "Hidden", "the window is back on the stage");
+        assert!(
+            w.focused,
+            "and it took the key — a tile that came back unfocused leaves the user typing behind it"
+        );
+    }
+
+    /// REQ-A717 — a change to the window list is **pushed**, not left for the frontend's poll.
+    ///
+    /// The chrome used to wait up to five seconds (`WM_WINDOWS_POLL_MS`) to notice, so the Dock
+    /// kept a running dot after ⌘W. The assertion is deliberately about the *host* half: the
+    /// frontend's subscription is pinned in `wmWindowsPoll.test.ts`, and this pins that there is
+    /// something for it to receive.
+    #[cfg(desktop)]
+    #[test]
+    fn a_window_list_change_is_pushed_as_wm_changed() {
+        use tauri::Listener;
+        let app = tauri::test::mock_builder()
+            .manage(WmState::new_for_test(FormFactor::Desktop))
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("a mock app builds");
+        let handle = app.handle().clone();
+        let pushes = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        {
+            let pushes = pushes.clone();
+            handle.listen(WM_CHANGED_EVENT, move |event| {
+                let snap: serde_json::Value =
+                    serde_json::from_str(event.payload()).expect("the push carries JSON");
+                pushes.lock().expect("push log").push(snap);
+            });
+        }
+        let state = handle.state::<WmState>();
+        state.register_app("notes").expect("registers");
+        tauri::WebviewWindowBuilder::new(&app, "notes", tauri::WebviewUrl::default())
+            .build()
+            .expect("a mock window builds");
+        state.open(&handle, "notes").expect("opens");
+
+        let seen = pushes.lock().expect("push log");
+        assert_eq!(
+            seen.len(),
+            1,
+            "opening a window announces the new list exactly once"
+        );
+        let pushed: Vec<&str> = seen[0]["windows"]
+            .as_array()
+            .expect("the payload carries a window list")
+            .iter()
+            .filter_map(|w| w["label"].as_str())
+            .collect();
+        let authoritative: Vec<String> = state
+            .snapshot()
+            .expect("snapshot")
+            .windows
+            .iter()
+            .map(|w| w.label.clone())
+            .collect();
+        assert!(
+            pushed.contains(&"notes"),
+            "the window that was just opened is in the announced list: {pushed:?}"
+        );
+        assert_eq!(
+            pushed,
+            authoritative.iter().map(String::as_str).collect::<Vec<_>>(),
+            "and the payload is the model's own list, not a placeholder"
+        );
+    }
+
+    /// The other half of REQ-A717: an **empty** event batch is a no-op command, and announcing it
+    /// would hand the frontend a spurious frame (and, for a `FocusChanged(None)`-only batch, a
+    /// needless re-render). Pinned directly on the choke point, because no public command produces
+    /// an empty batch on demand.
+    #[cfg(desktop)]
+    #[test]
+    fn an_empty_event_batch_does_not_announce() {
+        use tauri::Listener;
+        let app = tauri::test::mock_builder()
+            .manage(WmState::new_for_test(FormFactor::Desktop))
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("a mock app builds");
+        let handle = app.handle().clone();
+        let pushes = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        {
+            let pushes = pushes.clone();
+            handle.listen(WM_CHANGED_EVENT, move |_| {
+                *pushes.lock().expect("push count") += 1;
+            });
+        }
+        let state = handle.state::<WmState>();
+        state.apply(&handle, &[]).expect("an empty batch applies");
+
+        assert_eq!(
+            *pushes.lock().expect("push count"),
+            0,
+            "a no-op batch stays silent"
+        );
     }
 
     /// REQ-A428 — the regression this pins was measured on a live launch: an app window's
@@ -2793,7 +4948,7 @@ mod tests {
         // point, so the cause is visible.
         for empty in ["", "   ", "\t"] {
             let err = normalize_shell_title(empty).expect_err("empty refused");
-            assert!(err.contains("empty"), "{err}");
+            assert!(err.to_string().contains("empty"), "{err}");
         }
         for (raw, code) in [
             ("Settings\nmore", "U+000A"),
@@ -2803,7 +4958,7 @@ mod tests {
         ] {
             let err = normalize_shell_title(raw).expect_err("control char refused");
             assert!(
-                err.contains(code) && err.contains("one line"),
+                err.to_string().contains(code) && err.to_string().contains("one line"),
                 "the refusal names the code point ({code}): {err}"
             );
         }
@@ -2908,6 +5063,61 @@ mod tests {
     }
 
     #[test]
+    fn logical_rect_maps_a_monitor_rect_including_negative_origins() {
+        // 1× monitor at the origin.
+        assert_eq!(
+            logical_rect(0, 0, 1920, 1080, 1.0),
+            Bounds::new(0, 0, 1920, 1080)
+        );
+        // A secondary to the *left* of the primary: a negative logical origin survives
+        // the division (this is what makes a snap land on the right display).
+        assert_eq!(
+            logical_rect(-2560, 0, 2560, 1440, 1.0),
+            Bounds::new(-2560, 0, 2560, 1440)
+        );
+        // A 2× monitor: physical pixels halve into logical ones, origin and all.
+        assert_eq!(
+            logical_rect(-3840, 180, 3840, 2160, 2.0),
+            Bounds::new(-1920, 90, 1920, 1080)
+        );
+        // An unusable scale is treated as 1 (never a divide by zero), same rule as the
+        // shell window's own conversion.
+        assert_eq!(
+            logical_rect(0, 0, 800, 600, 0.0),
+            Bounds::new(0, 0, 800, 600)
+        );
+        assert_eq!(
+            logical_rect(0, 0, 800, 600, f64::NAN),
+            Bounds::new(0, 0, 800, 600)
+        );
+    }
+
+    #[test]
+    fn a_snap_keeps_a_window_on_the_secondary_display_it_is_already_on() {
+        // The pure snap rule against an explicit work area (multi-display, REQ-A690): the
+        // frame is cut from the *supplied* area, so a window whose centre is on a
+        // negative-origin secondary is tiled there, not yanked onto the primary.
+        let state = WmState::new_for_test(FormFactor::Desktop);
+        state.register_app("notes").unwrap();
+        let core = state.lock().unwrap();
+        let secondary = Bounds::new(-1920, 25, 1920, 1080);
+
+        let right = snap_plan_in(&core, "notes", "right", secondary).unwrap();
+        assert_eq!(right.x, -960, "the right half of the *secondary*");
+        assert_eq!(right.right(), secondary.right());
+
+        let tl = snap_plan_in(&core, "notes", "top-left", secondary).unwrap();
+        assert_eq!(tl.x, -1920, "a corner stays on the secondary");
+        assert_eq!(tl.y, 25, "its own work-area origin is honoured");
+
+        // The same zone against the primary's area lands on the primary: the work area is
+        // the only thing that chose the display.
+        let primary = Bounds::new(0, 25, 1920, 1080);
+        let on_primary = snap_plan_in(&core, "notes", "right", primary).unwrap();
+        assert_eq!(on_primary.x, 960);
+    }
+
+    #[test]
     fn re_measuring_the_screen_reports_only_real_changes() {
         let s = WmState::with_form_factor(FormFactor::Desktop);
         // The first measurement applies and is reported.
@@ -2951,6 +5161,339 @@ mod tests {
             .unwrap()
             .expect("a different size is a change");
         assert!(tiny.split.is_none(), "the split ended with the window");
+    }
+
+    /// REQ-A1563 — the rail is a **geometric** reservation: turning Stage mode on moves
+    /// the work area every placement path is measured against, and turning it off is the
+    /// identity again. A class with no rail refuses the toggle instead of storing a `true`
+    /// that `stage_rail_width()` would keep contradicting.
+    #[test]
+    fn turning_stage_mode_on_insets_the_work_area_by_the_rail() {
+        let s = WmState::with_form_factor(FormFactor::Desktop);
+        let screen = s.screen().unwrap();
+        assert!(!s.stage_enabled().unwrap(), "opt-in: off until asked");
+        assert_eq!(s.rail_width().unwrap(), 0);
+        assert_eq!(s.work_area().unwrap(), screen, "no rail, no inset");
+
+        assert!(s.set_stage_enabled(true).unwrap());
+        let rail = s.rail_width().unwrap();
+        assert_eq!(rail, STAGE_RAIL_WIDTH);
+        let work = s.work_area().unwrap();
+        assert_eq!(work.x, rail as i32, "the stage starts where the rail ends");
+        assert_eq!(
+            work.width,
+            screen.width - rail,
+            "and loses exactly the rail"
+        );
+        assert_eq!(
+            (work.y, work.height),
+            (screen.y, screen.height),
+            "the rail takes the left edge only"
+        );
+
+        assert!(!s.set_stage_enabled(false).unwrap());
+        assert_eq!(s.work_area().unwrap(), screen, "off is the identity again");
+    }
+
+    /// The toggle is refused where there is no rail, and a refusal changes nothing — the
+    /// same honest-negative [`WmState::set_stage_enabled`] documents.
+    #[test]
+    fn stage_mode_is_refused_on_a_class_with_no_rail() {
+        for form in [FormFactor::Phone, FormFactor::Tablet, FormFactor::Robot] {
+            let s = WmState::with_form_factor(form);
+            let err = s.set_stage_enabled(true).unwrap_err();
+            assert!(err.contains(form.as_str()), "{err}");
+            assert!(
+                !s.stage_enabled().unwrap(),
+                "{form:?}: a refused toggle must not store a rail nobody has"
+            );
+            assert_eq!(s.rail_width().unwrap(), 0);
+        }
+    }
+
+    /// A live split captured the rect its two panes share; the rail narrows that rect, so
+    /// the session is **re-fitted** — and *ends* rather than silently re-clamping the
+    /// divider when the narrower rect can no longer host two minimum panes (the rule
+    /// [`WmState::sync_screen`] states for a screen change).
+    #[test]
+    fn turning_stage_mode_on_re_fits_a_live_split_and_ends_one_that_would_not_fit() {
+        // A roomy desktop: the split survives, shifted off the rail.
+        let s = WmState::with_form_factor(FormFactor::Desktop);
+        s.sync_screen(Bounds::new(0, 0, 1600, 900)).unwrap();
+        s.register_app("a").unwrap();
+        s.register_app("b").unwrap();
+        let split = s.enter_split("a", "b", "auto").unwrap().split.unwrap();
+        assert_eq!(split.panes[0].x, 0, "the split starts at the screen edge");
+
+        s.set_stage_enabled(true).unwrap();
+        let after = s.layout_snapshot().unwrap();
+        let split = after
+            .split
+            .expect("1600px still hosts two panes beside a 180px rail");
+        assert_eq!(
+            split.panes[0].x, STAGE_RAIL_WIDTH as i32,
+            "the panes moved onto the stage with the rail"
+        );
+
+        // A screen that fits a split but not a split **plus** a rail: 720px cannot host
+        // two 360px panes with an 8px divider, so the session ends honestly.
+        let tight = WmState::with_form_factor(FormFactor::Desktop);
+        tight.sync_screen(Bounds::new(0, 0, 900, 800)).unwrap();
+        tight.register_app("a").unwrap();
+        tight.register_app("b").unwrap();
+        assert!(tight.enter_split("a", "b", "auto").unwrap().split.is_some());
+        tight.set_stage_enabled(true).unwrap();
+        assert!(
+            tight.layout_snapshot().unwrap().split.is_none(),
+            "the split ends rather than leaving a pane under the rail"
+        );
+    }
+
+    /// The two numbers the shell lays out around are the **same** derivation: `rail_width`
+    /// is definitionally how much `stage_work_area` took off the left edge. A second
+    /// derivation (each path calling `stage_work_area` itself) is how the rail and the
+    /// desktop-icon inset come to disagree about how wide it is.
+    #[test]
+    fn the_reported_rail_width_is_exactly_what_the_work_area_lost() {
+        let s = WmState::with_form_factor(FormFactor::Desktop);
+        for (w, h) in [(1600u32, 900u32), (400, 700), (0, 0), (2380, 1348)] {
+            s.sync_screen(Bounds::new(0, 0, w, h)).unwrap();
+            s.set_stage_enabled(true).ok();
+            let screen = s.screen().unwrap();
+            let work = s.work_area().unwrap();
+            assert_eq!(
+                s.rail_width().unwrap(),
+                screen.width.saturating_sub(work.width),
+                "{w}x{h}: the reported width is the lost width"
+            );
+            assert!(
+                work.width >= s.policy().unwrap().min_pane.width || work.width == screen.width,
+                "{w}x{h}: a rail is drawn only when a minimum pane still fits beside it"
+            );
+        }
+    }
+
+    /// The throttle rule (REQ-A1564), which is the only part of the clamp that decides
+    /// whether the host's correction and the user's hand fight over one rectangle.
+    #[test]
+    fn should_clamp_honours_the_debounce() {
+        // Never corrected: the first correction of a drag is immediate, not delayed by
+        // the throttle — a window dropped behind the rail must not sit there.
+        assert!(should_clamp(None, 0, STAGE_CLAMP_DEBOUNCE_MS));
+        assert!(should_clamp(None, u64::MAX, STAGE_CLAMP_DEBOUNCE_MS));
+        // Inside the window: quiet.
+        assert!(!should_clamp(Some(1000), 1000, 120));
+        assert!(!should_clamp(Some(1000), 1119, 120));
+        // Exactly at the window: allowed (`>=`, not `>`), so the throttle is 120 ms and
+        // not "121 ms and change".
+        assert!(should_clamp(Some(1000), 1120, 120));
+        assert!(should_clamp(Some(1000), 5000, 120));
+        // A clock that stepped **backwards** reads as "long enough", never as a lockout
+        // that would silence the clamp for the rest of the session.
+        assert!(should_clamp(Some(9_000), 1_000, 120));
+        // A zero debounce degenerates to "always", so the constant is the only thing
+        // that decides the pace.
+        assert!(should_clamp(Some(1000), 1000, 0));
+    }
+
+    /// A window dragged over the rail is put back beside it — a **move**, not a resize —
+    /// and the rule is the same pure one the zoom path uses.
+    #[test]
+    fn a_window_dragged_over_the_rail_is_put_back_beside_it() {
+        let s = WmState::with_form_factor(FormFactor::Desktop);
+        s.sync_screen(Bounds::new(0, 0, 1600, 900)).unwrap();
+        s.set_stage_enabled(true).unwrap();
+        let rail = s.rail_width().unwrap();
+        assert_eq!(rail, STAGE_RAIL_WIDTH);
+
+        let moved = s
+            .stage_clamp_target("files_1", Bounds::new(40, 100, 500, 500), 1_000)
+            .unwrap()
+            .expect("a rect covering the band has an answer");
+        assert_eq!(moved.x, rail as i32, "pushed to where the stage starts");
+        assert_eq!(
+            (moved.y, moved.width, moved.height),
+            (100, 500, 500),
+            "a move: the user's own height and width are kept"
+        );
+    }
+
+    /// The clamp is a no-op in every case where moving would be churn — and in each of
+    /// them it must not even *stamp* the throttle, or a window that later genuinely
+    /// intrudes would be silently skipped for 120 ms.
+    #[test]
+    fn a_window_already_clear_of_the_rail_is_not_touched() {
+        let s = WmState::with_form_factor(FormFactor::Desktop);
+        s.sync_screen(Bounds::new(0, 0, 1600, 900)).unwrap();
+        s.set_stage_enabled(true).unwrap();
+
+        assert_eq!(
+            s.stage_clamp_target("files_1", Bounds::new(200, 100, 500, 500), 1_000)
+                .unwrap(),
+            None,
+            "clear of the band: no platform call, no event, no re-remember"
+        );
+        // No stamp was written, so an immediate intruding move is still corrected.
+        assert!(
+            s.stage_clamp_target("files_1", Bounds::new(0, 100, 500, 500), 1_001)
+                .unwrap()
+                .is_some(),
+            "an unstamped ledger means the next real intrusion is answered at once"
+        );
+    }
+
+    /// The throttle itself, through the same seam: two intruding events in one window of
+    /// time produce **one** correction.
+    #[test]
+    fn a_drag_produces_one_correction_per_throttle_window() {
+        let s = WmState::with_form_factor(FormFactor::Desktop);
+        s.sync_screen(Bounds::new(0, 0, 1600, 900)).unwrap();
+        s.set_stage_enabled(true).unwrap();
+        let intruding = Bounds::new(10, 100, 400, 400);
+
+        assert!(s
+            .stage_clamp_target("files_1", intruding, 5_000)
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            s.stage_clamp_target("files_1", intruding, 5_050).unwrap(),
+            None,
+            "a second event 50 ms later: the host must not answer its own correction"
+        );
+        assert!(
+            s.stage_clamp_target("files_1", intruding, 5_120)
+                .unwrap()
+                .is_some(),
+            "and at the debounce edge it is allowed again"
+        );
+        // Per window: a *different* label keeps its own clock.
+        assert!(s
+            .stage_clamp_target("notes_1", intruding, 5_121)
+            .unwrap()
+            .is_some());
+    }
+
+    /// Stage mode off: the clamp does no work and touches no platform — the same
+    /// "introducing the mode changes nothing for anyone who never turns it on" rule the
+    /// rest of the stage-aware paths in this file follow.
+    #[test]
+    fn the_clamp_is_a_no_op_while_stage_mode_is_off() {
+        let s = WmState::with_form_factor(FormFactor::Desktop);
+        s.sync_screen(Bounds::new(0, 0, 1600, 900)).unwrap();
+        assert!(!s.stage_enabled().unwrap());
+        assert_eq!(
+            s.stage_clamp_target("files_1", Bounds::new(0, 0, 500, 500), 1_000)
+                .unwrap(),
+            None
+        );
+
+        // And on a class whose rail width is zero even with the mode on — the phone — the
+        // toggle is refused first, so this is the belt to that braces: a stored `true`
+        // could never reach here, but the rule must hold on its own terms too.
+        let phone = WmState::with_form_factor(FormFactor::Phone);
+        phone.sync_screen(Bounds::new(0, 0, 400, 800)).unwrap();
+        assert_eq!(
+            phone
+                .stage_clamp_target("files_1", Bounds::new(0, 0, 500, 500), 1_000)
+                .unwrap(),
+            None,
+            "no rail means nothing to clamp, whatever the flag says"
+        );
+    }
+
+    /// **Clamp, then remember** — the whole point of A3. The rectangle written to the
+    /// geometry store is the corrected one, never the one the user dragged to: a
+    /// position inside the band would otherwise be restored at the next launch, with no
+    /// drag in sight to explain it.
+    #[test]
+    fn the_clamped_rectangle_is_the_one_that_gets_remembered() {
+        // A 2× display, so a missing or doubles conversion cannot pass by luck.
+        let mut captured = window_state::WindowState {
+            x: Some(80),
+            y: Some(200),
+            width: Some(1000),
+            height: Some(1000),
+            visible: Some(true),
+            updated_ms: None,
+        };
+        let rect = Bounds::new(40, 100, 500, 500);
+        let target = Bounds::new(180, 100, 500, 500);
+
+        note_clamped_rect(&mut captured, rect, target, 2.0);
+
+        assert_eq!(
+            (captured.x, captured.y),
+            (Some(360), Some(200)),
+            "the remembered position is the corrected one, in physical px"
+        );
+        assert_eq!(
+            (captured.width, captured.height),
+            (Some(1000), Some(1000)),
+            "a move is not a resize: the platform's own outer size is left alone"
+        );
+        assert_eq!(
+            captured.visible,
+            Some(true),
+            "the store's other fields stand"
+        );
+    }
+
+    /// …and when the clamp **does** resize (a window wider than the whole work area, which
+    /// `reflow_out_of_rail` caps), the new size is remembered too — otherwise the next
+    /// launch would reopen it at the old width and put its right edge off the stage again.
+    #[test]
+    fn a_resizing_clamp_remembers_its_new_size_as_well() {
+        let mut captured = window_state::WindowState {
+            x: Some(0),
+            y: Some(0),
+            width: Some(2400),
+            height: Some(600),
+            visible: None,
+            updated_ms: None,
+        };
+        note_clamped_rect(
+            &mut captured,
+            Bounds::new(-400, 0, 1200, 300),
+            Bounds::new(180, 0, 820, 480),
+            1.0,
+        );
+        assert_eq!(
+            (captured.x, captured.y, captured.width, captured.height),
+            (Some(180), Some(0), Some(820), Some(480))
+        );
+    }
+
+    /// On a screen too narrow to afford the full rail, the rail **gives way** — it shrinks
+    /// to whatever a minimum pane can spare, rather than eating into the pane. The clamp
+    /// reads that narrowed number and never its own idea of how wide a rail "should" be, so
+    /// a 400 px screen is clamped to 40 px of band and a 360 px stage, not to 180 px.
+    ///
+    /// Pinned here because this is the seam where a second "how wide is the rail?" would
+    /// otherwise creep in: `reflow_out_of_rail` is fed `rail_width()`, which is *derived*
+    /// from the same inset the placement paths use, so the two cannot disagree.
+    #[test]
+    fn the_clamp_uses_the_rail_that_survived_the_give_way() {
+        let s = WmState::with_form_factor(FormFactor::Desktop);
+        // 400 px: narrower than the full rail plus a 360 px minimum pane, so the rail
+        // shrinks to 400 − 360 = 40 and the stage is exactly one minimum pane wide.
+        s.sync_screen(Bounds::new(0, 0, 400, 800)).unwrap();
+        s.set_stage_enabled(true).ok();
+        let rail = s.rail_width().unwrap();
+        assert_eq!(rail, 40, "the rail gave way to the minimum pane");
+        assert_eq!(
+            s.work_area().unwrap(),
+            Bounds::new(40, 0, 360, 800),
+            "…leaving a stage exactly one minimum pane wide"
+        );
+        // The reason `reflow_out_of_rail`'s own "no room beside the rail" refusal is
+        // unreachable from here: a rail that survived at all leaves `avail_w >= min_pane`,
+        // so this seam can only ever say "move it", never "there is nowhere to move it to".
+        let moved = s
+            .stage_clamp_target("files_1", Bounds::new(0, 100, 200, 300), 1_000)
+            .unwrap()
+            .expect("a narrowed band still has an answer");
+        assert_eq!(moved.x, 40, "pushed clear of the 40 px band, not of 180");
+        assert_eq!(moved.width, 360, "grown to the minimum it cannot fit under");
     }
 
     #[test]
@@ -3170,7 +5713,7 @@ mod tests {
         s.open_surface("legacy:x").unwrap();
         let err = s.enter_split("a", "legacy:x", "auto").unwrap_err();
         assert!(
-            err.contains("robot") && err.contains("no user interface"),
+            err.to_string().contains("robot") && err.to_string().contains("no user interface"),
             "the refusal names the class: {err}"
         );
         assert!(s.layout_snapshot().unwrap().split.is_none());
@@ -3238,7 +5781,12 @@ mod tests {
         // exactly the shape of the SMS-trash defect (a renamed Rust field reads as
         // `undefined` in the shell), and my normalizer would then quietly fall back
         // to phone defaults instead of failing. So the contract is pinned here, key
-        // by key; the TS mirror is pinned by `wm.test.ts`'s key-set test, and both
+        // by key. NOTE (REQ-A667): this test pins the *Rust* side against a Rust-local
+        // `vec!`; it does NOT read `lib/wm.ts`, and `wm.test.ts`'s key-set test does not
+        // read this file either — the earlier "the TS mirror is pinned by wm.test.ts"
+        // claim was false. The actual cross-language binding is
+        // `declaredMirrors.test.ts`'s "wm.ts layout wire shapes == the amos-tauri::wm
+        // serde structs" (REQ-A667), which reads these three structs' field names; both
         // lists are documented in `docs/multi-window.md` §1.5.
         let s = WmState::with_form_factor(FormFactor::Tablet);
         s.register_app("notes").unwrap();
@@ -3259,6 +5807,7 @@ mod tests {
                 "form",
                 "free_resize",
                 "multi_window",
+                "rail_width",
                 "screen_h",
                 "screen_w",
                 "split",
@@ -3278,6 +5827,10 @@ mod tests {
         );
         assert_eq!(obj["screen_w"], 1080, "the fallback screen until measured");
         assert_eq!(obj["screen_h"], 1920);
+        // Present on every class, `0` where there is no rail — the shell reads the one
+        // number without a second "does this class have a rail" branch (a missing key
+        // would read as `undefined` and the mock's fallback would hide it).
+        assert_eq!(obj["rail_width"], 0, "a tablet has no Stage rail");
 
         let split = obj["split"].as_object().expect("a split object");
         let mut split_keys: Vec<&str> = split.keys().map(String::as_str).collect();
@@ -3444,6 +5997,253 @@ mod tests {
     }
 
     #[test]
+    fn a_desktop_window_snaps_to_the_halves_of_the_measured_work_area() {
+        let state = WmState::new_for_test(FormFactor::Desktop);
+        state.register_app("notes").unwrap();
+        // The work area a device pass measured on this machine (1496×880 logical).
+        state.set_screen(1496, 880).unwrap();
+
+        let left = {
+            let core = state.lock().unwrap();
+            snap_plan(&core, "notes", "left").unwrap()
+        };
+        assert_eq!(left, Bounds::new(0, 0, 748, 880));
+        let right = {
+            let core = state.lock().unwrap();
+            snap_plan(&core, "notes", "right").unwrap()
+        };
+        assert_eq!(right.x, 748, "the right half starts where the left ends");
+        assert_eq!(
+            right.right(),
+            left.right() + i64::from(right.width),
+            "the two halves tile the work area"
+        );
+        // A quarter and maximize come from the same pure rule — and the quarter shows the
+        // whole composition, not just the split: the desktop class' `min_pane` height (480)
+        // is *taller* than the 440 a quarter of an 880 work area would take, so
+        // `enforce_min` grows it and `clamp_into` then slides it up until it fits (a 480-tall
+        // frame at y = 440 would hang 40 px past the screen, so it moves to 880 − 480 = 400).
+        // The width is untouched, because 748 already clears the 360 minimum. That is the
+        // honest answer — "the minimum wins, then the frame is pulled back on screen" — not
+        // the bare 440 the arithmetic alone would give.
+        let q = {
+            let core = state.lock().unwrap();
+            snap_plan(&core, "notes", "bottom-right").unwrap()
+        };
+        assert_eq!(q, Bounds::new(748, 400, 748, 480));
+        let full = {
+            let core = state.lock().unwrap();
+            snap_plan(&core, "notes", "maximize").unwrap()
+        };
+        assert_eq!(full.width, 1496);
+        assert_eq!(full.height, 880);
+    }
+
+    #[test]
+    fn a_snap_is_refused_by_name_for_every_reason() {
+        let state = WmState::new_for_test(FormFactor::Desktop);
+        state.register_app("notes").unwrap();
+
+        // An unknown zone is refused, never guessed into one of the nine.
+        let core = state.lock().unwrap();
+        let err = snap_plan(&core, "notes", "middle").unwrap_err();
+        assert!(err.contains("unknown snap zone"), "{err}");
+        // A label nothing registered.
+        let err = snap_plan(&core, "no-such-window", "left").unwrap_err();
+        assert!(err.contains("no window is registered"), "{err}");
+        // The Launcher *is* the screen.
+        let err = snap_plan(&core, LAUNCHER_LABEL, "left").unwrap_err();
+        assert!(err.contains("the screen itself"), "{err}");
+    }
+
+    #[test]
+    fn a_class_without_free_window_geometry_refuses_a_snap() {
+        // A phone's app window is fullscreen by construction: a "snap" there cannot mean
+        // anything, so it is refused rather than silently ignored.
+        let state = WmState::new_for_test(FormFactor::Phone);
+        // A phone shows one window at a time, but it still registers.
+        state.register_app("notes").unwrap();
+        let core = state.lock().unwrap();
+        let err = snap_plan(&core, "notes", "left").unwrap_err();
+        assert!(err.contains("phone"), "the refusal names the class: {err}");
+        assert!(err.contains("free window geometry"), "{err}");
+    }
+
+    #[test]
+    fn a_pane_of_an_active_split_refuses_a_snap() {
+        let state = WmState::new_for_test(FormFactor::Desktop);
+        state.register_app("calculator").unwrap();
+        state.register_app("settings").unwrap();
+        state.enter_split("calculator", "settings", "auto").unwrap();
+        let core = state.lock().unwrap();
+        let err = snap_plan(&core, "calculator", "left").unwrap_err();
+        assert!(
+            err.contains("in a split"),
+            "snapping a pane would leave the split describing a layout that is not on screen: {err}"
+        );
+        assert!(
+            err.contains("exit the split first"),
+            "…and the refusal tells the operator the way out: {err}"
+        );
+    }
+
+    #[test]
+    fn pane_rects_delegates_to_the_domain_split_rule() {
+        // The host must not own a second geometry rule: `pane_rects` is `split_panes`
+        // with the policy's own gap and minimum pane (REQ-A512).
+        for form in [FormFactor::Phone, FormFactor::Tablet, FormFactor::Desktop] {
+            let policy = LayoutPolicy::of(form);
+            let screen = Bounds::new(0, 0, 1440, 900);
+            for axis in [SplitAxis::Vertical, SplitAxis::Horizontal] {
+                for percent in [1u32, 40, 50, 60, 99] {
+                    assert_eq!(
+                        pane_rects(policy, screen, axis, percent),
+                        amos_wm::layout::split_panes(
+                            screen,
+                            axis,
+                            policy.divider_gap,
+                            percent,
+                            policy.min_pane
+                        ),
+                        "{form} {axis:?} at {percent}%"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn slide_over_rect_delegates_to_the_domain_panel_rule() {
+        // The host must not own a second geometry rule for the floating panel either:
+        // `slide_over_rect` is `slide_over_pane` with the policy's own margin + minimum
+        // pane (REQ-A675).
+        for form in [FormFactor::Phone, FormFactor::Tablet, FormFactor::Desktop] {
+            let policy = LayoutPolicy::of(form);
+            let screen = Bounds::new(0, 0, 1440, 900);
+            for axis in [SplitAxis::Vertical, SplitAxis::Horizontal] {
+                for percent in [1u32, 33, 50, 60, 99] {
+                    assert_eq!(
+                        slide_over_rect(policy, screen, axis, percent),
+                        amos_wm::layout::slide_over_pane(
+                            screen,
+                            axis,
+                            percent,
+                            policy.min_pane,
+                            policy.slide_over_margin
+                        ),
+                        "{form} {axis:?} at {percent}%"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn slide_over_rect_hugs_the_trailing_edge_and_refuses_a_screen_too_small() {
+        let policy = LayoutPolicy::of(FormFactor::Tablet);
+        let screen = Bounds::new(0, 0, 1200, 800);
+        let b = slide_over_rect(policy, screen, SplitAxis::Vertical, 33).unwrap();
+        assert_eq!(
+            b.right(),
+            i64::from(screen.width) - i64::from(policy.slide_over_margin),
+            "the panel floats one margin in from the right edge"
+        );
+        // One pane's worth of height cannot host a full-height panel — honest None.
+        assert_eq!(
+            slide_over_rect(
+                policy,
+                Bounds::new(0, 0, 2000, policy.min_pane.height),
+                SplitAxis::Vertical,
+                33
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn pane_rects_is_none_when_two_minimum_panes_plus_the_gap_do_not_fit() {
+        let policy = LayoutPolicy::of(FormFactor::Tablet);
+        let too_narrow = Bounds::new(0, 0, policy.min_pane.width, 2000);
+        assert_eq!(
+            pane_rects(policy, too_narrow, SplitAxis::Vertical, 50),
+            None,
+            "one pane's worth of width cannot host two panes — honest None, never a \
+             zero/negative pane"
+        );
+        let just_fits = Bounds::new(
+            0,
+            0,
+            policy.min_pane.width * 2 + policy.divider_gap,
+            policy.min_pane.height,
+        );
+        assert!(
+            pane_rects(policy, just_fits, SplitAxis::Vertical, 50).is_some(),
+            "exactly two minimum panes plus the gap fits"
+        );
+    }
+
+    #[test]
+    fn a_measured_screen_upgrades_a_revisable_phone_build_to_a_tablet() {
+        // REQ-A512: the touch shell's split gate reads `columns`, and `columns` only
+        // reaches 2 once the class is a tablet. A mobile build defaults to Phone, so the
+        // measured screen is the only thing that can settle it.
+        let state = WmState::with_form_origin(FormFactor::Phone, FormFactor::Phone, true);
+        // Before any measurement nothing is claimed: one column, still a phone.
+        let snap = state.layout_snapshot().expect("snapshot");
+        assert_eq!((snap.form.as_str(), snap.columns), ("phone", 1));
+
+        // A handset-sized screen confirms the phone.
+        let snap = state
+            .set_screen(430, 932)
+            .expect("screen 430x932 is a believable reading");
+        assert_eq!((snap.form.as_str(), snap.columns), ("phone", 1));
+
+        // A tablet-sized screen re-classes the host, which is what makes two panes
+        // reachable.
+        let snap = state
+            .set_screen(2048, 1536)
+            .expect("screen 2048x1536 is a believable reading");
+        assert_eq!(
+            (snap.form.as_str(), snap.columns),
+            ("tablet", 2),
+            "the measured screen settled the class"
+        );
+    }
+
+    #[test]
+    fn a_pinned_class_is_never_re_derived_from_the_screen() {
+        // `with_form_factor` is an explicit choice (tests, embedders). A phone stays a
+        // phone on a tablet-sized screen — an explicit class must not be second-guessed.
+        let state = WmState::new_for_test(FormFactor::Phone);
+        let snap = state
+            .set_screen(2048, 1536)
+            .expect("screen 2048x1536 is a believable reading");
+        assert_eq!((snap.form.as_str(), snap.columns), ("phone", 1));
+    }
+
+    #[test]
+    fn reclass_only_ever_moves_a_phone() {
+        let big = Bounds::new(0, 0, 2048, 1536);
+        assert_eq!(
+            reclass_for_screen(FormFactor::Phone, big),
+            Some(FormFactor::Tablet)
+        );
+        assert_eq!(
+            reclass_for_screen(FormFactor::Phone, Bounds::new(0, 0, 430, 932)),
+            Some(FormFactor::Phone)
+        );
+        // Compile-time classes are not re-classed by a screen, and an unmeasured screen
+        // proves nothing.
+        for f in [FormFactor::Desktop, FormFactor::Robot, FormFactor::Tablet] {
+            assert_eq!(reclass_for_screen(f, big), Some(f), "{f} must not move");
+        }
+        assert_eq!(
+            reclass_for_screen(FormFactor::Phone, Bounds::new(0, 0, 0, 0)),
+            Some(FormFactor::Phone)
+        );
+    }
+
+    #[test]
     fn enforce_min_is_applied_to_split_panes() {
         // G5: split pane geometry must respect min_pane (REQ-A256).
         use amos_wm::layout::{Bounds, Size};
@@ -3599,6 +6399,367 @@ mod tests {
             logical_screen(f64::from(w), f64::from(h), 1.0, FALLBACK_SCREEN),
             Bounds::new(0, 0, 2560, 1600),
             "re-reading a stale scale factor is the defect this path prevents"
+        );
+    }
+
+    // ---- REQ-A473: app-window identity (which app, which instance) ------------------
+
+    /// A mock app with a desktop `WmState` — the shape the identity tests below need,
+    /// because the identity is assigned on the **production** path (`open` /
+    /// `new_window`), not by the test seam.
+    #[cfg(desktop)]
+    fn desktop_host() -> (
+        tauri::App<tauri::test::MockRuntime>,
+        AppHandle<tauri::test::MockRuntime>,
+    ) {
+        let app = tauri::test::mock_builder()
+            .manage(WmState::new_for_test(FormFactor::Desktop))
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("a mock app builds");
+        let handle = app.handle().clone();
+        (app, handle)
+    }
+
+    /// The defect this whole change exists for: a second window for one app. Before the
+    /// identity model `open` could only focus the existing window, so this test could not
+    /// have been written at all.
+    #[cfg(desktop)]
+    #[test]
+    fn a_second_window_of_one_app_gets_its_own_label_and_identity() {
+        let (_app, handle) = desktop_host();
+        let state = handle.state::<WmState>();
+
+        state
+            .open(&handle, "files")
+            .expect("the first window opens");
+        assert_eq!(
+            state.app_id_of("files").expect("ledger readable"),
+            Some("files".to_string()),
+            "the first window of 'files' is labelled 'files'"
+        );
+
+        let (_events, label) = state
+            .new_window(&handle, "files")
+            .expect("a second window is allowed on desktop");
+        assert_eq!(
+            label, "files_2",
+            "the additional window gets the lowest free instance ordinal"
+        );
+
+        let snap = state.snapshot().expect("snapshot");
+        let mut files: Vec<(String, u32)> = snap
+            .windows
+            .iter()
+            .filter(|w| w.app == "files")
+            .map(|w| (w.label.clone(), w.instance))
+            .collect();
+        files.sort();
+        assert_eq!(
+            files,
+            vec![("files".to_string(), 1), ("files_2".to_string(), 2)],
+            "both windows are registered, each with its own label and instance"
+        );
+        // …and the launcher is not an app window (its identity is reported as absent
+        // rather than as a fabricated app id).
+        let launcher = snap
+            .windows
+            .iter()
+            .find(|w| w.label == LAUNCHER_LABEL)
+            .expect("the launcher is in the snapshot");
+        assert_eq!(launcher.app, "", "the launcher shows no application");
+        assert_eq!(launcher.instance, 0, "…and is not an instance of one");
+    }
+
+    /// The idempotence that keeps `wm_open` safe as the *only* path a shell icon uses:
+    /// clicking an app that is already open must focus it, never add a window.
+    #[cfg(desktop)]
+    #[test]
+    fn wm_open_is_idempotent_and_never_mints_a_second_window() {
+        let (_app, handle) = desktop_host();
+        let state = handle.state::<WmState>();
+
+        state.open(&handle, "files").expect("opens");
+        state.open(&handle, "files").expect("focuses");
+        state.open(&handle, "files").expect("focuses again");
+
+        let snap = state.snapshot().expect("snapshot");
+        let files: Vec<&WindowInfo> = snap.windows.iter().filter(|w| w.app == "files").collect();
+        assert_eq!(files.len(), 1, "three opens, one window: {snap:?}");
+        assert!(files[0].focused, "the last open is the focused window");
+    }
+
+    /// An instance label names a **window**, so passing one to `wm_open` is refused with
+    /// the name of the command that does mean "add a window" — the one-spelling rule,
+    /// enforced at the host's front door.
+    #[cfg(desktop)]
+    #[test]
+    fn wm_open_refuses_a_window_instance_label() {
+        let (_app, handle) = desktop_host();
+        let state = handle.state::<WmState>();
+
+        let err = state
+            .open(&handle, "files_2")
+            .expect_err("a window label is not an app id");
+        assert!(
+            err.contains("files_2") && err.contains("wm_new_window"),
+            "the refusal names the value and the command that would be right: {err}"
+        );
+        assert!(
+            state.snapshot().expect("snapshot").windows.len() == 1,
+            "a refused open leaves no window behind (only the launcher)"
+        );
+    }
+
+    /// Closing one instance must not leave identity residue: the ledger is what the ⌘`
+    /// ring and the next allocation are computed from, so a leaked record would both keep
+    /// a dead window in the ring and refuse to reuse its label.
+    #[cfg(desktop)]
+    #[test]
+    fn a_closed_instance_leaves_no_identity_and_its_label_is_reused() {
+        let (_app, handle) = desktop_host();
+        let state = handle.state::<WmState>();
+
+        state.open(&handle, "files").expect("opens");
+        let (_e, label) = state.new_window(&handle, "files").expect("second window");
+        assert_eq!(label, "files_2");
+
+        state.close(&handle, &label).expect("closes");
+        assert_eq!(
+            state.app_id_of(&label).expect("ledger readable"),
+            None,
+            "the closed window's identity is gone (it must not stay in the ⌘` ring)"
+        );
+
+        let (_e, again) = state.new_window(&handle, "files").expect("reopens");
+        assert_eq!(
+            again, "files_2",
+            "the freed ordinal is reused: the numbers do not run away"
+        );
+    }
+
+    /// ⌘` — the chord that was unreachable while an app could have one window.
+    #[cfg(desktop)]
+    #[test]
+    fn cycling_walks_one_apps_windows_and_wraps() {
+        let (_app, handle) = desktop_host();
+        let state = handle.state::<WmState>();
+
+        state.open(&handle, "files").expect("opens");
+        state.new_window(&handle, "files").expect("second window");
+        // A second app, so the ring cannot accidentally be "all windows".
+        state.open(&handle, "notes").expect("opens notes");
+
+        let focused_label = |s: &WmState| {
+            let snap = s.snapshot().expect("snapshot");
+            snap.windows
+                .iter()
+                .find(|w| w.focused)
+                .map(|w| w.label.clone())
+        };
+
+        // Focus is on `notes` (the last window opened), so the first step starts at an end
+        // of the files ring rather than at whatever was focused.
+        let first = state.cycle_app(&handle, "files", true).expect("cycles");
+        assert_eq!(first, "files", "forward starts at the first window");
+        assert_eq!(focused_label(&state), Some("files".to_string()));
+
+        let second = state.cycle_app(&handle, "files", true).expect("cycles");
+        assert_eq!(second, "files_2");
+        assert_eq!(focused_label(&state), Some("files_2".to_string()));
+
+        let wrapped = state.cycle_app(&handle, "files", true).expect("cycles");
+        assert_eq!(wrapped, "files", "forward from the last wraps to the first");
+
+        let back = state
+            .cycle_app(&handle, "files", false)
+            .expect("cycles back");
+        assert_eq!(back, "files_2", "backward from the first wraps to the last");
+    }
+
+    /// A ring of one is a no-op, and the caller is told so: a "success" that moved nothing
+    /// is the dead-chord shape this repository treats as a defect.
+    #[cfg(desktop)]
+    #[test]
+    fn cycling_an_app_with_one_window_is_refused_with_a_reason() {
+        let (_app, handle) = desktop_host();
+        let state = handle.state::<WmState>();
+        state.open(&handle, "files").expect("opens");
+
+        let err = state
+            .cycle_app(&handle, "files", true)
+            .expect_err("nothing to cycle");
+        assert!(
+            err.contains("2") || err.contains("two"),
+            "the refusal names the requirement: {err}"
+        );
+
+        let err = state
+            .cycle_app(&handle, "nosuchapp", true)
+            .expect_err("no windows at all");
+        assert!(
+            err.contains("nosuchapp"),
+            "the refusal names the app: {err}"
+        );
+    }
+
+    /// The class rule is asked for the **second instance** too, through the same function
+    /// the first window goes through: a phone shows one app window, so it refuses a second
+    /// window of the same app for exactly the reason it refuses a second app.
+    #[test]
+    fn a_class_without_multi_window_refuses_a_second_instance_of_the_same_app() {
+        let s = WmState::new_for_test(FormFactor::Phone);
+        s.register_app("files")
+            .expect("the first window is allowed");
+        let err = s
+            .register_app_instance("files")
+            .expect_err("a phone gets one app window");
+        assert!(
+            err.contains("phone"),
+            "the refusal names the class whose policy refused: {err}"
+        );
+        assert_eq!(
+            s.snapshot().expect("snapshot").windows.len(),
+            2,
+            "the refused window leaves no trace (the launcher + the one app window)"
+        );
+    }
+
+    /// REQ-A478 — the cascade only reaches a window if the host **applies** the position.
+    ///
+    /// Measured on this machine (2026-09-19): `.position()` was never called, so the class
+    /// rule's `x`/`y` had no effect on any real window and three `⌘N` windows all landed at
+    /// the OS's own choice of `236,70`. This pins the narrow rule that fixes it: apply the
+    /// computed position from instance 2 on, and leave instance 1 exactly as shipped.
+    #[test]
+    fn only_a_cascaded_instance_has_its_position_applied() {
+        assert!(
+            !places_position_at(1),
+            "the first window of an app keeps the OS's own placement (unchanged behaviour)"
+        );
+        assert!(!places_position_at(0), "a bogus ordinal is not a cascade");
+        for instance in 2..=16 {
+            assert!(
+                places_position_at(instance),
+                "instance {instance} is a cascade and must be placed"
+            );
+        }
+    }
+
+    /// The identity survives the two readers that hold a label and need the app: the OS
+    /// window title (a second instance must not fall back to the product name) and the
+    /// shell-facing `wm_app_of_label`.
+    #[cfg(desktop)]
+    #[test]
+    fn an_instance_is_titled_with_its_apps_name_not_the_fallback() {
+        assert_eq!(
+            resolved_title("files_2", None, "Amos").expect("title"),
+            "Files",
+            "the second Files window is titled 'Files', not 'Amos'"
+        );
+        assert_eq!(
+            resolved_title("store:org.amos.demo_3", None, "Amos").expect("title"),
+            "Amos",
+            "an unknown app *id* still falls back — that is the fallback for an id, not for a label"
+        );
+
+        let (_app, handle) = desktop_host();
+        let state = handle.state::<WmState>();
+        state.open(&handle, "files").expect("opens");
+        let (_e, label) = state.new_window(&handle, "files").expect("second");
+        assert_eq!(
+            state.app_id_of(&label).expect("ledger readable"),
+            Some("files".to_string()),
+            "the shell asks the host which app a window belongs to (it does not parse the label)"
+        );
+    }
+
+    /// REQ-A431 / REQ-A869 — which window a menu action on "the focused window" acts on:
+    /// the key window first, the model as the fallback, the launcher never.
+    ///
+    /// **Pure**, so the rule is pinned without a window server, without a menu and without
+    /// printing anything. Moved here with the function (REQ-A869) from `menu.rs`, where the
+    /// test was `the_menu_close_target_prefers_the_key_window_and_falls_back_to_the_model`
+    /// — the rule has three consumers now, so its test cannot live inside one of them.
+    ///
+    /// The named witnesses below are the point: a rewrite of the body that keeps the
+    /// *counts* right (one branch in, one label out) still has to answer these five pairs.
+    #[cfg(desktop)]
+    #[test]
+    fn the_focused_target_prefers_the_key_window_and_falls_back_to_the_model() {
+        // The platform names a key app window: that is macOS's own answer to "what is in
+        // front", and it wins even when the model disagrees (the model lags a real click).
+        assert_eq!(
+            focused_target_label(Some("notes"), Some("photos")).as_deref(),
+            Some("notes")
+        );
+        // The platform names no key window — measured right after a window is created, the
+        // REQ-A431 defect — so the window manager's answer is used instead of acting on none.
+        assert_eq!(
+            focused_target_label(None, Some("settings")).as_deref(),
+            Some("settings")
+        );
+        // The launcher is never a target, in either branch (F-SH-008): when only the launcher
+        // is focused there is honestly nothing to act on, which each consumer must report
+        // rather than substitute a default.
+        assert_eq!(focused_target_label(Some("main"), None), None);
+        assert_eq!(focused_target_label(None, Some("main")), None);
+        // A key launcher does not override an actionable model answer — the fallback is a
+        // *second source*, not a tiebreak that a non-actionable key window cancels.
+        assert_eq!(
+            focused_target_label(Some("main"), Some("notes")).as_deref(),
+            Some("notes")
+        );
+        assert_eq!(focused_target_label(None, None), None);
+    }
+
+    /// A **poisoned** lock is not "this window has no context" — the rule `peek`'s own doc
+    /// states, applied to the three accessors that did not follow it.
+    ///
+    /// `peek` recovers the guard (`unwrap_or_else(|p| p.into_inner())`) and says why in prose;
+    /// `set` / `clear` / `take_for` took the same lock with `if let Ok(..)` instead, so after any
+    /// panic-while-holding they **silently dropped every mutation** — and `take_for` answered
+    /// `None`, which is *verbatim* the claim its sibling's doc forbids. The consumer is
+    /// `ai_bridge::merge_system_selection`: with the entry gone it falls back to the global
+    /// clipboard's newest text, so the AI is told a string the user copied in some other window
+    /// is *this* window's selection — a silent substitution, no error anywhere.
+    ///
+    /// Red-first: `catch_unwind` really poisons the lock, then each accessor is asserted to
+    /// behave exactly as it would on a clean lock. Negative control: restore the `if let Ok`
+    /// shape and this goes red (the first `set` assertion).
+    #[test]
+    fn a_poisoned_context_lock_does_not_lose_a_selection() {
+        let ctx = SystemContext::new();
+        ctx.set("ai", "notes", "the first selection");
+        assert!(!ctx.inner.is_poisoned(), "a fresh lock is not poisoned");
+
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = ctx.inner.lock().unwrap_or_else(|p| p.into_inner());
+            panic!("a handler panicked while holding the context lock");
+        }));
+        assert!(ctx.inner.is_poisoned(), "the lock must really be poisoned");
+
+        // The write half: a selection captured under poison still lands.
+        ctx.set("ai", "notes", "a later selection");
+        assert_eq!(
+            ctx.peek("ai").map(|e| e.text),
+            Some("a later selection".to_string()),
+            "a poisoned lock is not 'this window has no context'"
+        );
+
+        // The consuming read: `take_for` hands the entry over instead of answering `None`.
+        assert_eq!(
+            ctx.take_for("ai").map(|e| e.text),
+            Some("a later selection".to_string()),
+            "a consuming read must not read poison as 'no context'"
+        );
+        assert!(ctx.peek("ai").is_none(), "an entry is taken exactly once");
+
+        // The removal: `clear` under poison really clears.
+        ctx.set("ai", "notes", "yet another");
+        ctx.clear("ai");
+        assert!(
+            ctx.peek("ai").is_none(),
+            "a removal under poison still removes"
         );
     }
 }

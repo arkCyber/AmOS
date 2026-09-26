@@ -57,6 +57,16 @@
     not(test),
     deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
 )]
+// Doc-integrity gate (REQ-A707, FMEA F-SH-166): the API docs must not carry dead links.
+// `broken_intra_doc_links`
+// catches a name that does not resolve at all; `private_intra_doc_links` catches a public
+// item linking a *private* one, which rustdoc silently renders as plain text — a reader
+// following the doc finds no target and cannot tell the link was ever meant to be one.
+#![deny(
+    rustdoc::broken_intra_doc_links,
+    rustdoc::private_intra_doc_links,
+    rustdoc::redundant_explicit_links
+)]
 
 pub mod broker;
 pub mod codec;
@@ -85,8 +95,9 @@ pub mod service;
 pub use broker::{Broker, Ingress, PublishReport, Subscription, SubscriptionStats, Transport};
 pub use codec::{Clock, Envelope, Header, Message, Timestamp};
 pub use discovery::{
-    beacon_pattern, spawn_federation, Beacon, BusDiscovery, Discovery, FederationTask,
-    MockDiscovery, NodeKind, PeerId, PeerInfo, PeerRegistry, PeerView, BEACON_TOPIC,
+    beacon_pattern, federation_period, spawn_federation, Beacon, BusDiscovery, Discovery,
+    FederationTask, MockDiscovery, NodeKind, PeerId, PeerInfo, PeerRegistry, PeerView,
+    BEACON_TOPIC,
 };
 pub use error::{LinkError, Result};
 pub use health::{HealthReason, LinkHealth};

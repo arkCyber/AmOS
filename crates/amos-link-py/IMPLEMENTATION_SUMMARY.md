@@ -33,7 +33,9 @@ Successfully implemented a complete Python SDK for the `amos-link` robot middlew
 - ✅ Comprehensive error messages for debugging
 
 #### 4. Type Safety
-- ✅ Type stubs (`amos_link_py.pyi`) for IDE autocompletion
+- ✅ Type stubs (`_native.pyi` + `py.typed`) for IDE autocompletion — the stub is bound to the
+  pyo3 surface by `scripts/py-stub-scan.mjs` (REQ-A719); it was named `amos_link_py.pyi`, which
+  PEP 561 resolves to nothing, and had drifted from the module
 - ✅ Strong typing in Python package (`__init__.py`)
 - ✅ `#[repr(C)]` alignment for FFI types
 - ✅ Thread-safe `Arc<T>` wrapping for all shared types
@@ -233,7 +235,7 @@ maturin develop --release
 1. **Source Code**
    - `/Users/arksong/AmOS/crates/amos-link-py/src/lib.rs` - Rust bindings
    - `/Users/arksong/AmOS/crates/amos-link-py/python/amos_link/__init__.py` - Python package
-   - `/Users/arksong/AmOS/crates/amos-link-py/python/amos_link/amos_link_py.pyi` - Type stubs
+   - `/Users/arksong/AmOS/crates/amos-link-py/python/amos_link/_native.pyi` - Type stubs
 
 2. **Configuration**
    - `/Users/arksong/AmOS/crates/amos-link-py/Cargo.toml` - Rust crate config

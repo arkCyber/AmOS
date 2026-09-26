@@ -19,8 +19,8 @@
  * Pure helpers are exported for tests; `syncDueEventAlerts` is the side-effecting
  * entry point used by the watcher (and callable on its own).
  */
-import { readStoreValue, writeStoreValue } from "./amosStore";
-import { NOTIF_KEY, NOTIF_CAP, normalizeNotifs, type Notif } from "./settings";
+import { readStoreValue, writeStoreValue, writeStoreValueChecked } from "./amosStore";
+import { NOTIF_KEY, NOTIF_CAP, normalizeNotifs, removeNotif, type Notif } from "./settings";
 import {
   CALENDAR_KEY,
   CALENDARS_KEY,
@@ -34,7 +34,7 @@ import {
   type CalendarEvent,
   type CalendarGroup,
 } from "./calendar";
-import { zh } from "../i18n/locales/zh";
+import { bgT } from "../svelte/bgText";
 
 export { CALENDAR_KEY, CALENDARS_KEY };
 
@@ -158,21 +158,41 @@ export function alertsToNotifs(
   });
 }
 
-/** Side-effecting reconciliation: fire new alerts + prune markers. Idempotent. */
+/**
+ * Side-effecting reconciliation: fire new alerts + prune markers. Idempotent.
+ *
+ * Two things about the notification write, both about the **marker** rather than the row:
+ *
+ *  - The write is **checked**, and the markers are consumed only for the alerts it actually
+ *    delivered. `markFired` used to run off the input `alerts` whatever the store answered,
+ *    so a refused write (quota — `amos.notifications` is up to `NOTIF_CAP` rows, this write is
+ *    the big one) recorded the occurrence as alerted while the user got nothing, and the
+ *    marker is exactly what stops the retry: the grace window below ("a missed alert is still
+ *    delivered within `ALERT_GRACE_MS`") could then never deliver it. Leaving the marker
+ *    unwritten keeps the alert due, so the next tick retries — a `setInterval` has no surface
+ *    to speak on, so "don't consume until it lands" is the honest shape (REQ-A1394 ∕ F-SH-653
+ *    is the same fix one module over, in `osTimerWatcher`).
+ *  - The row is written **id-stable**: `cal:<event>@<startAt>` names one occurrence, so a
+ *    retry (or any later pass) must replace that row rather than prepend a second copy of it.
+ *    The stored array is what a raw reader sees, and duplicates there eat `NOTIF_CAP`.
+ */
 export function syncDueEventAlerts(now = Date.now()): void {
   const events = normalizeEvents(readStoreValue<unknown>(CALENDAR_KEY, []));
   const groups = normalizeCalendars(readStoreValue<unknown>(CALENDARS_KEY, []));
   const fired = normalizeFired(readStoreValue<unknown>(CALENDAR_FIRED_KEY, {}));
   const alerts = collectDueEventAlerts(events, groups, fired, now);
+  let delivered = true;
   if (alerts.length > 0) {
     // Normalize the existing list: a corrupt value must not wedge the alert
     // pipeline (spreading a non-array would throw on every tick, forever).
     const existing = normalizeNotifs(readStoreValue<unknown>(NOTIF_KEY, []));
-    const fresh = alertsToNotifs(alerts, zh["app.calendar"], now);
+    const fresh = alertsToNotifs(alerts, bgT("app.calendar"), now);
     // Newest alert first, keep the rest, respect the notification cap.
-    writeStoreValue(NOTIF_KEY, [...fresh.reverse(), ...existing].slice(0, NOTIF_CAP));
+    let list = existing;
+    for (const n of fresh) list = [n, ...removeNotif(list, n.id)];
+    delivered = writeStoreValueChecked(NOTIF_KEY, list.slice(0, NOTIF_CAP));
   }
-  const next = pruneFired(markFired(fired, alerts), now);
+  const next = pruneFired(markFired(fired, delivered ? alerts : []), now);
   if (JSON.stringify(next) !== JSON.stringify(fired)) {
     writeStoreValue(CALENDAR_FIRED_KEY, next);
   }

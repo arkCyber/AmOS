@@ -83,7 +83,7 @@ message StatusReply {
   bool running = 1;                      // is the inference daemon alive & ready
   string model = 2;                      // active model identifier
   int64 uptime_seconds = 3;              // daemon uptime
-  uint32 gpu_util = 4;                   // rough GPU/NPU utilisation percent
+  optional uint32 gpu_util = 4;          // GPU/NPU utilisation percent; ABSENT = no metrics instrumented (a bare 0 would be a fabricated reading)
   uint32 active_sessions = 5;            // number of live agent sessions
   int64 rpc_total = 6;                   // RPCs seen at the gRPC boundary (monitoring)
   int64 heartbeats = 7;                  // periodic self-health ticks emitted (monitoring)
@@ -142,6 +142,18 @@ message StatusReply {
   // `lost_bytes`/`write_failures` is how an operator learns the on-disk trail is
   // *incomplete* instead of assuming it is complete.
   LogSinkMetrics log_sink = 19;
+
+  // Structured JSON-line sink health (REQ-A420), added 2026-09-18: an *opt-in*
+  // companion to the human log sink that writes one machine-parseable JSON
+  // object per event into `amos-ai.jsonl` next to the human `amos-ai.log`.
+  // `enabled=false` means stdout only (or AMOS_LOG_JSON is unset) — the
+  // counters are then the honest zeros of a sink that never persisted anything,
+  // and never a fabricated reading. The two sinks are independent: either may
+  // be enabled alone; `get_status` reports each one in its own block so an
+  // operator never has to cross-reference two files to learn which sinks are
+  // alive. Wire shape mirrors `LogSinkMetrics` so a single UI card can render
+  // both.
+  JsonLogSinkMetrics json_log_sink = 22;
 
   // Backend circuit breaker (REQ-A131), added 2026-09-12: while a backend is down,
   // generations fail fast with a stated reason instead of every caller walking the
@@ -205,6 +217,19 @@ message LogSinkMetrics {
   uint64 lost_bytes = 4;        // bytes a failed write could not persist
   uint64 write_failures = 5;    // failed write/flush/rotation attempts
   uint64 rotations = 6;         // completed roll-overs (older lines moved to .1…)
+  uint64 active_bytes = 7;      // size of the active file right now
+}
+
+// Wire mirror of `JsonSinkReport` in `crates/amos-ai/src/jsonlog.rs`. Same
+// shape as `LogSinkMetrics` by design — a UI card can render both with the
+// same code path.
+message JsonLogSinkMetrics {
+  bool enabled = 1;             // a JSON sink is open (false => human sink + stdout)
+  string path = 2;              // the active file ("" when disabled)
+  uint64 bytes_written = 3;     // bytes appended since start-up
+  uint64 lost_bytes = 4;        // bytes a failed write could not persist
+  uint64 write_failures = 5;    // failed write/flush/rotation attempts
+  uint64 rotations = 6;         // completed roll-overs
   uint64 active_bytes = 7;      // size of the active file right now
 }
 
@@ -415,6 +440,10 @@ message RagStatusRequest {}
 
 message RagStatusReply {
   uint64 indexed = 1;            // passages currently indexed
-  uint32 dimension = 2;          // 0 when nothing indexed yet (dimension unknown)
+  // The index's vector dimension, **absent** until the first ingest — a reader must
+  // not read a missing dimension as `0`, which is not a dimension any embedder can
+  // have (`amos-vector-db` refuses `ZeroDimension`). Was a bare `uint32` whose `0`
+  // meant "unknown"; widening to `optional` carries the presence instead.
+  optional uint32 dimension = 2;
   string embedder = 3;           // "mock" | "ollama" (honest backend label)
 }

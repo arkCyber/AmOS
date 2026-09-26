@@ -24,10 +24,31 @@ export interface CompassSettings {
 export interface CompassReading {
   /** Heading in degrees (0-360, 0 = north). */
   heading: number;
-  /** Tilt angles for level display. */
-  tilt: { x: number; y: number };
-  /** Whether device orientation is available. */
+  /**
+   * Tilt angles for level display. Each axis is **independently nullable**: a
+   * `deviceorientation` frame may carry one of `beta`/`gamma` and not the other
+   * (the two are separate sensor fields, each `double?`), so `null` here means
+   * "this axis was not measured in this frame" — it is **not** a tilt of 0°.
+   * Folding it to `0` was the F-SH-755 defect: an unmeasured axis drew a bubble
+   * on the centre line and printed `0.0°`, and (with the other axis inside the
+   * 2° band) let the level tab claim 「已水平」 over a frame that never measured
+   * it.
+   */
+  tilt: { x: number | null; y: number | null };
+  /**
+   * Whether tilt data is flowing — the accelerometer's `beta`/`gamma`. This is
+   * what the **level** tab needs, and it stays true on a device with no
+   * magnetometer.
+   */
   available: boolean;
+  /**
+   * Whether a heading was actually reported — `alpha`, which needs a
+   * magnetometer. `alpha` is `null` on a device that has none while `beta`/
+   * `gamma` keep arriving, so "we have orientation data" and "we have a heading"
+   * are **two** facts: the compass tab needs this one, the level tab needs
+   * `available`.
+   */
+  headingKnown: boolean;
   /** Accuracy estimate (radians, from DeviceOrientation). */
   accuracy?: number;
 }
@@ -236,20 +257,55 @@ export function isCachedDeclinationValid(
 }
 
 /**
- * Fetch magnetic declination from World Magnetic Model API.
- * Falls back to 0 if unavailable (offline or API error).
- * 
+ * Pull the declination out of a World Magnetic Model API payload, or `null` when
+ * the payload does not carry one. The API answers `{ result: [{ declination }] }`
+ * with a **number**, but older/other endpoints return it as a numeric **string** —
+ * both are accepted; anything else (missing field, `"east"`, `NaN`) is `null`.
+ *
+ * Pure on purpose: the parse rule is the part worth testing without a network, and
+ * keeping it here means `fetchDeclination` is only network I/O on top of it.
+ */
+export function declinationFromApiPayload(raw: unknown): number | null {
+  if (!raw || typeof raw !== "object") return null;
+  const result = (raw as { result?: unknown }).result;
+  if (!Array.isArray(result) || result.length === 0) return null;
+  const first = result[0];
+  if (!first || typeof first !== "object") return null;
+  const value = (first as { declination?: unknown }).declination;
+  // A blank string is not a number: `Number("")` is 0, and accepting it would
+  // fabricate exactly the plausible zero this function exists to refuse.
+  const n =
+    typeof value === "number"
+      ? value
+      : typeof value === "string" && value.trim() !== ""
+        ? Number(value)
+        : NaN;
+  if (!Number.isFinite(n)) return null;
+  return validateDeclination(n);
+}
+
+/**
+ * Fetch magnetic declination from the World Magnetic Model API.
+ *
+ * Returns `null` when the value could **not be obtained** — offline, a non-2xx
+ * answer, an unparseable body, or a timeout. It deliberately does **not** fall
+ * back to `0`: `0°` is a perfectly real declination (it holds along the agonic
+ * line, and is within a degree or two of it over a lot of the planet), so a
+ * fabricated zero is indistinguishable from a measured one and would be applied
+ * as a true-north correction that never happened. `null` forces the caller to
+ * decide what to show, which is the only way to keep the label honest.
+ *
  * @param lat - Latitude in degrees (-90 to 90)
  * @param lon - Longitude in degrees (-180 to 180)
- * @returns Magnetic declination in degrees (+ = east, - = west), or 0 on error
+ * @returns Magnetic declination in degrees (+ = east, - = west), or `null` if unavailable
  * @throws Error if coordinates are invalid
  */
-export async function fetchDeclination(lat: number, lon: number): Promise<number> {
+export async function fetchDeclination(lat: number, lon: number): Promise<number | null> {
   try {
     // Validate coordinates first (throws on invalid input - intentional for API misuse detection)
     validateLatitude(lat);
     validateLongitude(lon);
-    
+
     // NOAA World Magnetic Model API (public, free)
     const url = `https://www.ngdc.noaa.gov/geomag-web/calculators/calculateDeclination`;
     const params = new URLSearchParams({
@@ -257,22 +313,18 @@ export async function fetchDeclination(lat: number, lon: number): Promise<number
       lon1: lon.toFixed(4),
       resultFormat: "json",
     });
-    
+
     const response = await fetch(`${url}?${params}`, { signal: AbortSignal.timeout(5000) });
     if (!response.ok) {
       console.warn(`[Compass] API error: ${response.status} ${response.statusText}`);
-      return 0;
+      return null;
     }
-    
-    const data = await response.json();
-    const declination = data.result?.[0]?.declination;
-    
-    if (typeof declination !== "number" || !Number.isFinite(declination)) {
-      console.warn("[Compass] Invalid declination in API response:", data);
-      return 0;
+
+    const declination = declinationFromApiPayload(await response.json());
+    if (declination === null) {
+      console.warn("[Compass] No usable declination in API response");
     }
-    
-    return validateDeclination(declination);
+    return declination;
   } catch (error) {
     // Re-throw validation errors (programming errors should fail fast)
     if (error instanceof Error && error.message.includes("Invalid latitude")) {
@@ -281,32 +333,55 @@ export async function fetchDeclination(lat: number, lon: number): Promise<number
     if (error instanceof Error && error.message.includes("Invalid longitude")) {
       throw error;
     }
-    
-    // Network errors, timeouts, parse errors - graceful degradation
+
+    // Network errors, timeouts, parse errors - report "unknown", never a guess.
     console.warn("[Compass] Failed to fetch declination:", error);
-    return 0;
+    return null;
   }
+}
+
+/** A cached look-up site, with the time the declination there was obtained. */
+export type DeclinationCacheLocation = { lat: number; lon: number; timestamp: number };
+
+/** Reply of [`fetchDeclinationWithCache`]. */
+export interface DeclinationResult {
+  /**
+   * The declination to use, or `null` when it is not known. A known `0` is a real
+   * value; `null` is the absence of one — the two must not be conflated.
+   */
+  declination: number | null;
+  /**
+   * Cache site to persist alongside a **known** declination. On a failed look-up
+   * this is the site handed in, unchanged (never a fresh one): a timestamp is a
+   * claim that the value there was measured, so it is only minted on success.
+   */
+  cachedLocation: DeclinationCacheLocation | undefined;
+  fromCache: boolean;
 }
 
 /**
  * Fetch declination with caching support.
- * Returns cached value if valid, otherwise fetches from API and updates cache.
- * 
+ * Returns the cached value when it is still valid, otherwise fetches from the API
+ * and — **only on success** — mints a fresh cache site.
+ *
+ * A failed look-up yields `declination: null` and leaves `cachedLocation` exactly
+ * as it was handed in. The two rules go together: a caller that keys "do I know
+ * the declination?" off `declination !== null` can never be told it knows one when
+ * it does not, and a caller that keys it off the presence of a cache site can
+ * never be handed a cache site that vouches for a value nobody measured.
+ *
  * @param lat - Current latitude in degrees
  * @param lon - Current longitude in degrees
+ * @param currentDeclination - The declination stored alongside `cachedLocation`
  * @param cachedLocation - Previously cached location data
- * @returns Object containing declination, cache location, and whether it was from cache
+ * @returns The declination (or `null`), the cache site to persist, and the source
  */
 export async function fetchDeclinationWithCache(
   lat: number,
   lon: number,
   currentDeclination: number,
-  cachedLocation?: { lat: number; lon: number; timestamp: number }
-): Promise<{
-  declination: number;
-  cachedLocation: { lat: number; lon: number; timestamp: number };
-  fromCache: boolean;
-}> {
+  cachedLocation?: DeclinationCacheLocation
+): Promise<DeclinationResult> {
   // Check if cache is valid
   if (isCachedDeclinationValid(cachedLocation, lat, lon)) {
     // Use cached declination
@@ -317,17 +392,16 @@ export async function fetchDeclinationWithCache(
     };
   }
 
-  // Fetch new declination
+  // Cache miss: ask the API. A failure is reported as unknown — the stale cache
+  // site (if any) is passed straight back, not refreshed.
   const declination = await fetchDeclination(lat, lon);
-  const newCachedLocation = {
-    lat,
-    lon,
-    timestamp: Date.now(),
-  };
+  if (declination === null) {
+    return { declination: null, cachedLocation, fromCache: false };
+  }
 
   return {
     declination,
-    cachedLocation: newCachedLocation,
+    cachedLocation: { lat, lon, timestamp: Date.now() },
     fromCache: false,
   };
 }
@@ -339,8 +413,15 @@ export function levelPercentage(tiltX: number, tiltY: number): number {
   return Math.min(100, (magnitude / 90) * 100);
 }
 
-/** Check if device is approximately level (within threshold degrees). */
-export function isLevel(tiltX: number, tiltY: number, threshold = 2): boolean {
+/**
+ * Check if device is approximately level (within threshold degrees).
+ *
+ * A `null` axis is **not** level: "we did not measure this axis" is not the same
+ * claim as "this axis reads 0°", and the level tab draws 「已水平」 off this
+ * answer — so an unmeasured axis must refuse the claim (F-SH-755).
+ */
+export function isLevel(tiltX: number | null, tiltY: number | null, threshold = 2): boolean {
+  if (tiltX === null || tiltY === null) return false;
   if (!Number.isFinite(tiltX) || !Number.isFinite(tiltY)) return false;
   if (!Number.isFinite(threshold) || threshold < 0) return false;
   return Math.abs(tiltX) < threshold && Math.abs(tiltY) < threshold;

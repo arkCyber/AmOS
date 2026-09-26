@@ -72,15 +72,22 @@ object AlarmGlue {
      */
     /** Notification channel for a firing alarm (created on demand, idempotent). */
     private const val ALARM_CHANNEL = "amos-alarm-firing"
-    /** Notification tag; the id is the notification's own id, so two alarms do not overwrite each other. */
+    /**
+     * Prefix of the firing notification's **tag**; the full id is appended by [notifyTag], so
+     * two alarms are never the same notification. (The tag alone was not enough before
+     * REQ-A1447 — the id half was `requestCode(id)`, which collides on `String.hashCode`.)
+     */
     private const val ALARM_NOTIFY_TAG = "amos.alarm"
     /** Intent extra carrying the alarm's instant (epoch ms), so the ring can say when it was set for. */
     const val EXTRA_AT_MS = "amos.alarm.atMs"
 
     /**
      * Status strings the Rust host maps to a typed device outcome and surfaces to the
-     * WebView — mirrored by `alarm_sched::device_arm_from_status`, which has a unit
-     * test pinning every spelling (keep the two in sync).
+     * WebView — mirrored by `alarm_sched::device_outcome_from_status`. The pin is
+     * **name → word**: `tests/alarm_device_binding_e2e.rs` reads the assignment below and
+     * requires `const val STATUS_SCHEDULED` to hold the word the `Scheduled` arm answers,
+     * and likewise for each of the five. Renaming a value or swapping two of them is red
+     * there (measured, REQ-A805) — so change a constant only together with the Rust map.
      */
     const val STATUS_SCHEDULED = "scheduled"
     const val STATUS_CANCELLED = "cancelled"
@@ -127,6 +134,7 @@ object AlarmGlue {
      * The copy is **the OS's own**: the title is the app label and the text is the alarm instant
      * formatted with the device locale, so nothing here hard-codes a language.
      */
+    @SuppressLint("UseKtx") // Uri.parse is the platform API; androidx.core.net.toUri needs core-ktx, which the generated project does not depend on (REQ-A380)
     fun notifyAlarm(context: Context, id: String, atMs: Long): String {
         val manager = context.getSystemService(Context.NOTIFICATION_SERVICE)
             as? NotificationManager
@@ -157,6 +165,12 @@ object AlarmGlue {
             ?: return NOTIFY_UNAVAILABLE
         launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
         launch.putExtra(EXTRA_ID, id)
+        // Same identity rule as [pending]: `PendingIntent` equality ignores extras, so the
+        // request code alone would make two hash-colliding ids the *same* full-screen intent
+        // — the second alarm's `EXTRA_ID` would overwrite the first's under
+        // `FLAG_UPDATE_CURRENT`, and tapping the older alarm's ring would open the newer one.
+        // `alarmIdentity`'s per-id data URI is what keeps them apart (REQ-A1447/F-TAU-025).
+        launch.setData(Uri.parse(alarmIdentity(id)))
         val show = PendingIntent.getActivity(
             context,
             requestCode(id),
@@ -177,8 +191,14 @@ object AlarmGlue {
             .setFullScreenIntent(show, true)
             .build()
         return try {
-            // One notification id per alarm: two alarms cannot overwrite each other's ring.
-            NotificationManagerCompat.from(context).notify(ALARM_NOTIFY_TAG, requestCode(id), notification)
+            // A notification is identified by its **(tag, id)** pair. The old line used a
+            // constant tag plus `requestCode(id)` — `REQUEST_BASE + id.hashCode()`, the very
+            // discriminator `alarmIdentity` exists to replace — so two hash-colliding ids
+            // ("Aa"/"BB") posted under the *same* identity and the second silently replaced
+            // the first's ring. That was the F-TAU-011 collision one layer over from the
+            // PendingIntent it had already been fixed for (REQ-A1447/F-TAU-025). The tag now
+            // carries the full id, so it cannot collide.
+            NotificationManagerCompat.from(context).notify(notifyTag(id), 0, notification)
             Log.i(TAG, "posted the firing notification for $id (full-screen intent)")
             NOTIFY_POSTED
         } catch (e: SecurityException) {
@@ -277,6 +297,16 @@ object AlarmGlue {
      * ids stay distinct.
      */
     internal fun alarmIdentity(id: String): String = "$ALARM_SCHEME://$id"
+
+    /**
+     * The **tag** half of one firing notification's identity `(tag, id)`.
+     *
+     * A notification is keyed by tag **and** id. The tag is a plain `String`, so carrying the
+     * whole id makes a collision impossible — unlike the `PendingIntent`, which has no string
+     * tag and so needed the [alarmIdentity] data URI to separate hash-colliding ids
+     * (REQ-A1447/F-TAU-025). Pure, so `AlarmIdentityTest` pins it on the host JVM.
+     */
+    internal fun notifyTag(id: String): String = "$ALARM_NOTIFY_TAG:$id"
 
     @SuppressLint("UseKtx") // Uri.parse is the platform API; androidx.core.net.toUri needs core-ktx, which the generated project does not depend on (REQ-A380)
     private fun pending(context: Context, id: String, atMs: Long): PendingIntent {

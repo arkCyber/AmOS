@@ -37,16 +37,19 @@ use std::sync::{Arc, Mutex};
 
 /// Upper bound on one camera-frame payload from the WebView side.
 ///
-/// 12 MP (4032 × 3024) RGBA = ~48 MiB; 4K NV21 = ~33 MiB. We cap at 50 MiB —
-/// sufficient for the largest standard sensor, and well below what a malicious or
-/// runaway caller might try to push. The inner `bus.record_frame` then checks
-/// the payload against the *advertised* camera's expected size, so any mismatch
-/// is a second-layer rejection.
-pub const MAX_FRAME_BYTES: usize = 50 << 20;
+/// Shares the one ceiling the whole camera path agrees on:
+/// [`amos_sensor::GLUE_MAX_FRAME_BYTES`] (16 MiB) is also what the Kotlin
+/// `SensorGlue.nativeOnCamera` checks *before* its upcall and what
+/// `amos_sensor::MAX_FRAME_BYTES` rejects inside the bus. Keeping the three in
+/// lock-step means a frame that passes one boundary can never be refused as
+/// oversized by another — there is exactly one number to reason about.
+/// The inner `bus.record_frame` then checks the payload against the *advertised*
+/// camera's expected size, so any mismatch is a second-layer rejection.
+pub const MAX_FRAME_BYTES: usize = amos_sensor::GLUE_MAX_FRAME_BYTES;
 
 use amos_sensor::{
     CameraConfig, CameraFrame, CameraId, ImuSample, LiveSensorProvider, PixelFormat, Resolution,
-    SensorKind, SensorManager, SensorMode, SensorProvider, StreamChange, Vec3,
+    SensorKind, SensorManager, SensorMode, SensorProvider, StreamChange, Vec3, VitalsSample,
 };
 use serde::{Deserialize, Serialize};
 use tauri::State;
@@ -77,16 +80,35 @@ impl From<&CameraConfig> for HostCamera {
 }
 
 /// Serialisable latest IMU sample (the most recent the glue pushed).
+///
+/// The acceleration axes are always present — an IMU with no acceleration sample
+/// has no sample at all. `gyro_x` / `gyro_y` / `gyro_z` and `temperature_c` are
+/// `Option` for the same reason [`HostVitals`]'s two readings are: the domain's
+/// rule is that an absent sensor is `null`, **never** a fabricated value.
+///
+/// * The gyroscope axes were the last fields here folded to a measurement: on a
+///   device with no gyroscope (the field S5, `dumpsys sensorservice`: `geomag
+///   fusion (no gyro)`) the glue paired a hardcoded `0f, 0f, 0f` onto every
+///   accelerometer sample, so this snapshot reported `gyro_x: 0` — "not
+///   rotating" — for an angular rate the device cannot measure, while
+///   `temperature_c` right beside it was honestly `null`. A gyroscope-less phone
+///   now reads `null` (REQ-A1872 / F-SEN-008).
+/// * The die temperature has no source on the Android glue that ships (it reads
+///   only the accelerometer and gyroscope) and used to be a bare `f32` fed by a
+///   hardcoded `25.0` placeholder, which the Live Sensors screen drew as a
+///   measured temperature.
+///
+/// The screen prints `—` for `null`.
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct HostImu {
     pub timestamp_ms: u64,
     pub accel_x: f64,
     pub accel_y: f64,
     pub accel_z: f64,
-    pub gyro_x: f64,
-    pub gyro_y: f64,
-    pub gyro_z: f64,
-    pub temperature_c: f32,
+    pub gyro_x: Option<f64>,
+    pub gyro_y: Option<f64>,
+    pub gyro_z: Option<f64>,
+    pub temperature_c: Option<f32>,
 }
 
 impl From<ImuSample> for HostImu {
@@ -96,12 +118,62 @@ impl From<ImuSample> for HostImu {
             accel_x: s.accel_m_s2.x,
             accel_y: s.accel_m_s2.y,
             accel_z: s.accel_m_s2.z,
-            gyro_x: s.gyro_rad_s.x,
-            gyro_y: s.gyro_rad_s.y,
-            gyro_z: s.gyro_rad_s.z,
+            gyro_x: s.gyro_rad_s.map(|g| g.x),
+            gyro_y: s.gyro_rad_s.map(|g| g.y),
+            gyro_z: s.gyro_rad_s.map(|g| g.z),
             temperature_c: s.temperature_c,
         }
     }
+}
+
+/// Serialisable latest wellness sample (the most recent the glue pushed).
+///
+/// Both readings are `Option` on the wire, preserving the domain's rule: an
+/// absent sensor is `null`, **never** a fabricated `0` (a `0` would read as a
+/// measurement — "no steps today" / "heart stopped"). The Health screen prints
+/// `—` for `null`.
+#[derive(Clone, Copy, Debug, Serialize, PartialEq)]
+pub struct HostVitals {
+    pub timestamp_ms: u64,
+    pub steps_total: Option<f64>,
+    pub heart_rate_bpm: Option<f64>,
+}
+
+impl From<VitalsSample> for HostVitals {
+    fn from(s: VitalsSample) -> Self {
+        Self {
+            timestamp_ms: s.timestamp_ms,
+            steps_total: s.steps_total,
+            heart_rate_bpm: s.heart_rate_bpm,
+        }
+    }
+}
+
+/// **Why** the snapshot's `gnss` block reads the way it does.
+///
+/// This vocabulary exists because `has_fix: false` used to be the answer to four
+/// different questions, and the UI could only say one thing about all of them. In
+/// particular a **failed read** (on a device the usual cause is a missing location
+/// grant — `LocationManager#getLastKnownLocation` throws `SecurityException`) was folded
+/// into the same `false` as "the receiver has not locked yet", so a phone that had never
+/// been granted location showed "searching for a location" forever and nothing on screen
+/// ever contradicted it (REQ-A772 / F-SH-228). Each variant here is a sentence the user
+/// can act on:
+///
+/// * `fix` — a fix is present (see the coordinates/accuracy beside it);
+/// * `searching` — the receiver is on and enabled, but has not locked yet;
+/// * `receiver-off` — the GPS provider is switched off (a setting, not a failure);
+/// * `permission-required` — the read **failed** and no location grant is held;
+/// * `read-failed` — the read **failed** for some other reason (a real error the UI
+///   must not dress up as progress).
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum GnssStatus {
+    Fix,
+    Searching,
+    ReceiverOff,
+    PermissionRequired,
+    ReadFailed,
 }
 
 /// Serialisable GNSS fix when a real `LocationManager` is bound (`bind_android`).
@@ -109,9 +181,43 @@ impl From<ImuSample> for HostImu {
 pub struct HostGnss {
     pub enabled: bool,
     pub has_fix: bool,
+    /// Why this block reads the way it does — see [`GnssStatus`]. `has_fix` is derived
+    /// from it (never set independently) so the two cannot disagree.
+    pub status: GnssStatus,
     pub latitude_deg: f64,
     pub longitude_deg: f64,
     pub accuracy_m: f64,
+}
+
+/// Fold the provider's answer into the snapshot's `gnss` block.
+///
+/// `read` is the provider's own answer and `granted` says whether the OS location grant is
+/// held; the whole point of the function is that **`Err` is not `Ok(None)`**. Kept pure
+/// and target-independent so the five-way distinction is pinned by a host test rather than
+/// only on a device (`read_gnss` itself is `feature = "android"`).
+pub fn host_gnss(
+    enabled: bool,
+    granted: bool,
+    read: Result<Option<amos_sensor::GeoFix>, String>,
+) -> HostGnss {
+    let fix = read.as_ref().ok().and_then(|o| o.as_ref());
+    let status = match (&read, fix) {
+        (Ok(Some(_)), Some(_)) => GnssStatus::Fix,
+        (Ok(_), _) if !enabled => GnssStatus::ReceiverOff,
+        (Ok(_), _) => GnssStatus::Searching,
+        // A failed read with no grant is the permission, and that is the fact the user can
+        // act on; with a grant it is an honest error. Neither is "still searching".
+        (Err(_), _) if !granted => GnssStatus::PermissionRequired,
+        (Err(_), _) => GnssStatus::ReadFailed,
+    };
+    HostGnss {
+        enabled,
+        has_fix: matches!(status, GnssStatus::Fix),
+        status,
+        latitude_deg: fix.map(|f| f.latitude_deg).unwrap_or(0.0),
+        longitude_deg: fix.map(|f| f.longitude_deg).unwrap_or(0.0),
+        accuracy_m: fix.map(|f| f.horizontal_accuracy_m).unwrap_or(0.0),
+    }
 }
 
 /// The Tauri event the System UI broadcasts to the WebView (via
@@ -161,6 +267,8 @@ pub struct SensorHostEvent {
     pub imu: Option<HostImu>,
     /// Set when `kind == "camera_frame"` (metadata only).
     pub frame: Option<HostFrameMeta>,
+    /// Set when `kind == "vitals"` (steps / heart rate).
+    pub vitals: Option<HostVitals>,
     /// Set when `kind == "mode"` — the mode we left.
     pub prev_mode: Option<String>,
 }
@@ -234,6 +342,14 @@ mod android_ctx {
     pub fn provider() -> Option<Arc<amos_sensor::AndroidSensorProvider>> {
         PROV.get().cloned()
     }
+
+    /// Whether a provider is installed (a previous attach won the slot).
+    ///
+    /// The registry's **own** state, so the JNI entry can tell the idempotent
+    /// re-attach from a genuine bind failure without assuming it from `bind`'s `Err`.
+    pub fn is_bound() -> bool {
+        PROV.get().is_some()
+    }
 }
 
 /// JNI entry: `SensorGlue.attachContext(Context)` — an instance `external fun` on
@@ -261,14 +377,136 @@ pub unsafe extern "system" fn Java_com_amos_ai_glue_SensorGlue_attachContext(
         if let Ok(vm) = env.get_java_vm() {
             // The sensor context is what makes GNSS/IMU real; a silent bind failure
             // would leave the snapshot on the mock with no symptom (REQ-A187).
-            if let Err(e) = android_ctx::bind(vm, &env, ctx) {
-                tracing::warn!(
+            // `bind` can also answer `Err` for the **idempotent** re-attach (the Kotlin
+            // `SensorGlue.attach` runs on every `onStart`, and "first caller wins"),
+            // which is not a failure: the provider is installed. The two cases are told
+            // apart by the registry's own state, never assumed from the `Err`
+            // (REQ-A1865 / F-TEL-049).
+            let bound = android_ctx::bind(vm, &env, ctx);
+            match crate::real_dial::attach_outcome(bound.is_err(), android_ctx::is_bound()) {
+                crate::real_dial::AttachOutcome::Attached => tracing::info!(
                     target: "amos::sensor",
-                    error = %e,
+                    "sensor context attached (SensorGlue.attachContext)"
+                ),
+                crate::real_dial::AttachOutcome::AlreadyBound => tracing::debug!(
+                    target: "amos::sensor",
+                    "sensor context already bound — re-attach skipped, GNSS/IMU are real"
+                ),
+                crate::real_dial::AttachOutcome::Failed => tracing::warn!(
+                    target: "amos::sensor",
+                    error = %bound.err().unwrap_or_default(),
                     "sensor context not bound — GNSS/IMU stay on the mock"
-                );
+                ),
             }
         }
+    }
+}
+
+/// JNI entry: `SensorGlue.nativeOnImu(tsMs, ax..az, gx..gz, tempC)` — the
+/// **bounded** IMU upcall the Kotlin skeleton makes for a sample it has already
+/// validated.
+///
+/// This is the honest Rust half of the Gap-3 glue seam: it is **not wired to a
+/// live bus** in this build, so it returns the typed
+/// [`amos_sensor::SensorError::Provider`] from
+/// [`amos_sensor::sim::native_on_imu`]. It never fabricates a sample — a JNI
+/// callback that silently did nothing is exactly the "no data but looks alive"
+/// failure mode the audit forbids (P0-3). The refusal is logged once per call so
+/// a device bring-up with the wrong producer is visible rather than silent.
+///
+/// # Safety
+/// `env`/`this` are the standard JNI instance-method arguments and must be valid
+/// for the call.
+#[cfg(feature = "android")]
+#[no_mangle]
+pub unsafe extern "system" fn Java_com_amos_ai_glue_SensorGlue_nativeOnImu(
+    _env: *mut jni::sys::JNIEnv,
+    _this: jni::sys::jobject,
+    ts_ms: i64,
+    _ax: f32,
+    _ay: f32,
+    _az: f32,
+    _gx: f32,
+    _gy: f32,
+    _gz: f32,
+    _temp_c: f32,
+) {
+    if let Err(e) = amos_sensor::sim::native_on_imu() {
+        tracing::warn!(
+            target: "amos::sensor",
+            ts_ms,
+            error = %e,
+            "SensorGlue.nativeOnImu upcall not wired"
+        );
+    }
+}
+
+/// JNI entry: `SensorGlue.nativeOnCamera(cameraId, width, height, format, fps,
+/// bytes)` — the **bounded** camera upcall. The `bytes` array length is bounded
+/// against [`MAX_FRAME_BYTES`] first (an oversize payload is refused as invalid
+/// arguments without touching the pixel data), then the upcall reports the same
+/// honest "not wired" typed error. It never stores or returns a frame.
+///
+/// # Safety
+/// `env`/`this` are the standard JNI instance-method arguments and must be valid
+/// for the call; `bytes` is a JVM-supplied local reference live for the call.
+#[cfg(feature = "android")]
+#[no_mangle]
+pub unsafe extern "system" fn Java_com_amos_ai_glue_SensorGlue_nativeOnCamera(
+    env: *mut jni::sys::JNIEnv,
+    _this: jni::sys::jobject,
+    camera_id: i32,
+    _width: i32,
+    _height: i32,
+    _format: i32,
+    _fps: i32,
+    bytes: jni::sys::jbyteArray,
+) {
+    if env.is_null() || bytes.is_null() {
+        return;
+    }
+    // One `unsafe` block for the whole borrow: `env` is the JVM-supplied JNIEnv*
+    // of this native call and `bytes` a live local ref for its duration, so
+    // wrapping the array reference is a local, bounded operation. The length is
+    // read here and nowhere else; the pixel data is never dereferenced by Rust.
+    //
+    // SAFETY: both raw handles come from the JVM for this call and stay valid
+    // until it returns; neither is stored or sent elsewhere.
+    let (env, arr) = {
+        // SAFETY: both raw handles are supplied by the JVM for this call and stay
+        // valid until it returns; neither is stored or sent anywhere else, and the
+        // array's pixel data is never dereferenced by Rust.
+        unsafe {
+            (
+                jni::JNIEnv::from_raw(env),
+                jni::objects::JByteArray::from_raw(bytes),
+            )
+        }
+    };
+    let Ok(env) = env else {
+        return;
+    };
+    let payload_len = match env.get_array_length(&arr) {
+        Ok(n) if n >= 0 => n as usize,
+        Ok(_) => return,
+        Err(e) => {
+            tracing::warn!(
+                target: "amos::camera",
+                camera_id,
+                error = %e,
+                "SensorGlue.nativeOnCamera could not read the payload length"
+            );
+            return;
+        }
+    };
+    if let Err(e) = amos_sensor::sim::native_on_camera(payload_len) {
+        tracing::warn!(
+            target: "amos::camera",
+            camera_id,
+            payload_len,
+            error = %e,
+            "SensorGlue.nativeOnCamera upcall not wired"
+        );
     }
 }
 
@@ -280,6 +518,9 @@ pub struct SensorHostSnapshot {
     pub cameras: Vec<HostCamera>,
     pub gnss: Option<HostGnss>,
     pub imu: Option<HostImu>,
+    /// Latest wellness sample (steps / heart rate), absent until a producer pushes.
+    #[serde(default)]
+    pub vitals: Option<HostVitals>,
     /// Energy-gated "would a continuous `kind`@`hz` stream be granted?" hint.
     pub stream_gate: StreamGate,
     /// Recently completed video clips (metadata only).
@@ -349,6 +590,7 @@ impl SensorHost {
                     mode,
                     imu: Some(HostImu::from(*s)),
                     frame: None,
+                    vitals: None,
                     prev_mode: None,
                 },
                 StreamChange::Frame(f) => SensorHostEvent {
@@ -358,6 +600,17 @@ impl SensorHost {
                     mode,
                     imu: None,
                     frame: Some(HostFrameMeta::from(f)),
+                    vitals: None,
+                    prev_mode: None,
+                },
+                StreamChange::Vitals(v) => SensorHostEvent {
+                    ts_ms,
+                    kind: "vitals".to_string(),
+                    backend,
+                    mode,
+                    imu: None,
+                    frame: None,
+                    vitals: Some(HostVitals::from(*v)),
                     prev_mode: None,
                 },
                 StreamChange::Cleared => SensorHostEvent {
@@ -367,6 +620,7 @@ impl SensorHost {
                     mode,
                     imu: None,
                     frame: None,
+                    vitals: None,
                     prev_mode: None,
                 },
             };
@@ -454,16 +708,30 @@ impl SensorHost {
             mode: mode.key().to_string(),
             imu: None,
             frame: None,
+            vitals: None,
             prev_mode: Some(prev.key().to_string()),
         });
     }
 
     /// Push the newest IMU sample from `[x,y,z]` accel/gyro (WebView / host friendly).
-    pub fn record_imu_values(&self, accel: [f64; 3], gyro: [f64; 3], temperature_c: f32) {
+    ///
+    /// `gyro` and `temperature_c` are `Option`: a producer that has no gyroscope
+    /// (or no die-temperature source) passes `None` and the snapshot reports
+    /// `null` for it — the seam does **not** default to `0` (nor to a
+    /// room-temperature placeholder). A die temperature or angular rate nothing
+    /// measured must stay unknown, and the screen prints `—` for it. This is the
+    /// same contract the sibling `sensor_host_record_vitals` command states for
+    /// its two scalars.
+    pub fn record_imu_values(
+        &self,
+        accel: [f64; 3],
+        gyro: Option<[f64; 3]>,
+        temperature_c: Option<f32>,
+    ) {
         let sample = ImuSample::new(
             now_ms(),
             Vec3::new(accel[0], accel[1], accel[2]),
-            Vec3::new(gyro[0], gyro[1], gyro[2]),
+            gyro.map(|g| Vec3::new(g[0], g[1], g[2])),
             temperature_c,
         );
         self.bus.record_imu(sample);
@@ -508,6 +776,19 @@ impl SensorHost {
         self.bus.imu_store().latest()
     }
 
+    /// Push the newest wellness sample (cumulative steps / heart rate). A reading
+    /// passed as `None` is stored as absent — the caller must not substitute a
+    /// fabricated `0`.
+    pub fn record_vitals(&self, steps_total: Option<f64>, heart_rate_bpm: Option<f64>) {
+        self.bus
+            .record_vitals(VitalsSample::new(now_ms(), steps_total, heart_rate_bpm));
+    }
+
+    /// The most recent wellness sample, if the glue has pushed one.
+    pub fn latest_vitals(&self) -> Option<VitalsSample> {
+        self.bus.vitals_store().latest()
+    }
+
     /// Record a completed video clip's metadata so the snapshot can surface it.
     pub fn record_video_clip(&self, clip: HostVideoClip) {
         if let Ok(mut guard) = self.video_clips.lock() {
@@ -538,6 +819,7 @@ impl SensorHost {
             .collect();
         let gnss = self.read_gnss();
         let imu = self.latest_imu().map(HostImu::from);
+        let vitals = self.latest_vitals().map(HostVitals::from);
         let gate = self.acquire_gate("imu", 100);
         let video_clips = self.video_clips();
         SensorHostSnapshot {
@@ -546,6 +828,7 @@ impl SensorHost {
             cameras,
             gnss,
             imu,
+            vitals,
             stream_gate: gate,
             video_clips,
         }
@@ -607,14 +890,19 @@ impl SensorHost {
         let guard = self.gnss.lock().unwrap_or_else(|p| p.into_inner());
         let provider = guard.as_ref()?;
         let enabled = provider.gnss_enabled();
-        let fix = provider.gnss_fix().ok().flatten();
-        Some(HostGnss {
+        // The `Result` is passed through intact: `.ok().flatten()` here is what used to
+        // turn a `SecurityException` (no location grant) into `has_fix: false`, i.e. into
+        // "still searching" — see `host_gnss`.
+        Some(host_gnss(
             enabled,
-            has_fix: fix.is_some(),
-            latitude_deg: fix.map(|f| f.latitude_deg).unwrap_or(0.0),
-            longitude_deg: fix.map(|f| f.longitude_deg).unwrap_or(0.0),
-            accuracy_m: fix.map(|f| f.horizontal_accuracy_m).unwrap_or(0.0),
-        })
+            crate::location_permission::grant_held(),
+            // REQ-A874 / F-SH-282: `host_gnss` reads only `Err(_)` vs `Ok` — it never inspects
+            // the error, so the wire type is `String` to keep the seam target-independent. Map
+            // the provider's own `SensorError` (which is `Display`) rather than widening the
+            // parameter: this call site is `cfg(feature = "android")`, so for 13 hours a type
+            // error here compiled nowhere the default-feature gates could see it.
+            provider.gnss_fix().map_err(|e| e.to_string()),
+        ))
     }
 
     /// If a Kotlin context has been attached but the real provider is not built yet,
@@ -684,14 +972,36 @@ pub fn sensor_host_set_mode(host: State<'_, SensorHost>, mode: String) -> Result
 }
 
 /// Tauri command: push the newest IMU sample (host/dev + glue-harness friendly).
+///
+/// `gyro` and `temperature_c` are `Option`: a gyroscope-less producer passes
+/// `null` for the rate and a die temperature nothing measured is sent as `null`,
+/// so both stay unknown — the command does not fill in a plausible default
+/// (neither `Vec3::ZERO` nor room temperature).
 #[tauri::command]
 pub fn sensor_host_record_imu(
     host: State<'_, SensorHost>,
     accel: [f64; 3],
-    gyro: [f64; 3],
-    temperature_c: f32,
+    gyro: Option<[f64; 3]>,
+    temperature_c: Option<f32>,
 ) -> Result<(), String> {
     host.record_imu_values(accel, gyro, temperature_c);
+    Ok(())
+}
+
+/// Tauri command: push the newest wellness sample (cumulative steps / heart rate).
+///
+/// Both arguments are `Option`, and a missing reading must be sent as `null` — the
+/// seam does **not** default to `0`. A `0` here is a real reading (a still device,
+/// a step counter that has not advanced), so coercing an absent reading to `0`
+/// would fabricate a measurement. This is also the host-feeder path for the Health
+/// screen's live tile on builds without the Android step/heart-rate glue.
+#[tauri::command]
+pub fn sensor_host_record_vitals(
+    host: State<'_, SensorHost>,
+    steps_total: Option<f64>,
+    heart_rate_bpm: Option<f64>,
+) -> Result<(), String> {
+    host.record_vitals(steps_total, heart_rate_bpm);
     Ok(())
 }
 
@@ -819,13 +1129,61 @@ mod tests {
             .record_frame_bytes(0, 16, 16, "yuv", 30, vec![0u8; 1024])
             .is_err());
 
-        h.record_imu_values([0.1, -9.8, 0.2], [0.0, 0.0, 0.0], 36.5);
+        h.record_imu_values([0.1, -9.8, 0.2], Some([0.0, 0.0, 0.0]), Some(36.5));
         let snap = h.snapshot();
         assert_eq!(snap.cameras.len(), 2);
         assert_eq!(snap.cameras[0].format, "rgba8");
         let imu = snap.imu.expect("imu pushed");
         assert!((imu.accel_y + 9.8).abs() < 1e-6);
-        assert!((imu.temperature_c - 36.5).abs() < 1e-6);
+        assert_eq!(imu.temperature_c, Some(36.5));
+    }
+
+    /// A die temperature nobody measured stays `None` — the host must not fill
+    /// the gap with a plausible default, and the axes must not be lost to it.
+    #[test]
+    fn an_absent_die_temperature_stays_unknown_on_the_host_wire() {
+        let h = SensorHost::new();
+        h.record_imu_values([0.1, -9.8, 0.2], Some([0.0, 0.0, 0.0]), None);
+        let imu = h.snapshot().imu.expect("imu pushed");
+        assert_eq!(imu.temperature_c, None);
+        // The sample is otherwise complete — "no die temperature" is not
+        // "no sample".
+        assert!((imu.accel_y + 9.8).abs() < 1e-6);
+
+        // Positive control: a real reading survives, so "always None" fails.
+        h.record_imu_values([0.1, -9.8, 0.2], Some([0.0, 0.0, 0.0]), Some(41.0));
+        assert_eq!(h.snapshot().imu.unwrap().temperature_c, Some(41.0));
+    }
+
+    /// A gyroscope-less sample serialises its absent angular rate as `null` — the
+    /// sibling contract to the die temperature above, and the one
+    /// `sensor_host_snapshot` broke on the field S5: it reported `gyro_x: 0` —
+    /// the measurement "not rotating" — for a rate the device has no sensor for,
+    /// while `temperature_c` beside it was honestly `null` (REQ-A1872 /
+    /// F-SEN-008).
+    #[test]
+    fn a_gyroscope_less_sample_serialises_its_absent_rate_as_null() {
+        let h = SensorHost::new();
+        h.record_imu_values([0.1, -9.8, 0.2], None, Some(36.5));
+        let json = serde_json::to_value(h.snapshot().imu.expect("imu pushed"))
+            .expect("HostImu is serialisable");
+        assert_eq!(json["gyro_x"], serde_json::Value::Null);
+        assert_eq!(json["gyro_y"], serde_json::Value::Null);
+        assert_eq!(json["gyro_z"], serde_json::Value::Null);
+        // The acceleration survives: "no gyroscope" is not "no sample".
+        assert!(
+            json["accel_y"]
+                .as_f64()
+                .is_some_and(|v| (v + 9.8).abs() < 1e-6),
+            "the accelerometer reading must not be lost to a missing gyroscope"
+        );
+
+        // Positive control: a measured rate serialises as a number, so "always
+        // null" cannot pass the assertions above.
+        h.record_imu_values([0.1, -9.8, 0.2], Some([0.01, -0.02, 0.03]), Some(36.5));
+        let json = serde_json::to_value(h.snapshot().imu.unwrap()).unwrap();
+        assert_eq!(json["gyro_x"], serde_json::json!(0.01));
+        assert_eq!(json["gyro_z"], serde_json::json!(0.03));
     }
 
     #[test]
@@ -877,7 +1235,7 @@ mod tests {
         // A valid 16x16 RGBA8 frame (1024 bytes) → camera_frame event.
         h.record_frame_bytes(0, 16, 16, "rgba8", 30, vec![9u8; 1024])
             .unwrap();
-        h.record_imu_values([0.0, -9.8, 0.0], [0.0, 0.0, 0.0], 36.5);
+        h.record_imu_values([0.0, -9.8, 0.0], Some([0.0, 0.0, 0.0]), Some(36.5));
 
         let got = seen.lock().unwrap_or_else(|g| g.into_inner());
         assert_eq!(got.len(), 2, "one frame + one imu event");
@@ -931,9 +1289,428 @@ mod tests {
         // A fresh host with no installed notifier must not panic when samples land.
         let h = SensorHost::new();
         h.set_cameras(vec![cam(0)]);
-        h.record_imu_values([0.0, -9.8, 0.0], [0.0, 0.0, 0.0], 30.0);
+        h.record_imu_values([0.0, -9.8, 0.0], Some([0.0, 0.0, 0.0]), Some(30.0));
         h.record_frame_bytes(0, 16, 16, "rgba8", 30, vec![9u8; 1024])
             .unwrap();
         h.set_mode(SensorMode::PowerSave);
+    }
+
+    #[test]
+    fn frame_ceiling_is_the_one_shared_16_mib_value() {
+        // The host command seam and the sensor bus agree on a single ceiling; a
+        // divergence here is a silent accept/refuse mismatch. The *third* party
+        // named in the doc comment — the Kotlin glue — is text, not Rust, so it
+        // is pinned separately by `the_glue_frame_ceiling_is_pinned_to_the_kotlin_source`.
+        assert_eq!(MAX_FRAME_BYTES, amos_sensor::GLUE_MAX_FRAME_BYTES);
+        assert_eq!(MAX_FRAME_BYTES, 16 << 20);
+        assert_eq!(amos_sensor::MAX_FRAME_BYTES, 16 * 1024 * 1024);
+        // A payload one byte over that ceiling is refused at the command seam.
+        let h = SensorHost::new();
+        h.set_cameras(vec![cam(0)]);
+        assert!(h
+            .record_frame_bytes(0, 16, 16, "rgba8", 30, vec![0u8; MAX_FRAME_BYTES + 1])
+            .is_err());
+    }
+
+    /// Evaluate the RHS of a Kotlin `val NAME = <int>` declaration from source
+    /// text, where the RHS is a product of integer literals (Kotlin writes the
+    /// ceiling as `16 * 1024 * 1024`). `_` digit separators and a trailing `//`
+    /// comment are tolerated; anything else (calls, references, hex) yields
+    /// `None` so the binding fails loudly rather than guessing.
+    fn kt_int_product(src: &str, name: &str) -> Option<u64> {
+        let needle = format!("val {name} =");
+        let rest = &src[src.find(&needle)? + needle.len()..];
+        let line = rest.lines().next()?.split("//").next().unwrap_or("").trim();
+        let mut product: u64 = 1;
+        let mut saw = false;
+        for tok in line.split('*') {
+            let t = tok.trim().replace('_', "");
+            product = product.checked_mul(t.parse().ok()?)?;
+            saw = true;
+        }
+        saw.then_some(product)
+    }
+
+    /// Return the source text of the Kotlin function whose signature begins with
+    /// `sig` (e.g. `"fun pushImuSample("`), from that point through the brace
+    /// that closes its body. `None` when the signature is absent, so a renamed
+    /// or deleted function fails loudly. Nested braces — including Kotlin string
+    /// templates like `${t.javaClass.simpleName}`, whose `{`/`}` balance — are
+    /// counted, not naively truncated at the first `}`.
+    fn kt_function_body<'a>(source: &'a str, sig: &str) -> Option<&'a str> {
+        let rest = &source[source.find(sig)?..];
+        let mut depth = 0usize;
+        let mut saw_open = false;
+        for (i, ch) in rest.char_indices() {
+            match ch {
+                '{' => {
+                    depth += 1;
+                    saw_open = true;
+                }
+                '}' => {
+                    depth -= 1;
+                    if saw_open && depth == 0 {
+                        return Some(&rest[..=i]);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn the_glue_frame_ceiling_is_pinned_to_the_kotlin_source() {
+        // `SensorGlue.kt` declares `private val MAX_FRAME_BYTES = 16 * 1024 * 1024`
+        // and refuses any larger frame *before* the `nativeOnCamera` upcall. That
+        // text was bound to nothing: raising it above the Rust ceiling makes Rust
+        // refuse an upcall Kotlin already accepted (a wasted rejection), but
+        // *lowering* it drops frames Rust would happily take — silently, with the
+        // Rust test above still green because it never reads the Kotlin. This test
+        // is the missing third leg of `MAX_FRAME_BYTES`.
+        const KOTLIN: &str = include_str!("../android-glue/com/amos/ai/glue/SensorGlue.kt");
+        let glue = kt_int_product(KOTLIN, "MAX_FRAME_BYTES")
+            .expect("SensorGlue.kt must declare `val MAX_FRAME_BYTES = <int product>`");
+        assert_eq!(
+            glue as usize, MAX_FRAME_BYTES,
+            "SensorGlue.kt MAX_FRAME_BYTES ({glue}) drifted from sensor_host::MAX_FRAME_BYTES ({MAX_FRAME_BYTES})"
+        );
+    }
+
+    #[test]
+    fn the_glue_reports_an_absent_die_temperature_as_nan_not_a_plausible_number() {
+        // `SensorGlue.kt` reads only `TYPE_ACCELEROMETER` / `TYPE_GYROSCOPE`, and
+        // Android has no die-temperature sensor behind either — so the honest value
+        // is "no reading". The glue states that with `Float.NaN`, which the Rust
+        // seam (`android_glue::die_temp_c`) decodes to `None`. It used to send a
+        // hardcoded `25.0f`: a *plausible* number nothing measured, which is worse
+        // than an obvious sentinel because no reader can tell it from a real
+        // reading. This pins the Kotlin half so the placeholder cannot come back.
+        const KOTLIN: &str = include_str!("../android-glue/com/amos/ai/glue/SensorGlue.kt");
+        // Assert on the *declaration line*, not the whole file: the prose above it is
+        // free to name the old `25.0f` it replaced.
+        let decl = KOTLIN
+            .lines()
+            .find(|l| l.contains("NO_DIE_TEMP_C ="))
+            .expect("SensorGlue.kt must declare NO_DIE_TEMP_C");
+        assert!(
+            decl.contains("Float.NaN"),
+            "the glue's absent die temperature must be the NaN sentinel, got: {decl}"
+        );
+        // The old fabricated constant must be gone, not merely shadowed.
+        assert!(
+            !KOTLIN.contains("DEFAULT_DIE_TEMP_C"),
+            "SensorGlue.kt still declares the fabricated DEFAULT_DIE_TEMP_C"
+        );
+        // Both upcall sites state the sentinel (the accel branch and the gyro branch).
+        assert_eq!(
+            KOTLIN.matches("NO_DIE_TEMP_C,").count(),
+            2,
+            "both recordImu call sites must pass NO_DIE_TEMP_C"
+        );
+    }
+
+    /// The sibling of the die-temperature pin above, for the gyroscope axes.
+    ///
+    /// `SensorGlue.kt`'s accelerometer branch used to pass a hardcoded zero
+    /// triple in the gyro slots, so on a device with no gyroscope (the field S5,
+    /// `dumpsys sensorservice`: `geomag fusion (no gyro)`) every sample carried
+    /// the measurement "not rotating" onto the wire — while the die temperature
+    /// on the same sample was honestly the NaN sentinel. This pins the Kotlin
+    /// half so the fabricated zero cannot come back (REQ-A1872 / F-SEN-008).
+    ///
+    /// This is the compilable red-first for the change: the assertions read the
+    /// Kotlin *source text*, so they fail before the glue is edited and pass
+    /// after — a type-widening in the Rust seam has no red-first of its own.
+    #[test]
+    fn the_glue_pairs_an_accel_sample_with_the_last_gyro_not_a_fabricated_zero() {
+        const KOTLIN: &str = include_str!("../android-glue/com/amos/ai/glue/SensorGlue.kt");
+        let accel = kt_function_body(KOTLIN, "Sensor.TYPE_ACCELEROMETER ->")
+            .expect("SensorGlue.kt must handle TYPE_ACCELEROMETER");
+        // The fabricated zero must be gone from the branch body (the message text
+        // quotes the old form, so this asserts on the extracted arm, not the file).
+        assert!(
+            !accel.contains("0f, 0f, 0f"),
+            "the accel branch still fabricates a zero angular rate, got: {accel}"
+        );
+        // ...replaced by the mirrored gyro readings.
+        assert!(
+            accel.contains("lastGyroX, lastGyroY, lastGyroZ"),
+            "the accel branch must pair the last gyro reading, got: {accel}"
+        );
+        // The mirrors must start at the NaN "no reading" sentinel, so a
+        // gyroscope-less device reports *absent* rather than `0`.
+        for f in ["lastGyroX", "lastGyroY", "lastGyroZ"] {
+            let decl = KOTLIN
+                .lines()
+                .find(|l| l.contains(&format!("private var {f} =")))
+                .unwrap_or_else(|| panic!("SensorGlue.kt must declare {f}"));
+            assert!(
+                decl.contains("Float.NaN"),
+                "{f} must start at the NaN sentinel, got: {decl}"
+            );
+        }
+        // The gyro branch must set them, or the pairing above is always absent.
+        let gyro = kt_function_body(KOTLIN, "Sensor.TYPE_GYROSCOPE ->")
+            .expect("SensorGlue.kt must handle TYPE_GYROSCOPE");
+        assert!(
+            gyro.contains("lastGyroX = event.values[0]"),
+            "the gyro branch must mirror its reading, got: {gyro}"
+        );
+    }
+
+    #[test]
+    fn the_glue_optional_temperature_does_not_gate_a_good_imu_sample() {
+        // The Rust half of this seam already states the rule, as a test:
+        // `android_glue::decode_imu` keeps a sample whose *temperature* is the
+        // `NaN` "no reading" sentinel — "a NaN temperature is not grounds to
+        // drop a sample with good axes" — and decodes it to `None`.
+        //
+        // The Kotlin half must agree. `pushImuSample` is the *recommended* entry
+        // point ("Prefer [pushImuSample], which validates first") and it takes
+        // the die temperature as a parameter the caller is told it may leave
+        // absent (`NO_DIE_TEMP_C = Float.NaN`: Android has no die-temperature
+        // source behind the accelerometer/gyro). A whole-sample finiteness gate
+        // that also tests `tempC` makes the glue's own sentinel un-sendable
+        // through the path the file recommends — the honest value is refused
+        // before it can reach the seam that knows how to decode it. Only the six
+        // motion components may gate the sample.
+        const KOTLIN: &str = include_str!("../android-glue/com/amos/ai/glue/SensorGlue.kt");
+        let body = kt_function_body(KOTLIN, "fun pushImuSample(")
+            .expect("SensorGlue.kt must declare `fun pushImuSample(`");
+        // Each axis must still be gated — otherwise "delete the guard" would
+        // pass the assertion below, and a NaN axis (which poisons every derived
+        // orientation) would ride through.
+        for axis in ["ax", "ay", "az", "gx", "gy", "gz"] {
+            assert!(
+                body.contains(&format!("isFinite({axis})")),
+                "pushImuSample must still refuse a non-finite axis ({axis}); body was:\n{body}"
+            );
+        }
+        // ...but the optional scalar must not.
+        assert!(
+            !body.contains("isFinite(tempC)"),
+            "pushImuSample gates the whole sample on the optional die temperature, \
+             so the glue's own `NO_DIE_TEMP_C = Float.NaN` sentinel would be \
+             refused through the recommended path; body was:\n{body}"
+        );
+    }
+
+    /// The glue's wellness registration must be **retryable**, because `attach()` is
+    /// the only place it is attempted and it is called more than once per session.
+    ///
+    /// The step counter needs the `ACTIVITY_RECOGNITION` runtime grant and the heart
+    /// rate needs `BODY_SENSORS`; `registerListener` refuses a sensor whose permission
+    /// is missing with a `SecurityException`. On a cold start that grant is usually
+    /// still *pending* — `MainActivity.onStart` calls `AmosGlue.onStart` before the
+    /// dialog is answered — and the retry the glue gets is the **second**
+    /// `AmosGlue.onStart`, fired from `onRequestPermissionsResult` once the user taps
+    /// Allow. `attach()` used to open with `if (attached) return` and then set
+    /// `attached = true` **whatever the wellness registration did**, so that second
+    /// call was skipped and the step counter stayed unregistered for the rest of the
+    /// session — the Health screen drew no steps until the process was restarted.
+    ///
+    /// Observed on a S5 / Android 14 (REQ-A1863): the same process logged no
+    /// `STEP_COUNTER (0x13)` registration while the grant was pending and **still none
+    /// after it was granted**, while a fresh process (the grant now held at boot)
+    /// registered 0x13 immediately.
+    #[test]
+    fn the_glue_retries_its_wellness_registration_on_a_later_attach() {
+        const KOTLIN: &str = include_str!("../android-glue/com/amos/ai/glue/SensorGlue.kt");
+        let attach = kt_function_body(KOTLIN, "fun attach(")
+            .expect("SensorGlue.kt must declare `fun attach(`");
+        // The latch. An attach pass that short-circuits on `attached` can never retry
+        // the wellness registration, which is the whole of the retry hook.
+        assert!(
+            !attach.contains("if (attached)"),
+            "attach() still short-circuits when already attached, so a wellness \
+             registration refused before the permission was granted is never \
+             retried; attach() body was:\n{attach}"
+        );
+        // ...and the attempt must really live in `attach()` — the function the second
+        // `AmosGlue.onStart` reaches.
+        assert!(
+            attach.contains("registerWellness("),
+            "attach() must attempt the wellness registration; body was:\n{attach}"
+        );
+        // The registration is its own step so a *later* attach can redo it: an
+        // inlined attempt behind the one-shot guard would pass the two checks above
+        // while staying unretryable.
+        let reg = kt_function_body(KOTLIN, "fun registerWellness(").expect(
+            "SensorGlue.kt must declare `fun registerWellness(` — the retryable \
+             registration step attach() calls",
+        );
+        for (flag, sensor) in [
+            ("stepCounterRegistered", "TYPE_STEP_COUNTER"),
+            ("heartRateRegistered", "TYPE_HEART_RATE"),
+        ] {
+            assert!(
+                reg.contains(sensor),
+                "registerWellness must still attempt {sensor}; body was:\n{reg}"
+            );
+            assert!(
+                reg.contains(flag),
+                "registerWellness must record the {sensor} outcome in `{flag}`; \
+                 body was:\n{reg}"
+            );
+        }
+        // `detach()` unregisters the listeners, so the bookkeeping must be cleared
+        // with them — otherwise a re-attach would believe a dead listener is live and
+        // skip the one registration path that can bring it back.
+        let detach = kt_function_body(KOTLIN, "fun detach(")
+            .expect("SensorGlue.kt must declare `fun detach(`");
+        for flag in ["stepCounterRegistered", "heartRateRegistered"] {
+            assert!(
+                detach.contains(&format!("{flag} = false")),
+                "detach() must clear `{flag}`: it unregisters the listeners, and a \
+                 stale `true` would make the next attach skip the re-registration; \
+                 detach() body was:\n{detach}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_glue_upcall_half_is_honest_and_never_fabricates() {
+        // The Rust half of the Kotlin `nativeOnImu` / `nativeOnCamera` upcalls is
+        // not wired in this build: it must refuse with a typed error rather than
+        // accept, so a caller can never mistake "no glue" for "data arrived".
+        assert!(matches!(
+            amos_sensor::sim::native_on_imu(),
+            Err(amos_sensor::SensorError::Provider(_))
+        ));
+        assert!(matches!(
+            amos_sensor::sim::native_on_camera(1024),
+            Err(amos_sensor::SensorError::Provider(_))
+        ));
+        // The payload ceiling is enforced *before* the honest refusal.
+        assert!(matches!(
+            amos_sensor::sim::native_on_camera(MAX_FRAME_BYTES + 1),
+            Err(amos_sensor::SensorError::InvalidArguments(_))
+        ));
+
+        // A host that never saw a push reports no IMU and no frame — the same
+        // honest emptiness, now asserted at the Tauri-facing snapshot.
+        let h = SensorHost::new();
+        assert_eq!(h.snapshot().imu, None);
+        assert!(h.latest_imu().is_none());
+    }
+
+    /// A fix is reported as `fix`, with the coordinates carried through unchanged.
+    #[test]
+    fn a_locked_receiver_reports_fix() {
+        let g = host_gnss(true, true, Ok(Some(geo(39.9042, 116.4074, 8.0))));
+        assert_eq!(g.status, GnssStatus::Fix);
+        assert!(g.has_fix);
+        assert_eq!(g.latitude_deg, 39.9042);
+        assert_eq!(g.longitude_deg, 116.4074);
+        assert_eq!(g.accuracy_m, 8.0);
+    }
+
+    /// **The defect this round closes (REQ-A772 / F-SH-228).** A *failed* read with no
+    /// location grant is `permission-required`, **not** `searching`: the two used to be
+    /// the same `has_fix: false`, which is why a device that had never been granted
+    /// location showed a spinner that could not resolve.
+    #[test]
+    fn a_failed_read_without_a_grant_is_not_searching() {
+        let denied = host_gnss(
+            true,
+            false,
+            Err("SecurityException: no location grant".into()),
+        );
+        assert_eq!(denied.status, GnssStatus::PermissionRequired);
+        assert!(!denied.has_fix);
+        assert_ne!(denied.status, GnssStatus::Searching);
+
+        // Same read, same failure, but the grant *is* held: that is a real error, and it is
+        // still not progress — an error must never be dressed up as "searching".
+        let broken = host_gnss(true, true, Err("LocationManager unavailable".into()));
+        assert_eq!(broken.status, GnssStatus::ReadFailed);
+        assert_ne!(broken.status, GnssStatus::Searching);
+        assert_ne!(denied.status, broken.status);
+    }
+
+    /// The three *non-failure* no-fix states stay distinct from each other.
+    #[test]
+    fn the_no_fix_states_are_distinct() {
+        // Receiver on, no lock yet.
+        assert_eq!(
+            host_gnss(true, true, Ok(None)).status,
+            GnssStatus::Searching
+        );
+        // The provider is switched off — a setting, not a failure, and not "denied" either.
+        assert_eq!(
+            host_gnss(false, true, Ok(None)).status,
+            GnssStatus::ReceiverOff
+        );
+        // A receiver that is off AND ungranted is still reported as off: the setting is the
+        // fact the user set, and "off" already explains the missing fix.
+        assert_eq!(
+            host_gnss(false, false, Ok(None)).status,
+            GnssStatus::ReceiverOff
+        );
+    }
+
+    /// `has_fix` is derived from `status`, so the two can never disagree — for every one of
+    /// the five states, in every combination of inputs the fold can see.
+    #[test]
+    fn has_fix_never_contradicts_status() {
+        let reads = [
+            Ok(Some(geo(1.0, 2.0, 3.0))),
+            Ok(None),
+            Err("boom".to_string()),
+        ];
+        for enabled in [true, false] {
+            for granted in [true, false] {
+                for read in &reads {
+                    let g = host_gnss(enabled, granted, read.clone());
+                    assert_eq!(
+                        g.has_fix,
+                        g.status == GnssStatus::Fix,
+                        "has_fix disagreed with status for enabled={enabled} granted={granted}"
+                    );
+                    // Nothing but a real fix may carry coordinates: an ungranted or failed
+                    // read must never leave the previous numbers (or a fabricated 0,0) behind
+                    // looking like a place.
+                    if g.status != GnssStatus::Fix {
+                        assert_eq!(
+                            (g.latitude_deg, g.longitude_deg, g.accuracy_m),
+                            (0.0, 0.0, 0.0)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The wire vocabulary the frontend branches on (`gps.ts`), pinned so a rename on
+    /// either side is a red rather than a silently unhandled state.
+    #[test]
+    fn gnss_status_wire_spellings_are_stable() {
+        let all = [
+            (GnssStatus::Fix, "fix"),
+            (GnssStatus::Searching, "searching"),
+            (GnssStatus::ReceiverOff, "receiver-off"),
+            (GnssStatus::PermissionRequired, "permission-required"),
+            (GnssStatus::ReadFailed, "read-failed"),
+        ];
+        for (status, wire) in all {
+            assert_eq!(
+                serde_json::to_value(status).expect("serialisable"),
+                serde_json::json!(wire)
+            );
+        }
+    }
+
+    /// A `GeoFix` with only the fields this module reads set.
+    fn geo(lat: f64, lon: f64, accuracy_m: f64) -> amos_sensor::GeoFix {
+        amos_sensor::GeoFix {
+            latitude_deg: lat,
+            longitude_deg: lon,
+            altitude_m: 0.0,
+            horizontal_accuracy_m: accuracy_m,
+            fix_mode: amos_sensor::FixMode::ThreeDim,
+            satellites_in_view: 9,
+            timestamp_ms: 0,
+        }
     }
 }

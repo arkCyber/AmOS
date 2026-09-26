@@ -31,6 +31,23 @@ async fn connect(
     Ok(AiAgentClient::new(channel))
 }
 
+/// Pin the deterministic mock engines for the whole test binary.
+///
+/// These tests exercise the bidi `Chat` transport (prompt → stream, audio → turn,
+/// Cancel), not any model. With no GGUF/sherpa model staged, the daemon's unset
+/// default is now an honest `unconfigured` engine (Gap 4) that answers nothing, so
+/// the mock has to be requested **explicitly** — the same posture the daemon's own
+/// `AMOS_BACKEND=mock` dev path takes. `Once` makes the process-global env write
+/// race-free: every caller blocks until the first one has set it.
+fn use_mock_backend() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        std::env::set_var("AMOS_BACKEND", "mock");
+        std::env::set_var("AMOS_ASR_BACKEND", "mock");
+    });
+}
+
 async fn wait_for_socket(path: &std::path::Path) {
     for _ in 0..50 {
         if path.exists() {
@@ -83,6 +100,7 @@ async fn bidi_chat_prompt_streams_tokens_then_done() {
     let path: PathBuf = std::env::temp_dir().join(format!("amos-bidi-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&path);
 
+    use_mock_backend();
     let server_path = path.clone();
     let server = tokio::spawn(async move {
         amos_ai::server::serve(server_path).await.unwrap();
@@ -112,6 +130,7 @@ async fn bidi_chat_semantic_intent_returns_ui_card() {
     let path: PathBuf = std::env::temp_dir().join(format!("amos-card-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&path);
 
+    use_mock_backend();
     let server_path = path.clone();
     let server = tokio::spawn(async move {
         amos_ai::server::serve(server_path).await.unwrap();
@@ -160,6 +179,7 @@ async fn bidi_chat_audio_is_acknowledged() {
         std::env::temp_dir().join(format!("amos-audio-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&path);
 
+    use_mock_backend();
     let server_path = path.clone();
     let server = tokio::spawn(async move {
         amos_ai::server::serve(server_path).await.unwrap();
@@ -196,6 +216,7 @@ async fn bidi_chat_audio_end_finalizes_a_short_utterance() {
         std::env::temp_dir().join(format!("amos-audio-end-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&path);
 
+    use_mock_backend();
     let server_path = path.clone();
     let server = tokio::spawn(async move {
         amos_ai::server::serve(server_path).await.unwrap();
@@ -237,6 +258,7 @@ async fn stray_audio_end_does_not_wedge_and_text_prompt_still_answers() {
         std::env::temp_dir().join(format!("amos-audio-end-stray-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&path);
 
+    use_mock_backend();
     let server_path = path.clone();
     let server = tokio::spawn(async move {
         amos_ai::server::serve(server_path).await.unwrap();
@@ -296,6 +318,7 @@ async fn bidi_chat_cancel_closes_stream() {
         std::env::temp_dir().join(format!("amos-cancel-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&path);
 
+    use_mock_backend();
     let server_path = path.clone();
     let server = tokio::spawn(async move {
         amos_ai::server::serve(server_path).await.unwrap();
@@ -332,6 +355,7 @@ async fn bidi_chat_cancel_interrupts_mid_generation() {
         std::env::temp_dir().join(format!("amos-cancel-mid-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&path);
 
+    use_mock_backend();
     let server_path = path.clone();
     let server = tokio::spawn(async move {
         amos_ai::server::serve(server_path).await.unwrap();
@@ -380,6 +404,7 @@ async fn bidi_chat_prompt_turn_is_profiled() {
         std::env::temp_dir().join(format!("amos-bidi-prof-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&path);
 
+    use_mock_backend();
     let server_path = path.clone();
     let server = tokio::spawn(async move {
         amos_ai::server::serve(server_path).await.unwrap();

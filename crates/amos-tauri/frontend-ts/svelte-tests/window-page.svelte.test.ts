@@ -343,7 +343,10 @@ describe("WindowPage.svelte", () => {
     expect(textOf(container, "wm-split"), "the reading is unchanged").toBe(
       "notes ⇆ maps · vertical @ 50%",
     );
-    expect(textOf(container, "wm-note")).toBe(zh["wm.actionFailed"]);
+    // REQ-A513: the diag-aware split variants now distinguish "host refused" from
+    // "no bridge", so the copy is the more informative one (the user can tell a
+    // transient refusal from "the desktop has gone").
+    expect(textOf(container, "wm-note")).toBe(zh["wm.hostRefused"]);
     const warned = recentDiag(20).find((e) => `${e.msg}`.includes("wm_split_move"));
     expect(warned, "the refusal is retrievable from the diagnostics ledger").toBeTruthy();
   });
@@ -416,6 +419,47 @@ describe("WindowPage.svelte", () => {
     expect(text[1]).toBe("notes [App] Shown");
     expect(text[2]).toContain("legacy:waydroid_0 [System] Shown");
     expect(text[2], "a container surface is marked as external").toContain(zh["wm.external"]);
+  });
+
+  test("an instance window shows its app and instance next to the label (REQ-A473)", async () => {
+    // A debug card is where "which app does this window show, and which instance of it" has
+    // to be *readable* — the label alone stopped answering it once an app could own several
+    // windows. The identity is printed **only when it is news**: `files` repeated after
+    // `files` would be noise on every row.
+    installHost(() => snap(), {
+      wm_windows: () => ({
+        focused: null,
+        windows: [
+          { id: 1, label: "files", app: "files", instance: 1, kind: "App", state: "Shown", focused: false, external: false },
+          { id: 2, label: "files_2", app: "files", instance: 2, kind: "App", state: "Shown", focused: false, external: false },
+          {
+            id: 3,
+            label: "legacy:waydroid_0",
+            app: "",
+            instance: 0,
+            kind: "System",
+            state: "Shown",
+            focused: false,
+            external: true,
+          },
+        ],
+      }),
+    });
+    const { container } = render(WindowPage);
+    await tick();
+    await settle();
+
+    const text = [...container.querySelectorAll('[data-testid="wm-window-row"]')].map(
+      (r) => r.textContent?.replace(/\s+/g, " ").trim() ?? "",
+    );
+    expect(text[0]).toBe("files [App] Shown");
+    expect(text[1]).toBe("files_2 [App] Shown · files #2");
+    // A surface with no app gains nothing from an identity line (`""`/0): no instance
+    // marker, and nothing appended after the external flag (the "·" before it belongs to
+    // `wm.external`, not to an identity).
+    expect(text[2]).toContain("legacy:waydroid_0 [System] Shown");
+    expect(text[2]).not.toContain("#");
+    expect(text[2].endsWith(zh["wm.external"]), text[2]).toBe(true);
   });
 
   test("the debug card re-reads on the host's push and on the refresh button", async () => {
@@ -524,5 +568,259 @@ describe("WindowPage.svelte", () => {
     await tick();
     await settle();
     expect(byTest(second.container, "wm-candidates-note")).toBeNull();
+  });
+});
+
+// ============================================================================
+// WindowPage-local keyboard shortcuts (REQ-A224 §shortcuts).
+//
+// The page is its own focusable surface (`tabindex="-1"`), so these keys only
+// fire while the user is on it — a typing user in another Settings field cannot
+// accidentally exit a split by pressing Escape in the IME picker. The hint
+// (`data-testid="wm-split-kbd"`) renders the same `<kbd>` chips for discoverability.
+// ============================================================================
+
+// ============================================================================
+// The Stage Manager switch (REQ-A1568).
+//
+// The mode has two other fronts (the Window menu's row and the ⌃⌘S chord); this is where a
+// user who never opens the Window menu finds it, so the three facts pinned here are the ones
+// that would rot silently: which class is offered the switch, that a flip asks the host for
+// the **inverse** and adopts only the host's own answer, and that a refusal says why without
+// moving the switch.
+// ============================================================================
+
+const stageSnap = (enabled: boolean) => ({ enabled, on_stage: [], parked: [] });
+
+/** The switch's backing button, whatever the row's markup is doing. */
+const switchOf = (c: HTMLElement) => c.querySelector('[role="switch"]') as HTMLButtonElement | null;
+
+/** The visible label a Row's switch is named by (WCAG 2.5.3: name = what is on screen). */
+const nameOf = (c: HTMLElement) => {
+  const sw = switchOf(c);
+  const id = sw?.getAttribute("aria-labelledby");
+  return id ? (c.querySelector(`#${id}`)?.textContent?.trim() ?? "") : "";
+};
+
+describe("WindowPage.svelte — Stage Manager (REQ-A1568)", () => {
+  test("only a class the host calls `desktop` is offered the switch", async () => {
+    // The gate is the class, **not** `rail_width > 0`: the rail is only reserved while the
+    // mode is on, so a rail-width gate would hide the switch in exactly the state it exists
+    // to leave (a flag gating the element it must read). The snapshot below is the proof —
+    // a desktop whose rail is 0 because the mode is off still gets the switch.
+    installHost(() => snap({ form: "desktop", columns: 4, free_resize: true, rail_width: 0 }), {
+      stage_snapshot: () => stageSnap(false),
+    });
+    const desktop = render(WindowPage);
+    await tick();
+    await settle();
+    expect(switchOf(desktop.container), "a desktop is offered Stage Manager").toBeTruthy();
+    expect(nameOf(desktop.container)).toBe(zh["wm.stage"]);
+    expect(switchOf(desktop.container)?.getAttribute("aria-checked")).toBe("false");
+    // The sentence names the same chord the Window menu's row shows, read off the table.
+    expect(textOf(desktop.container, "wm-stage-note")).toBe(
+      zh["wm.stageNote"].replace("{chord}", "⌃⌘S"),
+    );
+    cleanup();
+
+    // A tablet has multiple windows and no rail; offering the switch there would offer a
+    // request the host refuses by name (`amos.stage.unsupported`).
+    installHost(() => snap());
+    const tablet = render(WindowPage);
+    await tick();
+    await settle();
+    expect(switchOf(tablet.container)).toBeNull();
+  });
+
+  test("flipping the switch asks for the inverse and adopts the host's answer", async () => {
+    installHost(() => snap({ form: "desktop", columns: 4, rail_width: 180 }), {
+      stage_snapshot: () => stageSnap(false),
+      stage_set_enabled: (args) => stageSnap(args?.enabled === true),
+    });
+    const { container } = render(WindowPage);
+    await tick();
+    await settle();
+
+    await fireEvent.click(switchOf(container) as HTMLButtonElement);
+    await tick();
+    await settle();
+
+    // It asked for the **inverse** of what the host last reported, not for a hard-coded true.
+    expect(calls.find((c) => c.cmd === "stage_set_enabled")?.args).toEqual({ enabled: true });
+    expect(switchOf(container)?.getAttribute("aria-checked")).toBe("true");
+
+    // …and back off again, from the host's own "on".
+    await fireEvent.click(switchOf(container) as HTMLButtonElement);
+    await tick();
+    await settle();
+    expect(calls.filter((c) => c.cmd === "stage_set_enabled").at(-1)?.args).toEqual({
+      enabled: false,
+    });
+    expect(switchOf(container)?.getAttribute("aria-checked")).toBe("false");
+  });
+
+  test("a refused flip leaves the switch alone and names the host's reason", async () => {
+    installHost(() => snap({ form: "desktop", columns: 4, rail_width: 180 }), {
+      stage_snapshot: () => stageSnap(false),
+      stage_set_enabled: () => {
+        // The Rust envelope, thrown the way Tauri throws it.
+        throw { code: "amos.stage.unsupported", message: "no rail on this class" };
+      },
+    });
+    const { container } = render(WindowPage);
+    await tick();
+    await settle();
+
+    await fireEvent.click(switchOf(container) as HTMLButtonElement);
+    await tick();
+    await settle();
+
+    // A mode the window manager never entered must not be shown as entered.
+    expect(switchOf(container)?.getAttribute("aria-checked")).toBe("false");
+    expect(textOf(container, "wm-stage-note-result")).toBe(zh["stage.errorUnsupported"]);
+    expect(
+      recentDiag(20).find((e) => `${e.msg}`.includes("stage_set_enabled")),
+      "the refusal is retrievable from the diagnostics ledger",
+    ).toBeTruthy();
+  });
+
+  test("a mode turned on from the shell's other front is followed by this page", async () => {
+    // The Window menu row and the ⌃⌘S chord change the same bit, and `stage_set_enabled`
+    // ends in the host's layout push — so the switch must follow a push rather than keep a
+    // reading from mount time.
+    let enabled = false;
+    installHost(() => snap({ form: "desktop", columns: 4, rail_width: enabled ? 180 : 0 }), {
+      stage_snapshot: () => stageSnap(enabled),
+    });
+    const { container } = render(WindowPage);
+    await tick();
+    await settle();
+    expect(switchOf(container)?.getAttribute("aria-checked")).toBe("false");
+
+    enabled = true;
+    listeners.get(LAYOUT_CHANGED_EVENT)?.({ payload: snap({ form: "desktop", rail_width: 180 }) });
+    await tick();
+    await settle();
+
+    expect(switchOf(container)?.getAttribute("aria-checked")).toBe("true");
+  });
+});
+
+describe("WindowPage.svelte — split keyboard shortcuts", () => {
+  test("Enter on the un-split page enters a split (no mouse)", async () => {
+    installHost(
+      () => snap(),
+      {
+        wm_split_candidates: () => ["notes", "maps"],
+        wm_split: () => splitSnap(),
+      },
+    );
+    const { container } = render(WindowPage);
+    await tick();
+    await settle();
+
+    // The shortcut hint is visible so the user knows the key exists.
+    expect(byTest(container, "wm-split-kbd")).toBeTruthy();
+
+    const page = byTest(container, "wm-page") as HTMLDivElement;
+    await fireEvent.keyDown(page, { key: "Enter" });
+    await tick();
+    await settle();
+
+    expect(calls.find((c) => c.cmd === "wm_split")?.args).toEqual({
+      primary: "notes",
+      secondary: "maps",
+      axis: "auto",
+    });
+  });
+
+  test("ArrowLeft / ArrowRight on a live split nudge the divider", async () => {
+    let live = true;
+    installHost(
+      () => (live ? splitSnap() : snap()),
+      {
+        wm_split_candidates: () => ["notes", "maps"],
+        wm_split_move: (args) => {
+          // The page passes the delta through as-is.
+          return splitSnap();
+        },
+      },
+    );
+    const { container } = render(WindowPage);
+    await tick();
+    await settle();
+    expect(byTest(container, "wm-exit-split")).toBeTruthy();
+
+    const page = byTest(container, "wm-page") as HTMLDivElement;
+    const before = calls.filter((c) => c.cmd === "wm_split_move").length;
+
+    await fireEvent.keyDown(page, { key: "ArrowLeft" });
+    await tick();
+    await fireEvent.keyDown(page, { key: "ArrowRight" });
+    await tick();
+    await settle();
+
+    const moves = calls.filter((c) => c.cmd === "wm_split_move");
+    expect(moves.length - before, "two nudges = two host calls").toBe(2);
+    // The page uses the same step the button uses (-5 / +5), not a fresh magnitude,
+    // so the host's own minimum-size guard stays the only authority on the clamp.
+    expect(moves.at(-2)?.args).toEqual({ delta: -5 });
+    expect(moves.at(-1)?.args).toEqual({ delta: 5 });
+  });
+
+  test("Escape on a live split exits the split and re-reads the candidates", async () => {
+    let live = true;
+    installHost(
+      () => (live ? splitSnap() : snap()),
+      {
+        wm_split_candidates: () => ["notes", "maps"],
+        wm_split_exit: () => {
+          live = false;
+          return snap();
+        },
+      },
+    );
+    const { container } = render(WindowPage);
+    await tick();
+    await settle();
+
+    const before = calls.filter((c) => c.cmd === "wm_split_candidates").length;
+    const page = byTest(container, "wm-page") as HTMLDivElement;
+    await fireEvent.keyDown(page, { key: "Escape" });
+    await tick();
+    await settle();
+
+    expect(calls.some((c) => c.cmd === "wm_split_exit")).toBe(true);
+    // The candidate list is only meaningful while no split is live: the page must
+    // re-read it on exit, just like clicking the button does.
+    expect(calls.filter((c) => c.cmd === "wm_split_candidates").length).toBeGreaterThan(before);
+    expect(textOf(container, "wm-split")).toBe(zh["wm.none"]);
+  });
+
+  test("a refused shortcut action says so (host-refused), not 'no bridge' (not-bridged)", async () => {
+    // The split variants distinguish the two failure shapes; a test that only
+    // inspected the actionFailed string would have missed the REQ-A513 change.
+    installHost(
+      () => splitSnap(),
+      {
+        wm_split_candidates: () => ["notes", "maps"],
+        wm_split_swap: () => {
+          throw new Error("split geometry is not available");
+        },
+      },
+    );
+    const { container } = render(WindowPage);
+    await tick();
+    await settle();
+
+    const page = byTest(container, "wm-page") as HTMLDivElement;
+    await fireEvent.keyDown(page, { key: "Enter" });
+    await tick();
+    await settle();
+
+    // The page reads the diag record's kind and surfaces the right copy.
+    expect(textOf(container, "wm-note")).toBe(zh["wm.hostRefused"]);
+    // The reading is unchanged — a refused call must not look like it happened.
+    expect(textOf(container, "wm-split")).toBe("notes ⇆ maps · vertical @ 50%");
   });
 });

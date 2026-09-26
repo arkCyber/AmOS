@@ -35,7 +35,11 @@
 //! * **Versions**: `versionName` is used when it parses as semver (a two-part
 //!   name like `5.0` is padded to `5.0.0`); otherwise the version is derived
 //!   monotonically from `versionCode` (base-1000 digit split), so upgrade
-//!   ordering never breaks on creative upstream naming.
+//!   ordering never breaks on creative upstream naming. A `versionCode` the
+//!   repo did not state, or stated as a non-integer, is **unknown** — never
+//!   build `0`. A build with no readable number and no parseable name has no
+//!   honest version, so its entry is skipped rather than shown as a fabricated
+//!   `0.0.0` (the same "skip, don't invent" rule as an unusable `hash`).
 //! * **Install**: an F-Droid entry is a `PackageFormat::Apk`; the engine
 //!   routes those to `AppStore::install_apk` (device PackageInstaller bridge).
 //!   `download` (fetch + verify to disk) works anywhere; silent install needs
@@ -79,6 +83,13 @@ mod flex {
         I(i64),
         U(u64),
         S(String),
+        /// Every other JSON shape a repo might put in a numeric field — a float
+        /// (`1726100000.0`), a bool, an array. Without this arm the untagged enum
+        /// returns a hard `Err` for such a value, which `?` propagates out of the
+        /// deserializer and **fails the whole index** — the opposite of the doc
+        /// above. This arm makes that promise true: an unrecognized shape is
+        /// [`None`], i.e. "unknown", never a poison pill (REQ-A1802).
+        Other(serde_json::Value),
     }
 
     pub(crate) fn opt_i64<'de, D: Deserializer<'de>>(d: D) -> Result<Option<i64>, D::Error> {
@@ -87,12 +98,11 @@ mod flex {
             Some(Num::I(n)) => Ok(Some(n)),
             Some(Num::U(n)) => Ok(Some(n.min(i64::MAX as u64) as i64)),
             Some(Num::S(s)) => Ok(s.trim().parse::<i64>().ok()),
+            // Only non-integer shapes reach here (a float, a bool, an array);
+            // `Value::as_i64` is `None` for every one of them, so the field is
+            // "unknown" — never a reason to fail the document.
+            Some(Num::Other(v)) => Ok(v.as_i64()),
         }
-    }
-
-    /// Like [`opt_i64`] for non-optional fields: anything unparsable is 0.
-    pub(crate) fn i64_or_zero<'de, D: Deserializer<'de>>(d: D) -> Result<i64, D::Error> {
-        Ok(opt_i64(d)?.unwrap_or(0))
     }
 
     pub(crate) fn opt_u64<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
@@ -105,6 +115,23 @@ mod flex {
             Some(Num::I(n)) => Ok(u64::try_from(n).ok()),
             Some(Num::U(n)) => Ok(Some(n)),
             Some(Num::S(s)) => Ok(s.trim().parse::<u64>().ok()),
+            Some(Num::Other(v)) => Ok(v.as_u64()),
+        }
+    }
+
+    /// [`opt_i64`] for a field that is a **non-negative count** — currently the
+    /// two `versionCode` fields (`FdroidPackage::version_code`,
+    /// `FdroidApp::suggested_version_code`). A negative value is *not* a number
+    /// the repo published: clamping it to `0` (or ranking it) mints a `0.0.0`
+    /// nobody released and hands the installer `version_code: 0`. Unknown is the
+    /// honest answer, exactly as [`opt_u64`] answers for a negative `size`.
+    pub(crate) fn opt_i64_nonneg<'de, D: Deserializer<'de>>(d: D) -> Result<Option<i64>, D::Error> {
+        match Option::<Num>::deserialize(d)? {
+            None => Ok(None),
+            Some(Num::I(n)) => Ok((n >= 0).then_some(n)),
+            Some(Num::U(n)) => Ok(Some(n.min(i64::MAX as u64) as i64)),
+            Some(Num::S(s)) => Ok(s.trim().parse::<i64>().ok().filter(|n| *n >= 0)),
+            Some(Num::Other(v)) => Ok(v.as_i64().filter(|n| *n >= 0)),
         }
     }
 
@@ -220,11 +247,14 @@ pub struct FdroidApp {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub license: Option<String>,
     /// The `versionCode` an F-Droid client would install. The official index
-    /// ships this as a *string*; both spellings parse (see [`flex`]).
+    /// ships this as a *string*; both spellings parse (see [`flex`]). It is a
+    /// `versionCode`, so it obeys the same rule as [`FdroidPackage::version_code`]:
+    /// a negative value is unknown (`None`), never a build number to match or
+    /// hand to a client ([`flex::opt_i64_nonneg`]).
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        deserialize_with = "flex::opt_i64"
+        deserialize_with = "flex::opt_i64_nonneg"
     )]
     pub suggested_version_code: Option<i64>,
     #[serde(
@@ -257,8 +287,19 @@ pub struct FdroidPackage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version_name: Option<String>,
     /// Android's monotonic build number — F-Droid's real ordering key.
-    #[serde(default, deserialize_with = "flex::i64_or_zero")]
-    pub version_code: i64,
+    ///
+    /// `Option<i64>`: a `versionCode` the repo did not state, stated in a shape
+    /// that is not an integer, or stated **negative** (see [`flex::opt_i64_nonneg`])
+    /// is **unknown**, not build `0`. `-5` is not a number anyone published, so
+    /// clamping it to `0` would rank an unnumbered build by a fabricated number
+    /// and mint `0.0.0` for it — the same fabrication [`flex::opt_u64`] refuses
+    /// for a negative `size`. Unknown stays unknown; see [`pick_package`].
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "flex::opt_i64_nonneg"
+    )]
+    pub version_code: Option<i64>,
     /// Filename under the repo root the APK downloads from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub apk_name: Option<String>,
@@ -400,30 +441,35 @@ fn category_to_fdroid(c: AppCategory) -> Vec<String> {
     }
 }
 
-/// Map a package's version onto the engine's [`Version`].
+/// Map a package's version onto the engine's [`Version`], or `None` when the
+/// package states nothing that yields one.
 ///
 /// `versionName` wins when it parses as semver (two-part names like `5.0` are
 /// padded to `5.0.0`). Otherwise the version is derived from `versionCode` by
 /// a base-1000 digit split (`code = major·10⁶ + minor·10³ + patch`), which is
 /// *strictly monotonic* in the code — so even apps with creative names keep
 /// working upgrade ordering, at the cost of a synthetic display version.
-fn map_version(version_name: Option<&str>, version_code: i64) -> Version {
+///
+/// A `versionCode` of `None` is **unknown**, not `0`: with no parseable name
+/// either, there is no honest version to show, and `None` says so rather than
+/// minting a `0.0.0` the repo never published.
+fn map_version(version_name: Option<&str>, version_code: Option<i64>) -> Option<Version> {
     if let Some(name) = version_name {
         if let Ok(v) = Version::parse(name) {
-            return v;
+            return Some(v);
         }
         if name.matches('.').count() == 1 {
             if let Ok(v) = Version::parse(&format!("{name}.0")) {
-                return v;
+                return Some(v);
             }
         }
     }
-    let code = version_code.max(0);
-    Version::new(
+    let code = version_code?.max(0);
+    Some(Version::new(
         (code / 1_000_000) as u32,
         ((code / 1_000) % 1_000) as u32,
         (code % 1_000) as u32,
-    )
+    ))
 }
 
 /// The inverse, used when *exporting*: a synthetic `versionCode` for a semver,
@@ -442,16 +488,39 @@ pub fn version_code_from(v: &Version) -> i64 {
 
 /// Pick the package a client would install: the app's `suggestedVersionCode`
 /// when present among the candidates, else the highest `versionCode`.
+///
+/// A candidate whose `versionCode` is `None` has **no build number to order
+/// by** — it is not build `0` and must not be ranked as the oldest. It is
+/// therefore only ever chosen when it is the *only* candidate (nothing to
+/// order); when two or more candidates state no number at all, "the highest"
+/// has no answer and the honest result is `None` rather than an arbitrary pick.
+/// This is the same refusal `manifest_for_app` makes for an entry it cannot
+/// represent honestly.
 fn pick_package<'a>(
     packages: &[&'a FdroidPackage],
     suggested: Option<i64>,
 ) -> Option<&'a FdroidPackage> {
     if let Some(code) = suggested {
-        if let Some(p) = packages.iter().copied().find(|p| p.version_code == code) {
+        if let Some(p) = packages
+            .iter()
+            .copied()
+            .find(|p| p.version_code == Some(code))
+        {
             return Some(p);
         }
     }
-    packages.iter().copied().max_by_key(|p| p.version_code)
+    if let Some(p) = packages
+        .iter()
+        .copied()
+        .filter(|p| p.version_code.is_some())
+        .max_by_key(|p| p.version_code)
+    {
+        return Some(p);
+    }
+    match packages {
+        [only] => Some(*only),
+        _ => None,
+    }
 }
 
 /// Display fields with the [`FdroidApp`]'s `localized` fallback applied:
@@ -552,7 +621,7 @@ fn manifest_for_app(
             .clone()
             .or_else(|| app.author.clone())
             .unwrap_or_default(),
-        version: map_version(pick.version_name.as_deref(), pick.version_code),
+        version: map_version(pick.version_name.as_deref(), pick.version_code)?,
         category: map_category(&app.categories),
         homepage: app
             .web_site
@@ -679,7 +748,7 @@ pub fn catalog_to_fdroid_index_v1(apps: &[AppManifest], repo_address: &str) -> F
             index.packages.push(FdroidPackage {
                 package_name: m.id.clone(),
                 version_name: Some(m.version.to_string()),
-                version_code: version_code_from(&m.version),
+                version_code: Some(version_code_from(&m.version)),
                 apk_name: Some(apk_filename(m)),
                 hash: m.package.sha256.as_ref().map(|c| c.value.clone()),
                 hash_type: m.package.sha256.as_ref().map(|_| "sha256".to_string()),
@@ -969,7 +1038,216 @@ mod tests {
             "versionCode base-1000 split"
         );
         // And the fallback stays monotonic, so upgrades keep working:
-        assert!(map_version(Some("cyanogen-9"), 4030205) > creative.version);
+        assert!(map_version(Some("cyanogen-9"), Some(4030205)).unwrap() > creative.version);
+    }
+
+    /// A package whose `versionCode` is **not readable** (a non-integer string, or
+    /// `null`) must not be folded to build `0`. `0` is a *measured* build number
+    /// the repo never stated: folding it lets `pick_package` order the build by a
+    /// fabricated value and `map_version` mint `0.0.0` for a package whose real
+    /// number was merely unreadable — a version nobody published, shown to the
+    /// user and handed to the installer as `version_code: 0`.
+    ///
+    /// REQ-A1762 / F-STORE-003.
+    ///
+    /// The sibling type in the same `flex` module refuses exactly this fold for
+    /// `size` ("that would be a *fabricated measurement*; Unknown (`None`) is the
+    /// honest answer"), `FdroidApp.suggested_version_code` is an `Option`, and
+    /// `manifest_for_app` refuses to fabricate an author. The unreadable build
+    /// number gets the same answer: unknown.
+    #[tokio::test]
+    async fn an_unreadable_version_code_is_not_folded_to_build_zero() {
+        let h = hex(b"apk bytes");
+        for code in [r#""1.2""#, "null", r#""""#] {
+            let json = format!(
+                r#"{{"repo":{{"address":"https://r"}},
+                    "apps":[{{"packageName":"org.ex.badcode","name":"Bad"}}],
+                    "packages":[{{"packageName":"org.ex.badcode","apkName":"b.apk",
+                                  "versionCode": {code},
+                                  "hash":"{h}","hashType":"sha256"}}]}}"#
+            );
+            let p = FdroidRepoProvider::from_index_bytes(json.as_bytes(), "").unwrap();
+            let catalog = fdroid_index_to_catalog(p.index(), "");
+            assert!(
+                catalog.is_empty(),
+                "a build whose versionCode ({code}) could not be read must not be \
+                 shown as a fabricated 0.0.0"
+            );
+        }
+    }
+
+    /// The positive control for the test above: a `versionCode` that *is* readable
+    /// — including the string spelling f-droid.org uses — keeps mapping exactly as
+    /// before. Without this, "refuse everything" would pass.
+    #[tokio::test]
+    async fn a_readable_string_version_code_still_maps() {
+        let h = hex(b"apk bytes");
+        let json = format!(
+            r#"{{"repo":{{"address":"https://r"}},
+                "apps":[{{"packageName":"org.ex.strcode","name":"Str"}}],
+                "packages":[{{"packageName":"org.ex.strcode","apkName":"s.apk",
+                              "versionCode": "1002003",
+                              "hash":"{h}","hashType":"sha256"}}]}}"#
+        );
+        let p = FdroidRepoProvider::from_index_bytes(json.as_bytes(), "").unwrap();
+        let catalog = fdroid_index_to_catalog(p.index(), "");
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog[0].version.to_string(), "1.2.3");
+    }
+
+    /// The docs of `mod flex` promise, verbatim, that "a value that is neither
+    /// [a quoted string nor a bare number] parses as `None` rather than poisoning
+    /// the whole index". The `Num` untagged enum only enumerated `I`/`U`/`S`, so a
+    /// JSON **float** (an integral value many encoders emit as `1.0` — JS
+    /// `JSON.stringify`, Go `float64`, Python after arithmetic) matched no arm and
+    /// made `Option::<Num>::deserialize` return a hard `Err` that `?` propagated out
+    /// of `from_index_bytes`: one float-valued field failed the **entire** index,
+    /// the opposite of the promise. `#[serde(default)]` does not save it — that
+    /// fills a *missing* field, not a present-but-undeserializable one. REQ-A1802 /
+    /// F-STORE-005.
+    #[tokio::test]
+    async fn a_non_integer_number_does_not_poison_the_whole_index() {
+        let h = hex(b"apk bytes");
+        // A float in a numeric field (`repo.timestamp`, `versionCode`) must answer
+        // "unknown", not abort the document.
+        let json = format!(
+            r#"{{"repo":{{"address":"https://r","timestamp":1726100000.0}},
+                "apps":[{{"packageName":"org.ex.float","name":"Float"}}],
+                "packages":[{{"packageName":"org.ex.float","apkName":"f.apk",
+                              "versionCode": 1.0,
+                              "hash":"{h}","hashType":"sha256"}}]}}"#
+        );
+        let p = FdroidRepoProvider::from_index_bytes(json.as_bytes(), "")
+            .expect("a float-valued field must not fail the whole index");
+        // The float `versionCode` is unknown, so the build is skipped — never
+        // minted as a fabricated `0.0.0`.
+        assert!(fdroid_index_to_catalog(p.index(), "").is_empty());
+        // Positive control: integer-valued fields still parse and map, so
+        // "reject the whole index" cannot pass this test.
+        let ok = format!(
+            r#"{{"repo":{{"address":"https://r","timestamp":1726100000}},
+                "apps":[{{"packageName":"org.ex.int","name":"Int"}}],
+                "packages":[{{"packageName":"org.ex.int","apkName":"i.apk",
+                              "versionCode": 5,
+                              "hash":"{h}","hashType":"sha256"}}]}}"#
+        );
+        let p = FdroidRepoProvider::from_index_bytes(ok.as_bytes(), "").unwrap();
+        assert_eq!(fdroid_index_to_catalog(p.index(), "").len(), 1);
+    }
+
+    /// The **negative** shape of the same rule (REQ-A1784 / F-STORE-004). A
+    /// `versionCode` is a non-negative build number; `-5` is not a number anyone
+    /// published, so clamping it to `0` mints a `0.0.0` the repo never published
+    /// — and hands the installer `version_code: 0`. The sibling
+    /// [`flex::opt_u64`] refuses exactly this for `size` ("a negative declared
+    /// size is **not** '0 bytes'"). Unknown is the honest answer here too.
+    #[tokio::test]
+    async fn a_negative_version_code_is_not_clamped_to_build_zero() {
+        let h = hex(b"apk bytes");
+        for code in ["-5", r#""-5""#] {
+            let json = format!(
+                r#"{{"repo":{{"address":"https://r"}},
+                    "apps":[{{"packageName":"org.ex.negcode","name":"Neg"}}],
+                    "packages":[{{"packageName":"org.ex.negcode","apkName":"n.apk",
+                                  "versionCode": {code},
+                                  "hash":"{h}","hashType":"sha256"}}]}}"#
+            );
+            let p = FdroidRepoProvider::from_index_bytes(json.as_bytes(), "").unwrap();
+            assert_eq!(
+                p.index().packages[0].version_code,
+                None,
+                "a negative versionCode ({code}) must parse as unknown, not a number"
+            );
+            let catalog = fdroid_index_to_catalog(p.index(), "");
+            assert!(
+                catalog.is_empty(),
+                "a negative versionCode ({code}) must not be clamped to build 0 and \
+                 shown as a fabricated 0.0.0"
+            );
+        }
+    }
+
+    /// The sibling field of the same rule: the app-level `suggestedVersionCode`
+    /// is a `versionCode` too, so a negative one is unknown there as well (it
+    /// must not be matched against a package or handed to a client as a build
+    /// number). REQ-A1784 / F-STORE-004.
+    #[tokio::test]
+    async fn a_negative_suggested_version_code_is_unknown() {
+        let json = r#"{"repo":{"address":"https://r"},
+            "apps":[{"packageName":"org.ex.negsug","name":"N",
+                     "suggestedVersionCode":-5}],
+            "packages":[]}"#;
+        let p = FdroidRepoProvider::from_index_bytes(json.as_bytes(), "").unwrap();
+        assert_eq!(
+            p.index().apps[0].suggested_version_code,
+            None,
+            "a negative suggestedVersionCode must parse as unknown, not a build number"
+        );
+    }
+
+    /// The positive control for the two tests above: `0` **is** a published
+    /// build number (a first release), so it must keep mapping to `0.0.0` exactly
+    /// as before. Without this, "refuse every versionCode" would pass.
+    #[tokio::test]
+    async fn a_zero_version_code_still_maps_to_a_published_build() {
+        let h = hex(b"apk bytes");
+        let json = format!(
+            r#"{{"repo":{{"address":"https://r"}},
+                "apps":[{{"packageName":"org.ex.zero","name":"Zero"}}],
+                "packages":[{{"packageName":"org.ex.zero","apkName":"z.apk",
+                              "versionCode": 0,
+                              "hash":"{h}","hashType":"sha256"}}]}}"#
+        );
+        let p = FdroidRepoProvider::from_index_bytes(json.as_bytes(), "").unwrap();
+        assert_eq!(p.index().packages[0].version_code, Some(0));
+        let catalog = fdroid_index_to_catalog(p.index(), "");
+        assert_eq!(catalog.len(), 1, "build 0 is a real, published build");
+        assert_eq!(catalog[0].version.to_string(), "0.0.0");
+    }
+
+    /// The ordering half of the same rule: a build whose `versionCode` is
+    /// unknown has no number to be ranked by, so it must never *win* the
+    /// "highest versionCode" comparison against a build that does state one —
+    /// and when no build states any number, "the highest" has no answer and
+    /// `pick_package` returns `None` rather than an arbitrary pick.
+    #[test]
+    fn pick_package_never_orders_by_an_unknown_build_number() {
+        let h = hex(b"apk bytes");
+        let build = |code: Option<i64>, apk: &str| FdroidPackage {
+            package_name: "org.ex.pick".into(),
+            apk_name: Some(apk.into()),
+            hash: Some(h.clone()),
+            hash_type: Some("sha256".into()),
+            version_code: code,
+            ..FdroidPackage::default()
+        };
+        let named = |p: Option<&FdroidPackage>| p.and_then(|p| p.apk_name.clone());
+
+        let numbered = build(Some(7), "seven.apk");
+        let unnumbered = build(None, "unknown.apk");
+        let list = [&numbered, &unnumbered];
+
+        assert_eq!(
+            named(pick_package(&list, None)).as_deref(),
+            Some("seven.apk"),
+            "a numbered build beats an unnumbered one (the unknown is not 0)"
+        );
+        assert_eq!(
+            named(pick_package(&list, Some(7))).as_deref(),
+            Some("seven.apk"),
+            "the suggested code matches only a build that states it"
+        );
+        assert_eq!(
+            named(pick_package(&[&unnumbered], None)).as_deref(),
+            Some("unknown.apk"),
+            "a lone candidate has nothing to be ordered against"
+        );
+        let other = build(None, "other.apk");
+        let ambiguous = [&unnumbered, &other];
+        assert!(
+            pick_package(&ambiguous, None).is_none(),
+            "two unnumbered builds cannot be ordered — refuse rather than guess"
+        );
     }
 
     #[test]
@@ -984,14 +1262,14 @@ mod tests {
             Version::new(999, 999, 999),
         ] {
             assert_eq!(
-                map_version(None, version_code_from(&v)),
-                v,
+                map_version(None, Some(version_code_from(&v))),
+                Some(v.clone()),
                 "{v} must round-trip"
             );
         }
         assert_eq!(
-            map_version(None, version_code_from(&Version::new(1, 1000, 0))),
-            Version::new(2, 0, 0),
+            map_version(None, Some(version_code_from(&Version::new(1, 1000, 0)))),
+            Some(Version::new(2, 0, 0)),
             ">=1000 carries into the next digit — the documented boundary"
         );
     }
@@ -1131,7 +1409,7 @@ mod tests {
         assert_eq!(index.packages.len(), 1, "only the APK emits a package");
         assert_eq!(
             index.packages[0].version_code,
-            version_code_from(&Version::new(1, 2, 3))
+            Some(version_code_from(&Version::new(1, 2, 3)))
         );
         assert_eq!(index.packages[0].hash_type.as_deref(), Some("sha256"));
         assert_eq!(
@@ -1287,7 +1565,7 @@ mod tests {
         let pkg = |id: &str, apk: &str| FdroidPackage {
             package_name: id.into(),
             version_name: Some("1.0".into()),
-            version_code: 1,
+            version_code: Some(1),
             apk_name: Some(apk.into()),
             hash: Some(h.clone()),
             hash_type: Some("sha256".into()),
@@ -1323,7 +1601,7 @@ mod tests {
         let pkg = |vc: i64, apk: &str, anti: &[&str]| FdroidPackage {
             package_name: "org.ex.builds".into(),
             version_name: Some(format!("{vc}.0")),
-            version_code: vc,
+            version_code: Some(vc),
             apk_name: Some(apk.into()),
             hash: Some(h.clone()),
             hash_type: Some("sha256".into()),
@@ -1432,7 +1710,7 @@ mod tests {
             let pkg = FdroidPackage {
                 package_name: id.into(),
                 version_name: Some("1.0.0".into()),
-                version_code: 1,
+                version_code: Some(1),
                 apk_name: Some("a.apk".into()),
                 hash: Some(h),
                 hash_type: Some("sha256".into()),
@@ -1536,7 +1814,7 @@ mod tests {
 
     #[test]
     fn version_code_split_is_monotonic() {
-        let v = |c: i64| map_version(None, c);
+        let v = |c: i64| map_version(None, Some(c)).unwrap();
         assert!(v(0) < v(1));
         assert!(v(999) < v(1_000));
         assert!(v(999_999) < v(1_000_000));

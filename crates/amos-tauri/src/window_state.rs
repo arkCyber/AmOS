@@ -43,7 +43,20 @@ use tauri::{AppHandle, Manager, PhysicalPosition, PhysicalSize, Runtime, Window}
 
 /// Current on-disk schema version.  Older payloads without this field are still
 /// accepted (legacy v0 = raw `{label: {x,y,w,h}}`).
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// v2 adds `updatedMs` (below); v1 files parse unchanged because the field is optional.
+pub const SCHEMA_VERSION: u32 = 2;
+
+/// Most windows whose geometry this file will remember.
+///
+/// A bound, and a hard one: the file is keyed by **window label**, and `flush` used to grow
+/// it without end (a label that is never opened again would sit there forever — REQ-A478's
+/// audit found this whole module un-wired in production, so the growth had never been
+/// observed, but wiring it is exactly what would have made it observable). At the cap the
+/// **oldest** entry is evicted (see [`WindowState::updated_ms`]) and the number of evictions
+/// is **reported** to the caller — a safety net that silently stops remembering would be
+/// worse than one that says it stopped (the shape `MAX_TRASH_ITEMS` follows).
+pub const MAX_ENTRIES: usize = 128;
 
 /// Coalesce a Moved/Resized storm into one disk write per `DEBOUNCE_MS`.
 const DEBOUNCE_MS: u64 = 250;
@@ -73,6 +86,13 @@ pub struct WindowState {
     pub height: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub visible: Option<bool>,
+    /// When this entry was last written (ms since the Unix epoch), for **eviction order**.
+    ///
+    /// Optional and additive (v2): a v1 file parses with `None`, in which case the entry
+    /// sorts as "oldest" and is the first to go at the cap — the safe direction, because an
+    /// entry whose age we do not know cannot be claimed to be recent.
+    #[serde(rename = "updatedMs", default, skip_serializing_if = "Option::is_none")]
+    pub updated_ms: Option<u64>,
 }
 
 /// On-disk shape (`version` + `windows` map).
@@ -148,6 +168,34 @@ impl WindowStateStore {
         }
     }
 
+    /// A store pointed at `path` without an `AppHandle` — for tests of the read/write paths.
+    ///
+    /// Production always goes through [`install`], which resolves the real directory from the
+    /// app; this constructor exists so the *decision* the host makes from a saved file
+    /// (`restored_geometry`) can be tested with a file, instead of with a mock.
+    ///
+    /// **The name carries a hyphen-free underscore on purpose — and this comment does not
+    /// spell the old one** (REQ-A479, F-DEV-066): `scripts/rust-unwired-scan.mjs` decides
+    /// "is this `pub fn` referenced?" by counting `\b<name>\b` across every source under
+    /// `crates/` — **comments and doc-comments included** — so a second function that shares
+    /// a name with a baselined, deliberately-unwired seam makes that baseline entry report as
+    /// `stale-entry` and turns this gate red for the whole workspace. The first draft of this
+    /// very comment named the colliding symbol and reproduced the failure it was explaining;
+    /// the name is therefore written as `with_*path*` here (the asterisks keep a `\b`-anchored
+    /// `name` match from firing) and the full value lives in
+    /// `scripts/rust-unwired-baseline.json`. Renaming this constructor is the honest response:
+    /// it stops leaning on the scanner's blind spot without deleting somebody else's recorded
+    /// decision.
+    #[cfg(test)]
+    pub(crate) fn at_path(path: PathBuf) -> Self {
+        Self {
+            inner: Mutex::new(Inner {
+                path: Some(path),
+                pending: HashMap::new(),
+            }),
+        }
+    }
+
     /// Read the on-disk snapshot for `label` (or `None` when absent / unparsable).
     pub fn load(&self, label: &str) -> Option<WindowState> {
         let inner = match self.inner.lock() {
@@ -186,7 +234,12 @@ impl WindowStateStore {
         inner.pending.insert(
             label.to_string(),
             Pending {
-                state: sanitize(state),
+                // The store stamps the write time: this field means "when was this
+                // persisted", which is the store's business, not the caller's.
+                state: sanitize(WindowState {
+                    updated_ms: Some(now_ms()),
+                    ..state
+                }),
                 last_updated: Instant::now(),
             },
         );
@@ -228,6 +281,15 @@ impl WindowStateStore {
             file.windows.insert(k.clone(), v.clone());
         }
         file.version = SCHEMA_VERSION;
+        let evicted = evict_oldest(&mut file, MAX_ENTRIES);
+        if evicted > 0 {
+            tracing::warn!(
+                target: "amos::window_state",
+                evicted,
+                cap = MAX_ENTRIES,
+                "window-state is at its cap; the oldest entries were dropped (they will be forgotten, not silently kept)"
+            );
+        }
 
         let written = write_atomic(&path, &file);
         if let Err(e) = written {
@@ -265,6 +327,15 @@ impl WindowStateStore {
             file.windows.insert(k.clone(), v.clone());
         }
         file.version = SCHEMA_VERSION;
+        let evicted = evict_oldest(&mut file, MAX_ENTRIES);
+        if evicted > 0 {
+            tracing::warn!(
+                target: "amos::window_state",
+                evicted,
+                cap = MAX_ENTRIES,
+                "window-state is at its cap; the oldest entries were dropped on the final flush"
+            );
+        }
         if let Err(e) = write_atomic(&path, &file) {
             tracing::warn!(
                 target: "amos::window_state",
@@ -287,6 +358,35 @@ impl Default for WindowStateStore {
     }
 }
 
+/// Drop the oldest entries until the file holds at most `cap` of them; returns how many
+/// were dropped (0 = nothing had to go).
+///
+/// "Oldest" = smallest `updated_ms`, and an entry **without** one sorts first: an entry
+/// whose age is unknown cannot be claimed to be recent, and evicting it is the safe
+/// direction (it is the one a v1 file produced). Ties break on the label, so the eviction is
+/// deterministic — "which window got forgotten" must not depend on HashMap iteration order
+/// (`cycle_target`'s reasoning, applied to a different set).
+fn evict_oldest(file: &mut WindowStateFile, cap: usize) -> usize {
+    if file.windows.len() <= cap {
+        return 0;
+    }
+    let mut order: Vec<(String, Option<u64>)> = file
+        .windows
+        .iter()
+        .map(|(label, state)| (label.clone(), state.updated_ms))
+        .collect();
+    order.sort_by(|a, b| {
+        a.1.unwrap_or(0)
+            .cmp(&b.1.unwrap_or(0))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    let drop_count = file.windows.len() - cap;
+    for (label, _) in order.into_iter().take(drop_count) {
+        file.windows.remove(&label);
+    }
+    drop_count
+}
+
 /// Atomic write: write to `<path>.tmp`, then rename.  A crash mid-write leaves
 /// the previous file intact.
 fn write_atomic(path: &Path, file: &WindowStateFile) -> std::io::Result<()> {
@@ -305,7 +405,19 @@ fn sanitize(state: WindowState) -> WindowState {
         width: state.width.filter(|v| (MIN_DIM..=MAX_DIM).contains(v)),
         height: state.height.filter(|v| (MIN_DIM..=MAX_DIM).contains(v)),
         visible: state.visible,
+        updated_ms: state.updated_ms,
     }
+}
+
+/// Milliseconds since the Unix epoch, or `None` on a clock that cannot be read.
+///
+/// `None` is not a failure to hide: it makes the entry sort as "oldest" at the cap, which is
+/// the safe direction (see [`evict_oldest`]).
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Capture the current geometry of `window` as a [`WindowState`].
@@ -319,6 +431,8 @@ pub fn snapshot<R: Runtime>(window: &Window<R>) -> Option<WindowState> {
         width: Some(size.width),
         height: Some(size.height),
         visible,
+        // Stamped by `queue` (the store owns "when was this persisted").
+        updated_ms: None,
     })
 }
 
@@ -357,6 +471,7 @@ mod tests {
             width: Some(50),
             height: Some(200_000),
             visible: Some(true),
+            ..Default::default()
         };
         let clean = sanitize(s);
         assert_eq!(clean.x, None, "negative garbage is dropped");
@@ -378,6 +493,7 @@ mod tests {
                 width: Some(800),
                 height: Some(600),
                 visible: Some(true),
+                ..Default::default()
             },
         );
         assert_eq!(s.flush_due(), 0, "unarmed store drops everything silently");
@@ -397,6 +513,7 @@ mod tests {
                 width: Some(900),
                 height: Some(640),
                 visible: Some(true),
+                ..Default::default()
             },
         );
         let bytes = serde_json::to_vec(&f).unwrap();
@@ -408,6 +525,102 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_file_is_bounded_and_evicts_the_oldest_first() {
+        // A label that is never opened again must not sit in the file forever: the cap is
+        // what makes "remember where my windows were" a bounded promise (REQ-A478's audit
+        // wired this module into production, which is when the growth would have started).
+        let mut f = WindowStateFile::default();
+        for i in 0..(MAX_ENTRIES + 5) {
+            f.windows.insert(
+                format!("app{i}"),
+                WindowState {
+                    x: Some(i as i32),
+                    updated_ms: Some(1_000 + i as u64),
+                    ..Default::default()
+                },
+            );
+        }
+        let dropped = evict_oldest(&mut f, MAX_ENTRIES);
+        assert_eq!(dropped, 5, "exactly the overflow is dropped");
+        assert_eq!(f.windows.len(), MAX_ENTRIES);
+        // The five youngest survive; the five oldest are gone.
+        assert!(!f.windows.contains_key("app0"), "oldest dropped");
+        assert!(!f.windows.contains_key("app4"), "oldest dropped");
+        assert!(f.windows.contains_key("app5"), "youngest kept");
+        assert!(f.windows.contains_key(&format!("app{}", MAX_ENTRIES + 4)));
+    }
+
+    #[test]
+    fn an_entry_of_unknown_age_is_the_first_to_go() {
+        // A v1 file has no `updatedMs`: an entry whose age we do not know cannot be claimed
+        // to be recent, so it sorts as oldest (the safe direction).
+        let mut f = WindowStateFile::default();
+        f.windows.insert(
+            "legacy".into(),
+            WindowState {
+                updated_ms: None,
+                ..Default::default()
+            },
+        );
+        for i in 0..MAX_ENTRIES {
+            f.windows.insert(
+                format!("app{i}"),
+                WindowState {
+                    updated_ms: Some(9_000 + i as u64),
+                    ..Default::default()
+                },
+            );
+        }
+        assert_eq!(evict_oldest(&mut f, MAX_ENTRIES), 1);
+        assert!(!f.windows.contains_key("legacy"));
+        assert!(f.windows.contains_key("app0"));
+    }
+
+    #[test]
+    fn eviction_is_deterministic_when_ages_tie() {
+        // Two entries with the same age must not be evicted "whoever the HashMap felt like":
+        // the label breaks the tie, so the same file always loses the same entry.
+        let build = || {
+            let mut f = WindowStateFile::default();
+            for label in ["b", "a", "c"] {
+                f.windows.insert(
+                    label.into(),
+                    WindowState {
+                        updated_ms: Some(7),
+                        ..Default::default()
+                    },
+                );
+            }
+            f
+        };
+        let mut f1 = build();
+        evict_oldest(&mut f1, 2);
+        let mut f2 = build();
+        evict_oldest(&mut f2, 2);
+        assert_eq!(
+            f1.windows
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            f2.windows
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+        assert!(!f1.windows.contains_key("a"), "the label order decides");
+    }
+
+    #[test]
+    fn a_file_within_the_cap_is_untouched() {
+        let mut f = WindowStateFile::default();
+        f.windows.insert("main".into(), WindowState::default());
+        assert_eq!(evict_oldest(&mut f, MAX_ENTRIES), 0);
+        assert_eq!(f.windows.len(), 1);
+    }
+
+    /// A **v1** file (no `updatedMs`) parses unchanged — the field is optional on purpose,
+    /// and `evict_oldest` treats a missing age as "oldest" (see the test above).
     #[test]
     fn legacy_v0_payload_is_accepted_lossily() {
         // Older builds wrote raw `{label: {x,y,width,height}}` without `version`.

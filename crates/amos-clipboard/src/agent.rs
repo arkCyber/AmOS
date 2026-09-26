@@ -13,7 +13,9 @@
 //! * **Guest ─► host**: [`GuestAgent::attach`] installs the provider's change
 //!   listener; genuine container copies (a change that is *not* our own echo) are
 //!   turned into a [`GuestToHost::ClipboardChanged`] and handed to the outbound
-//!   callback (which a thin transport encodes + sends to the host).
+//!   callback (which a thin transport encodes + sends to the host). A push that
+//!   [`GuestAgent::apply`] actually **applies** is confirmed on that same callback
+//!   as [`GuestToHost::PushAcked`] — one guest→host channel, not two.
 //!
 //! The agent never talks bytes itself — it returns/consumes protocol messages, so
 //! the framing and I/O stay in the embedding transport.
@@ -34,6 +36,11 @@ fn is_own_echo(guard: &Mutex<EchoGuard>, text: &str) -> bool {
         .unwrap_or(true)
 }
 
+/// The guest→host outbound channel: the one closure a transport hands over, shared
+/// by the change listener ([`GuestToHost::ClipboardChanged`]) and the ack path
+/// ([`GuestToHost::PushAcked`]).
+type Outbound = Arc<dyn Fn(GuestToHost) + Send + Sync>;
+
 /// The guest-side clipboard agent. Generic over the [`ClipboardProvider`] so it is
 /// constructed with a [`MockClipboardProvider`] in tests/CI and an
 /// `AndroidClipboardProvider` on-device.
@@ -42,6 +49,11 @@ pub struct GuestAgent<P: ClipboardProvider> {
     /// Shared so both the apply path (records our own set) and the change listener
     /// (checks "is this our own echo?") see one consistent view.
     guard: Arc<Mutex<EchoGuard>>,
+    /// The guest→host outbound channel, installed by [`Self::attach`]. `apply`'s
+    /// `PushAcked` confirmation rides the same channel as the change reports — the
+    /// guest has one wire to the host, not one per message kind. No channel
+    /// installed ⇒ no ack is fabricated.
+    outbound: Mutex<Option<Outbound>>,
 }
 
 impl<P: ClipboardProvider> GuestAgent<P> {
@@ -50,6 +62,7 @@ impl<P: ClipboardProvider> GuestAgent<P> {
         Self {
             provider,
             guard: Arc::new(Mutex::new(EchoGuard::new())),
+            outbound: Mutex::new(None),
         }
     }
 
@@ -66,8 +79,14 @@ impl<P: ClipboardProvider> GuestAgent<P> {
     /// listener does not report our own write back to the host as a user copy; if
     /// the write **fails**, the note is rolled back so a later genuine copy of the
     /// same text is not wrongly suppressed.
+    ///
+    /// A push that actually changed the clipboard is confirmed to the host with a
+    /// [`GuestToHost::PushAcked`] carrying the push's `seq` ([`Self::ack`]). A
+    /// no-op (already equal, blank) or a failed write is **not** acked: the ack
+    /// claims the guest clipboard now holds the pushed text, and that claim may
+    /// only be made when it is true.
     pub fn apply(&self, push: &HostToGuest) -> Result<bool, String> {
-        let HostToGuest::PushText { text, .. } = push;
+        let HostToGuest::PushText { seq, text, .. } = push;
         if text.trim().is_empty() {
             return Ok(false);
         }
@@ -80,7 +99,10 @@ impl<P: ClipboardProvider> GuestAgent<P> {
             g.note_set_now(text);
         }
         match self.provider.set_primary_text(text) {
-            Ok(()) => Ok(true),
+            Ok(()) => {
+                self.ack(*seq);
+                Ok(true)
+            }
             Err(e) => {
                 // Nothing was written, so no echo will arrive: undo the note so a
                 // later *genuine* copy of this text isn't suppressed.
@@ -92,6 +114,18 @@ impl<P: ClipboardProvider> GuestAgent<P> {
         }
     }
 
+    /// Confirm to the host that the push with this `seq` was applied, on the
+    /// outbound channel [`Self::attach`] installed. The channel is cloned out of the
+    /// slot *before* it is called, so a callback that re-enters the agent cannot
+    /// deadlock on the slot's lock. A poisoned slot drops the ack rather than
+    /// panicking — an unconfirmed push is honest; a crash on the copy path is not.
+    fn ack(&self, seq: u64) {
+        let out = self.outbound.lock().ok().and_then(|slot| slot.clone());
+        if let Some(out) = out {
+            out(GuestToHost::PushAcked { seq });
+        }
+    }
+
     /// Whether an inbound platform change `text` should be reported to the host
     /// (i.e. it is **not** our own echo). See [`is_own_echo`] for the fail-safe.
     pub fn should_report(&self, text: &str) -> bool {
@@ -99,12 +133,18 @@ impl<P: ClipboardProvider> GuestAgent<P> {
     }
 
     /// Install the provider's change listener so genuine container copies reach
-    /// `out` as [`GuestToHost::ClipboardChanged`]. Idempotent re-`attach` just
-    /// replaces the listener. Echoes of our own [`Self::apply`] are suppressed.
+    /// `out` as [`GuestToHost::ClipboardChanged`], **and** record `out` as the
+    /// agent's outbound channel so an applied push reaches it as
+    /// [`GuestToHost::PushAcked`]. Idempotent re-`attach` just replaces both.
+    /// Echoes of our own [`Self::apply`] are suppressed.
     pub fn attach<F>(&self, out: F) -> Result<(), String>
     where
         F: Fn(GuestToHost) + Send + Sync + 'static,
     {
+        let out: Outbound = Arc::new(out);
+        if let Ok(mut slot) = self.outbound.lock() {
+            *slot = Some(out.clone());
+        }
         let guard = self.guard.clone();
         let listener = move |text: &str| {
             if !is_own_echo(&guard, text) {
@@ -181,10 +221,76 @@ mod tests {
 
         // Host push -> agent applies -> provider fires listener synchronously.
         agent.apply(&push_text("from-host")).unwrap();
+        let msgs = store.lock().unwrap();
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m, GuestToHost::ClipboardChanged { .. })),
+            "the echo of our own apply must not be reported to the host as a copy"
+        );
+    }
+
+    /// The outbound channel **is** the guest→host wire: an applied push must be
+    /// confirmed with its own `seq`, so the host can tell "the guest applied this"
+    /// apart from "we sent it and heard nothing".
+    #[test]
+    fn an_applied_push_is_acked_on_the_outbound_channel() {
+        let mock = MockClipboardProvider::new();
+        let agent = GuestAgent::new(mock.clone());
+        let (store, out) = collector();
+        agent.attach(out).unwrap();
+
+        let push = HostToGuest::PushText {
+            seq: 7,
+            ts_ms: 0,
+            text: "from-host".into(),
+        };
+        assert!(agent.apply(&push).unwrap());
+        assert_eq!(
+            *store.lock().unwrap(),
+            vec![GuestToHost::PushAcked { seq: 7 }],
+            "an applied push is acked exactly once, carrying the push's own seq"
+        );
+    }
+
+    /// A push the guest did **not** apply must not be acked: an ack states that the
+    /// guest clipboard now holds the pushed text.
+    #[test]
+    fn a_push_the_guest_did_not_apply_is_not_acked() {
+        let mock = MockClipboardProvider::new();
+        mock.set_primary_text("already").unwrap(); // -> the push is a no-op
+        let agent = GuestAgent::new(mock.clone());
+        let (store, out) = collector();
+        agent.attach(out).unwrap();
+
+        assert!(!agent.apply(&push_text("already")).unwrap());
+        assert!(!agent.apply(&push_text("   ")).unwrap()); // blank: never applied
         assert!(
             store.lock().unwrap().is_empty(),
-            "the echo of our own apply must not be reported to the host"
+            "an ack would claim an application that never happened"
         );
+    }
+
+    #[test]
+    fn a_failed_push_is_not_acked() {
+        let agent = GuestAgent::new(RejectingClipboard);
+        let (store, out) = collector();
+        agent.attach(out).unwrap();
+        assert!(agent.apply(&push_text("boom")).is_err());
+        assert!(
+            store.lock().unwrap().is_empty(),
+            "nothing was written, so nothing may be acked"
+        );
+    }
+
+    /// Honest boundary: with no outbound channel installed there is nowhere to send
+    /// an ack — `apply` must still work (and must not panic).
+    #[test]
+    fn apply_without_an_outbound_channel_still_works() {
+        let mock = MockClipboardProvider::new();
+        let agent = GuestAgent::new(mock.clone());
+        assert!(agent.apply(&push_text("from-host")).unwrap());
+        assert_eq!(mock.text().as_deref(), Some("from-host"));
     }
 
     #[test]
@@ -213,12 +319,16 @@ mod tests {
         let (store, out) = collector();
         agent.attach(out).unwrap();
 
-        // Host push "A" (no report), then a user copy "B" (reported).
+        // Host push "A" (no copy report), then a user copy "B" (reported).
         agent.apply(&push_text("A")).unwrap();
         mock.set_primary_text("B").unwrap();
         let msgs = store.lock().unwrap();
-        assert_eq!(msgs.len(), 1, "only the genuine copy is reported");
-        match &msgs[0] {
+        let copies: Vec<&GuestToHost> = msgs
+            .iter()
+            .filter(|m| matches!(m, GuestToHost::ClipboardChanged { .. }))
+            .collect();
+        assert_eq!(copies.len(), 1, "only the genuine copy is reported");
+        match copies[0] {
             GuestToHost::ClipboardChanged { text, .. } => assert_eq!(text, "B"),
             _ => panic!("expected ClipboardChanged"),
         }

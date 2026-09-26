@@ -14,6 +14,20 @@ export interface FileOperationError {
   reason: 
     | "store_full"       // 存储配额耗尽
     | "store_locked"     // 存储被锁定 (并发写入冲突)
+    /**
+     * **本机存储写不进去 —— 不可用或已满**（REQ-A510）。
+     *
+     * 为什么需要它：`writeJson` / `writeStoreValueChecked` 只回答"落没落地"，答不出**是哪一种**
+     * （其文档原话：a rejected write (full/unavailable storage) has to be visible；`common.storeWriteFailed`
+     * 的文案也是"本机存储写入失败（**不可用或已满**）"）。而在此之前，三处拒写都标成 `store_locked`
+     * （"存储繁忙 / 并发写锁"）—— 这个应用**没有**能观测到写锁的生产者（`localStorage.setItem` 不加锁），
+     * 于是用户读到"存储繁忙，请重试"，而真实条件可能是"空间已满"：按钮按了也不会成功，除非他先腾出空间。
+     * 这个 reason 就是不猜：名字、文案与"写不进去"这件事本身对齐，而 `retryable` 仍为 `true`
+     * （存储状态确实可能变化 —— 腾出空间、或存储恢复可用；REQ-A468 的测试正是这一半）。
+     *
+     * `store_full` / `store_locked` 保留：它们对**能分辨**的生产者仍然正确，今天没有这样的生产者。
+     */
+    | "store_unavailable"
     | "name_conflict"    // 文件名冲突
     | "not_found"        // 条目不存在
     | "invalid_name"     // 非法文件名
@@ -64,6 +78,7 @@ export function createFileError(
 function getSeverity(reason: FileOperationError["reason"]): ErrorSeverity {
   switch (reason) {
     case "store_full":
+    case "store_unavailable": // 写不进去就是"这次改动没保存"——与 store_full 同一量级
     case "permission_denied":
       return "critical";
     case "store_locked":
@@ -85,6 +100,7 @@ function getSeverity(reason: FileOperationError["reason"]): ErrorSeverity {
 function isRetryable(reason: FileOperationError["reason"]): boolean {
   switch (reason) {
     case "store_locked":  // 并发锁可能释放
+    case "store_unavailable": // 存储**可能**恢复：腾出空间、或禁用状态被解除（REQ-A510）
     case "unknown":       // 未知错误可能是临时故障
       return true;
     case "store_full":    // 配额耗尽需要用户清理
@@ -201,6 +217,25 @@ export function shouldRetry(
   config: RetryConfig = DEFAULT_RETRY_CONFIG
 ): boolean {
   return error.retryable && attempt < config.maxAttempts;
+}
+
+/**
+ * A stable identity for **the same failed action across its retries** (REQ-A607).
+ *
+ * Every failed attempt mints a fresh `FileOperationError` with its own `timestamp`, so
+ * neither object identity nor the timestamp can tell a *retry of one action* from a
+ * *new failure* — yet a retry budget has to survive the former and reset on the latter.
+ * Operation + reason + the (sorted) context is that identity: a retry re-enters **the
+ * same** user action with the same arguments and so reproduces the signature, while a
+ * different action — or the same action on a different entry — does not.
+ */
+export function retrySignature(error: FileOperationError | null): string | null {
+  if (!error) return null;
+  const ctx = error.context ?? {};
+  const parts = Object.keys(ctx)
+    .sort()
+    .map((k) => `${k}=${String(ctx[k])}`);
+  return `${error.operation}:${error.reason}${parts.length ? `:${parts.join(",")}` : ""}`;
 }
 
 /**

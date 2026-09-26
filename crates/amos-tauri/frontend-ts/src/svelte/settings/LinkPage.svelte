@@ -10,16 +10,21 @@
   // The readout is **dated and re-read**: every number on screen is a snapshot taken at
   // `readAt` (printed as `link.probe`), the page re-reads while it is open and visible, and a
   // re-read that gets no answer drops the numbers instead of leaving frozen ones on screen.
-  // There is no toggle: this page observes, it does not command (the CLI owns
-  // publishing; docs/amos-link.md §6).
+  // There is no toggle: **this page** observes, it does not command. Commanding is a
+  // different screen over the same bridge — the Robot console (`svelte/RobotApp.svelte`,
+  // `lib/robot.ts`), whose `link_publish` sends arm / estop / gait to
+  // `amos/<robot>/control/action`. The CLI is no longer the only publisher
+  // (docs/amos-link.md §6).
   import { onMount } from "svelte";
   import {
     actuationAgeMs,
     counterSummary,
+    estopReasonKey,
     formatUptime,
     healthKey,
     linkLevel,
     linkStatus,
+    peerDeclared,
     peerSummary,
     reportAgeKey,
     reportAgeText,
@@ -28,6 +33,7 @@
     robotLevel,
     robotLevelKey,
     robotSummary,
+    watchdogText,
     type LinkStatus,
   } from "../../lib/link";
   import { t } from "../locale.svelte";
@@ -152,8 +158,15 @@
                 <span class="truncate">
                   {peer.id}{#if peer.endpoint} · {peer.endpoint}{/if}
                 </span>
-                <span class="shrink-0">
-                  {peer.last_seen_ms}ms · {peer.beacons}×
+                <!--
+                  「这个 peer 多久没被听见了」有两个不同的答案：有 beacon 的 peer 给的是
+                  *听见* 的年龄，而 `beacons === 0` 的 peer 是**手工声明**的，`last_seen_ms`
+                  量的是**声明**的年龄、`0×` 也从来不是「收到过 0 次广播」。照字面画
+                  （`259200000ms · 0×`）会让一个从未被听见的静态条目看起来跟活着的机器人
+                  一样 —— 与 `RobotApp` 的同名表同一判据（`lib/link.ts::peerDeclared`）。
+                -->
+                <span class="shrink-0" data-testid="link-peer-seen">
+                  {peerDeclared(peer) ? t("link.peerDeclared") : `${peer.last_seen_ms}ms · ${peer.beacons}×`}
                 </span>
               </li>
             {/each}
@@ -187,6 +200,7 @@
                 printing a number.
               -->
               {@const ageMs = actuationAgeMs(robot, readAt)}
+              {@const reasonKey = estopReasonKey(robot.estop_reason)}
               <li class="text-sm">
                 <div class="flex justify-between gap-3">
                   <span class="truncate">{robotSummary(robot)}</span>
@@ -197,6 +211,26 @@
                 <p class="text-xs opacity-60" data-testid="link-robot-age">
                   {t(reportAgeKey(ageMs), { age: reportAgeText(ageMs ?? 0) })}
                 </p>
+                <!-- How much of the last action reached the bus — the count the HAL measured
+                     (`RobotHal::apply`/`estop` return how many frames the bus accepted, never a
+                     guess: `docs/amos-link.md` §3). It separates 「commanded」 from 「wrote
+                     nothing」, and for a profile machine (which reports `gait` empty by design,
+                     `docs/robot-domains.md` §6.4) it is the only such fact. -->
+                <p class="text-xs opacity-60" data-testid="link-robot-frames">
+                  {t("link.actuationFrames")}: {robot.frames}
+                </p>
+                <!-- Why torque was cut: `estopped` alone cannot tell a watchdog cut from a
+                     commanded one (the CLI prints the same fact as `estopped=true(watchdog)`). -->
+                {#if reasonKey}
+                  <p class="text-xs opacity-60" data-testid="link-robot-estop-reason">
+                    {t("link.estopReason")}: {t(reasonKey)}
+                  </p>
+                {/if}
+                {#if robot.watchdog_ms !== null}
+                  <p class="text-xs opacity-60" data-testid="link-robot-watchdog">
+                    {t("link.watchdogPeriod")}: {watchdogText(robot.watchdog_ms)}
+                  </p>
+                {/if}
                 {#if robot.last_refusal}
                   <p class="text-xs opacity-60" data-testid="link-robot-refusal">
                     {t("link.robotRefused", { seq: robot.last_refusal.seq })}:

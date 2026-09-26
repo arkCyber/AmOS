@@ -20,7 +20,15 @@ import {
   syncDueEventAlerts,
 } from "../lib/calendarCore";
 import { NOTIF_KEY, normalizeNotifs, type Notif } from "../lib/settings";
+import { LOCALE_KEY } from "../svelte/i18n";
 import { DEFAULT_CALENDAR_ID, DAY_MS, type CalendarEvent, type CalendarGroup } from "../lib/calendar";
+import { GlobalRegistrator } from "@happy-dom/global-registrator";
+
+try {
+  GlobalRegistrator.register();
+} catch {
+  /* already registered */
+}
 
 const at = (y: number, mo: number, d: number, h = 0, mi = 0): number =>
   new Date(y, mo - 1, d, h, mi, 0, 0).getTime();
@@ -67,6 +75,9 @@ beforeEach(() => {
 });
 afterEach(() => {
   (globalThis as unknown as { window?: unknown }).window = realWindow;
+  // The locale lives in the *real* (happy-dom) localStorage, not the stubbed `window`
+  // one — clear it so a leaked `en` cannot reach the next file in the bun batch.
+  localStorage.removeItem(LOCALE_KEY);
 });
 
 describe("calendarCore — fired markers", () => {
@@ -232,6 +243,22 @@ describe("calendarCore — syncDueEventAlerts (store round-trip)", () => {
     syncDueEventAlerts(start + 1000);
     const after = normalizeNotifs(JSON.parse(store.get(NOTIF_KEY) ?? "[]") as Notif[]);
     expect(after.length).toBe(1);
+  });
+
+  test("the pushed notification's app name follows the UI locale", () => {
+    // `currentLocale()` — the non-reactive reader the producers use — reads the **bare**
+    // `localStorage` global, not the `window` stub above (that one only carries the
+    // stores). The locale is removed again in `afterEach`: the bun batch runs every file
+    // in one process, so a leaked locale would be read by the files after this one.
+    const store = new Map<string, string>();
+    withStorage(store);
+    localStorage.setItem(LOCALE_KEY, "en");
+    const start = at(2026, 3, 9, 14);
+    store.set(CALENDARS_KEY, JSON.stringify(GROUPS));
+    store.set(CALENDAR_KEY, JSON.stringify([ev({ id: "a", title: "Standup", startAt: start })]));
+    syncDueEventAlerts(start);
+    const notifs = normalizeNotifs(JSON.parse(store.get(NOTIF_KEY) ?? "[]") as Notif[]);
+    expect(notifs[0]!.app).toBe("Calendar");
   });
 
   test("hidden calendars and alert-less events never notify", () => {

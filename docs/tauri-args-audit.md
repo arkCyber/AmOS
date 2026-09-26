@@ -87,6 +87,33 @@ interpreter ran `auto → zh` no matter what the user had configured in
 **Fixed** to `sourceLang`/`targetLang`, pinned by `backend.test.ts` (positive +
 negative assertion on the old keys) and the gate.
 
+## Findings from REQ-A1830 (F-OTA-008) — the argument's *type* folds an unknown
+
+The two defects above were about the wire **key**. A third failure mode lives one
+level deeper: the key is right, but its **type cannot express "unknown"**, so the
+value a client sends is a folded lie rather than a missing fact.
+
+`ota_check`/`ota_install` declared `charging: bool`. The battery authority this UI
+reads (`lib/batteryStatus.ts::normalizeSample`) is three-valued — it keeps `null`
+for "the charging bit could not be read" — and so are the host's own
+`host_battery.rs::charging` (`Option<bool>`, "null when unknown") and
+`amos-monitor::BatteryStatus.charging`. The old frontend line, `charging:
+sys?.battery_charging === true`, turned that `null` into a measured `false`, so a
+device whose charger was never read was reported to the policy as "known to be on
+battery":
+
+* with the level also unread, the deferral was named `unknown_battery` — pointing
+  the user at a battery that was never the obstacle;
+* with a low level, the battery floor was applied to a device that may have been
+  plugged in (which would have waived the floor entirely).
+
+**Fixed** by widening the argument to `Option<bool>` end-to-end — command params,
+`DeviceFacts.charging`, the CLI (`--on-battery`, sibling to `--battery`'s
+"omit ⇒ unknown") and a new distinct reason `UnknownCharging` — and by giving the
+frontend a pure `otaChargingFact(wire)` that preserves `null`/`undefined`. The
+gate cannot see this class: it reads the *key*, not the type, and `read-fold-scan`
+looks for `??` folds, not `=== true` truthiness on a nullable source.
+
 ## Running it
 
 ```sh

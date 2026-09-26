@@ -107,10 +107,28 @@ describe("buildSnapshot", () => {
     expect(snap.files).toEqual([]);
   });
 
-  it("treats unknown sizes as zero in the total", () => {
-    const files = [extFile({ name: "a", uri: "u-a", ts: 0 })];
+  it("withholds the total when a size was not reported", () => {
+    // One unmeasured size withholds the whole total — the same rule the live device-files
+    // header follows (`totalExternalBytes`). Recording the partial sum (here `0`) would
+    // print 「0 B」 over three files whose sizes nobody read.
+    const files = [
+      extFile({ name: "a", uri: "u-a", ts: 1, sizeBytes: 100 }),
+      extFile({ name: "b", uri: "u-b", ts: 2 }),
+      extFile({ name: "c", uri: "u-c", ts: 3, sizeBytes: 300 }),
+    ];
     const snap = buildSnapshot("t", files);
-    expect(snap.totalBytes).toBe(0);
+    expect(snap.totalBytes).toBeNull();
+    // The per-file sizes are still carried, so a reader can see which one is unknown.
+    expect(snap.files.map((f) => f.sizeBytes)).toEqual([100, null, 300]);
+  });
+
+  it("totals only when every size was reported", () => {
+    // Positive control: the withholding rule must not become "never total".
+    const files = [
+      extFile({ name: "a", uri: "u-a", ts: 1, sizeBytes: 0 }),
+      extFile({ name: "b", uri: "u-b", ts: 2, sizeBytes: 0 }),
+    ];
+    expect(buildSnapshot("t", files).totalBytes).toBe(0);
   });
 });
 
@@ -167,5 +185,11 @@ describe("formatSnapshotSize", () => {
     expect(formatSnapshotSize(1536)).toBe("1.5 KB");
     expect(formatSnapshotSize(5 * 1024 * 1024)).toBe("5 MB");
     expect(formatSnapshotSize(-1)).toBe("—");
+  });
+
+  it("withholds a total it never measured", () => {
+    // `null` is "not measured", not a number out of range: the header must read 「—」
+    // rather than the `0 B` the pre-fix `?? 0` fold fabricated.
+    expect(formatSnapshotSize(null)).toBe("—");
   });
 });

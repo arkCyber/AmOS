@@ -71,11 +71,14 @@
     return configs.find((c) => c.corner === corner) || DEFAULT_HOT_CORNERS[0]!;
   }
 
-  const cornerLabels: Record<Corner, string> = {
-    "top-left": t("settings.hotCorner.topLeft"),
-    "top-right": t("settings.hotCorner.topRight"),
-    "bottom-left": t("settings.hotCorner.bottomLeft"),
-    "bottom-right": t("settings.hotCorner.bottomRight"),
+  // 存 key、在模板里 `t()` —— 与同文件的 actions / modifiers 两个表同一条规则。
+  // 挂载时译好会把语言冻住：切语言后标题、下拉框、提示都跟着变，唯独四个角落的
+  // 标签停在旧语言（见 locale.svelte.ts 文件头：`t()` 要在渲染期调用才是响应式的）。
+  const CORNER_LABEL_KEYS: Record<Corner, string> = {
+    "top-left": "settings.hotCorner.topLeft",
+    "top-right": "settings.hotCorner.topRight",
+    "bottom-left": "settings.hotCorner.bottomLeft",
+    "bottom-right": "settings.hotCorner.bottomRight",
   };
 </script>
 
@@ -94,7 +97,7 @@
       <div class={GROUP}>
         <div class="px-4 py-3">
           <label for={ACTION_IDS[corner]} class="block text-sm font-medium mb-2">
-            {cornerLabels[corner as Corner]}
+            {t(CORNER_LABEL_KEYS[corner as Corner])}
           </label>
 
           <!-- Action selector -->

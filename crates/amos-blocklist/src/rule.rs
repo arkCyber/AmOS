@@ -85,10 +85,19 @@ impl MatchKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rule {
     /// Stable id (derived from pattern + kind + channel) for list keys/removal.
+    ///
+    /// Defaulted on read: [`crate::Blocklist::from_json`] re-derives it from the
+    /// pattern and never reads the stored one, so a hand-edited row that omits
+    /// it is the benign edit, not an unreadable rule (REQ-A1777).
+    #[serde(default)]
     pub id: String,
     /// Normalized pattern (digits with an optional leading `+`, as typed).
     pub pattern: String,
     /// Digits used for comparison (pattern without the leading `+`).
+    ///
+    /// Defaulted on read for the same reason as [`Rule::id`]: it is re-derived
+    /// from the pattern, never trusted from the file.
+    #[serde(default)]
     pub digits: String,
     pub kind: MatchKind,
     pub channel: Channel,
@@ -202,4 +211,15 @@ pub fn starts_with_number(digits: &str, prefix: &str) -> bool {
         return true;
     }
     (1..=3).any(|cc| d.len() > cc && d[cc..].starts_with(p))
+}
+
+/// The pattern a prefix rule actually matches on, after the same access-prefix
+/// normalization [`starts_with_number`] applies to every address.
+///
+/// [`MIN_PREFIX_DIGITS`] must be checked against **this**, not the typed digits:
+/// `010` normalizes to `10` and `0001` to `1`, so a guard that measures the raw
+/// text green-lights a rule whose real reach is only 1–2 digits — silently
+/// blocking every `10…`/`1…` number, the exact outcome the guard exists to stop.
+pub fn effective_prefix(digits: &str) -> &str {
+    trim_zeros(digits)
 }

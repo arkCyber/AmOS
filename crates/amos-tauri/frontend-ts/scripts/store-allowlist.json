@@ -5,7 +5,8 @@
     "device-state": "Mirrors of OS/device state (wifi, bluetooth, cellular, flashlight, the personal hotspot's AP configuration). The device itself is the source of truth and re-reports on the next boot; restoring a stale copy could contradict the hardware.",
     "meta": "The backup blob itself — snapshotting a backup would copy it into itself.",
     "enterprise-admin": "Enterprise/MDM state an administrator configured (API + webhook config, the audit trail's own config and sync queue, MDM policy config and the daily execution counters, the enterprise template catalogue and its installation bookkeeping, the shortcuts webhook list). It is device-local **administrative** state, not user content: restoring it from an end user's backup could silently re-apply a policy the admin has since changed or revoked, so losing it costs the admin a re-sync with the MDM server — which is the authoritative side anyway.",
-    "device-expectation": "Keys the app **reads but nothing in this build writes** (`amos.app.version`, `amos.user.id/name/email` — read by the enterprise audit trail to stamp each entry, written by no component). Losing them costs nothing today because they are always empty; they are listed so the gap is documented (the audit entries carry empty identity/version) instead of looking like a configured value that quietly failed to load."
+    "device-expectation": "Keys the app **reads but nothing in this build writes** (`amos.app.version`, `amos.user.id/name/email` — read by the enterprise audit trail to stamp each entry, written by no component). `amos.app.version` is a host-override seam: the audit trail stamps `AMOS_UI_VERSION` (the real build constant, pinned to `package.json` by `version.test.ts`) when no host value is present, so an entry never lies about its build. `amos.user.*` have no source at all — this shell has no login — so the audit trail marks an absent subject explicitly `unattributed` rather than naming a fabricated user (`lib/buildIdentity.ts`, REQ-A695). Losing any of them costs nothing (the honest defaults fire); they are listed so the gap is documented instead of looking like a configured value that quietly failed to load.",
+    "host-error-code": "**Not store keys at all.** These are the stable `code` strings of the host's error envelopes (`crates/amos-tauri/src/error.rs`, `ErrorCode::as_str`), which the `host_fs` and `print` bridges send to the UI so it can branch on a refusal (REQ-A539); `print`'s three arrived with REQ-A869 and were missing from this list until REQ-A873 ran the classifier over the whole tree again; the `interpret` six arrived the same way — `InterpApp.svelte` maps `bridgeDiag(cmd).code` onto localized sentences (REQ-A461's typed envelope), so the codes are read on the screen and never touch the store. They share the `amos.` prefix the scanner matches on, so they are listed here to be classified rather than to be backed up — nothing reads or writes them through the store, and a backup that carried them would change nothing."
   },
   "keys": [
     {
@@ -33,6 +34,18 @@
       "kind": "configuration"
     },
     {
+      "key": "amos.home.widgets",
+      "kind": "configuration"
+    },
+    {
+      "key": "amos.split",
+      "kind": "configuration"
+    },
+    {
+      "key": "amos.slideOver",
+      "kind": "configuration"
+    },
+    {
       "key": "amos.appLibrary.groups",
       "kind": "configuration"
     },
@@ -49,6 +62,14 @@
       "kind": "configuration"
     },
     {
+      "key": "amos.focus.schedule",
+      "kind": "configuration"
+    },
+    {
+      "key": "amos.focus.auto",
+      "kind": "configuration"
+    },
+    {
       "key": "amos.lock",
       "kind": "configuration"
     },
@@ -58,6 +79,10 @@
     },
     {
       "key": "amos.notesPrefs",
+      "kind": "configuration"
+    },
+    {
+      "key": "amos.contacts.avatarTheme",
       "kind": "configuration"
     },
     {
@@ -131,6 +156,66 @@
     {
       "key": "amos.appstore.upgrade_failed",
       "kind": "configuration"
+    },
+    {
+      "key": "amos.podcast.url_invalid",
+      "kind": "host-error-code"
+    },
+    {
+      "key": "amos.podcast.url_scheme_unsupported",
+      "kind": "host-error-code"
+    },
+    {
+      "key": "amos.podcast.fetch_failed",
+      "kind": "host-error-code"
+    },
+    {
+      "key": "amos.podcast.parse_failed",
+      "kind": "host-error-code"
+    },
+    {
+      "key": "amos.podcast.feed_rejected",
+      "kind": "host-error-code"
+    },
+    {
+      "key": "amos.podcast.unknown_feed",
+      "kind": "host-error-code"
+    },
+    {
+      "key": "amos.podcast.subscription_limit",
+      "kind": "host-error-code"
+    },
+    {
+      "key": "amos.podcast.store_failed",
+      "kind": "host-error-code"
+    },
+    {
+      "key": "amos.podcast.download_failed",
+      "kind": "host-error-code"
+    },
+    {
+      "key": "amos.podcast.download_no_dir",
+      "kind": "host-error-code"
+    },
+    {
+      "key": "amos.podcast.download_unsupported",
+      "kind": "host-error-code"
+    },
+    {
+      "key": "amos.podcast.no_audio",
+      "kind": "host-error-code"
+    },
+    {
+      "key": "amos.podcast.episode_id_empty",
+      "kind": "host-error-code"
+    },
+    {
+      "key": "amos.podcast.episode_id_too_long",
+      "kind": "host-error-code"
+    },
+    {
+      "key": "amos.podcast.rpc_failed",
+      "kind": "host-error-code"
     },
     {
       "key": "amos.spaces.delete_last",
@@ -217,12 +302,28 @@
       "kind": "device-state"
     },
     {
+      "key": "amos.health.counter",
+      "kind": "device-state"
+    },
+    {
+      "key": "amos.rotation",
+      "kind": "configuration"
+    },
+    {
       "key": "amos.cloud.backup",
       "kind": "meta"
     },
     {
       "key": "amos.compass.settings",
       "kind": "configuration"
+    },
+    {
+      "key": "amos.health.profile",
+      "kind": "configuration"
+    },
+    {
+      "key": "amos.ota",
+      "kind": "derived"
     },
     {
       "key": "amos.measure.settings",
@@ -317,6 +418,11 @@
       "kind": "derived"
     },
     {
+      "key": "dock.prefs.v1",
+      "kind": "configuration",
+      "note": "The Dock's own arrangement (position / auto-hide / magnification / icon size), `DOCK_PREFS_KEY` in `lib/dockPrefs.ts`. It is the user's taste for **this** machine's dock, the same kind of local UI state as `amos.home.layout` above — not content anyone authored, and a restore onto a phone or a different display would move the user's dock to a shape they chose elsewhere. This entry arrived late (REQ-A1890): the gate's corpus was the `amos.` naming convention, and this key is the one store key that does not follow it, so it sat in neither `SYNC_STORES` nor this list while `store-scan` reported every key classified. The gate now reads the store API's call sites, which is why it appears here."
+    },
+    {
       "key": "amos.brightness",
       "kind": "configuration",
       "note": "WebView-only display dimming (G-β-1); deliberately device-local — restoring a 60% value onto an external monitor would dim the wrong physical screen."
@@ -325,6 +431,172 @@
       "key": "amos.files.reveal",
       "kind": "derived",
       "why": "A one-shot **command**, not state (REQ-A458): whoever wants the Files screen to show one entry writes {id, nonce} here from another window, and the Files screen clears it the moment it has. Losing it loses nothing (a reveal nobody served is a reveal nobody is waiting for), and keeping it in a backup would make a restore re-fire a reveal that happened days ago."
+    },
+    {
+      "key": "amos.files.view",
+      "kind": "derived",
+      "why": "A one-shot **command**, not state (REQ-A783) — the sibling of `amos.files.reveal` above and allow-listed for the same reasons. Whoever wants the Files screen to land on one of its four views writes {view, nonce} here from another window (the desktop Dock's trash tile does), and the screen clears it the moment it has. This is a *destination*, not content the user created: keeping it in a backup would mean restoring a snapshot made days ago yanks the first Files window that opens to whatever view was requested back then."
+    },
+    {
+      "key": "amos.settings.page",
+      "kind": "derived",
+      "why": "A one-shot **command**, not state (REQ-A790) — the third of the same family as `amos.files.reveal` and `amos.files.view` above, and allow-listed for the same reasons. Whoever wants the Settings window to land on one page writes {page, nonce} here from another window (the desktop Dock's 「打开偏好设置」 row does, aiming at the Dock pane), and the screen clears it the moment it has. Note `page` is validated against `SETTINGS_PAGES` on read and an unknown name is **ignored**, so a value left by a newer build cannot land the user on some other page. This is a *destination*, not content the user created: keeping it in a backup would mean restoring a snapshot made days ago yanks the first Settings window that opens to a pane chosen back then."
+    },
+    {
+      "key": "amos.host_fs.root_not_configured",
+      "kind": "host-error-code"
+    },
+    {
+      "key": "amos.host_fs.root_not_found",
+      "kind": "host-error-code"
+    },
+    {
+      "key": "amos.host_fs.root_not_a_dir",
+      "kind": "host-error-code"
+    },
+    {
+      "key": "amos.host_fs.path_not_found",
+      "kind": "host-error-code"
+    },
+    {
+      "key": "amos.host_fs.path_is_a_dir",
+      "kind": "host-error-code"
+    },
+    {
+      "key": "amos.host_fs.path_is_not_a_dir",
+      "kind": "host-error-code"
+    },
+    {
+      "key": "amos.host_fs.path_escapes_root",
+      "kind": "host-error-code"
+    },
+    {
+      "key": "amos.host_fs.file_too_large",
+      "kind": "host-error-code"
+    },
+    {
+      "key": "amos.host_fs.read_failed",
+      "kind": "host-error-code"
+    },
+    {
+      "key": "amos.host_fs.write_failed",
+      "kind": "host-error-code"
+    },
+    {
+      "key": "amos.host_fs.read_not_utf8",
+      "kind": "host-error-code"
+    },
+    {
+      "key": "amos.host_fs.write_atomics_failed",
+      "kind": "host-error-code"
+    },
+    {
+      "key": "amos.host_fs.target_exists",
+      "kind": "host-error-code"
+    },
+    {
+      "key": "amos.host_fs.dir_not_empty",
+      "kind": "host-error-code"
+    },
+    {
+      "key": "amos.host_fs.recursion_limit",
+      "kind": "host-error-code"
+    },
+    {
+      "key": "amos.host_fs.create_dir_failed",
+      "kind": "host-error-code"
+    },
+    {
+      "key": "amos.host_fs.remove_failed",
+      "kind": "host-error-code"
+    },
+    {
+      "key": "amos.host_fs.rename_failed",
+      "kind": "host-error-code"
+    },
+    {
+      "key": "amos.host_fs.copy_failed",
+      "kind": "host-error-code"
+    },
+    {
+      "key": "amos.print.unsupported_platform",
+      "kind": "host-error-code"
+    },
+    {
+      "key": "amos.print.no_window",
+      "kind": "host-error-code"
+    },
+    {
+      "key": "amos.print.dialog_failed",
+      "kind": "host-error-code"
+    },
+    {
+      "key": "amos.mail.foreground_required",
+      "kind": "host-error-code"
+    },
+    {
+      "key": "amos.recordings.foreground_required",
+      "kind": "host-error-code"
+    },
+    {
+      "key": "amos.rag.foreground_required",
+      "kind": "host-error-code"
+    },
+    {
+      "key": "amos.stage.arrange_impossible",
+      "kind": "host-error-code"
+    },
+    {
+      "key": "amos.stage.disabled",
+      "kind": "host-error-code"
+    },
+    {
+      "key": "amos.stage.lock_failed",
+      "kind": "host-error-code"
+    },
+    {
+      "key": "amos.stage.persist_failed",
+      "kind": "host-error-code"
+    },
+    {
+      "key": "amos.stage.unsupported",
+      "kind": "host-error-code"
+    },
+    {
+      "key": "amos.stage.window_in_split",
+      "kind": "host-error-code"
+    },
+    {
+      "key": "amos.stage.window_is_screen",
+      "kind": "host-error-code"
+    },
+    {
+      "key": "amos.stage.window_unknown",
+      "kind": "host-error-code"
+    },
+    {
+      "key": "amos.interpret.no_active",
+      "kind": "host-error-code"
+    },
+    {
+      "key": "amos.interpret.session_id_mismatch",
+      "kind": "host-error-code"
+    },
+    {
+      "key": "amos.interpret.text_too_long",
+      "kind": "host-error-code"
+    },
+    {
+      "key": "amos.interpret.audio_too_large",
+      "kind": "host-error-code"
+    },
+    {
+      "key": "amos.interpret.session_failed",
+      "kind": "host-error-code"
+    },
+    {
+      "key": "amos.interpret.channel_failed",
+      "kind": "host-error-code"
     }
   ]
 }

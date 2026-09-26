@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import { GlobalRegistrator } from "@happy-dom/global-registrator";
 import {
   IME_CANDIDATE_PAGE_SIZE,
@@ -6,6 +7,7 @@ import {
   IME_FUZZY_PAIRS,
   IME_LETTER_ROWS,
   IME_SYMBOL_ROWS,
+  IME_ZH_SYMBOL_ROWS,
   candidatePageCount,
   deleteBeforeCaret,
   imeBackspace,
@@ -22,6 +24,7 @@ import {
   isTextEntry,
   pageCandidates,
   readImeEnabled,
+  toChinesePunctuation,
   writeImeEnabled,
 } from "../lib/ime";
 
@@ -89,6 +92,54 @@ describe("lib/ime — bridge wrappers", () => {
     expect(await imeKey("z")).toBeNull();
     expect(await imeCommit(0)).toBeNull();
     expect(await imeForgetLast()).toBeNull();
+  });
+});
+
+describe("lib/ime — 被拒的写入不是「已保存的偏好」（REQ-A1432）", () => {
+  /** Replace `window.localStorage` with one whose `setItem` throws **only** for `key`. */
+  function installRefusingStorage(key: string): () => void {
+    const real = window.localStorage;
+    const fake = {
+      getItem: (k: string) => real.getItem(k),
+      removeItem: (k: string) => real.removeItem(k),
+      clear: () => real.clear(),
+      key: (i: number) => real.key(i),
+      get length() {
+        return real.length;
+      },
+      setItem: (k: string, v: string) => {
+        if (k === key) throw new DOMException("quota", "QuotaExceededError");
+        real.setItem(k, v);
+      },
+    };
+    Object.defineProperty(window, "localStorage", {
+      value: fake,
+      configurable: true,
+      writable: true,
+    });
+    return () => {
+      Object.defineProperty(window, "localStorage", {
+        value: real,
+        configurable: true,
+        writable: true,
+      });
+    };
+  }
+
+  test("writeImeEnabled 把存储的判决交回调用方（拒写 ⇒ false，且盘上还是旧值）", () => {
+    window.localStorage.setItem(IME_ENABLED_KEY, "false");
+    const restore = installRefusingStorage(IME_ENABLED_KEY);
+    try {
+      expect(writeImeEnabled(true)).toBe(false);
+      // 这就是「偏好」这个断言所依赖的事实：屏幕上的开关若跟着动，盘上并没有动。
+      expect(window.localStorage.getItem(IME_ENABLED_KEY)).toBe("false");
+      expect(readImeEnabled()).toBe(false);
+    } finally {
+      restore();
+    }
+    // 存储回来可写 ⇒ 判决翻成 true，且这次真的落盘了。
+    expect(writeImeEnabled(true)).toBe(true);
+    expect(window.localStorage.getItem(IME_ENABLED_KEY)).toBe("true");
   });
 });
 
@@ -246,18 +297,59 @@ describe("lib/ime — layout, preference and paging", () => {
     for (const k of flat) expect(k.length).toBe(1);
   });
 
-  test("the fuzzy-pair list has the nine engine pairs", () => {
-    expect([...IME_FUZZY_PAIRS]).toEqual([
-      "z_zh",
-      "c_ch",
-      "s_sh",
-      "n_l",
-      "f_h",
-      "r_l",
-      "in_ing",
-      "en_eng",
-      "an_ang",
-    ]);
+  test("the Chinese symbol page carries Chinese punctuation and half-width digits", () => {
+    const zh = IME_ZH_SYMBOL_ROWS.flat();
+    // The punctuation a Chinese IME must produce is actually on the page…
+    for (const g of ["，", "。", "？", "！", "、", "：", "；", "「", "」"]) {
+      expect(zh).toContain(g);
+    }
+    // …the half-width twins are not (English mode owns them)…
+    expect(zh).not.toContain(".");
+    expect(zh).not.toContain(",");
+    // …and digits stay half-width (a phone number, not １２３).
+    expect(IME_ZH_SYMBOL_ROWS[0]).toEqual(["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"]);
+  });
+
+  test("toChinesePunctuation maps the ASCII punctuation a Chinese IME converts", () => {
+    expect(toChinesePunctuation(",")).toBe("，");
+    expect(toChinesePunctuation(".")).toBe("。");
+    expect(toChinesePunctuation("?")).toBe("？");
+    expect(toChinesePunctuation("!")).toBe("！");
+    expect(toChinesePunctuation(":")).toBe("：");
+    expect(toChinesePunctuation(";")).toBe("；");
+    expect(toChinesePunctuation("(")).toBe("（");
+    expect(toChinesePunctuation(")")).toBe("）");
+    expect(toChinesePunctuation("<")).toBe("《");
+    expect(toChinesePunctuation("\\")).toBe("、");
+  });
+
+  test("toChinesePunctuation is a pass-through for letters, digits and twinless symbols", () => {
+    // Anything without an unambiguous Chinese form must survive untouched, or an
+    // email address / phone number typed in Chinese mode would be mangled.
+    for (const ch of ["a", "Z", "7", "@", "#", "$", "%", "&", "*", "+", "=", "-", "/", " "]) {
+      expect(toChinesePunctuation(ch)).toBe(ch);
+    }
+    // Already-Chinese glyphs are idempotent (the symbol page emits these directly).
+    expect(toChinesePunctuation("，")).toBe("，");
+  });
+
+  test("the fuzzy-pair list is the nine engine pairs, read from `amos_ime`", () => {
+    // REQ-A644: the fuzzy list is a declared cross-language mirror (`amos_ime`),
+    // not a locally-owned constant.
+    // `ime.ts` says the list "must match `amos_ime::FUZZY_PAIRS`", but this test
+    // used to assert a locally re-typed copy of the same nine strings — a value
+    // equal to itself. It never touched `amos_ime`. Read the Rust `key()` map and
+    // require both directions, so a rename on either side is a red here.
+    const src = readFileSync(
+      new URL("../../../../amos-ime/src/fuzzy.rs", import.meta.url),
+      "utf8",
+    );
+    const keyIdx = src.indexOf("pub const fn key(self)");
+    expect(keyIdx).toBeGreaterThan(0);
+    const body = src.slice(keyIdx, keyIdx + 500);
+    const rust = [...body.matchAll(/=>\s*"([a-z_]+)"/g)].map((m) => m[1] ?? "");
+    expect(rust).toHaveLength(9);
+    expect(rust).toEqual([...IME_FUZZY_PAIRS]);
   });
 
   test("the enabled preference round-trips and defaults by pointer type", () => {

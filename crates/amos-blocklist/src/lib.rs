@@ -35,5 +35,5 @@ mod list;
 mod rule;
 
 pub use error::BlocklistError;
-pub use list::Blocklist;
+pub use list::{Blocklist, Loaded};
 pub use rule::{BlockReason, Channel, MatchKind, Rule, DEFAULT_CAP, MIN_PREFIX_DIGITS};

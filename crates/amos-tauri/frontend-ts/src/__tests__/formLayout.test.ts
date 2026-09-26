@@ -4,12 +4,20 @@ import {
   DESKTOP_MAX_COLS,
   DESKTOP_MAX_ROWS,
   deviceChrome,
+  DOCK_RECENT_SLOTS,
+  dockRecents,
+  dockRecentSlots,
   homeGrid,
   homeTile,
+  masterDetail,
   pageCapacity,
   photosCols,
   PHONE_GRID,
   pwaHubCols,
+  TABLET_SIDEBAR_MAX_PX,
+  TABLET_SIDEBAR_MIN_PX,
+  TABLET_SIDEBAR_MIN_WIDTH,
+  webManInline,
   type HomeGrid,
 } from "../lib/formLayout";
 import type { FormFactor } from "../lib/wm";
@@ -294,5 +302,162 @@ describe("pwaHubCols — system PWA index grid column count", () => {
       const n = pwaHubCols(form);
       expect(Number.isInteger(n) && n >= 1).toBe(true);
     }
+  });
+});
+
+describe("masterDetail — the tablet's list→detail layout (REQ-A512 sibling)", () => {
+  // The decision family's *second* behavioral consumer of the host's measured
+  // `columns` (the split gate is the first): a list→detail surface may put its list
+  // beside the detail, but only on a tablet whose screen the host has measured wide
+  // enough for two panes. Every other class keeps the push-page it has always had.
+
+  test("only the tablet ever shows a sidebar", () => {
+    for (const form of ["phone", "desktop", "robot"] as FormFactor[]) {
+      expect(masterDetail(form, 4, 2000)).toEqual({ sidebar: false, sidebarWidth: 0 });
+    }
+  });
+
+  test("a tablet whose columns the host measured < 2 gets no sidebar", () => {
+    // The host's column signal is the same gate `canSplit` uses — a screen it says
+    // cannot fit two panes must not get a sidebar column either.
+    expect(masterDetail("tablet", 1, 1200)).toEqual({ sidebar: false, sidebarWidth: 0 });
+    expect(masterDetail("tablet", 0, 1200)).toEqual({ sidebar: false, sidebarWidth: 0 });
+  });
+
+  test("a tablet narrower than the sidebar threshold stays a push page", () => {
+    // 600 px passes `columns_for`'s band but a 260 px sidebar would leave a 340 px
+    // detail — narrower than the phone's own min_pane. The threshold clears that.
+    expect(masterDetail("tablet", 2, 600).sidebar).toBe(false);
+    expect(masterDetail("tablet", 2, TABLET_SIDEBAR_MIN_WIDTH - 1).sidebar).toBe(false);
+    expect(masterDetail("tablet", 2, TABLET_SIDEBAR_MIN_WIDTH).sidebar).toBe(true);
+  });
+
+  test("an unmeasured width never invents a sidebar (the conservative rule)", () => {
+    for (const bad of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(masterDetail("tablet", 2, bad)).toEqual({ sidebar: false, sidebarWidth: 0 });
+    }
+  });
+
+  test("the sidebar width is a bounded fraction of the measured screen", () => {
+    // 900 portrait → 288 ; 1200 landscape → 384 clamped to the 360 cap.
+    expect(masterDetail("tablet", 2, 900)).toEqual({ sidebar: true, sidebarWidth: 288 });
+    expect(masterDetail("tablet", 2, 1200)).toEqual({
+      sidebar: true,
+      sidebarWidth: TABLET_SIDEBAR_MAX_PX,
+    });
+    // At the threshold the 32 % floor is raised to the minimum column.
+    expect(masterDetail("tablet", 2, 700)).toEqual({
+      sidebar: true,
+      sidebarWidth: TABLET_SIDEBAR_MIN_PX,
+    });
+  });
+
+  test("a shown sidebar always leaves a detail column wider than the phone min_pane", () => {
+    for (const w of [700, 768, 900, 1024, 1200, 2048]) {
+      const md = masterDetail("tablet", 2, w);
+      expect(md.sidebar).toBe(true);
+      expect(md.sidebarWidth).toBeGreaterThanOrEqual(TABLET_SIDEBAR_MIN_PX);
+      expect(md.sidebarWidth).toBeLessThanOrEqual(TABLET_SIDEBAR_MAX_PX);
+      // 360 = the shell's phone `min_pane`; a detail narrower than that would be a
+      // sidebar that made the content worse than not having one.
+      expect(w - md.sidebarWidth).toBeGreaterThanOrEqual(360);
+    }
+  });
+
+  test("sidebarWidth is 0 exactly when the sidebar is hidden", () => {
+    for (const form of FORMS) {
+      for (const [cols, w] of [
+        [0, 0],
+        [2, 600],
+        [2, 900],
+        [4, 1600],
+      ] as Array<[number, number]>) {
+        const md = masterDetail(form, cols, w);
+        expect(md.sidebarWidth === 0).toBe(!md.sidebar);
+      }
+    }
+  });
+
+  test("the rule is pure — same inputs, same answer (and never NaN)", () => {
+    for (const w of [0, 700, 900, 1200, 2048]) {
+      const a = masterDetail("tablet", 2, w);
+      expect(a).toEqual(masterDetail("tablet", 2, w));
+      expect(Number.isInteger(a.sidebarWidth)).toBe(true);
+      expect(a.sidebarWidth).toBeGreaterThanOrEqual(0);
+    }
+  });
+});
+
+describe("dockRecentSlots — the iPad Dock's recently-used section", () => {
+  test("only the tablet's Dock carries one (iPad, not iPhone)", () => {
+    expect(dockRecentSlots("tablet")).toBe(DOCK_RECENT_SLOTS);
+    for (const form of ["phone", "robot"] as FormFactor[]) {
+      expect(dockRecentSlots(form)).toBe(0);
+    }
+  });
+
+  test("the desktop answers 0 even though macOS has such a section (its shell is elsewhere)", () => {
+    // `DesktopShell` + `lib/desktopLayout.ts` own the desktop Dock and never mount this
+    // launcher, so a non-zero answer would be policy no production path renders.
+    expect(dockRecentSlots("desktop")).toBe(0);
+  });
+
+  test("every class gets a non-negative integer answer", () => {
+    for (const form of FORMS) {
+      const n = dockRecentSlots(form);
+      expect(Number.isInteger(n)).toBe(true);
+      expect(n).toBeGreaterThanOrEqual(0);
+    }
+  });
+});
+
+describe("dockRecents — the apps the Dock section may show", () => {
+  test("most-recent-first order is preserved, capped at the slot count", () => {
+    expect(dockRecents(["notes", "photos", "files", "mail"], [], 3)).toEqual(["notes", "photos", "files"]);
+  });
+
+  test("a pinned app is never repeated in the section (and the cap is on the kept ones)", () => {
+    // Dropping a pinned id must let the next recent in, not shrink the section.
+    expect(dockRecents(["notes", "photos", "files"], ["notes"], 2)).toEqual(["photos", "files"]);
+  });
+
+  test("duplicates collapse to their most-recent occurrence", () => {
+    expect(dockRecents(["notes", "photos", "notes", "files"], [], 3)).toEqual(["notes", "photos", "files"]);
+  });
+
+  test("a non-positive or non-finite slot count shows nothing (never a whole history)", () => {
+    for (const slots of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+      expect(dockRecents(["notes", "photos"], [], slots)).toEqual([]);
+    }
+  });
+
+  test("it filters nothing else — an empty history is an empty section, not a default", () => {
+    expect(dockRecents([], ["notes"], 3)).toEqual([]);
+  });
+
+  test("the rule is pure", () => {
+    const recents = ["notes", "photos", "files"];
+    expect(dockRecents(recents, ["notes"], 2)).toEqual(dockRecents(recents, ["notes"], 2));
+  });
+});
+
+describe("webManInline — whether the browser hosts a page inline (REQ-A554)", () => {
+  test("large-screen classes host inline; phone and robot keep the punt card", () => {
+    // The whole point: the answer is a function of the **class**, nothing else.
+    const expected: Record<FormFactor, boolean> = {
+      phone: false,
+      tablet: true,
+      desktop: true,
+      robot: false,
+    };
+    for (const form of FORMS) {
+      expect(webManInline(form)).toBe(expected[form]);
+    }
+  });
+
+  test("it takes no width — there is no viewport input to disagree with the class", () => {
+    // A regression guard on the call shape: the old defect *was* a width argument.
+    expect(webManInline("tablet")).toBe(true);
+    expect(webManInline("phone")).toBe(false);
   });
 });

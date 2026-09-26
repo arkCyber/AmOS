@@ -47,12 +47,12 @@ cargo clippy -p amos-appstore-cli --all-targets -- -D warnings
 
 ```bash
 # Embed the CLI's command interpreter in a program (no shell).
-cargo run -p amos-appstore-cli --example embed_commands
+cargo run -p amos-appstore-cli --example appstore_embed_commands
 ```
 
 | example | shows |
 |---|---|
-| `embed_commands` | `run` (what `main.rs` calls) used from a harness: the catalog, a view and a `download`-only flow against the offline provider, printing what the shell would have printed |
+| `appstore_embed_commands` | `run` (what `main.rs` calls) used from a harness: the catalog, a view and a `download`-only flow against the offline provider, printing what the shell would have printed |
 
 ## Honest boundaries
 

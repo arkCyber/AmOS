@@ -10,6 +10,10 @@
 //     on a non-rooted device, or nftables in an AOSP/rooted build) is actually
 //     enforcing. On the default host build the backend is the in-process Mock and
 //     `enforced` is false — arming records intent, never a fabricated "blocked".
+//   * `SetAppEgress` records an app's declared egress. A grant is a *declaration*
+//     held by the daemon; it becomes an enforceable rule only for an app with its
+//     own `uid`. A shared-uid hosted bundle is recorded (`declared_apps`) but
+//     contributes no rule — this seam never pretends a shared uid was isolated.
 syntax = "proto3";
 
 package amos_netguard;
@@ -38,13 +42,24 @@ message StatusReply {
   // User intent: is the guard armed?
   bool enabled = 1;
   // The enforcement backend in use: "mock" (default host) | "vpn" | "nftables".
+  // This names the guard backend the daemon actually holds (its
+  // `NetworkGuard::enforces` claim backs `enforced` below), not a free label.
   string backend = 2;
-  // True ONLY when a real backend is actually enforcing on this device.
+  // True ONLY when a real backend is actually enforcing on this device. Derived
+  // from the held backend's own enforcement claim, so the default mock reports
+  // false.
   bool enforced = 3;
-  // Number of egress policy rules the guard holds.
+  // Number of egress policy rules the guard holds — the *configured* count,
+  // populated by `SetAppEgress` / `RevokeAppEgress` (an app with a non-zero uid
+  // contributes one rule per declared host). Read it as "rules configured", never
+  // as "rules enforced" (that is `enforced`, and it needs a real backend).
   uint64 policy_rules = 4;
   // Top domains by bytes in the current audit window (empty when no data).
   repeated EgressSample top_egress = 5;
+  // Number of apps holding a declared egress set (the registry size). An app
+  // whose `uid` is 0 is counted here but contributes no `policy_rules` — see
+  // `SetAppEgressRequest.uid`.
+  uint64 declared_apps = 6;
 }
 
 // The metadata signal kind that produced one audited egress event.
@@ -78,11 +93,61 @@ message NoteEgressRequest {
 
 message NoteEgressReply {}
 
+// One app's declared egress allow-list: the hosts an installed app says it may
+// reach (a hosted web bundle's `allowed_domains`, a PWA manifest's
+// `[permissions.network].allowed_domains`). Held by the daemon as that app's
+// *declaration*; when `uid` is non-zero it is also emitted as a uid-keyed allow
+// rule for the guard to apply. Re-sending the same `app_id` **replaces** its set
+// (idempotent) — it never appends. An empty `allow_domains` is a valid
+// declaration ("this app declares no egress").
+message SetAppEgressRequest {
+  // Stable app id (the store / index id). Must be non-empty, bounded, and free
+  // of control characters — the daemon refuses anything else.
+  string app_id = 1;
+  // The app's Android uid. `0` means "no uid" (e.g. a hosted web bundle that
+  // shares the shell's uid): the declaration is still recorded and counted in
+  // `declared_apps`, but no packet-level rule is emitted, because the guard's
+  // `Policy` is uid-scoped and one shared uid cannot isolate one bundle from
+  // another (docs/anti-telemetry-egress-guard.md §2.3).
+  uint32 uid = 2;
+  // Declared egress hosts, in the same grammar as the manifest
+  // `allowed_domains` (fully-qualified lowercase ASCII host, no wildcard).
+  // Malformed / over-long entries are **refused**, never silently dropped.
+  repeated string allow_domains = 3;
+}
+
+message SetAppEgressReply {
+  // Total configured rules across all apps after this upsert.
+  uint64 policy_rules = 1;
+  // Registry size after this upsert.
+  uint64 declared_apps = 2;
+}
+
+// Drop one app's declared egress (its uninstall counterpart). Removing an absent
+// app is a no-op that still reports the current totals.
+message RevokeAppEgressRequest {
+  string app_id = 1;
+}
+
+message RevokeAppEgressReply {
+  // Total configured rules across all apps after the removal.
+  uint64 policy_rules = 1;
+  // Registry size after the removal.
+  uint64 declared_apps = 2;
+}
+
 service NetGuardService {
   // Arm or disarm the egress guard.
   rpc Toggle(ToggleRequest) returns (ToggleReply);
   // Current armed state + backend + small audit summary.
   rpc Status(StatusRequest) returns (StatusReply);
+  // Record (or replace) one app's declared egress. Idempotent per app id; a
+  // currently-armed guard is re-applied so the change takes effect immediately,
+  // and a backend that refuses to apply rolls the declaration back (the reported
+  // state never drifts from what the guard actually holds).
+  rpc SetAppEgress(SetAppEgressRequest) returns (SetAppEgressReply);
+  // Drop one app's declared egress (the uninstall counterpart).
+  rpc RevokeAppEgress(RevokeAppEgressRequest) returns (RevokeAppEgressReply);
   // TEST/INJECTION: fold one metadata egress event into the audit counter so
   // `Status.top_egress` reflects a feed. Served ONLY when the process opts in via
   // `AMOS_NETGUARD_ALLOW_INJECT=1` (off on every production boot, mirroring the

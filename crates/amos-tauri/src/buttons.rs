@@ -37,12 +37,13 @@ pub const MAX_DOM_PAYLOAD_BYTES: usize = 512;
 /// "why" without ever inspecting the message text. A consumer should always
 /// pattern-match on `code`, not on `message`.
 pub mod codes {
+    use crate::error::ErrorCode;
     /// Caller-supplied button name could not be parsed into any known button.
-    pub const UNKNOWN_BUTTON: &str = "amos.buttons.unknown";
+    pub const UNKNOWN_BUTTON: &str = ErrorCode::ButtonsUnknown.as_str();
     /// Caller-supplied button name exceeds [`super::MAX_BUTTON_NAME_BYTES`].
-    pub const NAME_TOO_LONG: &str = "amos.buttons.name_too_long";
+    pub const NAME_TOO_LONG: &str = ErrorCode::ButtonsNameTooLong.as_str();
     /// Frontend bridge could not be reached on a registered listener.
-    pub const DELIVERY_FAILED: &str = "amos.buttons.delivery_failed";
+    pub const DELIVERY_FAILED: &str = ErrorCode::ButtonsDeliveryFailed.as_str();
 }
 
 /// The three physical buttons exposed to the System UI.

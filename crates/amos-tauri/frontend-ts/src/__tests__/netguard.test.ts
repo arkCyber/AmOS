@@ -7,6 +7,7 @@ const MOCK_OFF: NetGuardStatus = {
   backend: "mock",
   enforced: false,
   policy_rules: 0,
+  declared_apps: 0,
   top_egress: [],
 };
 
@@ -30,6 +31,7 @@ describe("network-guard client (pure helpers)", () => {
       backend: "nftables",
       enforced: true,
       policy_rules: 2,
+      declared_apps: 1,
       top_egress: [{ domain: "tracker.example", bytes: 900 }],
     };
     expect(guardLevel(enforcing)).toBe("armed-enforced");
@@ -49,6 +51,7 @@ describe("network-guard client (pure helpers)", () => {
         backend,
         enforced: true,
         policy_rules: 0,
+        declared_apps: 0,
         top_egress: [],
       };
       expect(guardLevel(contradictory), `backend=${JSON.stringify(backend)}`).toBe(
@@ -66,6 +69,7 @@ describe("network-guard client (pure helpers)", () => {
         backend,
         enforced: true,
         policy_rules: 1,
+        declared_apps: 0,
         top_egress: [],
       };
       expect(guardLevel(enforcing), `backend=${backend}`).toBe("armed-enforced");
@@ -77,6 +81,7 @@ describe("network-guard client (pure helpers)", () => {
         backend: "mock+vpn",
         enforced: true,
         policy_rules: 0,
+        declared_apps: 0,
         top_egress: [],
       }),
     ).toBe("armed-intent");

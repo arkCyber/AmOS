@@ -31,9 +31,10 @@
 //!   ordinary provider **refuses** a recognized emergency code and the emergency
 //!   provider **refuses** an ordinary number — the same hard separation the
 //!   domain/`Mock` enforces — so 110/112 can never fall onto the SIM path.
-//! * `answer`/`end`/recording and live `status` are **not** wired yet: real in-call
-//!   control requires an `InCallService`/`TelephonyCallback` bridge + a call-state
-//!   broadcast (device-validated P3; they return an explicit `Provider` error).
+//! * `answer`/`end`/recording/muting and live `status` are **not** wired yet: real
+//!   in-call control requires an `InCallService`/`TelephonyCallback` bridge + a
+//!   call-state broadcast (device-validated P3; they return an explicit `Provider`
+//!   error).
 //! * `subscribe` returns a live receiver wired to an in-call event registry (empty
 //!   until the device callback lands).
 //!
@@ -230,16 +231,30 @@ impl TelephonyProvider for AndroidTelephonyProvider {
     }
 
     async fn start_recording(&self, _id: &CallId) -> Result<()> {
+        // This provider is NOT compiled into the APK: `amos-tauri` does not depend on
+        // `amos-telephony` (only `amos-ai` does, and not with the `android` feature), so no
+        // path here ever runs on a device. The shipped capture seam is the Kotlin glue
+        // `AmosInCallService.setRecording` ← `amos-tauri/src/incall.rs` (a real
+        // `MediaRecorder` writing `<filesDir>/recordings/<id>.m4a`, filed into the ledger in
+        // `amos-tauri/src/recording.rs` — REQ-A1579 / F-TEL-038). Do not implement capture
+        // here: it would be unreachable and would tell a second story about the audio source.
         Err(TelephonyError::Provider(
-            "on-device recording requires a call-audio tap (audio pipeline, not yet wired)"
+            "this provider is not in the APK; on-device recording lives in the Tauri in-call seam"
                 .to_string(),
         ))
     }
 
     async fn stop_recording(&self, _id: &CallId) -> Result<()> {
+        // Same as `start_recording` above: unreachable in the shipped build.
         Err(TelephonyError::Provider(
-            "on-device recording requires a call-audio tap (audio pipeline, not yet wired)"
+            "this provider is not in the APK; on-device recording lives in the Tauri in-call seam"
                 .to_string(),
+        ))
+    }
+
+    async fn set_muted(&self, _id: &CallId, _muted: bool) -> Result<()> {
+        Err(TelephonyError::Provider(
+            "on-device mute requires an InCallService bridge (P3, device-validated)".to_string(),
         ))
     }
 

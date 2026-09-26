@@ -134,7 +134,7 @@ message Actuation {
   uint32 frames = 4;                 // frames written to the bus for that action
   bool armed = 5;                    // drivers energized (read from the bus, not inferred)
   bool estopped = 6;                 // torque cut and latched until an explicit arm
-  string estop_reason = 7;           // "" | "commanded" | "watchdog" (why torque was cut)
+  string estop_reason = 7;           // "" | "commanded" | "watchdog" | "bus-fault" (why torque was cut)
   uint64 watchdog_ms = 8;            // deadman period; 0 = none configured
   uint64 last_refusal_seq = 9;       // 0 = nothing refused
   string last_refusal = 10;          // "" = nothing refused (else: why it was refused)

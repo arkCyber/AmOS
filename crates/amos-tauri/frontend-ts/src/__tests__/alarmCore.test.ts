@@ -124,7 +124,7 @@ describe("alarmCore ringsToNotifs", () => {
     );
     expect(notifs).toHaveLength(1);
     const n = notifs[0]!;
-    expect(n.id).toBe("alarm:a:09:05");
+    expect(n.id).toBe("alarm:a:09:05:1970-01-01");
     expect(n.app).toBe("clock");
     expect(n.icon).toBe("🎯");
     expect(n.title).toBe("Stand up");

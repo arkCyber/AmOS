@@ -24,15 +24,26 @@
 ```
 src/
 ├── lib/
-│   ├── shortcuts.ts              # 核心逻辑
+│   ├── shortcuts.ts              # 核心逻辑（列表 / 编辑器 / 执行器 / 触发器）
+│   ├── shortcutSchedule.ts       # 定时触发的纯判定（绝对时刻在 Rust）
+│   ├── shortcutGallery.ts        # 快捷指令库的**预设模板数据** + 纯函数（REQ-A500）
 │   └── __tests__/
-│       └── shortcuts.test.ts     # 单元测试
-├── svelte/
-│   └── ShortcutsApp.svelte       # UI 组件
-└── assets/
-    └── icons/
-        └── IconShortcuts.svelte  # 应用图标
+│       ├── shortcuts.test.ts     # 单元测试
+│       ├── shortcuts-engine.test.ts
+│       ├── shortcuts-automation.test.ts
+│       ├── shortcuts-phase2.test.ts
+│       ├── shortcut-schedule.test.ts
+│       └── shortcutGallery.test.ts
+└── svelte/
+    └── ShortcutsApp.svelte       # UI 组件（list / editor / gallery 三个视图）
 ```
+
+> 这份清单按 **2026-09-19 的真实树**核对过（REQ-A505）：此前它列着
+> `assets/icons/IconShortcuts.svelte` —— 那个文件**没有任何引用**（Dock 上没有快捷指令瓦片，
+> 其余三个 `assets/icons/*` 都在用），本轮作为死副本删除；同时补上了后来出现的
+> `shortcutSchedule.ts` / `shortcutGallery.ts` 与它们的测试。组件级测试在
+> `svelte-tests/shortcuts-gallery.svelte.test.ts`（运行方式见 `docs/TRACEABILITY_MATRIX.md` 的
+> REQ-A500 行）。
 
 ### 核心模块
 

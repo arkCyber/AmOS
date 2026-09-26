@@ -154,6 +154,27 @@ describe("notes store helpers", () => {
     expect(noteStats("🙂 好").chars).toBe(3);
   });
 
+  test("noteStats counts lines in the trimmed body, like its sibling fields (REQ-A1610 ∕ F-SH-820)", () => {
+    // `chars` and `words` are measured on `text.trim()`; `lines` must be too, or a
+    // note with a blank line above/below it reports more lines than it has. The
+    // compose box prints exactly this pair — "{chars} 字 · {lines} 行" — so the
+    // divergence is user-visible: a one-line "你好" typed under two blank lines
+    // read as "2 字 · 6 行".
+    const st = noteStats("\n\n你好\n\n\n");
+    expect(st.chars).toBe(2);
+    expect(st.words).toBe(1);
+    expect(st.lines).toBe(1);
+
+    // No body at all ⇒ no lines; the early return already covers this, so it is a
+    // positive control that the fix does not widen the return shape.
+    expect(noteStats("\n")).toEqual({ chars: 0, words: 0, lines: 0 });
+    // An *inner* blank line survives the trim and is a real separator — the fix
+    // must not collapse it.
+    expect(noteStats("a\n\nb").lines).toBe(3);
+    // And a well-formed note is byte-identical before and after the fix.
+    expect(noteStats("买 牛奶\n开会 材料").lines).toBe(2);
+  });
+
   test("tasksOf parses [ ] / [x] lines and ignores other text", () => {
     const text = "购物\n[ ] 牛奶\n[x] 面包\n普通一行\n- [X] 大写";
     const tasks = tasksOf(text);
@@ -621,6 +642,112 @@ describe("duplicateNote", () => {
   test("no-op when the id is missing", () => {
     const base = [{ id: "a", text: "x", ts: 1, created: 1 }];
     expect(duplicateNote(base, "nope", 9)).toBe(base);
+  });
+
+  test("carries the ink layer onto the copy (REQ-A526)", () => {
+    const layer = { w: 10, h: 10, strokes: [{ tool: "pen" as const, color: "#000", width: 2, pts: [{ x: 1, y: 2, p: 1, t: 0 }] }] };
+    const base = [{ id: "a", text: "x", ts: 1, created: 1, ink: layer }];
+    const next = duplicateNote(base, "a", 9);
+    expect(next[0]!.ink).toEqual(layer);
+  });
+});
+
+/**
+ * REQ-A526 — the ink layer's back-compat contract.
+ *
+ * The load-bearing property is that a note written before pen support existed is
+ * **byte-identical** after a normalize round trip. Asserting `toBeUndefined()` would not
+ * prove that: an own-property `ink: undefined` still serializes away and would only
+ * surface as a spurious "changed" verdict in a deep comparison. So these tests assert
+ * the property is *absent*, with `in`.
+ */
+describe("ink layer on a note (REQ-A526)", () => {
+  const layer = {
+    w: 300,
+    h: 400,
+    strokes: [{ tool: "pen" as const, color: "#000", width: 2, pts: [{ x: 5, y: 6, p: 1, t: 0 }] }],
+  };
+
+  test("normalizeNotes keeps an ink-only note, synthesizing an empty body", () => {
+    const out = normalizeNotes([{ id: "i", ts: 5, ink: layer }]);
+    expect(out).toHaveLength(1);
+    expect(out[0]!.text).toBe("");
+    expect(out[0]!.ink).toEqual(layer);
+  });
+
+  test("normalizeNotes still drops an entry with neither body nor ink", () => {
+    expect(normalizeNotes([{ ts: 5 }, { id: "x" }])).toEqual([]);
+  });
+
+  test("normalizeNotes drops a malformed layer without dropping the note", () => {
+    const out = normalizeNotes([{ id: "t", text: "kept", ts: 5, ink: { strokes: "no" } }]);
+    expect(out).toHaveLength(1);
+    expect(out[0]!.text).toBe("kept");
+    expect("ink" in out[0]!).toBe(false);
+  });
+
+  test("a pre-ink note comes back with no ink own-property at all", () => {
+    const out = normalizeNotes([{ id: "a", text: "hello", ts: 1, created: 1, pinned: true }]);
+    expect("ink" in out[0]!).toBe(false);
+    expect(Object.keys(out[0]!).sort()).toEqual(["created", "id", "pinned", "text", "ts"]);
+  });
+
+  test("editNote persists ink under a blank body and bumps the timestamp", () => {
+    const base = [{ id: "a", text: "draft", ts: 1 }];
+    const out = editNote(base, "a", "   ", 50, layer);
+    expect(out[0]!.text).toBe("");
+    expect(out[0]!.ts).toBe(50);
+    expect(out[0]!.ink).toEqual(layer);
+  });
+
+  test("editNote returns the same reference when text and ink are both unchanged", () => {
+    const base = [{ id: "a", text: "x", ts: 1, ink: layer }];
+    expect(editNote(base, "a", "x", 99, layer)).toBe(base);
+  });
+
+  test("editNote bumps the timestamp when only the ink changed", () => {
+    const base = [{ id: "a", text: "x", ts: 1, ink: layer }];
+    const moved = { ...layer, strokes: [{ ...layer.strokes[0]!, pts: [{ x: 9, y: 9, p: 1, t: 0 }] }] };
+    const out = editNote(base, "a", "x", 77, moved);
+    expect(out[0]!.ts).toBe(77);
+    expect(out[0]!.ink).toEqual(moved);
+  });
+
+  test("editNote clears the layer on null and deletes the key", () => {
+    const base = [{ id: "a", text: "x", ts: 1, ink: layer }];
+    const out = editNote(base, "a", "x", 77, null);
+    expect(out[0]!.ts).toBe(77);
+    expect("ink" in out[0]!).toBe(false);
+  });
+
+  test("editNote refuses to strand a note with a blank body and no ink", () => {
+    const base = [{ id: "a", text: "x", ts: 1 }];
+    expect(editNote(base, "a", "  ", 77)).toBe(base);
+    // Clearing the last stroke while the body is also blank would leave a note with
+    // nothing in it. Refusing (same reference, no timestamp churn) is the honest answer:
+    // the caller asked for a state that must not exist.
+    const inked = [{ id: "a", text: "x", ts: 1, ink: layer }];
+    expect(editNote(inked, "a", " ", 77, null)).toBe(inked);
+    // …but clearing the layer once a body is present goes through.
+    expect(editNote(inked, "a", "kept", 77, null)).toEqual([{ id: "a", text: "kept", ts: 77 }]);
+  });
+
+  // The three- and four-argument forms are what every pre-existing caller uses. They
+  // must neither introduce an `ink` key nor disturb one that is already there.
+  test("a text-only caller introduces no ink key and leaves an existing layer alone", () => {
+    const plain = [{ id: "a", text: "x", ts: 1 }];
+    const edited = editNote(plain, "a", "y", 9);
+    expect("ink" in edited[0]!).toBe(false);
+
+    const inked = [{ id: "a", text: "x", ts: 1, ink: layer }];
+    const kept = editNote(inked, "a", "y", 9);
+    expect(kept[0]!.ink).toEqual(layer);
+  });
+
+  test("an ink note survives a JSON persistence round trip", () => {
+    const stored = normalizeNotes([{ id: "a", text: "", ts: 5, ink: layer }]);
+    const reloaded = normalizeNotes(JSON.parse(JSON.stringify(stored)));
+    expect(reloaded).toEqual(stored);
   });
 });
 

@@ -68,6 +68,54 @@ describe("ClockApp.svelte", () => {
     }
   });
 
+  // The world-clock list is the user's content in exactly the way the alarm list is: they add,
+  // remove and reorder cities by hand, and the rows redraw the moment they do. The write's own
+  // verdict must be read, or a refused store loses the change silently — the screen shows the
+  // new city and a reload shows it never happened. (The alarm writer a few lines below has said
+  // so since it was written; the city writer was left `void`.)
+  test("a rejected world-clock write is reported (the cities are the user's content too)", async () => {
+    const restore = failWritesFor("amos.worldclock");
+    try {
+      const host = render(ClockApp);
+      await tick();
+      // The rows still draw (the reducer state did move) — so the only thing that can tell the
+      // user the change will not survive a reload is the sentence.
+      expect(host.container.querySelectorAll("[data-city]").length).toBeGreaterThan(0);
+      expect(txt(host)).toContain("本机存储写入失败");
+      // …and the disk really holds nothing: that is what the next launch reads.
+      expect(window.localStorage.getItem("amos.worldclock")).toBeNull();
+    } finally {
+      restore();
+    }
+  });
+
+  test("adding a city on a refused store shows it and says it did not land", async () => {
+    const restore = failWritesFor("amos.worldclock");
+    try {
+      const host = render(ClockApp);
+      await fireEvent.input(inputByAria(host, "搜索城市")!, { target: { value: "罗马" } });
+      const add = host.container.querySelector('button[data-role="add-city"]') as HTMLButtonElement;
+      await fireEvent.click(add);
+      await tick();
+      expect(host.container.querySelector('[data-city="Europe/Rome"]')).toBeTruthy();
+      expect(txt(host)).toContain("本机存储写入失败");
+      expect(window.localStorage.getItem("amos.worldclock")).toBeNull();
+    } finally {
+      restore();
+    }
+  });
+
+  test("a landed world-clock write says nothing (control)", async () => {
+    const host = render(ClockApp);
+    await fireEvent.input(inputByAria(host, "搜索城市")!, { target: { value: "罗马" } });
+    const add = host.container.querySelector('button[data-role="add-city"]') as HTMLButtonElement;
+    await fireEvent.click(add);
+    await tick();
+    expect(host.container.querySelector('[data-city="Europe/Rome"]')).toBeTruthy();
+    expect(txt(host)).not.toContain("本机存储写入失败");
+    expect(window.localStorage.getItem("amos.worldclock")).not.toBeNull();
+  });
+
   test("world-clock rows carry an iOS-style offset / day subtitle", async () => {
     const host = render(ClockApp);
     const rows = host.container.querySelectorAll('[data-city]');
@@ -157,6 +205,40 @@ describe("ClockApp.svelte", () => {
     const host = render(ClockApp);
     await fireEvent.click(tab(host, "秒表") as HTMLButtonElement);
     expect(txt(host)).toContain("00:00.00");
+  });
+
+  // iOS parity: 计次 is available while the stopwatch is **paused**, not only while running
+  // (the lap snapshots the frozen elapsed). The idle stopwatch has nothing to lap.
+  test("计次 stays available while the stopwatch is paused", async () => {
+    const host = render(ClockApp);
+    await fireEvent.click(tab(host, "秒表") as HTMLButtonElement);
+    const byAria = (label: string) =>
+      [...host.container.querySelectorAll("button")].find(
+        (b) => b.getAttribute("aria-label") === label,
+      ) as HTMLButtonElement;
+    const lap = () => byAria("计次");
+    const runToggle = () => byAria("秒表");
+
+    // idle: nothing to lap
+    expect(lap().disabled).toBe(true);
+
+    // start → let elapsed advance → lap while running
+    await fireEvent.click(runToggle());
+    await new Promise<void>((r) => setTimeout(r, 80));
+    await fireEvent.click(lap());
+    await tick();
+    expect(txt(host)).toContain("计次 1");
+
+    // pause → the lap button must STAY enabled (the fix; it used to be disabled)
+    await fireEvent.click(runToggle());
+    expect(lap().disabled).toBe(false);
+    await fireEvent.click(lap());
+    await tick();
+    expect(txt(host)).toContain("计次 2");
+
+    // reset → idle again, nothing to lap
+    await fireEvent.click(byAria("重置"));
+    expect(lap().disabled).toBe(true);
   });
 
   test("timer tab shows initial 00:00", async () => {
@@ -511,6 +593,53 @@ describe("ClockApp.svelte", () => {
     expect(t.endAtMs!).toBeGreaterThan(Date.now());
   });
 
+  // REQ-A962: the running state was painted only as a glyph + colour, and the static
+  // `aria-label` shadows the glyph — so the toggle also carries `aria-pressed`, and it must
+  // track exactly what the glyph shows. (Seeded explicitly: an earlier case in this file
+  // leaves a *running* timer in the shared store.)
+  test("the timer's play/pause says whether it is running (REQ-A962)", async () => {
+    window.localStorage.setItem(
+      "amos.timer",
+      JSON.stringify({ running: false, totalMs: 60_000, remainingMs: 60_000, endAtMs: 0, fired: false }),
+    );
+    const host = render(ClockApp);
+    await fireEvent.click(tab(host, "计时器") as HTMLButtonElement);
+    const toggle = () =>
+      [...host.container.querySelectorAll("button")].find(
+        (b) => b.getAttribute("aria-label") === "计时器",
+      ) as HTMLButtonElement;
+    expect(toggle().getAttribute("data-icon")).toBe("play");
+    expect(toggle().getAttribute("aria-pressed")).toBe("false");
+
+    await fireEvent.click(toggle());
+    await tick();
+    expect(toggle().getAttribute("data-icon")).toBe("pause"); // the glyph really moved
+    expect(toggle().getAttribute("aria-pressed")).toBe("true"); // and so did the state
+
+    await fireEvent.click(toggle()); // pause again — leave no running timer behind
+    await tick();
+    expect(toggle().getAttribute("aria-pressed")).toBe("false");
+  });
+
+  // The stopwatch's toggle is the sibling of the timer's — same fix, pinned separately so
+  // one of them cannot regress behind the other's test (REQ-A962).
+  test("the stopwatch's play/pause says whether it is running (REQ-A962)", async () => {
+    const host = render(ClockApp);
+    await fireEvent.click(tab(host, "秒表") as HTMLButtonElement);
+    const toggle = () =>
+      [...host.container.querySelectorAll("button")].find(
+        (b) => b.getAttribute("aria-label") === "秒表",
+      ) as HTMLButtonElement;
+    expect(toggle().getAttribute("aria-pressed")).toBe("false");
+    await fireEvent.click(toggle());
+    await tick();
+    expect(toggle().getAttribute("data-icon")).toBe("pause");
+    expect(toggle().getAttribute("aria-pressed")).toBe("true");
+    await fireEvent.click(toggle()); // stop it — the 1 Hz interval is torn down on unmount,
+    await tick(); // but leave the tab idle rather than running.
+    expect(toggle().getAttribute("aria-pressed")).toBe("false");
+  });
+
   test("an armed (not-started) timer is restored across restart", async () => {
     window.localStorage.setItem(
       "amos.timer",
@@ -623,6 +752,54 @@ describe("ClockApp.svelte", () => {
     (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = undefined;
   });
 
+  // REQ-A875 / F-ALM-004. `nativeAlarmDeviceState().cancel` had no reader at all, so a
+  // cancellation the device did not carry out was invisible: the module forgot the id and
+  // the user was never told the OS might still ring. The pair below is two-sided — the line
+  // is drawn for the refusal and *not* drawn for the release — because an assertion that only
+  // ever sees the refusal cannot tell "the notice is right" from "the notice is always there".
+  const ALARM_ON = [{ id: "a1", hour: 7, min: 30, label: "", enabled: true, ringing: false, tone: "🔔" }];
+  const ALARM_OFF = [{ id: "a1", hour: 7, min: 30, label: "", enabled: false, ringing: false, tone: "🔔" }];
+
+  async function renderClockAfterDisable(cancelState: string) {
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string, args: Record<string, unknown> = {}) =>
+        cmd === "scheduler_alarm_cancel"
+          ? { id: args.id, wasRegistered: true, device: { state: cancelState } }
+          : null,
+      listen: async () => async () => {},
+    };
+    resetArmedNativeAlarmsForTest();
+    window.localStorage.setItem("amos.alarms", JSON.stringify(ALARM_ON));
+    await reconcileNativeAlarms(new Date(2024, 0, 1, 6, 0).getTime());
+    // The user turns the alarm off → the host is asked to cancel it.
+    window.localStorage.setItem("amos.alarms", JSON.stringify(ALARM_OFF));
+    await reconcileNativeAlarms(new Date(2024, 0, 1, 6, 5).getTime());
+
+    const host = render(ClockApp);
+    await tick();
+    await fireEvent.click(tab(host, "闹钟") as HTMLButtonElement);
+    return host;
+  }
+
+  test("says when a turned-off alarm may still ring from the OS (REQ-A875)", async () => {
+    const host = await renderClockAfterDisable("unavailable");
+    const pending = host.container.querySelector('[data-testid="alarm-native-cancel-pending"]');
+    expect(pending).not.toBeNull();
+    expect(pending!.getAttribute("data-pending")).toBe("1");
+    expect(pending!.textContent).toContain("可能仍会响");
+    cleanup();
+    resetArmedNativeAlarmsForTest();
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = undefined;
+  });
+
+  test("a cancellation the OS confirmed is not announced as pending", async () => {
+    const host = await renderClockAfterDisable("cancelled");
+    expect(host.container.querySelector('[data-testid="alarm-native-cancel-pending"]')).toBeNull();
+    cleanup();
+    resetArmedNativeAlarmsForTest();
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = undefined;
+  });
+
   test("timer accepts a custom mm:ss and quick presets", async () => {
     const host = render(ClockApp);
     await fireEvent.click(tab(host, "计时器") as HTMLButtonElement);
@@ -647,5 +824,95 @@ describe("ClockApp.svelte", () => {
     ) as HTMLButtonElement;
     expect(play).toBeTruthy();
     expect((play as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  // ---- the three live readouts are queryable, like the four clock faces (REQ-A1115) ----
+  //
+  // `role="timer"` names a value that changes on its own so screen readers can ask for it
+  // on demand, without `aria-live` (which would shout every second — REQ-A284 refused it).
+  // StatusBar / LockScreen / ClockWidget / StageClock and the in-call duration all carry
+  // `role="timer"` + a stable label; the Clock app's own three readouts did not.
+  const readout = (host: { container: HTMLElement }) =>
+    host.container.querySelector<HTMLElement>('[role="timer"]');
+
+  test("the world clock's time is a labelled timer, not an anonymous div (REQ-A1115)", () => {
+    const host = render(ClockApp);
+    const el = readout(host);
+    expect(el, "the current time must be queryable by assistive tech").not.toBeNull();
+    expect(el!.getAttribute("aria-label")).toBe("当前时间");
+    expect(el!.textContent?.trim()).toMatch(/^\d{2}:\d{2}:\d{2}$/);
+  });
+
+  test("the countdown is a labelled timer (REQ-A1115)", async () => {
+    const host = render(ClockApp);
+    await fireEvent.click(tab(host, "计时器") as HTMLButtonElement);
+    const el = readout(host);
+    expect(el, "the countdown must be queryable by assistive tech").not.toBeNull();
+    expect(el!.getAttribute("aria-label")).toBe("计时器");
+    expect(el!.textContent?.trim()).toMatch(/^\d{2}:\d{2}$/);
+  });
+
+  test("the stopwatch is a labelled timer (REQ-A1115)", async () => {
+    const host = render(ClockApp);
+    await fireEvent.click(tab(host, "秒表") as HTMLButtonElement);
+    const el = readout(host);
+    expect(el, "the elapsed stopwatch must be queryable by assistive tech").not.toBeNull();
+    expect(el!.getAttribute("aria-label")).toBe("秒表");
+    expect(el!.textContent?.trim()).toMatch(/^\d{2}:\d{2}\.\d{2}$/);
+  });
+});
+
+/**
+ * REQ-A1431 ∕ FMEA F-SH-689 — the countdown's write verdict.
+ *
+ * `amos.timer` is the **third** independent writer on this screen (the alarm list and the
+ * city list are the other two, and both already speak). It is the one whose refusal costs
+ * the most: the record exists *only* so an OS notifier can finish the countdown after this
+ * screen closes (`lib/timerStore.ts`'s doc), so a refused write leaves the countdown the
+ * user set living on this screen alone — it rings nowhere, and nothing on screen said so.
+ */
+describe("ClockApp.svelte — a refused countdown write is reported (REQ-A1431)", () => {
+  const armFive = (h: { container: HTMLElement }) =>
+    [...h.container.querySelectorAll("button")].find(
+      (b) => (b.textContent ?? "").trim() === "5 分",
+    ) as HTMLButtonElement | undefined;
+
+  test("拒绝写入时说出拒写，且盘上没有这一枚计时器", async () => {
+    window.localStorage.removeItem("amos.timer");
+    const restore = failWritesFor("amos.timer");
+    try {
+      const host = render(ClockApp);
+      await tick();
+      // The mount flush is a **no-op** write (nothing has changed yet), so it must NOT
+      // print 「本次改动未保存」 on a screen where the user has done nothing.
+      expect(txt(host)).not.toContain("本机存储写入失败");
+
+      await fireEvent.click(tab(host, "计时器") as HTMLButtonElement);
+      await fireEvent.click(armFive(host)!);
+      await tick();
+
+      // The countdown is armed on screen; the store refused it, so the sentence is the only
+      // thing that can tell the user it will not be there when the screen closes.
+      expect(host.container.querySelector('[data-testid="timer-readout"]')?.textContent ?? txt(host)).toContain("05:00");
+      expect(txt(host)).toContain("本机存储写入失败");
+      expect(window.localStorage.getItem("amos.timer")).toBeNull();
+    } finally {
+      restore();
+      window.localStorage.removeItem("amos.timer");
+    }
+  });
+
+  test("对照：写入被收下时什么都不说，且盘上有这一枚计时器", async () => {
+    window.localStorage.removeItem("amos.timer");
+    const host = render(ClockApp);
+    await tick();
+    await fireEvent.click(tab(host, "计时器") as HTMLButtonElement);
+    await fireEvent.click(armFive(host)!);
+    await tick();
+    expect(txt(host)).not.toContain("本机存储写入失败");
+    expect(window.localStorage.getItem("amos.timer")).not.toBeNull();
+    const stored = JSON.parse(window.localStorage.getItem("amos.timer")!) as { totalMs?: number };
+    expect(stored.totalMs).toBe(300_000);
+    window.localStorage.removeItem("amos.timer");
   });
 });

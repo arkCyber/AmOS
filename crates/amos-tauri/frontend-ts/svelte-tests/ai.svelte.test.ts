@@ -8,7 +8,7 @@
  * the two-step clear, and the sessions panel's offline empty state. The two voice
  * buttons degrade to disabled offline (checked in voice-buttons.svelte.test.ts).
  */
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { cleanup, fireEvent, render } from "@testing-library/svelte";
 import { tick } from "svelte";
 import AiApp from "../src/svelte/AiApp.svelte";
@@ -112,6 +112,76 @@ describe("AiApp.svelte (offline shell)", () => {
     await fireEvent.click(btnText(host, "会话") as HTMLButtonElement);
     await settle();
     expect(txt(host)).toContain("暂无 daemon 会话"); // ai.sessionEmpty
+  });
+});
+
+/**
+ * REQ-A1271 — the copy has to follow the effect.
+ *
+ * `copyReply` was `try { await navigator.clipboard?.writeText(lastAgent.text); copiedReply =
+ * true; } catch {}`. When `navigator.clipboard` is absent the optional call short-circuits to
+ * `undefined` — no throw, so the `catch` never fires and `copiedReply` was set regardless: the
+ * button read 「✓」 with nothing on the clipboard. `PhotosApp::copyText` (REQ-A352) is the same
+ * question answered with the guard `if (!navigator.clipboard?.writeText) return false;`.
+ */
+describe("AiApp.svelte — a copy that did not land (REQ-A1271)", () => {
+  /** Swap `navigator.clipboard` for `value`; the captured descriptor restores it exactly. */
+  function withClipboard(value: unknown): () => void {
+    const before = Object.getOwnPropertyDescriptor(window.navigator, "clipboard");
+    Object.defineProperty(window.navigator, "clipboard", {
+      value,
+      configurable: true,
+      writable: true,
+    });
+    return () => {
+      if (before) Object.defineProperty(window.navigator, "clipboard", before);
+      else delete (window.navigator as unknown as { clipboard?: unknown }).clipboard;
+    };
+  }
+
+  /** Send one turn offline so an agent bubble (and therefore the copy button) exists. */
+  async function askOnce(host: { container: HTMLElement }) {
+    const input = textareaByPlaceholder(host, "输入指令") as HTMLTextAreaElement;
+    await fireEvent.input(input, { target: { value: "hello" } });
+    await fireEvent.click(btnByAria(host, zh["a11y.send"]) as HTMLButtonElement);
+    await settle();
+  }
+
+  test("with no clipboard at all, copy-reply says so instead of showing ✓", async () => {
+    const restore = withClipboard(undefined);
+    try {
+      const host = render(AiApp);
+      await settle();
+      await askOnce(host);
+      await fireEvent.click(btnText(host, "复制回答") as HTMLButtonElement);
+      await settle();
+      expect(txt(host)).toContain(zh["common.copyFailed"]);
+      expect(btnText(host, "✓"), "nothing was copied, so nothing may claim it was").toBeFalsy();
+    } finally {
+      restore();
+    }
+  });
+
+  test("a working clipboard copies the reply and still shows ✓", async () => {
+    const written: string[] = [];
+    const restore = withClipboard({
+      writeText: (s: string) => {
+        written.push(s);
+        return Promise.resolve();
+      },
+    });
+    try {
+      const host = render(AiApp);
+      await settle();
+      await askOnce(host);
+      await fireEvent.click(btnText(host, "复制回答") as HTMLButtonElement);
+      await settle();
+      expect(written).toHaveLength(1);
+      expect(btnText(host, "✓")).toBeTruthy();
+      expect(txt(host)).not.toContain(zh["common.copyFailed"]);
+    } finally {
+      restore();
+    }
   });
 });
 
@@ -308,6 +378,44 @@ describe("AiApp.svelte — attached system context (wm SystemContext)", () => {
       args: { targetWindow: "ai" },
     });
     expect(banner(host)).toBeNull();
+  });
+
+  test("a refused detach says so and keeps the context on screen", async () => {
+    // `system_clear_context` fails on the host (a bad target label) and `invoke` folds
+    // that into `null` — the same value its `void` success has. Clearing `ctxEntry`
+    // anyway hid the hint while the host still held the context and `chat_agent`
+    // merged it into the next request: the user removed a context the AI kept receiving.
+    let current: unknown = { source_window: "notes", text: "预算审查", timestamp_ms: 1 };
+    (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string) => {
+        if (cmd === "system_peek_context") return current;
+        if (cmd === "system_clear_context") {
+          throw {
+            code: "amos.system.context_clear_failed",
+            message: "context target_window invalid: 999 bytes (max 128)",
+          };
+        }
+        return null;
+      },
+      listen: async () => () => {},
+    };
+    const host = render(AiApp);
+    await settle();
+    expect(banner(host)).toBeTruthy();
+
+    await fireEvent.click(
+      host.container.querySelector('[data-testid="ai-context-clear"]') as HTMLButtonElement,
+    );
+    await vi.waitFor(() => {
+      expect(host.container.querySelector('[data-testid="ai-context-error"]')).toBeTruthy();
+    });
+
+    const alert = host.container.querySelector('[data-testid="ai-context-error"]')!;
+    expect(alert.getAttribute("role")).toBe("alert");
+    expect(alert.textContent).toContain("target_window invalid");
+    expect(alert.textContent).toContain(zh["ai.contextClearFailed"].split("{detail}")[0]);
+    // The context is still attached — the banner (and its retry button) must stay.
+    expect(banner(host)).toBeTruthy();
   });
 
   test("says nothing when no context is attached (never claims there is none)", async () => {

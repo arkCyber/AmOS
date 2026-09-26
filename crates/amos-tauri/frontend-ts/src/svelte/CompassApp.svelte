@@ -28,12 +28,25 @@
   let settings = $state<CompassSettings>(initialSettings);
   let reading = $state<CompassReading>({
     heading: 0,
-    tilt: { x: 0, y: 0 },
+    // 没测到 ≠ 0°：两个轴各自可空，`null` 是「这一帧没给这个轴」（见 lib/compass.ts）。
+    tilt: { x: null, y: null },
     available: false,
+    headingKnown: false,
   });
   let tab = $state<"compass" | "level">("compass");
   let permissionGranted = $state(false);
   let locationGranted = $state(false);
+  /**
+   * Whether the platform has the orientation **API** at all — a capability fact, not
+   * a permission one.
+   *
+   * Without `DeviceOrientationEvent`, `requestOrientationPermission()` answers `false`
+   * forever, so the permission panel was asking the user to grant something that cannot
+   * be granted, and its 「启用传感器」 button reloads straight back into the same panel.
+   * `lib/compass.isOrientationSupported()` states this fact; the render has to read it
+   * rather than collapse it into "not yet granted" (REQ-A1519 ∕ F-SH-761).
+   */
+  let supported = $state(isOrientationSupported());
 
   // Persist settings
   $effect(() => {
@@ -41,13 +54,37 @@
   });
 
   // Computed values
+  //
+  // "True north" is only a claim we can make when a declination was actually
+  // obtained. A cached site is exactly that proof (`fetchDeclinationWithCache`
+  // mints one only on a successful look-up), so its presence is the known bit —
+  // and a real declination of 0°/unknown must not be conflated.
+  const declinationKnown = $derived(settings.cachedLocation != null);
+  const trueNorthApplied = $derived(settings.useTrueNorth && declinationKnown);
+  /**
+   * Any orientation data at all — tilt *or* a heading. Distinguishes "the sensor
+   * has said nothing yet / does not exist" from "it is reporting, but not a
+   * heading".
+   */
+  const anySensorData = $derived(reading.available || reading.headingKnown);
   const displayHeading = $derived(
-    settings.useTrueNorth && reading.available
+    trueNorthApplied
       ? applyDeclination(reading.heading, settings.declination)
       : reading.heading
   );
   const cardinal = $derived(cardinalDirection(displayHeading, locale()));
-  const levelPct = $derived(levelPercentage(reading.tilt.x, reading.tilt.y));
+  /**
+   * Both tilt axes were measured in the current frame. The bubble, the numeric
+   * readouts and the level verdict need **both**: a one-axis frame is a partial
+   * reading, and the missing axis may not be drawn as 0° (F-SH-755).
+   */
+  const tiltComplete = $derived(reading.tilt.x !== null && reading.tilt.y !== null);
+  /** `null` = some axis was not measured ⇒ no bar; the caller renders 「—」. */
+  const levelPct = $derived(
+    reading.tilt.x !== null && reading.tilt.y !== null
+      ? levelPercentage(reading.tilt.x, reading.tilt.y)
+      : null,
+  );
   const deviceLevel = $derived(isLevel(reading.tilt.x, reading.tilt.y));
 
   // --- lifecycle ---
@@ -80,13 +117,11 @@
             settings.declination,
             settings.cachedLocation
           );
-          
-          if (result.fromCache) {
-            // Using cached declination - no need to update
-            console.log("Using cached magnetic declination");
-          } else {
-            // Update with fresh data
-            console.log("Fetched new magnetic declination:", result.declination);
+
+          // Only a known value updates settings: writing a `null` through would
+          // erase a good cached declination (and dropping the cache site would
+          // make the UI forget it ever knew one) just because one look-up missed.
+          if (!result.fromCache && result.declination !== null) {
             settings = {
               ...settings,
               declination: result.declination,
@@ -108,21 +143,24 @@
       const beta = event.beta;   // -180 to 180, tilt front-back
       const gamma = event.gamma; // -90 to 90, tilt left-right
 
-      if (alpha === null) {
-        reading = { ...reading, available: false };
-        return;
-      }
+      // `alpha` (the heading) needs a magnetometer; `beta`/`gamma` (tilt) come
+      // from the accelerometer and keep arriving without one. Two facts, kept
+      // apart: the level tab reads tilt, the compass tab reads the heading. The
+      // old single flag marked the whole reading unavailable the moment `alpha`
+      // was null, so a device with no magnetometer lost its bubble level too —
+      // and the tilt in that very event was discarded (REQ-A1275 / F-SH-550).
+      const tiltKnown = beta !== null || gamma !== null;
+      const headingKnown = alpha !== null;
 
-      // Convert alpha (0 = north, increases clockwise) to compass heading
-      const heading = normalizeHeading(360 - alpha);
-      
       reading = {
-        heading,
-        tilt: {
-          x: gamma ?? 0,
-          y: beta ?? 0,
-        },
-        available: true,
+        // Convert alpha (0 = north, increases clockwise) to compass heading.
+        heading: headingKnown ? normalizeHeading(360 - alpha) : reading.heading,
+        // 两个轴各自可空：`?!0` 会把「这一帧没量这个轴」折成 0°，于是气泡落在中线上、
+        // 读数印 `0.0°`，而且当另一个轴在 2° 带内时还会报「已水平」——一次没人量过的
+        // 水平（F-SH-755）。原始 `null` 一路带到渲染层，由它决定说「—」。
+        tilt: { x: gamma, y: beta },
+        available: tiltKnown,
+        headingKnown,
         accuracy: (event as any).webkitCompassAccuracy ?? undefined,
       };
     };
@@ -159,14 +197,18 @@
 
 <div class="flex h-full flex-col">
   <!-- Tab Bar -->
-  <div class="flex border-b border-neutral-200 dark:border-neutral-800">
+  <div class="flex border-b border-neutral-200 dark:border-neutral-800" role="tablist">
     <button
+      role="tab"
+      aria-selected={tab === "compass"}
       onclick={() => (tab = "compass")}
       class={tabCls(tab === "compass")}
     >
       {t("compass.compass")}
     </button>
     <button
+      role="tab"
+      aria-selected={tab === "level"}
       onclick={() => (tab = "level")}
       class={tabCls(tab === "level")}
     >
@@ -177,7 +219,17 @@
   <!-- Compass Tab -->
   {#if tab === "compass"}
     <div class="flex flex-1 flex-col items-center justify-center p-4">
-      {#if !permissionGranted}
+      {#if !supported}
+        <!-- No orientation API on this platform at all: there is nothing to grant.
+             Say 「传感器不可用」 — the permission panel below would ask for a
+             permission that cannot exist and its button would reload back into
+             itself. -->
+        <div class="text-center" data-testid="compass-unsupported">
+          <p class="text-sm text-neutral-600 dark:text-neutral-400">
+            {t("compass.unavailable")}
+          </p>
+        </div>
+      {:else if !permissionGranted}
         <div class="text-center">
           <p class="mb-4 text-sm text-neutral-600 dark:text-neutral-400">
             {t("compass.permissionRequired")}
@@ -193,10 +245,19 @@
             {t("compass.enableSensor")}
           </button>
         </div>
-      {:else if !reading.available}
+      {:else if !anySensorData}
         <div class="text-center">
           <p class="text-sm text-neutral-600 dark:text-neutral-400">
             {t("compass.unavailable")}
+          </p>
+        </div>
+      {:else if !reading.headingKnown}
+        <!-- Tilt is flowing but no heading was reported: a device with no
+             magnetometer. Say that — do not fold it into "sensor not
+             available" (the level tab beside this one still works). -->
+        <div class="text-center" data-testid="compass-no-heading">
+          <p class="text-sm text-neutral-600 dark:text-neutral-400">
+            {t("compass.noHeading")}
           </p>
         </div>
       {:else}
@@ -207,7 +268,7 @@
           </div>
           <div class="mt-2 text-2xl font-medium">{cardinal}</div>
           <div class="mt-1 text-sm text-neutral-500">
-            {settings.useTrueNorth ? t("compass.trueNorth") : t("compass.magneticNorth")}
+            {trueNorthApplied ? t("compass.trueNorth") : t("compass.magneticNorth")}
           </div>
         </div>
 
@@ -322,14 +383,14 @@
           <button onclick={toggleNorth} class={btnCls(settings.useTrueNorth)}>
             {settings.useTrueNorth ? t("compass.trueNorth") : t("compass.magneticNorth")}
           </button>
-          {#if settings.useTrueNorth && !locationGranted}
+          {#if settings.useTrueNorth && !declinationKnown}
             <span class="text-xs text-neutral-500">
-              ({t("compass.declinationUnavailable")})
+              ({locationGranted ? t("compass.declinationUnknown") : t("compass.declinationUnavailable")})
             </span>
           {/if}
         </div>
 
-        {#if settings.useTrueNorth && settings.declination !== 0}
+        {#if trueNorthApplied}
           <div class="mt-2 text-xs text-neutral-500">
             {t("compass.declination")}: {settings.declination.toFixed(1)}°
           </div>
@@ -348,15 +409,24 @@
           </p>
         </div>
       {:else}
-        <!-- Level Display -->
-        <div class="mb-8 text-center">
-          <div class="text-5xl font-light">
-            {deviceLevel ? "✓" : "○"}
+        <!-- Level Display. Both axes are required: with one axis missing there is
+             no level to report and no bubble to place — say which, rather than
+             drawing the missing axis on the centre line (F-SH-755). -->
+        {#if tiltComplete}
+          <div class="mb-8 text-center">
+            <div class="text-5xl font-light">
+              {deviceLevel ? "✓" : "○"}
+            </div>
+            <div class="mt-2 text-lg font-medium">
+              {deviceLevel ? t("compass.levelAchieved") : t("compass.levelAdjust")}
+            </div>
           </div>
-          <div class="mt-2 text-lg font-medium">
-            {deviceLevel ? t("compass.levelAchieved") : t("compass.levelAdjust")}
+        {:else}
+          <div class="mb-8 text-center" data-testid="compass-partial-tilt">
+            <div class="text-5xl font-light">—</div>
+            <div class="mt-2 text-lg font-medium">{t("compass.tiltIncomplete")}</div>
           </div>
-        </div>
+        {/if}
 
         <!-- Bubble Level -->
         <div class="relative mb-8" style="width: 280px; height: 280px;">
@@ -411,47 +481,52 @@
             />
           </svg>
 
-          <!-- Bubble (responds to tilt) -->
-          <div
-            class="absolute rounded-full bg-accent shadow-lg transition-all duration-100"
-            style="
-              width: 40px;
-              height: 40px;
-              left: {140 + (reading.tilt.x / 90) * 130 - 20}px;
-              top: {140 + (reading.tilt.y / 90) * 130 - 20}px;
-              opacity: {deviceLevel ? 1 : 0.7};
-            "
-          ></div>
+          <!-- Bubble (responds to tilt). Drawn only when both axes were measured: a
+               missing axis has no position on this 2-D plane. -->
+          {#if reading.tilt.x !== null && reading.tilt.y !== null}
+            <div
+              class="absolute rounded-full bg-accent shadow-lg transition-all duration-100"
+              style="
+                width: 40px;
+                height: 40px;
+                left: {140 + (reading.tilt.x / 90) * 130 - 20}px;
+                top: {140 + (reading.tilt.y / 90) * 130 - 20}px;
+                opacity: {deviceLevel ? 1 : 0.7};
+              "
+            ></div>
+          {/if}
         </div>
 
-        <!-- Tilt Angles -->
+        <!-- Tilt Angles. An unmeasured axis reads 「—」, never `0.0°`. -->
         <div class="grid grid-cols-2 gap-4 text-center">
           <div>
             <div class="text-xs text-neutral-500">{t("compass.tiltX")}</div>
-            <div class="text-2xl font-light tabular-nums">
-              {reading.tilt.x.toFixed(1)}°
+            <div class="text-2xl font-light tabular-nums" data-testid="compass-tilt-x">
+              {reading.tilt.x === null ? "—" : `${reading.tilt.x.toFixed(1)}°`}
             </div>
           </div>
           <div>
             <div class="text-xs text-neutral-500">{t("compass.tiltY")}</div>
-            <div class="text-2xl font-light tabular-nums">
-              {reading.tilt.y.toFixed(1)}°
+            <div class="text-2xl font-light tabular-nums" data-testid="compass-tilt-y">
+              {reading.tilt.y === null ? "—" : `${reading.tilt.y.toFixed(1)}°`}
             </div>
           </div>
         </div>
 
-        <!-- Level Status -->
-        <div class="mt-4">
-          <div class="h-2 w-64 overflow-hidden rounded-full bg-neutral-200 dark:bg-neutral-800">
-            <div
-              class="h-full transition-all duration-300"
-              class:bg-green-500={deviceLevel}
-              class:bg-orange-500={!deviceLevel && levelPct < 50}
-              class:bg-red-500={!deviceLevel && levelPct >= 50}
-              style="width: {Math.min(100, levelPct)}%"
-            ></div>
+        <!-- Level Status (both axes measured ⇒ a bar; otherwise nothing to draw) -->
+        {#if levelPct !== null}
+          <div class="mt-4">
+            <div class="h-2 w-64 overflow-hidden rounded-full bg-neutral-200 dark:bg-neutral-800">
+              <div
+                class="h-full transition-all duration-300"
+                class:bg-green-500={deviceLevel}
+                class:bg-orange-500={!deviceLevel && levelPct < 50}
+                class:bg-red-500={!deviceLevel && levelPct >= 50}
+                style="width: {Math.min(100, levelPct)}%"
+              ></div>
+            </div>
           </div>
-        </div>
+        {/if}
       {/if}
     </div>
   {/if}

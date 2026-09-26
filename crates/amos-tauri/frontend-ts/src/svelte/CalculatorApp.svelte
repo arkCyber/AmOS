@@ -124,6 +124,7 @@
   <div class="flex justify-end px-4 pt-2">
     <button
       onclick={() => (showHist = !showHist)}
+      aria-expanded={showHist}
       class="rounded-full px-3 py-1 text-[13px] leading-none transition active:scale-95 {showHist
         ? 'bg-[#ff9f0a] text-white'
         : 'bg-white/10 text-white/70 hover:bg-white/20'}"

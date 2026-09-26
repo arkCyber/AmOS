@@ -19,7 +19,10 @@
 //! `proto/netguard.proto`.
 
 use amos_proto::amos_netguard::net_guard_service_client::NetGuardServiceClient;
-use amos_proto::amos_netguard::{StatusReply, StatusRequest, ToggleReply, ToggleRequest};
+use amos_proto::amos_netguard::{
+    RevokeAppEgressReply, RevokeAppEgressRequest, SetAppEgressReply, SetAppEgressRequest,
+    StatusReply, StatusRequest, ToggleReply, ToggleRequest,
+};
 use serde::Serialize;
 
 use crate::error::{AmosError, ErrorCode};
@@ -31,10 +34,13 @@ async fn build_channel() -> Result<crate::daemon::DaemonChannel, String> {
 /// Wire vocabulary for the netguard / network-guard module. The UI i18n layer
 /// branches on these; renaming a variant is a wire break.
 pub mod codes {
+    use crate::error::ErrorCode;
     /// Network-guard toggle RPC failed (daemon unreachable / rejected).
-    pub const TOGGLE_FAILED: &str = "amos.netguard.toggle_failed";
+    pub const TOGGLE_FAILED: &str = ErrorCode::NetGuardToggleFailed.as_str();
     /// Network-guard status RPC failed.
-    pub const STATUS_FAILED: &str = "amos.netguard.status_failed";
+    pub const STATUS_FAILED: &str = ErrorCode::NetGuardStatusFailed.as_str();
+    /// Declaring / revoking an app's egress failed (daemon unreachable / refused).
+    pub const EGRESS_FAILED: &str = ErrorCode::NetGuardEgressFailed.as_str();
 }
 
 /// Upper bound on a single top-egress sample's domain (bytes).
@@ -78,6 +84,8 @@ pub struct NetGuardStatus {
     pub enforced: bool,
     /// Number of egress policy rules the guard holds.
     pub policy_rules: u64,
+    /// Number of apps holding a declared egress set (the daemon's registry size).
+    pub declared_apps: u64,
     /// Top domains by bytes in the current audit window (empty when no data).
     pub top_egress: Vec<NetGuardEgressSample>,
 }
@@ -100,6 +108,7 @@ fn to_status(r: &StatusReply) -> NetGuardStatus {
         // only user intent was recorded.
         enforced: r.enforced,
         policy_rules: r.policy_rules,
+        declared_apps: r.declared_apps,
         top_egress: r
             .top_egress
             .iter()
@@ -165,6 +174,83 @@ pub async fn netguard_status() -> Result<NetGuardStatus, AmosError> {
     Ok(to_status(&reply))
 }
 
+/// Serialisable mirror of one daemon `SetAppEgressReply` / `RevokeAppEgressReply`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct NetGuardEgressChange {
+    /// Total configured rules across all apps after the change.
+    pub policy_rules: u64,
+    /// Registry size after the change.
+    pub declared_apps: u64,
+}
+
+/// Record (or replace) one app's declared egress in the daemon.
+///
+/// Deliberately **not** a `#[tauri::command]`: the caller is Rust — an install
+/// path that already holds the app's manifest — never the WebView. Exposing an
+/// arbitrary `app_id`/`uid`/`allow_domains` write to JS would let the page widen
+/// another app's egress grant; keeping it Rust-side means one install path, one
+/// declaration (see `appstore::pwa_open_remote`).
+///
+/// `uid == 0` means "no uid": the declaration is recorded but contributes no
+/// packet rule (a shared-uid hosted bundle cannot be isolated at the packet
+/// layer). The daemon owns that distinction; this is a thin passthrough.
+pub async fn grant_app_egress(
+    app_id: &str,
+    uid: u32,
+    allow_domains: &[String],
+) -> Result<NetGuardEgressChange, AmosError> {
+    let mut client = NetGuardServiceClient::new(build_channel().await.map_err(|e| {
+        AmosError::with_cause(ErrorCode::NetGuardEgressFailed, codes::EGRESS_FAILED, e)
+    })?);
+    let reply: SetAppEgressReply = client
+        .set_app_egress(SetAppEgressRequest {
+            app_id: app_id.to_string(),
+            uid,
+            allow_domains: allow_domains.to_vec(),
+        })
+        .await
+        .map_err(|e| {
+            AmosError::with_cause(ErrorCode::NetGuardEgressFailed, codes::EGRESS_FAILED, e)
+        })?
+        .into_inner();
+    Ok(NetGuardEgressChange {
+        policy_rules: reply.policy_rules,
+        declared_apps: reply.declared_apps,
+    })
+}
+
+/// Drop one app's declared egress from the daemon's registry.
+///
+/// The counterpart to [`grant_app_egress`], called by the uninstall path
+/// (`appstore::appstore_uninstall`) so a removed app stops contributing rules.
+/// Like the grant, it is **not** a `#[tauri::command]`: the WebView must not be
+/// able to revoke another app's grant. A best-effort caller tolerates an offline
+/// daemon (the declaration is gone from the store's inventory either way; the
+/// registry simply keeps a stale entry until the next restart).
+pub async fn revoke_app_egress(app_id: &str) -> Result<NetGuardEgressChange, AmosError> {
+    let mut client = NetGuardServiceClient::new(build_channel().await.map_err(|e| {
+        AmosError::with_cause(ErrorCode::NetGuardEgressFailed, codes::EGRESS_FAILED, e)
+    })?);
+    let reply: RevokeAppEgressReply = client
+        .revoke_app_egress(RevokeAppEgressRequest {
+            app_id: app_id.to_string(),
+        })
+        .await
+        .map_err(|e| {
+            AmosError::with_cause(ErrorCode::NetGuardEgressFailed, codes::EGRESS_FAILED, e)
+        })?
+        .into_inner();
+    Ok(NetGuardEgressChange {
+        policy_rules: reply.policy_rules,
+        declared_apps: reply.declared_apps,
+    })
+}
+
+// The revoke counterpart (`RevokeAppEgress`) is deliberately not exposed here yet:
+// the host has no PWA-removal path to call it from, and an unwired `pub async fn`
+// would be a claim with no caller. The daemon serves and tests the RPC; this
+// bridge lands with the removal path.
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,6 +273,7 @@ mod tests {
             // A mock backend must surface as NOT enforcing — never a fabricated block.
             enforced: false,
             policy_rules: 3,
+            declared_apps: 2,
             top_egress: vec![amos_proto::amos_netguard::EgressSample {
                 domain: "tracker.example".into(),
                 bytes: 900,
@@ -196,6 +283,7 @@ mod tests {
         assert_eq!(s.backend, "mock");
         assert!(!s.enforced);
         assert_eq!(s.policy_rules, 3);
+        assert_eq!(s.declared_apps, 2);
         assert_eq!(s.top_egress.len(), 1);
         assert_eq!(s.top_egress[0].domain, "tracker.example");
         assert_eq!(s.top_egress[0].bytes, 900);
@@ -208,6 +296,7 @@ mod tests {
             backend: "nftables".into(),
             enforced: true,
             policy_rules: 0,
+            declared_apps: 0,
             top_egress: vec![],
         });
         assert!(s.enforced);
@@ -218,6 +307,7 @@ mod tests {
     fn netguard_codes_are_stable_string_keys() {
         assert_eq!(codes::TOGGLE_FAILED, "amos.netguard.toggle_failed");
         assert_eq!(codes::STATUS_FAILED, "amos.netguard.status_failed");
+        assert_eq!(codes::EGRESS_FAILED, "amos.netguard.egress_failed");
     }
 
     #[test]
@@ -231,6 +321,7 @@ mod tests {
             backend: "mock".into(),
             enforced: false,
             policy_rules: 0,
+            declared_apps: 0,
             top_egress: vec![
                 amos_proto::amos_netguard::EgressSample {
                     domain: huge,
@@ -257,6 +348,7 @@ mod tests {
             backend: "mock".into(),
             enforced: false,
             policy_rules: 0,
+            declared_apps: 0,
             top_egress: vec![amos_proto::amos_netguard::EgressSample {
                 domain: "a".into(),
                 bytes: u64::MAX,

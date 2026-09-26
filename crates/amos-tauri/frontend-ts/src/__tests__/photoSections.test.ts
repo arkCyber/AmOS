@@ -4,7 +4,15 @@
  * timestamps from whole-day offsets, so no timezone/DST ambiguity can leak in.
  */
 import { describe, expect, test } from "bun:test";
-import { dayIndex, dayKey, groupDays, setFavs, type DaySectionText } from "../lib/photos";
+import {
+  dayIndex,
+  dayKey,
+  groupDays,
+  knownTs,
+  setFavs,
+  UNKNOWN_DAY_KEY,
+  type DaySectionText,
+} from "../lib/photos";
 
 const now = new Date(2026, 8, 8, 12, 0, 0).getTime(); // 2026-09-08 12:00 local
 const DAY = 86_400_000;
@@ -14,6 +22,7 @@ const tx: DaySectionText = {
   today: "TODAY",
   yesterday: "YEST",
   date: (ts) => `D:${dayKey(ts)}`,
+  unknown: "UNKNOWN",
 };
 
 describe("photo day grouping", () => {
@@ -49,6 +58,31 @@ describe("photo day grouping", () => {
     const one = groupDays([D(now)], now, tx);
     expect(one).toHaveLength(1);
     expect(one[0]?.items).toHaveLength(1);
+  });
+
+  // REQ-A1852: a photo whose `ts` is the documented unknown sentinel (0) is NOT a
+  // 1970-01-01 day. Before the fix this section carried `key === "1970-01-01"` and the
+  // concrete-date label, so the wall drawn a date the host never reported.
+  test("the unknown sentinel is not bucketed as a 1970 day, and trails the wall", () => {
+    const sections = groupDays([D(0), D(now)], now, tx);
+    // its own key — never the calendar day `dayKey(0)` would mint
+    expect(sections.map((s) => s.key)).toEqual([dayKey(now), UNKNOWN_DAY_KEY]);
+    expect(sections.map((s) => s.key)).not.toContain("1970-01-01");
+    const unknown = sections[1];
+    expect(unknown?.label).toBe("UNKNOWN");
+    expect(unknown?.label).not.toContain("1970");
+    // all sentinel rows collapse into one bucket (the same single source of truth)
+    expect(groupDays([D(0), D(0), D(now)], now, tx)[1]?.items).toHaveLength(2);
+  });
+
+  // The positive controls (the two tests above) are what stop "always answer unknown":
+  // a real today / yesterday / concrete date still gets its own label and key. `knownTs`
+  // is the single predicate both halves read.
+  test("knownTs admits every real stamp and rejects only the sentinel", () => {
+    expect(knownTs(now)).toBe(true);
+    expect(knownTs(1)).toBe(true); // a real 1970 stamp is a measurement, not "unknown"
+    expect(knownTs(0)).toBe(false);
+    expect(knownTs(Number.NaN)).toBe(false);
   });
 });
 

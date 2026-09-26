@@ -101,15 +101,47 @@ describe("nativeApps bridge", () => {
     expect(await nativeAvailability()).toEqual({ wine: true, linux: false });
   });
 
-  test("listings merge both surfaces and are [] only when the host answered", async () => {
+  /**
+   * REQ-A1363 / F-SH-627. The sibling fold F-SH-266 removed from the **listing**
+   * (`nativeApps`) was left in the **availability** read, where `wine === true` turned a
+   * refused probe into `false` — and the screen reads `false` as 「本机没有安装 Wine」, a
+   * claim about this machine's PATH. Only `null` (the host did not answer) stays `null`;
+   * a malformed non-boolean answer is still `false` (the test above), because junk *is*
+   * an answer and "no answer" is not.
+   */
+  test("a refused probe stays null per kind — it does not become a false claim", async () => {
+    installBridge((cmd) => {
+      if (cmd === "wine_is_available") return new Error("the probe could not read PATH");
+      if (cmd === "linux_is_available") return true;
+      return null;
+    });
+    expect(await nativeAvailability()).toEqual({ wine: null, linux: true });
+  });
+
+  test("listings are per kind, and [] only for the kind the host answered", async () => {
     installBridge((cmd) => {
       if (cmd === "wine_apps") return [{ id: "w1", name: "Wine App", exePath: "a.exe" }];
       if (cmd === "linux_apps") return [];
       return null;
     });
-    const apps = await nativeApps();
-    expect(apps?.map((a) => a.id)).toEqual(["w1"]);
+    const read = await nativeApps();
+    expect(read?.wine?.map((a) => a.id)).toEqual(["w1"]);
+    // The host answered for Linux and found nothing: `[]`, **not** `null`.
+    expect(read?.linux).toEqual([]);
     expect(calls.map((c) => c.command)).toEqual(["wine_apps", "linux_apps"]);
+  });
+
+  // The fold this pins: a rejected `invoke` answers `null`, and a merged array could not
+  // carry the difference between "refused" and "empty" for one half (REQ-A836 / F-SH-266).
+  test("a half the host refused stays null instead of becoming an empty list", async () => {
+    installBridge((cmd) => {
+      if (cmd === "wine_apps") return new Error("the enumerator could not read the prefixes");
+      if (cmd === "linux_apps") return [{ id: "l1", name: "Linux App", exec: "l" }];
+      return null;
+    });
+    const read = await nativeApps();
+    expect(read?.wine).toBeNull();
+    expect(read?.linux?.map((a) => a.id)).toEqual(["l1"]);
   });
 
   test("launch names the command per surface and passes the id key Rust declares", async () => {

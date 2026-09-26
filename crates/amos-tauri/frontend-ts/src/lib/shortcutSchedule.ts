@@ -29,12 +29,34 @@ export interface ShortcutTriggerSpec {
 /**
  * What the OS half of an arming actually did (`alarm_sched::DeviceOutcome`, serde-tagged
  * `{ state, detail? }`). `host_only` means "the ledger holds it, no `AlarmManager` here";
- * the refusal states (`disallowed` / `denied` / `unavailable` / `unattached`) mean the
- * phone will **not** wake — the shell surfaces whichever it got instead of rounding up.
+ * the refusal states (`disallowed` / `denied` / `unavailable` / `unattached` / `unknown`)
+ * mean the phone will **not** wake.
+ *
+ * The shell must not round that up. {@link osHoldsAlarm} is the one rule (it mirrors the
+ * Rust `DeviceOutcome::keeps_ledger`), and `osShortcutTriggers` logs a line for every armed
+ * trigger the OS did **not** take — the same way it already surfaces a `rejected` rule — so
+ * a trigger that will not fire while the phone dozes is never mistaken for one that will.
  */
 export interface DeviceOutcome {
   state: string;
   detail?: unknown;
+}
+
+/**
+ * The device states that mean the OS half really holds the alarm — exactly the Rust
+ * `alarm_sched::DeviceOutcome::keeps_ledger` set (`matches!(self, Scheduled | HostOnly)`).
+ *
+ * Every other state — a refusal (`disallowed` / `denied` / `unavailable` / `unattached`),
+ * the glue's own `unknown`, or a token we do not recognise — means the phone will not be
+ * woken, so the shell says so instead of treating the trigger as armed. Keeping this list
+ * as a whitelist (not a blacklist of refusals) makes an unfamiliar token fail **safe**: an
+ * unknown word is treated as "not held", never as a working alarm.
+ */
+export const DEVICE_HOLDS = ["scheduled", "host_only"] as const;
+
+/** Whether `state` means the OS half really holds the alarm (see {@link DEVICE_HOLDS}). */
+export function osHoldsAlarm(state: string): boolean {
+  return (DEVICE_HOLDS as readonly string[]).includes(state);
 }
 
 /** One armed trigger in the sync reply. */

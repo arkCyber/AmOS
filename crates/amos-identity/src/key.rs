@@ -88,6 +88,10 @@ pub enum IdentityKey {
 impl IdentityKey {
     /// Build an identity deterministically from a seed for the given curve.
     ///
+    /// Any 32 bytes are a valid Ed25519 seed. A secp256k1 seed must be a
+    /// non-zero scalar below the curve order; anything else is
+    /// [`Error::InvalidSeed`]. (REQ-A561)
+    ///
     /// # Examples
     /// ```
     /// use amos_identity::{Curve, IdentityKey};
@@ -97,9 +101,11 @@ impl IdentityKey {
     pub fn from_seed(curve: Curve, seed: [u8; 32]) -> Result<Self> {
         match curve {
             Curve::Ed25519 => Ok(IdentityKey::Ed25519(Ed25519Key::from_seed(seed))),
-            Curve::Secp256k1 => Ok(IdentityKey::Secp256k1(
-                amos_web3::secp::SecretKey::from_seed(seed)?,
-            )),
+            Curve::Secp256k1 => match amos_web3::secp::SecretKey::from_seed(seed) {
+                Ok(k) => Ok(IdentityKey::Secp256k1(k)),
+                Err(amos_web3::error::Error::InvalidSecret) => Err(Error::InvalidSeed),
+                Err(e) => Err(Error::Web3(e.to_string())),
+            },
         }
     }
 
@@ -158,6 +164,22 @@ mod tests {
             assert!(did_str.starts_with("did:key:z"));
             assert_eq!(did::parse_did_key(&did_str).unwrap().0, curve);
         }
+    }
+
+    #[test]
+    fn invalid_secp_seed_is_invalid_seed_not_web3() {
+        // Ed25519 accepts any 32 bytes, including all-zero.
+        assert!(IdentityKey::from_seed(Curve::Ed25519, [0u8; 32]).is_ok());
+        // secp256k1 rejects zero and out-of-range scalars, surfaced as the
+        // crate-native `InvalidSeed` (not the opaque `Web3(..)` catch-all).
+        assert!(matches!(
+            IdentityKey::from_seed(Curve::Secp256k1, [0u8; 32]),
+            Err(Error::InvalidSeed)
+        ));
+        assert!(matches!(
+            IdentityKey::from_seed(Curve::Secp256k1, [0xff; 32]),
+            Err(Error::InvalidSeed)
+        ));
     }
 
     #[test]

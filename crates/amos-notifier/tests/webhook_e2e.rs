@@ -424,6 +424,60 @@ fn http_version_1_0_4xx_is_dropped() {
 }
 
 // ========================================================================
+// Response framing (a status line is not guaranteed to arrive in one read)
+// ========================================================================
+
+/// A 200 whose **status line is split across TCP segments** must still
+/// read as `Sent`.
+///
+/// The status line is not the unit of delivery: TCP may hand the receiver
+/// any prefix of the response, and a client that classifies whatever its
+/// *first* `read()` returned sees `"HTTP/1.1"` — which starts with neither
+/// `"HTTP/1.1 2"` nor `"HTTP/1.1 4"`, so a delivery the webhook actually
+/// accepted is reported `Failed`. That is not a cosmetic miscount: the
+/// dispatcher reads `Failed` as "reached no operator", so the operator
+/// fallback fires for an alert that *was* taken and `sent`/`failed` both
+/// lie. This test splits the status line and waits long enough between the
+/// two writes that the peer's first read really does see only the prefix.
+#[test]
+fn a_200_split_across_two_segments_is_still_sent() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut s, _) = match listener.accept() {
+            Ok(pair) => pair,
+            Err(_) => return,
+        };
+        // Drain the request up to the header terminator so the peer is not
+        // writing into a socket we never read.
+        let mut req = Vec::new();
+        let mut chunk = [0u8; 1024];
+        while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+            match s.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => req.extend_from_slice(&chunk[..n]),
+                Err(_) => break,
+            }
+            if req.len() > 32 * 1024 {
+                break;
+            }
+        }
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        // Segment 1: the version alone. Segment 2: the rest, sent only after
+        // a pause, so the client's first read() cannot have both.
+        let _ = s.write_all(&resp[..8]);
+        let _ = s.flush();
+        thread::sleep(Duration::from_millis(50));
+        let _ = s.write_all(&resp[8..]);
+        let _ = s.flush();
+        thread::sleep(Duration::from_millis(50));
+    });
+    let ch = WebhookChannel::new(format!("http://127.0.0.1:{port}/h"));
+    assert_eq!(ch.send(&Alert::p0("a", "b")), SendOutcome::Sent);
+    let _ = server.join();
+}
+
+// ========================================================================
 // Dispatcher + Webhook (the production-shape integration)
 // ========================================================================
 

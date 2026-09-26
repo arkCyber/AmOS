@@ -1,0 +1,8 @@
+# -*- coding: utf-8 -*-
+content = open('docs/TRACEABILITY_MATRIX.md', encoding='utf-8').read()
+new_entry = '''| REQ-A461 | `interpret_*` 命令用 `Result<T, String>` 暴露错误，前端 i18n 层无 `amos.interpret.*` 命名空间（REQ-A461，2026-09-25，起点是「按照航空航天级别标准，帮助我审计与补全代码，注意错误处理功能」）：①`error.rs` 新增 6 个 ErrorCode：`InterpretNoActive`/`InterpretSessionIdMismatch`/`InterpretTextTooLong`/`InterpretAudioTooLarge`/`InterpretSessionFailed`/`InterpretChannelFailed`；同步更新 `as_str()`/`ALL_VARIANTS`/`FROZEN_VARIANT_COUNT`（128→134）/`group` 测试。②`interpret.rs` 全部 `Result<T, String>` → `AmosResult<T>`，`Err` 改用 `AmosError::new(ErrorCode::...)`。③`backend.ts`：`BridgeDiag.command-failed` 新增 `code?: string`；`noteDiag` 在 catch 分支提取 code。④`InterpApp.svelte` 新增 `statusForInterpError` 工具按 code 渲染 `interp.err.*` 键；4 处换用该工具。⑤i18n 新增 6 键（zh.ts ∕ en.ts）。 | `crates/amos-tauri/src/error.rs` · `crates/amos-tauri/src/interpret.rs` · `crates/amos-tauri/frontend-ts/src/lib/backend.ts` · `crates/amos-tauri/frontend-ts/src/svelte/InterpApp.svelte` · `crates/amos-tauri/frontend-ts/src/i18n/locales/zh.ts` · `crates/amos-tauri/frontend-ts/src/i18n/locales/en.ts` · `docs/FMEA.md`（F-SH-646）· `CHANGELOG.md` | `cargo check -p amos-tauri --lib --tests` 0 错误；`cargo test -p amos-tauri --lib interpret::tests` 12/12 通过；`cargo test -p amos-tauri --lib error::tests::wire_codes_are_frozen` 通过；`bun run tsc --noEmit` 0 错误。discriminant 测试 7 例验证各 ErrorCode；负控：把 `Err(AmosError::new)` 改回 `Err("...".into())` → 编译错误。 | ✅ 已交付（2026-09-25） |
+'''
+lines = content.rstrip('\n').split('\n')
+lines.append(new_entry)
+open('docs/TRACEABILITY_MATRIX.md', 'w', encoding='utf-8').write('\n'.join(lines) + '\n')
+print('Appended REQ-A461 to TRACEABILITY_MATRIX.md')

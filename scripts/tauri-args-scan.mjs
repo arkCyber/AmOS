@@ -65,10 +65,19 @@ function walk(dir, ext, acc = []) {
   return acc;
 }
 
-/** Strip `//…` and block comments (a call named only in a comment is not a call). */
-export function stripComments(src) {
-  return src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
-}
+/**
+ * Strip `//…` and block comments (a call named only in a comment is not a call).
+ *
+ * Re-exported from `tauri-command-scan.mjs` rather than copied: this file and that one had
+ * **two spellings of the same three helpers**, a previous round fixed the bracket-counting
+ * defect in both *by hand*, and the copy here kept a second defect the original had already
+ * lost — `parseRegistered` located the macro with `indexOf` on the raw source, so prose
+ * quoting `generate_handler!` became the list (279 false "declared but NOT registered"
+ * findings). One parser, one place to be wrong.
+ */
+import { stripComments, parseRegistered, matchingBracket } from "./tauri-command-scan.mjs";
+
+export { stripComments, parseRegistered, matchingBracket };
 
 /** `source_lang` → `sourceLang` (the `heck` conversion tauri-macros applies). */
 export function lowerCamel(name) {
@@ -168,41 +177,6 @@ export function parseCommandArgs(src) {
   return out;
 }
 
-/**
- * Command names from a `generate_handler![…]` block (last path segment).
- *
- * Delimited by **balanced brackets**: a per-entry attribute (`#[cfg(desktop)]`)
- * carries its own `]`, and stopping at the first one truncated the list — which
- * reported every desktop-only command as "declared but NOT registered"
- * (`tauri-command-scan.mjs` had the same defect; both now count brackets).
- */
-export function parseRegistered(src) {
-  const start = src.indexOf("generate_handler!");
-  if (start < 0) return [];
-  const open = src.indexOf("[", start);
-  if (open < 0) return [];
-  const close = matchingBracket(src, open);
-  if (close < 0) return [];
-  return stripComments(src.slice(open + 1, close))
-    .split(",")
-    .map((e) => e.trim())
-    .filter((e) => e !== "")
-    .map((e) => e.split("::").pop().trim())
-    .filter((e) => /^[A-Za-z_]\w*$/.test(e));
-}
-
-/** Index of the `]` that closes the `[` at `open`, or -1 when unbalanced. */
-export function matchingBracket(src, open) {
-  let depth = 0;
-  for (let i = open; i < src.length; i++) {
-    if (src[i] === "[") depth++;
-    else if (src[i] === "]") {
-      depth--;
-      if (depth === 0) return i;
-    }
-  }
-  return -1;
-}
 
 /**
  * `invoke("cmd", { … })` call sites.

@@ -7,6 +7,8 @@ import {
   collectDueRings,
   dateKey,
   firedKey,
+  flaggedRingingIds,
+  liveRingingIds,
   markRung,
   normalizeFired,
   nextArmments,
@@ -77,7 +79,9 @@ describe("alarmCore — OS-level due alarms", () => {
       zh["app.clock"],
       NOW.getTime(),
     );
-    expect(n[0]!.id).toBe("alarm:a:08:00");
+    // The id names the arrival: `<alarm>:<HH:MM>:<that day>`, so a daily alarm's next ring
+    // is a new row rather than the same one (REQ-A1400 ∕ F-SH-658).
+    expect(n[0]!.id).toBe("alarm:a:08:00:2026-09-07");
     expect(n[0]!.app).toBe(zh["app.clock"]);
     expect(n[0]!.icon).toBe("🔔");
     expect(n[0]!.title!.length).toBeLessThanOrEqual(61);
@@ -98,7 +102,7 @@ describe("alarmCore — OS-level due alarms", () => {
 
     syncDueAlarmAlerts(NOW.getTime());
     let notifs = JSON.parse(window.localStorage.getItem(NOTIF_KEY) ?? "[]") as { id: string }[];
-    expect(notifs.filter((x) => x.id === "alarm:w1:08:00")).toHaveLength(1);
+    expect(notifs.filter((x) => x.id.startsWith("alarm:w1:08:00:"))).toHaveLength(1);
     expect(notifs.filter((x) => x.id.startsWith("alarm:off"))).toHaveLength(0);
     expect(notifs.filter((x) => x.id.startsWith("alarm:later"))).toHaveLength(0);
     // The ringing flag is persisted so a later-open Clock screen shows a live ring.
@@ -113,7 +117,7 @@ describe("alarmCore — OS-level due alarms", () => {
     // Same instant again → no duplicate arrival (already ringing / marker set).
     syncDueAlarmAlerts(NOW.getTime());
     notifs = JSON.parse(window.localStorage.getItem(NOTIF_KEY) ?? "[]");
-    expect(notifs.filter((x) => x.id === "alarm:w1:08:00")).toHaveLength(1);
+    expect(notifs.filter((x) => x.id.startsWith("alarm:w1:08:00:"))).toHaveLength(1);
 
     // User acknowledges (dismisses → ringing false). Next day the daily alarm
     // fires again (its date marker no longer matches).
@@ -123,7 +127,12 @@ describe("alarmCore — OS-level due alarms", () => {
     const nextDay = new Date(2026, 8, 8, 8, 0, 30); // 2026-09-08 (Tuesday)
     syncDueAlarmAlerts(nextDay.getTime());
     notifs = JSON.parse(window.localStorage.getItem(NOTIF_KEY) ?? "[]");
-    expect(notifs.filter((x) => x.id === "alarm:w1:08:00")).toHaveLength(2);
+    // Two days, two **distinct** arrivals. The id carries the day, which is what the
+    // OS arrival banner keys on (`newestAddedNotif` compares id **sets**): with one id
+    // for both days it stayed silent for the second ring, and the stored array merely
+    // grew a duplicate nothing on screen showed.
+    const rings = notifs.filter((x) => x.id.startsWith("alarm:w1:08:00:"));
+    expect(new Set(rings.map((x) => x.id)).size).toBe(2);
   });
 
   test("nextArmments plans only enabled alarms' next native occurrence", () => {
@@ -139,5 +148,76 @@ describe("alarmCore — OS-level due alarms", () => {
     expect(armed[0]!.id).toBe("alarm:a");
     // 07:30 today already passed at 08:00 → next is tomorrow 07:30.
     expect(armed[0]!.atMs).toBe(new Date(2026, 8, 8, 7, 30).getTime());
+  });
+});
+
+describe("alarmCore — a persisted ring is bounded to its own day (REQ-A1392)", () => {
+  const TODAY = dateKey(NOW); // 2026-09-07
+  const YESTERDAY = "2026-09-06";
+  const key = firedKey(al({ id: "w1", hour: 8, min: 0 }));
+
+  const store = () => JSON.parse(window.localStorage.getItem(ALARM_KEY) ?? "[]") as Alarm[];
+  const firedStore = () =>
+    JSON.parse(window.localStorage.getItem(ALARM_FIRED_KEY) ?? "{}") as Record<string, string>;
+  const notifs = () => JSON.parse(window.localStorage.getItem(NOTIF_KEY) ?? "[]") as { id: string }[];
+  const seedRing = (marker: string | null) => {
+    window.localStorage.setItem(
+      ALARM_KEY,
+      JSON.stringify([al({ id: "w1", hour: 8, min: 0, label: "起床", ringing: true })]),
+    );
+    if (marker !== null) {
+      window.localStorage.setItem(ALARM_FIRED_KEY, JSON.stringify({ [key]: marker }));
+    }
+  };
+
+  test("liveRingingIds keeps today's ring and drops another day's", () => {
+    const raw = [
+      { id: "today", hour: 8, min: 0, ringing: true },
+      { id: "old", hour: 8, min: 0, ringing: true },
+      { id: "off", hour: 8, min: 0, ringing: false },
+    ];
+    expect([...flaggedRingingIds(raw)].sort()).toEqual(["old", "today"]);
+    const fired = { "today|08:00": TODAY, "old|08:00": YESTERDAY };
+    expect([...liveRingingIds(raw, fired, NOW)]).toEqual(["today"]);
+    // No marker at all is NOT "today's ring" — the day it arrived is unknown, and the
+    // in-app tick writes its own marker (see clock-ring-marker.svelte.test.ts).
+    expect([...liveRingingIds(raw, {}, NOW)]).toEqual([]);
+    expect([...liveRingingIds(raw, fired, new Date(2026, 8, 8, 8, 0))]).toEqual([]);
+  });
+
+  test("a ring the user never dismissed does not silence the alarm the next day", () => {
+    seedRing(YESTERDAY);
+
+    expect(syncDueAlarmAlerts(NOW.getTime())).toBe(true);
+    // The arrival is surfaced again — that is the whole point: the bit was yesterday's,
+    // so it must not keep skipping today's occurrence.
+    expect(notifs().filter((x) => x.id.startsWith("alarm:w1:08:00:"))).toHaveLength(1);
+    expect(firedStore()[key]).toBe(TODAY);
+    expect(store().find((a) => a.id === "w1")!.ringing).toBe(true);
+
+    // …and once it is today's ring, a second reconcile at the same minute is the
+    // ordinary idempotent no-op (the marker now suppresses it).
+    expect(syncDueAlarmAlerts(NOW.getTime())).toBe(false);
+    expect(notifs().filter((x) => x.id.startsWith("alarm:w1:08:00:"))).toHaveLength(1);
+  });
+
+  test("a ring whose day has passed is retracted even when its minute is not due", () => {
+    seedRing(YESTERDAY);
+
+    // 09:30 — the alarm is not due, so nothing rings, yet the stale bit must go.
+    expect(syncDueAlarmAlerts(new Date(2026, 8, 7, 9, 30).getTime())).toBe(false);
+    expect(notifs()).toHaveLength(0);
+    expect(store().find((a) => a.id === "w1")!.ringing).toBe(false);
+    // pruneRung dropped yesterday's marker in the same pass.
+    expect(firedStore()[key]).toBeUndefined();
+  });
+
+  test("today's ring is left untouched (control)", () => {
+    seedRing(TODAY);
+
+    expect(syncDueAlarmAlerts(NOW.getTime())).toBe(false);
+    expect(notifs()).toHaveLength(0);
+    expect(store().find((a) => a.id === "w1")!.ringing).toBe(true);
+    expect(firedStore()[key]).toBe(TODAY);
   });
 });

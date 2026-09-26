@@ -1,4 +1,5 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { get } from "svelte/store";
 import {
   confidenceKey,
   isHigh,
@@ -6,6 +7,8 @@ import {
   kindLabel,
   SPY_HIT_EVENT,
   spyNotif,
+  spyWatch,
+  startTelemetrySpyWatcher,
   toSpyHit,
   type SpyHitPayload,
 } from "../lib/telemetrySpy";
@@ -105,5 +108,59 @@ describe("telemetry-spy egress audit bridge (pure helpers)", () => {
     // Even localized, the notification never carries the identifier's numeric value.
     expect(JSON.stringify(nZh)).not.toContain("490154203237518");
     expect(JSON.stringify(nEn)).not.toContain("490154203237518");
+  });
+});
+
+/**
+ * REQ-A1553 — the seam the audit page reports from.
+ *
+ * `bridgeDiag` is a module-global ledger in `lib/backend`, so each case installs its own
+ * host and the store is reset between tests; the point of each case is *which* of the two
+ * `null` answers `subscribe` can give we are in.
+ */
+describe("telemetry-spy attach state (REQ-A1553)", () => {
+  let listenVerdict: "ok" | "refused" = "ok";
+  let listened: string[] = [];
+
+  beforeEach(() => {
+    listenVerdict = "ok";
+    listened = [];
+    spyWatch.set(null);
+    (globalThis as { window?: unknown }).window = {
+      __TAURI_INTERNALS__: {
+        invoke: async () => null,
+        listen: async (channel: string) => {
+          listened.push(channel);
+          // The host refused the registration — the state `listenEvent` reports as
+          // `listen-failed`, and the one a page must not draw as "auditing".
+          return listenVerdict === "ok" ? () => {} : null;
+        },
+      },
+    };
+  });
+  afterEach(() => {
+    delete (globalThis as { window?: unknown }).window;
+    spyWatch.set(null);
+  });
+
+  test("an established listen reads as attached, and the channel is the spy feed", async () => {
+    const stop = await startTelemetrySpyWatcher(() => {});
+    expect(stop).not.toBeNull();
+    expect(listened).toEqual([SPY_HIT_EVENT]);
+    expect(get(spyWatch)).toBe("attached");
+  });
+
+  test("a REFUSED listen reads as refused — not as attached, and not as quiet", async () => {
+    listenVerdict = "refused";
+    expect(await startTelemetrySpyWatcher(() => {})).toBeNull();
+    // `bridged()` is true here, so a capability-derived status would say "attached"
+    // while no hit can ever arrive (REQ-A838's own consequence for this kind).
+    expect(get(spyWatch)).toBe("refused");
+  });
+
+  test("no host at all leaves the not-attached answer, not a refusal", async () => {
+    delete (globalThis as { window?: unknown }).window;
+    expect(await startTelemetrySpyWatcher(() => {})).toBeNull();
+    expect(get(spyWatch)).toBeNull();
   });
 });

@@ -48,6 +48,18 @@ object BluetoothGattGlue {
     private const val TAG = "AmosGlue.BLE"
     private val mainHandler = Handler(Looper.getMainLooper())
 
+    /*
+     * `setCharacteristicNotification` verdicts (mirrored by `notify_verdict` in
+     * `crates/amos-tauri/src/ble.rs`; REQ-A1158 / F-SH-459). Only the numeric values cross JNI,
+     * so the two lists must stay in step.
+     */
+    /** No request reached the stack (no glue / not connected / refused / no permission). */
+    internal const val NOTIFY_NO_REQUEST = 0
+    /** The CCC descriptor write was queued; the device's verdict arrives in `onDescriptorWrite`. */
+    internal const val NOTIFY_DESCRIPTOR_QUEUED = 1
+    /** The characteristic carries no CCC descriptor — the device cannot be told to notify. */
+    internal const val NOTIFY_NO_DESCRIPTOR = 2
+
     @Volatile
     private var gatt: BluetoothGatt? = null
 
@@ -90,8 +102,13 @@ object BluetoothGattGlue {
     private external fun nativeInstall(context: Context)
 
     /**
-     * Connect to `address`. Returns `true` when the connection was initiated
-     * (the framework then delivers `onConnectionStateChange` asynchronously).
+     * Connect to `address`. Returns `true` when a GATT **client object** was created and the
+     * request was handed to the framework — **not** whether the device answered.
+     *
+     * The rendezvous verdict arrives asynchronously in `onConnectionStateChange(status,
+     * newState)`; `ble_connect` waits for it rather than reading this return as "connected"
+     * (REQ-A1158 / F-SH-459). A `false` here means "no request was made" (no adapter, bad MAC,
+     * `BLUETOOTH_CONNECT` missing), which is a different fact from "the device refused".
      */
     @JvmStatic
     fun connect(context: Context, address: String): Boolean {
@@ -161,8 +178,11 @@ object BluetoothGattGlue {
 
     /**
      * Discover all services on the connected device.
-     * Returns the number of services found (call `getDiscoveredServices()` after
-     * the `onServicesDiscovered` callback fires).
+     *
+     * Answers whether the platform **accepted** the request (`1`) or refused it (`0`). The list
+     * itself does not come back here — it arrives later in [onServicesDiscovered], which is why
+     * this member has no getter to pair with: the Rust side's `ble_discover_services` waits for
+     * that callback rather than draining a cache on the same tick (REQ-A1157 / F-SH-458).
      */
     @JvmStatic
     fun discoverServices(): Int {
@@ -176,13 +196,37 @@ object BluetoothGattGlue {
         }
     }
 
-    /** All services discovered so far. */
-    fun getDiscoveredServices(): List<Map<String, Any>> {
-        return discoveredServices.map { svc ->
-            mapOf(
-                "uuid" to svc.uuid.toString(),
+    /**
+     * The discovered services as the JSON array the Rust callback expects.
+     *
+     * Each service carries its **characteristics** — uuid and the raw
+     * `BluetoothGattCharacteristic.getProperties()` bitmask — because the screen has to know
+     * which actions a characteristic permits before it offers them. Without this the screen
+     * could enumerate services but not their characteristics, so the user typed the
+     * characteristic uuid by hand and every read/write/subscribe looked available until the
+     * device refused it (REQ-A1198 / F-SH-487).
+     *
+     * One builder, called by the only path that crosses to Rust (`onServicesDiscovered`): a
+     * second, hand-written copy of this shape is how two answers to one question drift apart.
+     */
+    private fun servicesJson(services: List<BluetoothGattService>): String {
+        val array = JSONArray()
+        for (svc in services) {
+            val characteristics = JSONArray()
+            for (chr in svc.characteristics) {
+                characteristics.put(
+                    JSONObject()
+                        .put("uuid", chr.uuid.toString())
+                        .put("properties", chr.properties),
+                )
+            }
+            array.put(
+                JSONObject()
+                    .put("uuid", svc.uuid.toString())
+                    .put("characteristics", characteristics),
             )
         }
+        return array.toString()
     }
 
     // ── Read ─────────────────────────────────────────────────────────────────
@@ -240,47 +284,58 @@ object BluetoothGattGlue {
     // ── Notify / Indicate ──────────────────────────────────────────────────────
 
     /**
-     * Enable notifications or indications for a characteristic.
-     * The glue forwards incoming values via `onCharacteristicChanged`.
+     * Enable notifications or indications for a characteristic, reporting **which** of the three
+     * outcomes happened rather than a bare boolean.
+     *
+     * Toggling notifications has two halves, and only the second is about the device: a *local*
+     * registration (`setCharacteristicNotification`) and the CCC descriptor write, whose verdict
+     * arrives later in `onDescriptorWrite` → [`onDescriptorWriteResult`]. This member used to
+     * return the local half alone, so `ble_subscribe` reported 「已订阅」 for a device that never
+     * acknowledged — or for a characteristic that carries no CCC at all, where the descriptor
+     * write never even happened (REQ-A1158 / F-SH-459).
+     *
+     * Returns one of [`NOTIFY_NO_REQUEST`], [`NOTIFY_DESCRIPTOR_QUEUED`], [`NOTIFY_NO_DESCRIPTOR`].
      */
     @JvmStatic
     fun setCharacteristicNotification(
         serviceUuid: String,
         characteristicUuid: String,
         enable: Boolean
-    ): Boolean {
-        val g = gatt ?: return false
+    ): Int {
+        val g = gatt ?: return NOTIFY_NO_REQUEST
         // Bind (service, characteristic) together so two services sharing a
         // 16-bit UUID (e.g. 0x2A19 Battery Level appearing in both the
         // Battery Service and Environmental Sensor) don't silently match the
         // first one discovered.
-        val svc = findService(UUID.fromString(serviceUuid)) ?: return false
-        val chr = svc.getCharacteristic(UUID.fromString(characteristicUuid)) ?: return false
-        // Report the platform's own answer instead of an unconditional `true`: a refused call
-        // (or a local registration the stack declined) is then visible to `ble_subscribe` rather
-        // than reported as success (REQ-A412).
+        val svc = findService(UUID.fromString(serviceUuid)) ?: return NOTIFY_NO_REQUEST
+        val chr = svc.getCharacteristic(UUID.fromString(characteristicUuid)) ?: return NOTIFY_NO_REQUEST
         return try {
             val accepted = g.setCharacteristicNotification(chr, enable)
 
             // Write the CCC descriptor (0x2902 for notifications).
             val descriptor = chr.getDescriptor(UUID.fromString("00002902-0000-1000-8000-00805f9b34fb"))
-            if (descriptor != null) {
-                val value = if (enable) {
-                    if (chr.properties and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0) {
-                        BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
+            when {
+                descriptor == null -> NOTIFY_NO_DESCRIPTOR
+                !accepted -> NOTIFY_NO_REQUEST
+                else -> {
+                    val value = if (enable) {
+                        if (chr.properties and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0) {
+                            BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
+                        } else {
+                            BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                        }
                     } else {
-                        BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                        BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE
                     }
-                } else {
-                    BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE
+                    descriptor.value = value
+                    // The verdict for this write arrives in onDescriptorWrite; answer whether the
+                    // stack *queued* it, not whether the device agreed.
+                    if (g.writeDescriptor(descriptor)) NOTIFY_DESCRIPTOR_QUEUED else NOTIFY_NO_REQUEST
                 }
-                descriptor.value = value
-                g.writeDescriptor(descriptor)
             }
-            accepted
         } catch (e: SecurityException) {
             connectRefused("setCharacteristicNotification", e)
-            false
+            NOTIFY_NO_REQUEST
         }
     }
 
@@ -326,7 +381,10 @@ object BluetoothGattGlue {
             Log.i(TAG, "connection state: status=$status newState=$newState")
             val connected = newState == BluetoothProfile.STATE_CONNECTED
             try {
-                onConnectionStateChange(connected)
+                // Forward the stack's own `status` (`0` == GATT_SUCCESS) so `ble_connect` can
+                // tell a clean connection from a refusal (e.g. 133) instead of assuming the
+                // rendezvous succeeded because `connectGatt` handed back a client object.
+                onConnectionStateChange(connected, status)
             } catch (_: UnsatisfiedLinkError) {
                 // JNI not loaded — no-op
             }
@@ -348,10 +406,8 @@ object BluetoothGattGlue {
             Log.i(TAG, "services discovered: status=$status count=${gatt.services.size}")
             discoveredServices.clear()
             discoveredServices.addAll(gatt.services)
-            val servicesList = discoveredServices.map { mapOf("uuid" to it.uuid.toString()) }
             try {
-                val servicesJson = convertListToJson(servicesList)
-                onServicesDiscovered(servicesJson)
+                onServicesDiscovered(servicesJson(discoveredServices))
             } catch (_: UnsatisfiedLinkError) {
                 // JNI not loaded
             }
@@ -364,12 +420,14 @@ object BluetoothGattGlue {
             status: Int,
         ) {
             Log.i(TAG, "char read: ${chr.uuid} status=$status len=${value.size}")
-            if (status == BluetoothGatt.GATT_SUCCESS) {
-                try {
-                    onCharacteristicReadResult(chr.uuid.toString(), value)
-                } catch (_: UnsatisfiedLinkError) {
-                    // JNI not loaded
-                }
+            // Report **every** verdict, not only success: a failed read used to skip the
+            // callback entirely, so the Rust waiter saw no answer at all and `ble_read` guessed
+            // with its 5s timeout — the device's own status never reached the screen
+            // (REQ-A1158 / F-SH-459). `value` is empty on failure and is not rendered as a value.
+            try {
+                onCharacteristicReadResult(chr.uuid.toString(), value, status)
+            } catch (_: UnsatisfiedLinkError) {
+                // JNI not loaded
             }
         }
 
@@ -405,20 +463,17 @@ object BluetoothGattGlue {
             status: Int,
         ) {
             Log.i(TAG, "descriptor write: ${descriptor.uuid} status=$status")
-        }
-    }
-
-    /** Convert a list of maps to a JSON string for JNI delivery. */
-    private fun convertListToJson(list: List<Map<String, Any>>): String {
-        val array = org.json.JSONArray()
-        for (item in list) {
-            val obj = JSONObject()
-            for ((k, v) in item) {
-                obj.put(k, v)
+            // Forward the *device's* verdict for the CCC write so `ble_subscribe` /
+            // `ble_unsubscribe` can resolve, instead of reporting the local registration as
+            // success (REQ-A1158 / F-SH-459). Keyed by characteristic UUID — the descriptor
+            // alone does not say which characteristic it configures.
+            val chrUuid = descriptor.characteristic?.uuid?.toString() ?: return
+            try {
+                onDescriptorWriteResult(chrUuid, status)
+            } catch (_: UnsatisfiedLinkError) {
+                // JNI not loaded
             }
-            array.put(obj)
         }
-        return array.toString()
     }
 
     // ── JNI stubs (called by Rust) ─────────────────────────────────────────────
@@ -437,13 +492,15 @@ object BluetoothGattGlue {
 
     // ── JNI upcall stubs (Rust → Kotlin) ──────────────────────────────────────
 
-    external fun onConnectionStateChange(connected: Boolean)
+    external fun onConnectionStateChange(connected: Boolean, status: Int)
 
     external fun onServicesDiscovered(servicesJson: String)
 
-    external fun onCharacteristicReadResult(uuid: String, value: ByteArray)
+    external fun onCharacteristicReadResult(uuid: String, value: ByteArray, status: Int)
 
     external fun onCharacteristicWriteResult(uuid: String, status: Int)
+
+    external fun onDescriptorWriteResult(uuid: String, status: Int)
 
     external fun onCharacteristicChanged(uuid: String, value: ByteArray)
 }

@@ -6,10 +6,16 @@
 // every incoming call, we ask the Rust blocklist (shared with the SMS filter),
 // and then either reject or allow it:
 //
-//   * blocked  → `disallowCall` + `rejectCall` + `skipNotification` (the call is
-//     never shown/answered) and the reason is written to the call log with
-//     `setCallComposerAttachments`-free metadata (we do not fabricate anything),
-//   * allowed  → the platform proceeds normally.
+//   * blocked  → `disallowCall` + `rejectCall` + `skipNotification` + `skipCallLog`
+//     (the call is never shown, never answered, and leaves **no** entry in the
+//     platform call log — the same rule the SMS side applies when it hides a
+//     blocked sender's thread from the list),
+//   * allowed  → the platform proceeds normally (and is logged normally).
+//
+// We do **not** record a block reason anywhere: `CallScreeningService.CallResponse`
+// has no field for one, and there is no sanctioned way to annotate the platform's
+// call log. An earlier version of this comment claimed the reason was written
+// there — no line ever did it.
 //
 // The rules live in Rust; this service only asks. That keeps one source of truth
 // for "is this number blocked" across SMS and calls.
@@ -30,7 +36,7 @@ class AmosCallScreeningService : CallScreeningService() {
         val response = CallResponse.Builder()
             .setDisallowCall(reject)
             .setRejectCall(reject)
-            .setSkipCallLog(false)
+            .setSkipCallLog(reject)
             .setSkipNotification(reject)
             .build()
         if (reject) {

@@ -67,7 +67,7 @@ describe("earlyIntentFor — what the pre-shell listener may do in this window",
       label: "settings",
     });
     expect(earlyIntentFor("minimizeWindow", "notes")).toEqual({
-      intent: "hide-window",
+      intent: "minimize-window",
       label: "notes",
     });
     // The launcher has no app of its own: the early phase has no focused-window poll, and

@@ -7,12 +7,27 @@ use amos_int::config::BothMode;
 use amos_int::error::{InterpretationError, Result};
 use amos_int::event::TtsRequest;
 use amos_int::language::Language;
-use amos_int::pipeline::{AsrEvent, Pipeline, PipelineInfo, SourceText, Translation, TtsAudio};
+use amos_int::pipeline::{
+    samples_to_duration, AsrEvent, Pipeline, PipelineInfo, SourceText, Translation, TtsAudio,
+};
 use amos_int::segment::{PartialSegment, Speaker};
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
 use crate::recognizer::StreamingRecognizer;
+
+/// The recognizer plus the **audio clock** that gives each utterance its real
+/// time bounds. The streaming path is the only place that sees the audio, so it
+/// is the only place that can say where in the stream an utterance began and
+/// ended — the [`AsrEvent::Final`] `start`/`end` fields downstream consumers
+/// (e.g. `amos_int`'s `Segment`) read as utterance time.
+struct AsrState<R> {
+    recognizer: R,
+    /// Stream-relative audio consumed since the pipeline started.
+    fed: Duration,
+    /// Stream-relative offset at which the current utterance began.
+    utterance_start: Duration,
+}
 
 /// An `amos_int::Pipeline` backed by a streaming recognizer.
 ///
@@ -24,16 +39,24 @@ use crate::recognizer::StreamingRecognizer;
 ///
 /// Use [`AsrPipelineBuilder`] to construct with a translation delegate.
 pub struct AsrPipeline<R: StreamingRecognizer + Send> {
-    recognizer: Mutex<R>,
+    state: Mutex<AsrState<R>>,
     translate: Option<Arc<dyn Pipeline>>,
     source_lang: Language,
 }
 
 impl<R: StreamingRecognizer + Send> AsrPipeline<R> {
+    fn state(recognizer: R) -> Mutex<AsrState<R>> {
+        Mutex::new(AsrState {
+            recognizer,
+            fed: Duration::ZERO,
+            utterance_start: Duration::ZERO,
+        })
+    }
+
     /// ASR-only pipeline (translation returns an error).
     pub fn new(recognizer: R, source_lang: impl Into<Language>) -> Self {
         Self {
-            recognizer: Mutex::new(recognizer),
+            state: Self::state(recognizer),
             translate: None,
             source_lang: source_lang.into(),
         }
@@ -64,7 +87,7 @@ impl<R: StreamingRecognizer + Send> AsrPipelineBuilder<R> {
 
     pub fn build(self) -> AsrPipeline<R> {
         AsrPipeline {
-            recognizer: Mutex::new(self.recognizer),
+            state: AsrPipeline::state(self.recognizer),
             translate: self.translate,
             source_lang: self.source_lang,
         }
@@ -89,8 +112,12 @@ impl<R: StreamingRecognizer + Send + Sync + 'static> Pipeline for AsrPipeline<R>
 
     async fn feed_audio(&self, chunk: &[f32]) -> Result<Vec<AsrEvent>> {
         let mut events = Vec::new();
-        let mut rec = self.recognizer.lock().await;
-        if let Some(h) = rec.push_samples(chunk) {
+        let mut st = self.state.lock().await;
+        // Advance the audio clock by the chunk's duration *before* the endpoint
+        // decision, so a finalizing utterance's `end` includes the audio that
+        // just completed it.
+        st.fed += samples_to_duration(chunk.len());
+        if let Some(h) = st.recognizer.push_samples(chunk) {
             events.push(AsrEvent::Partial(PartialSegment {
                 speaker: Speaker::default(),
                 text: h.text,
@@ -98,17 +125,19 @@ impl<R: StreamingRecognizer + Send + Sync + 'static> Pipeline for AsrPipeline<R>
                 lang: h.lang,
             }));
         }
-        if rec.is_endpoint() {
-            let text = rec.finalize();
+        if st.recognizer.is_endpoint() {
+            let text = st.recognizer.finalize();
             if !text.trim().is_empty() {
                 events.push(AsrEvent::Final {
                     text,
                     lang: self.source_lang.clone(),
-                    start: Duration::ZERO,
-                    end: Duration::ZERO,
+                    start: st.utterance_start,
+                    end: st.fed,
                 });
             }
-            rec.reset();
+            st.recognizer.reset();
+            // The next utterance begins where this one ended.
+            st.utterance_start = st.fed;
         }
         Ok(events)
     }
@@ -117,15 +146,18 @@ impl<R: StreamingRecognizer + Send + Sync + 'static> Pipeline for AsrPipeline<R>
         // Flush the recognizer's in-flight utterance even if it never signalled
         // an endpoint (finite clip, forced stop). Reset for the next utterance.
         let mut events = Vec::new();
-        let mut rec = self.recognizer.lock().await;
-        let text = rec.finalize();
-        rec.reset();
+        let mut st = self.state.lock().await;
+        let text = st.recognizer.finalize();
+        st.recognizer.reset();
+        let start = st.utterance_start;
+        let end = st.fed;
+        st.utterance_start = st.fed;
         if !text.trim().is_empty() {
             events.push(AsrEvent::Final {
                 text,
                 lang: self.source_lang.clone(),
-                start: Duration::ZERO,
-                end: Duration::ZERO,
+                start,
+                end,
             });
         }
         Ok(events)
@@ -182,6 +214,72 @@ mod tests {
             let p4 = pipe.feed_audio(&vec![0.0; 160]).await.unwrap();
             assert!(matches!(&p4[0], AsrEvent::Partial(p) if p.text == "你"));
         });
+    }
+
+    /// The finalized utterance must carry its real time bounds within the stream:
+    /// `start` where the utterance began, `end` where it ended. Both were
+    /// hard-coded to `Duration::ZERO`, so every finalized segment claimed a
+    /// zero-width utterance at t=0 — the declared "utterance start/end"
+    /// measurement that no code path established, even though this pipeline is
+    /// the one component that sees the audio and can supply it (REQ-A611).
+    ///
+    /// One 160-sample frame at 16 kHz is exactly 10 ms.
+    #[test]
+    fn finalized_utterance_carries_its_real_time_bounds() {
+        let pipe = AsrPipeline::new(
+            MockStreamingRecognizer::new(["你", "好", "，Amos"], 3),
+            "zh",
+        );
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let frame = vec![0.0f32; 160]; // 10 ms
+
+            let first = collect_final(&pipe, &frame, 3).await;
+            let (start, end) = first.expect("the first utterance finalizes at the endpoint");
+            assert_eq!(
+                start,
+                Duration::ZERO,
+                "the first utterance begins at the stream origin"
+            );
+            assert_eq!(
+                end,
+                Duration::from_millis(30),
+                "three 10 ms frames of audio = 30 ms"
+            );
+            assert!(end > start, "an utterance is not zero-width");
+
+            // A second utterance's bounds start where the first ended.
+            let second = collect_final(&pipe, &frame, 3).await;
+            let (start2, end2) = second.expect("the second utterance finalizes too");
+            assert_eq!(
+                start2,
+                Duration::from_millis(30),
+                "the second utterance begins where the first ended"
+            );
+            assert_eq!(
+                end2,
+                Duration::from_millis(60),
+                "and ends 30 ms of audio later"
+            );
+        });
+    }
+
+    /// Feed `frames` frames and return the first `AsrEvent::Final` seen.
+    async fn collect_final(
+        pipe: &AsrPipeline<MockStreamingRecognizer>,
+        frame: &[f32],
+        frames: usize,
+    ) -> Option<(Duration, Duration)> {
+        for _ in 0..frames {
+            for ev in pipe.feed_audio(frame).await.unwrap() {
+                if let AsrEvent::Final { start, end, .. } = ev {
+                    return Some((start, end));
+                }
+            }
+        }
+        None
     }
 
     #[test]

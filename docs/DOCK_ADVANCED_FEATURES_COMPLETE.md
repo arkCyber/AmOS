@@ -10,7 +10,11 @@
 > `clientX`（侧栏里所有图标的 X 中心几乎相同 ⇒ 整列一起放大）、自动隐藏的唤起点只看底部 80px
 > （**「左侧 + 自动隐藏」是一个死角**：Dock 正确隐藏之后再也唤不回来）、容量恒按**宽度**量
 > （侧栏永远只报 3 个）。真正修好是 REQ-A414：把"哪条边"收敛成 `lib/dockConfig.ts` 的 7 个纯函数。
-> 第 1 节（Bounce）与第 2 节（自动隐藏）的描述与实现一致，未受影响。
+> **第 1 节（Bounce）与实现一致**；**第 2 节（自动隐藏）也已订正**（见下，REQ-A551）——旧句
+> "第 2 节未受影响"是错的：本节曾描述 `fullscreenchange` 驱动的自动隐藏，而那正是 REQ-A415
+> 修掉的缺陷本身。此外，本报告是一份 **2026-09-17 的快照**，其「未来扩展」一节所列的三项
+> 后来都已落地（见文末订正，REQ-A551），而「配置选项」里那份 `DockConfig` 类型也已被删除
+> （无人使用的导出，见配置选项一节的订正）。
 
 ---
 
@@ -47,6 +51,18 @@ emitDockBounce('messages');
 - 添加 `translateY` CSS 过渡动画
 - 鼠标接近底部 80px 范围时显示 Dock
 - 使用 `setTimeout` 实现 3 秒延迟隐藏
+
+> **订正（2026-09-20，REQ-A551）**：上面这段描述的是**已被删除的旧行为**。自动隐藏的一直是
+> `fullscreenchange` 门——`Dock.svelte` 曾写作 `autoHideEnabled && isFullscreen()`，而
+> `isFullscreen()` 读 `document.fullscreenElement`，**Tauri 窗口的原生全屏不设该属性**、
+> `fullscreenchange` 也不触发；只有 `main` 桌面窗口挂这个 Dock，它的
+> `document.fullscreenElement` **永远为 `null`** ⇒ 右键菜单里那颗「自动隐藏」复选框勾了等于
+> 没勾（一个永久空开关，REQ-A415）。现在的行为由**用户偏好**驱动：
+> `prefs.autoHide` 勾上即隐藏、指针移近 Dock **自己的那条边**时唤出
+> （`lib/dockConfig.ts::dockRevealZone`，唤起的边随位置走——旧实现只看底部 80px，
+> "左侧 + 自动隐藏"是一个唤不回来的死角）。隐藏动画也随位置走（底部 `translateY`、
+> 侧栏 `translateX`，见 `dockHideTransform`），不再是恒 `translateY`。判定与
+> 行为由 `svelte-tests/dock-autohide.svelte.test.ts` 钉住。
 
 **CSS 过渡**:
 ```css
@@ -92,17 +108,24 @@ dockPositionClass('right')  // "right-0 top-[24px] bottom-0 justify-end"
 
 ## 🔧 配置选项
 
+> **订正（2026-09-20，REQ-A551）**：下面这份 `DockConfig` / `DEFAULT_DOCK_CONFIG` **在今天的
+> 代码里已不存在**——它曾在最初的 `lib/dockConfig.ts` 中定义，后来因**无人使用**被删（本仓
+> `docs/FINAL_CODE_AUDIT_2026_SEP17.md` 把它与 `BOUNCE_ANIMATION`、`dockSizeStyle` 等一起列为
+> 「从未使用的导出」，`docs/CODE_AUDIT_COMPLETION_2026_SEP17.md` 记录了那次移除）。取而代之、
+> 真正在用的是 `lib/dockPrefs.ts::DockPrefs`：`magnification` 是**倍数**（`number`，1.0–2.0）
+> 而非 `boolean`，并多了一个 `iconSize`（32–64 px）；默认值也不同（`magnification: 1.5`、
+> `iconSize: 48`）。偏好通过 `DOCK_PREFS_KEY`（`"dock.prefs.v1"`）持久化。
+
 ```typescript
-interface DockConfig {
+// 实际落地（lib/dockPrefs.ts）：
+interface DockPrefs {
   position: "bottom" | "left" | "right";
   autoHide: boolean;
-  magnification: boolean;
+  magnification: number; // 1.0 - 2.0
+  iconSize: number;      // 32 - 64 (px)
 }
-
-const DEFAULT_DOCK_CONFIG: DockConfig = {
-  position: "bottom",
-  autoHide: false,
-  magnification: true,
+const DEFAULT_DOCK_PREFS: DockPrefs = {
+  position: "bottom", autoHide: false, magnification: 1.5, iconSize: 48,
 };
 ```
 
@@ -157,7 +180,16 @@ $ npm run test
 
 ## 🔮 未来扩展
 
-### 即将支持的功能
+> **订正（2026-09-20，REQ-A551）**：下面「即将支持」的三项**此后都已落地**，这份清单是
+> 2026-09-17 当时的待办，不是今天的缺口：
+> 1. **用户配置持久化** —— 已实现：`lib/dockPrefs.ts` 的 `DockPrefs` 经 `DOCK_PREFS_KEY`
+>    写入共享 store，`Dock.svelte` 挂载时读回（`normalizeDockPrefs`）。
+> 2. **Settings UI** —— 已实现：Dock 空白处**右键**打开 `DockGlobalContextMenu`，提供位置
+>    （左/底/右）、自动隐藏、放大倍数、图标大小的开关（macOS 的右键 Dock 即此）。
+> 3. **侧边 Dock 样式** —— 已实现：REQ-A414 把"哪条边"收敛进 `lib/dockConfig.ts` 的纯函数
+>    （定位类、隐藏位移、放大轴、容量轴、唤起区）。
+
+### 曾经的待办（保留原文）
 1. **用户配置持久化** - 将位置/自动隐藏偏好保存到 localStorage
 2. **Settings UI** - 在设置页面添加 Dock 配置面板
 3. **侧边 Dock 样式** - 优化左侧/右侧 Dock 的图标排列

@@ -25,6 +25,8 @@ import {
   groupContacts,
   getAvatarThemes,
   isAvatarTheme,
+  DEFAULT_AVATAR_THEME,
+  normalizeAvatarTheme,
   type Contact,
 } from "../lib/contacts";
 
@@ -285,6 +287,21 @@ describe("isAvatarTheme（类型守卫，REQ-A406）", () => {
     const themes = getAvatarThemes();
     expect(themes).toHaveLength(7);
     expect(themes.every((t) => isAvatarTheme(t))).toBe(true);
+  });
+});
+
+describe("normalizeAvatarTheme（存储读回来的值先过一遍守卫）", () => {
+  test("认得的值原样返回", () => {
+    for (const t of getAvatarThemes()) {
+      expect(normalizeAvatarTheme(t)).toBe(t);
+    }
+  });
+
+  test("缺失/损坏/未知一律回落到默认（不能把头像池清空）", () => {
+    for (const bad of [undefined, null, "", 0, 42, {}, [], "ANIMALS", "system", "animals "]) {
+      expect([bad, normalizeAvatarTheme(bad)]).toEqual([bad, DEFAULT_AVATAR_THEME]);
+    }
+    expect(DEFAULT_AVATAR_THEME).toBe("animals");
   });
 });
 

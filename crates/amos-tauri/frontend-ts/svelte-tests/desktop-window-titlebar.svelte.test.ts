@@ -20,6 +20,11 @@ import { cleanup, render } from "@testing-library/svelte";
 import { tick } from "svelte";
 import DesktopAppWindow from "../src/svelte/DesktopAppWindow.svelte";
 import { APP_WINDOW_TITLEBAR_HEIGHT, APP_WINDOW_TITLEBAR_INSET } from "../src/lib/desktopLayout";
+import { clearDiag, recentDiag } from "../src/lib/debugLog";
+
+/** Did the diagnostic ledger record a message containing `needle`? (REQ-A764.) */
+const diagSaid = (needle: string): boolean =>
+  recentDiag(200).some((e) => e.msg.includes(needle));
 
 type Call = { cmd: string; args?: Record<string, unknown> };
 let calls: Call[] = [];
@@ -130,6 +135,31 @@ describe("G-α — macOS Overlay 标题栏 (REQs §3)", () => {
     expect(calls.filter((c) => c.cmd === "wm_maximize")).toEqual([
       { cmd: "wm_maximize", args: { label: "calendar" } },
     ]);
+  });
+
+  /**
+   * REQ-A764 — a refused `wm_maximize` must be *said*, not swallowed.
+   *
+   * The double-click dropped the boolean, so a host refusal (a split pane owns its rectangle; a
+   * label stale from the 5 s poll names a closed window) left the gesture silently dead — while
+   * its sibling, Window ▸ Zoom, reports the same refusal through `windowMenuAction`. The host
+   * here answers `null` (the refusal shape this repo's `invoke` uses), so the double-click must
+   * land a diagnostic naming the command and the window.
+   */
+  test("被拒的 wm_maximize 会被报出来，不再静默（REQ-A764）", async () => {
+    clearDiag();
+    render(DesktopAppWindow, { props: { id: "calendar" } });
+    await tick();
+    const bar = document.querySelector(
+      '[data-testid="app-window-titlebar"]',
+    ) as HTMLElement | null;
+    bar?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    await new Promise((r) => setTimeout(r, 50));
+    bar?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    // The warning is written from the `wm_maximize` promise's `.then`, one microtask later.
+    await new Promise((r) => setTimeout(r, 0));
+    expect(calls.some((c) => c.cmd === "wm_maximize")).toBe(true);
+    expect(diagSaid("the host refused to maximize `calendar`")).toBe(true);
   });
 
   test("单击（< 300 ms 内只一次）不派命令", async () => {

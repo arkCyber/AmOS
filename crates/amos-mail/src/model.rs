@@ -100,10 +100,16 @@ pub struct EmailSummary {
     pub from: Option<Address>,
     pub to: Vec<Address>,
     pub subject: String,
-    /// Unix epoch seconds.
+    /// The message's date, as Unix epoch seconds: its `Date:` header when present
+    /// and parseable, otherwise the server's receipt time (`INTERNALDATE` on the
+    /// live path). `0` is **not** an "unknown" marker — consumers render it as the
+    /// epoch — so only a provider that can establish neither leaves it there.
     pub date: i64,
     pub flags: EmailFlags,
-    /// Number of attachments (bodies are fetched separately).
+    /// Number of attachments (bodies are fetched separately). It is a *measured*
+    /// count: on the live path it comes from the message's `BODYSTRUCTURE`, and a
+    /// provider that cannot establish it must not report `0` (which every surface
+    /// renders as "this message has no files").
     pub attachment_count: usize,
 }
 
@@ -232,13 +238,25 @@ impl SendDraft {
     }
 }
 
-/// Acknowledgment returned by a successful send.
+/// Acknowledgment returned by a send the provider *accepted*.
+///
+/// "Accepted" is deliberately not the same as "delivered over the network": the
+/// offline mock stores a copy in `Sent` and puts nothing on a wire, so
+/// [`Self::delivered`] carries the difference. A receipt that only ever said
+/// "here is an id" let the UI print 「已发送」 for a message that never left the
+/// device (F-SH-824).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SendReceipt {
     /// Provider-local id of the stored copy (in the `Sent` mailbox).
     pub id: String,
     /// Unix epoch seconds when it was sent.
     pub date: i64,
+    /// Whether a real transport accepted the message **for delivery**.
+    ///
+    /// `false` means it was only filed in the local `Sent` mailbox — the mock /
+    /// offline backend has no wire to put it on. Callers must not render that as
+    /// 「已发送」: the message was stored, not transmitted.
+    pub delivered: bool,
 }
 
 #[cfg(test)]

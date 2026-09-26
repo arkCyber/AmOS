@@ -191,6 +191,97 @@ describe("NotesApp.svelte", () => {
     const stored = readStoreValue<{ state?: string }[]>("amos.notes", []);
     expect(stored.filter((n) => n.state === "archived").length).toBe(2);
   });
+
+  /**
+   * REQ-A1266 / F-SH-543 — the same rule REQ-A1259 installed for the *single-item* writes
+   * (`add`, `saveEdit`, `importMd`), never swept over the **bulk** ones.
+   *
+   * `runBatch` ran `persist(fn(selInView));` and then `exitSel()` whatever `persist`
+   * answered. `persist(next): boolean` returns false and sets the store banner when the
+   * write is refused, so a refused bulk write changed nothing in storage — but `exitSel()`
+   * (`selecting = false; selected = []`) unmounts the batch toolbar (`{#if selecting}`)
+   * holding all five verbs. The user saw 「本机存储写入失败」 and then had to re-enter select
+   * mode and re-pick every note.
+   */
+  describe("REQ-A1266: a refused bulk write must not throw away the selection", () => {
+    /**
+     * Add `titles`, then enter select mode and tick the first `pick` of them.
+     *
+     * The rows are found **by title**, not by `aria-pressed` alone: the mode chips
+     * (备忘录 ∕ 归档 ∕ 垃圾) carry `aria-pressed` too and come earlier in the DOM, so a
+     * bare `[aria-pressed]` query ticks the tab strip instead of the notes.
+     */
+    async function composeAndSelect(host: { container: HTMLElement }, titles: string[], pick: number) {
+      const ta = host.container.querySelector(
+        'textarea[data-testid="note-compose"]',
+      ) as HTMLTextAreaElement;
+      for (const v of titles) {
+        await fireEvent.input(ta, { target: { value: v } });
+        await fireEvent.click(btnTrim(host, "保存")!);
+      }
+      await fireEvent.click(btnTrim(host, "选择")!);
+      const rowOf = (title: string) =>
+        [...host.container.querySelectorAll("button[aria-pressed]")].find((b) =>
+          (b.textContent ?? "").includes(title),
+        ) as HTMLButtonElement;
+      for (let i = 0; i < pick; i++) await fireEvent.click(rowOf(titles[i]!));
+    }
+
+    test("存储拒绝时「批量归档」不清多选，也不动存储", async () => {
+      const host = render(NotesApp);
+      await composeAndSelect(host, ["甲事项", "乙事项", "丙清单"], 2);
+      expect(txt(host)).toContain("已选 2");
+
+      const restore = failWritesFor("amos.notes");
+      try {
+        await fireEvent.click(btnTrim(host, "归档")!);
+        await new Promise<void>((r) => setTimeout(r, 0));
+
+        // The refusal is reported…
+        expect(host.container.querySelector('[data-testid="note-store-error"]')?.textContent ?? "")
+          .toContain("本机存储写入失败");
+        // …nothing was archived (the write never landed)…
+        const stored = readStoreValue<{ state?: string }[]>("amos.notes", []);
+        expect(stored.filter((n) => n.state === "archived").length).toBe(0);
+        expect(txt(host)).toContain("甲事项");
+        // …and the selection the user assembled is still there to retry with. (Scoped to the
+        // two note rows: the 备忘录 mode chip carries `aria-pressed` too.)
+        expect(txt(host), "被拒的批量写不得把多选推走").toContain("已选 2");
+        const picked = [...host.container.querySelectorAll("button[aria-pressed]")].filter((b) =>
+          ["甲事项", "乙事项"].some((ttl) => (b.textContent ?? "").includes(ttl)),
+        );
+        expect(picked.length, "两行都还在屏上").toBe(2);
+        expect(
+          picked.every((b) => b.getAttribute("aria-pressed") === "true"),
+          "两行仍应是选中态",
+        ).toBe(true);
+      } finally {
+        restore();
+      }
+    });
+
+    // Companion leaf: the gate must not have been bought by never leaving select mode.
+    // On a write that lands, the batch runs and select mode ends.
+    test("批量归档落地时，选择模式照常退出", async () => {
+      const host = render(NotesApp);
+      await composeAndSelect(host, ["甲事项", "乙事项", "丙清单"], 2);
+      expect(txt(host)).toContain("已选 2");
+
+      await fireEvent.click(btnTrim(host, "归档")!);
+      await new Promise<void>((r) => setTimeout(r, 0));
+
+      expect(txt(host)).not.toContain("甲事项");
+      expect(
+        readStoreValue<{ state?: string }[]>("amos.notes", []).filter((n) => n.state === "archived")
+          .length,
+      ).toBe(2);
+      // Select mode is over: the count label is gone and 选择 is offered again (丙清单 keeps
+      // the toolbar mounted, so its absence is a real signal rather than the empty view).
+      expect(txt(host), "落地之后选择模式必须退出").not.toContain("已选");
+      expect(btnTrim(host, "选择"), "选择按钮应重新出现").toBeTruthy();
+    });
+  });
+
   test("exporting a note without a backend reports a failed clipboard fallback honestly", async () => {
     const host = render(NotesApp);
     const ta = host.container.querySelector('textarea[data-testid="note-compose"]') as HTMLTextAreaElement;
@@ -415,6 +506,39 @@ describe("NotesApp.svelte — Markdown import / export", () => {
     expect(txt(host)).toContain("已导入");
   });
 
+  // REQ-A1259 / F-SH-530: `importMd` was the one write in this file that did not consult
+  // `persist`'s verdict — it discarded it, then cleared the compose box (the import's
+  // success gesture) and painted "已导入「{title}」" (its success report) anyway. Both
+  // `add` and `saveEdit` above already state the rule it broke: the user's typed text must
+  // never be cleared into a write that did not happen. The pasted Markdown is the user's
+  // only copy, so a refused write silently destroys it *and* claims success.
+  test("a refused write must not be reported as a successful import (REQ-A1259)", async () => {
+    const pasted = "---\ntitle: 周报\n---\n# 周报标题\n\n正文内容";
+    const restore = failWritesFor("amos.notes");
+    try {
+      const host = render(NotesApp);
+      const compose = host.container.querySelector(
+        'textarea[data-testid="note-compose"]',
+      ) as HTMLTextAreaElement;
+      await fireEvent.input(compose, { target: { value: pasted } });
+      await fireEvent.click(host.container.querySelector('[data-testid="note-import-md"]')!);
+      await tick();
+
+      // Nothing landed...
+      expect(readStoreValue<unknown[]>("amos.notes", [])).toHaveLength(0);
+      // ...the failure is reported...
+      expect(
+        host.container.querySelector('[data-testid="note-store-error"]')?.textContent ?? "",
+      ).toContain(zh["note.saveFailed"]);
+      // ...the draft survives (it is the user's only copy)...
+      expect(compose.value).toBe(pasted);
+      // ...and nothing claims the import happened.
+      expect(txt(host)).not.toContain(zh["note.imported"].replace("{title}", "周报标题"));
+    } finally {
+      restore();
+    }
+  });
+
   test("⇩ .md export affordance is present and reports the clipboard outcome honestly", async () => {
     const host = render(NotesApp);
     const compose = host.container.querySelector(
@@ -558,6 +682,111 @@ describe("NotesApp.svelte — 按修改时间排序偏好", () => {
     expect(texts[0]).toContain("更早创建的备注");
     expect(texts[1]).toContain("最近修改的备注");
   });
+});
+
+describe("NotesApp.svelte — handwriting (REQ-A526)", () => {
+  const stroke = {
+    tool: "pen",
+    color: "#1f2937",
+    width: 2,
+    pts: [
+      { x: 1, y: 1, p: 0.5, t: 0 },
+      { x: 40, y: 40, p: 0.5, t: 0 },
+    ],
+  };
+  const ink = { w: 320, h: 120, strokes: [stroke] };
+
+  function seedNotes(notes: unknown[]) {
+    window.localStorage.setItem("amos.notes", JSON.stringify(notes));
+  }
+
+  test("a hand-drawn note carries a row badge; a text-only note does not", async () => {
+    seedNotes([
+      { id: "drawn", text: "带笔迹的便签", ts: 900, created: 900, ink },
+      { id: "typed", text: "纯文字便签", ts: 800, created: 800 },
+    ]);
+    const host = render(NotesApp);
+    await new Promise<void>((r) => setTimeout(r, 0));
+
+    const badges = host.container.querySelectorAll('[data-testid="note-row-ink"]');
+    expect(badges.length).toBe(1);
+    // The badge must sit on the inked row, not the typed one.
+    const drawn = [...host.container.querySelectorAll("button")].find((b) =>
+      (b.textContent ?? "").includes("带笔迹的便签"),
+    );
+    expect(drawn?.querySelector('[data-testid="note-row-ink"]')).toBeTruthy();
+  });
+
+  test("palm rejection is on by default and persists when turned off", async () => {
+    seedNotes([]);
+    window.localStorage.removeItem("amos.notesPrefs");
+    const host = render(NotesApp);
+    const cb = host.container.querySelector(
+      'input[data-testid="note-pref-palm-rejection"]',
+    ) as HTMLInputElement;
+    // Unlike the other two prefs, the *safe* value is "on" — a legacy store with no
+    // field must degrade to rejection, not to unprotected drawing.
+    expect(cb.checked).toBe(true);
+
+    await fireEvent.click(cb);
+    const saved = JSON.parse(window.localStorage.getItem("amos.notesPrefs") ?? "{}");
+    expect(saved.palmRejection).toBe(false);
+  });
+
+  /**
+   * The pref must reach the *draw surface*, not just the list's checkbox. Driving it
+   * through NotesApp is what proves `palmRejection={prefs.palmRejection}` is wired:
+   * NoteEditor's own test already pins that a `false` prop lets a wide finger draw.
+   */
+  async function wideTouchDraws(palmRejection: boolean): Promise<boolean> {
+    seedNotes([{ id: "n1", text: "便签", ts: 900, created: 900 }]);
+    window.localStorage.setItem(
+      "amos.notesPrefs",
+      JSON.stringify({ palmRejection, openInEditor: true }),
+    );
+    const host = render(NotesApp);
+    await new Promise<void>((r) => setTimeout(r, 0));
+
+    const cb = host.container.querySelector(
+      'input[data-testid="note-pref-palm-rejection"]',
+    ) as HTMLInputElement;
+    if (cb.checked !== palmRejection) await fireEvent.click(cb);
+
+    const row = [...host.container.querySelectorAll("button")].find((b) =>
+      (b.textContent ?? "").includes("便签"),
+    );
+    if (!row) return false;
+    await fireEvent.click(row); // openInEditor → the full-page editor
+    await new Promise<void>((r) => setTimeout(r, 0));
+
+    await fireEvent.click(host.container.querySelector('[data-testid="note-editor-draw"]')!);
+    const canvas = host.container.querySelector('[data-testid="note-ink-canvas"]')!;
+    const down = new Event("pointerdown", { bubbles: true, cancelable: true });
+    Object.assign(down, {
+      pointerId: 1,
+      pointerType: "touch",
+      isPrimary: true,
+      width: 30,
+      height: 30,
+      pressure: 0.5,
+      tiltX: 0,
+      tiltY: 0,
+      clientX: 10,
+      clientY: 10,
+    });
+    canvas.dispatchEvent(down);
+    await new Promise<void>((r) => setTimeout(r, 0));
+    return host.container.querySelector('[data-testid="note-ink-live"]') !== null;
+  }
+
+  test("with rejection off a wide finger contact reaches the canvas as a stroke", async () => {
+    expect(await wideTouchDraws(false)).toBe(true);
+  });
+
+  test("with rejection on (the default) the same contact is swallowed", async () => {
+    expect(await wideTouchDraws(true)).toBe(false);
+  });
+
 });
 
 
@@ -804,6 +1033,30 @@ describe("NotesApp.svelte — 搜索命中在正文预览里也高亮", () => {
     expect(status?.textContent ?? "").toContain("ollama");
   });
 
+  test("ask-my-notes withholds an empty index's dimension — never 「0 维」", async () => {
+    (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {
+      // Nothing indexed: the daemon sends no dimension (it has none — a zero-width
+      // vector cannot exist), so the panel must withhold the mark, not draw a size.
+      invoke: async (cmd: string) =>
+        cmd === "rag_status" ? { indexed: 0, embedder: "mock" } : null,
+      listen: async () => () => {},
+    };
+    const host = render(NotesApp);
+    await fireEvent.click(
+      host.container.querySelector('button[data-testid="note-ask-toggle"]') as HTMLButtonElement,
+    );
+    await new Promise<void>((r) => setTimeout(r, 0));
+    const status = host.container.querySelector('[data-testid="note-rag-status"]');
+    expect(status).toBeTruthy();
+    // The whole line, so a partial fallback sentence cannot satisfy this.
+    expect(status?.textContent?.trim()).toBe(
+      zh["note.ragStatus"]
+        .replace("{n}", "0")
+        .replace("{dim}", "—")
+        .replace("{embedder}", "mock"),
+    );
+  });
+
   test("ask-my-notes toggles a panel and reports offline without a daemon", async () => {
     const host = render(NotesApp);
     const toggle = host.container.querySelector(
@@ -861,6 +1114,84 @@ describe("NotesApp.svelte — Spotlight deep link (appLinks.openNote)", () => {
     await tick();
     expect(host.container.querySelector('textarea[data-testid="note-editor-textarea"]')).toBeNull();
     expect(txt(host)).toContain("买菜清单");
+  });
+});
+
+/**
+ * REQ-A1470 / F-SH-720 — the inline editor's ⧉ 复制 button.
+ *
+ * `copySelection(text): Promise<boolean>` documents its own contract in lib/clipboard.ts:
+ * "`false` means nothing was copied and the caller must say so: the claim follows the effect
+ * (REQ-A352 / REQ-A355)". The same file's `copiedToClipboard` states the rule again and every
+ * export/share path reads the verdict; `copyEditing` was the one write path in this file that
+ * discarded it — `await copySelection(editVal);` and nothing else — so a refused copy (no bridge
+ * clipboard, or an insecure/denied context) was a wholly silent no-op sitting next to the 📋
+ * paste button. The sibling tell: the same screen's four other clipboard verbs all report.
+ */
+describe("NotesApp.svelte — 内联编辑器的 ⧉ 复制（诚实回报）", () => {
+  const tick = () => new Promise<void>((r) => setTimeout(r, 0));
+  const composeTa = (host: { container: HTMLElement }) =>
+    host.container.querySelector('textarea[data-testid="note-compose"]') as HTMLTextAreaElement;
+  const copyBtn = (host: { container: HTMLElement }) =>
+    host.container.querySelector(
+      `button[aria-label="${zh["note.copyHint"]}"]`,
+    ) as HTMLButtonElement | null;
+
+  /** Add a note and open its inline editor (the panel holding ⧉ ∕ 📋 ∕ 🕘). */
+  async function addAndEdit(host: { container: HTMLElement }, v: string) {
+    await fireEvent.input(composeTa(host), { target: { value: v } });
+    await fireEvent.click(btnTrim(host, "保存")!);
+    await tick();
+    await fireEvent.click(btnTrim(host, "编辑")!);
+    await tick();
+  }
+
+  test("一次被拒的复制要说出「没有被复制」，而不是静默", async () => {
+    // No __TAURI_INTERNALS__ ⇒ no clipboard bridge ⇒ `copySelection` reports false.
+    delete (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+    const host = render(NotesApp);
+    await addAndEdit(host, "要复制的正文");
+
+    const btn = copyBtn(host);
+    expect(btn, "⧉ 复制按钮应在内联编辑器工具栏上").toBeTruthy();
+    await fireEvent.click(btn as HTMLButtonElement);
+    await tick();
+
+    const err = host.container.querySelector('[data-testid="note-clip-error"]');
+    expect(err, "被拒的复制必须有话说（此前是彻底静默）").toBeTruthy();
+    expect(err?.textContent ?? "").toContain(zh["common.copyFailed"]);
+  });
+
+  test("复制落地时不出错句，且会清掉上一次的拒绝句", async () => {
+    // First a refused copy (no bridge), then a bridge that answers `clipboard_write`.
+    delete (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+    const host = render(NotesApp);
+    await addAndEdit(host, "先失败后成功");
+    await fireEvent.click(copyBtn(host) as HTMLButtonElement);
+    await tick();
+    expect(host.container.querySelector('[data-testid="note-clip-error"]')).toBeTruthy();
+
+    // Now arm a working clipboard bridge and copy again.
+    const written: Array<Record<string, unknown>> = [];
+    (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string, args?: Record<string, unknown>) => {
+        if (cmd === "clipboard_write") {
+          written.push((args?.payload as Record<string, unknown>) ?? {});
+          return { kind: "text", text: (args?.payload as { text?: string })?.text ?? "", seq: 1 };
+        }
+        return null;
+      },
+      listen: async () => () => {},
+    };
+    await fireEvent.click(copyBtn(host) as HTMLButtonElement);
+    await tick();
+
+    expect(written.length, "文本确实抵达了剪贴板").toBe(1);
+    expect(String(written[0]?.text ?? "")).toContain("先失败后成功");
+    expect(
+      host.container.querySelector('[data-testid="note-clip-error"]'),
+      "复制成功后不得留着上一次的拒绝句",
+    ).toBeNull();
   });
 });
 

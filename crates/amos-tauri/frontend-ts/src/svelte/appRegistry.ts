@@ -10,7 +10,7 @@
  * available on phone / tablet / robot.
  */
 
-import { desktopFormActive } from "../lib/desktopApps";
+import { desktopFormActive } from "../lib/formAuthority.svelte";
 import { isPhoneApp } from "../lib/phoneApps";
 
 export interface SvelteAppLoaderLike {
@@ -56,7 +56,12 @@ export const ALL_APP_LOADERS: Record<string, SvelteAppLoaderLike> = {
   webman: () => import("./WebManApp.svelte"),
   compass: () => import("./CompassApp.svelte"),
   measure: () => import("./MeasureApp.svelte"),
+  health: () => import("./HealthApp.svelte"),
+  podcast: () => import("./PodcastsApp.svelte"),
   shortcuts: () => import("./ShortcutsApp.svelte"),
+  nfc: () => import("./NfcApp.svelte"),
+  ble: () => import("./BleApp.svelte"),
+  robot: () => import("./RobotApp.svelte"),
 };
 
 /**

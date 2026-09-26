@@ -36,10 +36,25 @@ use serde::{Deserialize, Serialize};
 
 /// Number of bytes in a frame length prefix (`u32` little-endian).
 pub const FRAME_LEN: usize = 4;
-/// Upper bound on the JSON payload of a single frame (1 MiB). Matches the text cap.
-pub const MAX_JSON_LEN: usize = 1 << 20;
-/// Upper bound on a single mirrored plain-text copy.
+/// Upper bound on a single mirrored plain-text copy. The kernel's own text cap
+/// (`amos-tauri`'s `MAX_TEXT_LEN`) is the same 1 MiB, so a copy the host accepts
+/// is a copy the wire must be able to carry.
 pub const MAX_MIRROR_TEXT: usize = 1 << 20;
+/// Bytes reserved inside `MAX_JSON_LEN` for the JSON envelope that wraps a mirrored
+/// text — the keys, quotes and `seq`/`ts_ms` numbers of
+/// `{"PushText":{"seq":N,"ts_ms":N,"text":"…"}}`. Two `u64`s render in at most 20
+/// digits each and the fixed punctuation is well under 100 bytes, so 512 covers the
+/// envelope of a text at `MAX_MIRROR_TEXT` with room to spare. It deliberately does
+/// **not** cover JSON *escaping* of the text: a copy whose escaping inflates it by
+/// more than this can still be refused by `MAX_JSON_LEN` — an honest limit, since a
+/// "1 MiB text" of nothing but quotes is a 2 MiB frame.
+const JSON_ENVELOPE_HEADROOM: usize = 512;
+/// Upper bound on the JSON payload of a single frame: `MAX_MIRROR_TEXT` **plus**
+/// `JSON_ENVELOPE_HEADROOM`, so the declared text cap is exactly reachable rather
+/// than sitting just past the frame cap. (An earlier revision set this equal to the
+/// text cap, which made a copy at the cap unencodable by the width of its own
+/// envelope — the declared bound was established by no path.)
+pub const MAX_JSON_LEN: usize = MAX_MIRROR_TEXT + JSON_ENVELOPE_HEADROOM;
 /// Echo-suppression window (ms). Mirrors the proven Kotlin `SUPPRESS_WINDOW_MS`
 /// of 500 ms so every path shares the same instinct.
 pub const ECHO_WINDOW_MS: u64 = 500;
@@ -249,14 +264,42 @@ mod tests {
 
     #[test]
     fn encode_rejects_payload_over_max_json() {
+        // A text large enough that even its own bytes exceed the *frame* cap: the
+        // JSON that wraps it can only be larger still.
         let msg = HostToGuest::PushText {
             seq: 1,
             ts_ms: 0,
-            text: "x".repeat(MAX_MIRROR_TEXT + 1),
+            text: "x".repeat(MAX_JSON_LEN),
         };
         assert!(
             encode(&msg).is_err(),
-            "oversized mirror text must be rejected"
+            "a payload over MAX_JSON_LEN must be rejected"
+        );
+    }
+
+    #[test]
+    fn a_mirror_text_at_the_declared_cap_fits_one_frame() {
+        // MAX_MIRROR_TEXT is declared as the bound on a mirrored copy; the kernel
+        // admits a text up to exactly that size, so the wire must be able to carry
+        // it. MAX_JSON_LEN reserves the envelope headroom that makes this true. (An
+        // earlier revision set MAX_JSON_LEN == MAX_MIRROR_TEXT, so a copy at the cap
+        // was refused by `encode` for the width of its own `{"PushText":{…}}`
+        // envelope and the declared cap was established by no path — REQ-A629.)
+        let text = "a".repeat(MAX_MIRROR_TEXT);
+        let msg = HostToGuest::PushText {
+            seq: 1,
+            ts_ms: 0,
+            text: text.clone(),
+        };
+        let frame = encode(&msg).expect("a copy at the declared cap must encode");
+        let mut d = FrameDecoder::<HostToGuest>::new();
+        let got = d.push(&frame).unwrap();
+        assert_eq!(got.len(), 1);
+        let HostToGuest::PushText { text: back, .. } = &got[0];
+        assert_eq!(
+            back.len(),
+            MAX_MIRROR_TEXT,
+            "the cap-sized copy round-trips"
         );
     }
 
@@ -489,5 +532,42 @@ mod tests {
             "only the latest set is guarded"
         );
         assert!(g.is_self_echo("new", 2000 + ECHO_WINDOW_MS));
+    }
+
+    /// Evaluate the RHS of a Kotlin `val NAME = <int>` declaration from source
+    /// text, where the RHS is an integer literal or product (Kotlin may suffix a
+    /// `Long` with `L` and separate digits with `_`). Returns `None` when the name
+    /// is absent or the RHS is not a plain integer expression, so a divergence in
+    /// form fails loudly rather than silently passing.
+    fn kt_int_literal(src: &str, name: &str) -> Option<u64> {
+        let needle = format!("val {name} =");
+        let rest = &src[src.find(&needle)? + needle.len()..];
+        let line = rest.lines().next()?.split("//").next().unwrap_or("").trim();
+        let mut product: u64 = 1;
+        let mut saw = false;
+        for tok in line.split('*') {
+            let t = tok.trim().trim_end_matches(['L', 'l']).replace('_', "");
+            product = product.checked_mul(t.parse().ok()?)?;
+            saw = true;
+        }
+        saw.then_some(product)
+    }
+
+    #[test]
+    fn the_echo_window_is_pinned_to_the_kotlin_glue() {
+        // `ECHO_WINDOW_MS` says it "mirrors the proven Kotlin `SUPPRESS_WINDOW_MS`",
+        // but that comment is the only thing holding the two together: the Kotlin
+        // object `ClipboardGlue` owns the *Android-side* echo window and nothing in
+        // this crate reads it. If the Kotlin window drifts (say to 1000ms), the host
+        // keeps 500 and the two directions of the same copy round-trip get different
+        // suppression windows — no test would notice. This pins the declared mirror.
+        const KOTLIN: &str =
+            include_str!("../../amos-tauri/android-glue/com/amos/ai/glue/ClipboardGlue.kt");
+        let glue = kt_int_literal(KOTLIN, "SUPPRESS_WINDOW_MS")
+            .expect("ClipboardGlue.kt must declare `val SUPPRESS_WINDOW_MS = <int>L`");
+        assert_eq!(
+            glue, ECHO_WINDOW_MS,
+            "ClipboardGlue.kt SUPPRESS_WINDOW_MS ({glue} ms) drifted from ECHO_WINDOW_MS ({ECHO_WINDOW_MS} ms)"
+        );
     }
 }

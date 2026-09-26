@@ -81,6 +81,17 @@ When the user focuses a text field inside a legacy app:
 3. Each key press is forwarded over gRPC to the container and injected as
    `input text` / key events into the focused app.
 
+**Status (2026-09-26): the system IME shipped, but *not* by this path.** The
+`AmosImeService` Android `InputMethodService` (REQ-A1893) is the implementation that
+landed: it lives in the System UI APK, runs in the *same* Android instance as the apps
+it types into, and commits through the platform's own `InputConnection` — no gRPC hop,
+no `input text` injection, and (crucially) the pinyin engine and learner are the
+process-local `amos-ime` ones rather than anything the container has to forward. See
+`docs/input-method.md` §System IME. The steps above describe the **host-side
+forwarding** design, which is what an *external* (non-same-instance) container would
+still need; it is deliberately not what shipped, because same-instance binding needs
+none of it.
+
 Gesture sharing mirrors the same path in reverse: system-level gestures (edge
 swipe, Home, Recents) are captured by the Tauri System UI and injected into the
 container or used to control the Rust `WindowManager` (see `docs/multi-window.md`).

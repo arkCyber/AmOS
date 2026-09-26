@@ -261,7 +261,8 @@ describe("MDM 管理系统", () => {
 
       const result = mdmManager.checkDailyExecutionLimit("shortcut-456");
       expect(result.allowed).toBe(false);
-      expect(result.reason).toContain("超过每日执行次数限制");
+      // 措辞与 `checkCanExecute()` 统一到同一句（同一上限只有一份实现，REQ-A899）
+      expect(result.reason).toContain("已达到每日最大执行次数");
     });
 
     it("应该在新的一天重置计数", () => {

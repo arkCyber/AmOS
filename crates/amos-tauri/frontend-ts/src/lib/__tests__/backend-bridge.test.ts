@@ -90,8 +90,13 @@ describe("backend 桥接协商与诊断", () => {
     delete (globalThis as { window?: unknown }).window;
     expect(backend.bridged()).toBe(false);
     expect(await backend.invoke("probe_no_window", { a: 1 })).toBeNull();
-    const unsub = await backend.subscribe("probe-ch", () => {});
-    expect(typeof unsub()).toBe("undefined"); // no-op
+    // REQ-A838: 没有桥就没有订阅 —— 返回 `null`，而不是一个看起来"能退订"的空操作。
+    expect(await backend.subscribe("probe-ch", () => {})).toBeNull();
+    expect(backend.bridgeDiag("probe-ch")).toEqual({
+      ok: false,
+      kind: "not-bridged",
+      command: "probe-ch",
+    });
     expect(backend.bridgeDiag("probe_no_window")).toEqual({
       ok: false,
       kind: "not-bridged",
@@ -142,21 +147,33 @@ describe("backend 桥接协商与诊断", () => {
     installInternals();
     const seen: unknown[] = [];
     const unsub = await backend.subscribe("probe-event", (p) => seen.push(p));
+    expect(unsub).not.toBeNull(); // REQ-A838：建立了订阅才有可退订的句柄
+    expect(backend.bridgeDiag("probe-event")).toEqual({ ok: true });
     listeners.get("probe-event")!({ payload: { n: 1 } });
     expect(seen).toEqual([{ n: 1 }]);
-    unsub();
+    unsub!();
     expect(listeners.has("probe-event")).toBe(false);
   });
 
-  it("subscribe：listen 抛错时返回 no-op，不向外抛", async () => {
+  it("subscribe：listen 抛错时返回 null 并记入台账，不向外抛（REQ-A838）", async () => {
     installInternals({
       listen: async () => {
         throw new Error("no events for you");
       },
     });
     const unsub = await backend.subscribe("probe-ch", () => {});
-    expect(typeof unsub).toBe("function");
-    expect(() => unsub()).not.toThrow();
+    // 旧契约在这里返回一个空操作，于是"订阅被拒绝"和"通道很安静"在调用方看来完全一样：
+    // 界面照常挂着，事件永远不会来。现在拒绝是一个可读的判定，而不是一个能调用的空函数。
+    expect(unsub).toBeNull();
+    expect(backend.bridgeDiag("probe-ch")).toMatchObject({
+      ok: false,
+      kind: "listen-failed",
+      command: "probe-ch",
+    });
+    // 台账还留着**为什么**被拒 —— 没有它，这条判定只说明"失败了"，排查时仍要重跑一遍。
+    const diag = backend.bridgeDiag("probe-ch");
+    const detail = diag.ok === false && "detail" in diag ? String(diag.detail) : "";
+    expect(detail).toContain("no events for you");
   });
 });
 
@@ -173,23 +190,29 @@ describe("backend 事件订阅与会话持久化", () => {
     const seen: unknown[] = [];
     const unsub = await backend.subscribe("probe-tcb", (p) => seen.push(p));
     await flush();
+    expect(unsub).not.toBeNull(); // REQ-A838：插件握手成功后同样必须给出可退订的句柄
     expect(cbIds.length).toBe(1);
     // 主机派发：插件层事件形状是 { payload, event, id }
     cbIds[0]!({ payload: "hello", event: "probe-tcb", id: 7 });
     expect(seen).toEqual(["hello"]);
     expect(calls.some((c) => c.command === "plugin:event|listen")).toBe(true);
-    unsub();
+    unsub!();
     expect(unregistered).toEqual([1]);
     expect(calls.some((c) => c.command === "plugin:event|unlisten")).toBe(true);
   });
 
-  it("subscribe：plugin:event|listen 注册失败时清理回调并返回 no-op", async () => {
+  it("subscribe：plugin:event|listen 注册失败时清理回调并返回 null（REQ-A838）", async () => {
     installInternals({ listen: undefined });
     failCommands = new Set(["plugin:event|listen"]);
     const unsub = await backend.subscribe("probe-tcb-fail", () => {});
     await flush();
-    expect(unregistered).toEqual([1]);
-    expect(typeof unsub()).toBe("undefined");
+    expect(unregistered).toEqual([1]); // 回调不能泄漏在宿主里
+    expect(unsub).toBeNull();
+    expect(backend.bridgeDiag("probe-tcb-fail")).toEqual({
+      ok: false,
+      kind: "listen-failed",
+      command: "probe-tcb-fail",
+    });
   });
 
   it("onTelephonyEvent：只把带 string id 的通话转发给回调，退订后不再转发", async () => {

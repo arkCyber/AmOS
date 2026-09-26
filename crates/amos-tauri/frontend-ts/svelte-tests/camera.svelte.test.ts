@@ -10,7 +10,7 @@
  *     and video mode records into the in-camera library (stub MediaRecorder).
  * Real viewfinder pixels / torch / recording bytes need a device.
  */
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { cleanup, fireEvent, render } from "@testing-library/svelte";
 import { tick } from "svelte";
 import CameraApp from "../src/svelte/CameraApp.svelte";
@@ -172,6 +172,27 @@ describe("CameraApp.svelte (offline / control surface)", () => {
     expect(txt(host)).not.toContain("HDR 需支持");
   });
 
+  // REQ-A1001 / F-SH-322: the grid and HDR buttons are plain on/off toggles whose only signal is
+  // `controlCls(...)` — a class — while the constant `aria-label` overrides the glyph for the
+  // accessible name. The burst button in this same toolbar already carried `aria-pressed`, so the
+  // idiom was in the file and two of the six controls had not been given it.
+  test("grid and HDR toggles report their own state", async () => {
+    const host = await renderLive();
+    const pressed = (aria: string) => btnAria(host, aria)?.getAttribute("aria-pressed");
+    expect(pressed("网格")).toBe("false");
+    expect(pressed("HDR")).toBe("false");
+    await fireEvent.click(btnAria(host, "网格") as HTMLButtonElement);
+    await fireEvent.click(btnAria(host, "HDR") as HTMLButtonElement);
+    await settle();
+    expect(pressed("网格")).toBe("true");
+    expect(pressed("HDR")).toBe("true");
+    await fireEvent.click(btnAria(host, "网格") as HTMLButtonElement);
+    await fireEvent.click(btnAria(host, "HDR") as HTMLButtonElement);
+    await settle();
+    expect(pressed("网格")).toBe("false");
+    expect(pressed("HDR")).toBe("false");
+  });
+
   test("flip lens re-acquires the stream and mirrors the front preview", async () => {
     const host = await renderLive();
     const before = gumCalls;
@@ -232,21 +253,25 @@ describe("CameraApp.svelte (offline / control surface)", () => {
     expect(host.container.querySelector('.border-amber-300')).toBeTruthy();
   });
 
-  test("a rapid double-tap does not lock focus (it is the zoom gesture)", async () => {
+  test("a rapid double-tap does not leave a stray AF box (it is the zoom gesture)", async () => {
     const host = await renderLive();
     const app = host.container.querySelector('[role="application"]') as HTMLElement;
     Object.defineProperty(app, "getBoundingClientRect", {
       configurable: true,
       value: () => ({ x: 0, y: 0, width: 100, height: 100, top: 0, left: 0, right: 100, bottom: 100 }),
     });
+    const hasAfBox = () =>
+      host.container.querySelector('.border-yellow-400, .border-amber-300') !== null;
     // two taps in quick succession (<300 ms): the first aims, the second is a
-    // double-tap → focus is NOT applied a second time, so it never locks.
+    // double-tap → focus is NOT applied a second time, so it never locks — AND
+    // the first tap's aim is undone, so focus and double-tap-zoom stay exclusive.
     await fireEvent.pointerDown(app, { clientX: 50, clientY: 50, pointerId: 1 });
     await fireEvent.pointerUp(app, { clientX: 50, clientY: 50, pointerId: 1 });
     await fireEvent.pointerDown(app, { clientX: 50, clientY: 50, pointerId: 2 });
     await fireEvent.pointerUp(app, { clientX: 50, clientY: 50, pointerId: 2 });
     await settle();
     expect(txt(host)).not.toContain("AE/AF LOCKED");
+    expect(hasAfBox()).toBe(false); // the first tap's AF box must not survive the zoom gesture
   });
 });
 
@@ -437,6 +462,32 @@ describe("CameraApp.svelte — the thumbnail links to the item it shows (REQ-A35
     // `latestPhoto` picks the newest, so the link names `p2` — the item the thumbnail shows.
     expect(seen.at(-1)?.photoId, "the thumbnail is a real link now").toBe("p2");
     off();
+  });
+});
+
+/**
+ * REQ-A1172 — the camera's own video player is the twin of the Photos overlay: both read an
+ * index that outlives the bytes, so both must say which of the two states they are in. A
+ * seeded capture (the normal case once its bytes are gone) used to draw only a "…".
+ */
+describe("CameraApp.svelte — 缺失字节的录像说明原因 (REQ-A1172)", () => {
+  test("打开一段没有字节的录像时说出原因，而不是只剩省略号", async () => {
+    window.localStorage.setItem(
+      "amos.captures",
+      JSON.stringify([
+        { id: "v1", ts: Date.now(), mime: "video/webm", durationMs: 3000, w: 1280, h: 720 },
+      ]),
+    );
+    const host = await renderLive();
+    await fireEvent.click(btnAria(host, "视频") as HTMLButtonElement);
+    await settle();
+    const tile = btnAria(host, zh["camera.library"]!);
+    expect(tile, "媒体库胶片出现后才有得点").toBeTruthy();
+    await fireEvent.click(tile as HTMLButtonElement);
+    await vi.waitFor(() => {
+      const msg = host.container.querySelector('[data-testid="viewer-msg"]');
+      expect(msg?.textContent).toContain(zh["media.recordingMissing"]);
+    });
   });
 });
 

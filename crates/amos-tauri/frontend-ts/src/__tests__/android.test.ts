@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import {
   addRecent,
   ANDROID_RECENT_KEY,
@@ -170,5 +171,60 @@ describe("normalizeAppsReply", () => {
       demo: false,
     });
     expect(r.apps.map((a) => a.package_name)).toEqual(["com.ok"]);
+  });
+});
+
+// ─── REQ-A670: the tier vocabulary is the lifecycle kernel's, not this file's ───────────────
+//
+// `runTierForPackage`'s doc claims the mapping over the container tiers ("focused / visible /
+// foreground-service → running; frozen / background → background; absent or stopped / unknown →
+// null, so the tile never lies about an app being alive"). The keys it branches on are **not**
+// this module's invention: the daemon's live LMK snapshot is built from
+// `amos_applife::AppState::key()` (`amos-android/src/service.rs` → `GetLmkSnapshot` →
+// `android_lmk_tasks`), so a rename or a new tier on the kernel side leaves this classifier's
+// labels matching nothing — a **running** app then falls into `default` and shows no indicator
+// at all, which the doc reserves for "stopped / unknown". The two tests above pin local
+// literals only, so that drift was silent; these read the authority.
+
+const RUST_ROOT = "../../../../";
+
+describe("runTierForPackage's vocabulary == amos_applife::AppState::key()", () => {
+  /** The kernel's wire keys, read from its source (variant → `key()` arm). */
+  function kernelKeys(): string[] {
+    const spec = readFileSync(new URL(RUST_ROOT + "amos-applife/src/spec.rs", import.meta.url), "utf8");
+    const at = spec.indexOf("pub fn key(self) -> &'static str {");
+    expect(at, "AppState::key() not found in amos-applife/src/spec.rs").toBeGreaterThan(0);
+    const body = spec.slice(at, spec.indexOf("\n    }", at));
+    const keys = [...body.matchAll(/AppState::\w+ => "([a-z_]+)"/g)].map((m) => m[1] ?? "");
+    // Non-vacuity: a rewrite that moves the arms out of the scanned window must fail loudly
+    // rather than make every assertion below trivially true over an empty list.
+    expect(keys).toHaveLength(6);
+    return keys;
+  }
+
+  test("every tier the classifier branches on is a key the kernel can emit", () => {
+    const source = readFileSync(new URL("../lib/android.ts", import.meta.url), "utf8");
+    const at = source.indexOf("export function runTierForPackage(");
+    expect(at, "runTierForPackage not found").toBeGreaterThan(0);
+    const body = source.slice(at, source.indexOf("\n}", at));
+    const labels = [...body.matchAll(/case "([a-z_]+)":/g)].map((m) => m[1] ?? "");
+    // The five tiers it names explicitly (the sixth, `stopped`, is the documented default).
+    expect(labels).toHaveLength(5);
+    const kernel = kernelKeys();
+    expect(labels.filter((l) => !kernel.includes(l))).toEqual([]);
+  });
+
+  test("every kernel tier maps to the tier the doc promises", () => {
+    const kernel = kernelKeys();
+    // The doc's mapping, with `stopped` the **only** tier that gets no indicator: anything else
+    // reading as `null` would hide a live app (`AndroidApp.svelte` renders the indicator from
+    // this value alone).
+    const silent = new Set(["stopped"]);
+    for (const key of kernel) {
+      const tier = runTierForPackage("com.amos.probe", [{ package_name: "com.amos.probe", state: key }]);
+      if (silent.has(key)) expect(tier, key).toBeNull();
+      else expect(tier, key).not.toBeNull();
+      expect([key, tier === null || tier === "running" || tier === "background"]).toEqual([key, true]);
+    }
   });
 });

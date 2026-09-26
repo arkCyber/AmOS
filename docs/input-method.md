@@ -1,8 +1,10 @@
 # Input method (输入法) — the on-screen pinyin keyboard
 
-Amos ships a **pinyin input method** for its own System UI: focus a text field and
-a docked keyboard appears; typing letters composes pinyin, and picking a candidate
-writes the Chinese word into that field.
+Amos ships a **pinyin input method** with two surfaces. In its own System UI, focus a
+text field and a docked keyboard appears; typing letters composes pinyin, and picking a
+candidate writes the Chinese word into that field. The same engine is also exposed as an
+Android **system IME** (`AmosImeService`), so any other app on the device can select it
+and type Chinese — see §System IME.
 
 The engine is [`inputx-pinyin`](https://crates.io/crates/inputx-pinyin) (an
 embedded ~165k-code FST dictionary with a per-user learning layer), wrapped by the
@@ -16,6 +18,7 @@ AmOS domain core so the ranking stays in one place and the UI only renders it.
 | Bridge | `crates/amos-tauri/src/ime.rs` | The nine `ime_*` Tauri commands, the per-window session map (`Mutex<ImeInner { core, windows: HashMap<label, _> }>`) and the `amos-ime.json` profile file (atomic temp+rename write, next to the blocklist/SMS stores). |
 | Client | `crates/amos-tauri/frontend-ts/src/lib/ime.ts` | One `invoke` wrapper per command + the pure helpers (`isTextEntry`, `insertTextAtCursor`, `deleteBeforeCaret`, key layouts, candidate pager). |
 | UI | `.../src/svelte/ImeKeyboard.svelte`, `.../ImeOverlay.svelte` | `ImeKeyboard` is presentation only; `ImeOverlay` owns focus tracking, the zh/en mode, insertion into the focused field, and the fuzzy-settings panel. Mounted by `Shell.svelte`, so every app gets it. |
+| System IME | `android-glue/.../AmosImeService.kt` + `crates/amos-tauri/src/android_ime.rs` | The Android `InputMethodService` other apps select, driving the **same** bridge under the `"android-ime"` pseudo-window; see §System IME. |
 
 ## Candidates
 
@@ -104,6 +107,31 @@ Rules the keyboard follows, each pinned by a test:
 * **Forgetting every learned word asks once.** It cannot be undone, so the button
   turns into a confirmation ("确认清除？" / "Confirm?") and drops the question when
   the settings panel closes.
+
+## Chinese punctuation (中文标点)
+
+In Chinese mode a punctuation key is the **Chinese** glyph, not its half-width
+twin — the ordinary pinyin-IME behaviour, applied on both keyboards:
+
+* the **`?123` page is mode-dependent**: in Chinese mode it shows Chinese
+  punctuation (`，。？！、：；“”…` and `（）《》【】「」‘’`), in English mode the
+  ASCII page (`. , ? ! …`). The user therefore always sees the glyph they get.
+* a **physical** `,` in Chinese mode is committed as `，` — with or without a code
+  in flight. This is a Chinese-IME behaviour, not only a composing one: with an
+  empty buffer the browser would otherwise insert a half-width `,`. Only the keys
+  that *have* a Chinese form are taken over; a twinless symbol (`@`, `#`, `$`)
+  and Space/Enter are still left to the field, so an email address typed in
+  Chinese mode survives intact.
+* **digits stay half-width in both modes.** `１２３` is never what a phone-number
+  field wants, so the Chinese page keeps the same ASCII digit row.
+* the mapping is a fixed **one-to-one** table (`lib/ime.ts` `toChinesePunctuation`).
+  A straight `"`/`'` has no single Chinese form — a Chinese quotation is a *pair*
+  (`“…”` / `‘…’`) — so it maps to the **opening** glyph and the closing glyph is a
+  key on the Chinese symbol page; the IME does **not** guess an open/close
+  alternation from invisible state.
+
+An already-Chinese glyph passes through unchanged (so a symbol-page tap is not
+double-translated), and everything the table does not name passes through too.
 
 ## Physical keyboard
 
@@ -267,8 +295,104 @@ size-constrained build passes `--no-default-features`; every call site in *our* 
 is unconditional (no `cfg`), and the engine answers "no suggestions" instead of
 pretending.
 
+## System IME (系统输入法)
+
+The keyboard above types into AmOS's own WebView. The **system IME** is the other
+half: a real Android `InputMethodService` that any app on the device — an app in the
+Waydroid container, or any app on the no-UI Android base (`docs/no-ui-android.md`) —
+can select in `Settings → 语言与输入法 → 键盘` and type Chinese into.
+
+It lives **inside the System UI APK** (`com.amos.ai`), not a separate APK: in the
+product form every app and the System UI run in the same Android instance, so the
+service can JNI straight into the same `libamos_tauri_lib.so` and reach the **same
+engine**. The Kotlin class is `com.amos.ai.glue.AmosImeService`
+(`crates/amos-tauri/android-glue/com/amos/ai/glue/AmosImeService.kt`), declared in
+`AndroidManifest.components.xml` with the action `android.view.InputMethod` — the
+value of `android.view.inputmethod.InputMethod.SERVICE_INTERFACE`, and the one
+string here a reader gets wrong: the package-shaped
+`android.view.inputmethod.InputMethod` looks right by analogy with the class name
+and matches nothing, so the IME installs, resolves in `dumpsys package`, and is
+absent from the keyboard list (`scripts/ime-action-scan.mjs` compares the literal
+to the SDK's constant) — and the **caller's** permission
+`android.permission.BIND_INPUT_METHOD` (a `signature|privileged` grant the platform
+holds, not us — so there is deliberately no `<uses-permission>` for it; see
+`scripts/android-permission-scan.mjs`'s `ime` family). The subtype list the platform
+enumerates is the tracked resource `android-glue/res/xml/method.xml`, pointed at by
+the service's `<meta-data android:name="android.view.im">`.
+
+**One engine, one learner, two surfaces.** The service does *not* carry a second
+engine. It drives the process-wide `ImeBridge` (`crates/amos-tauri/src/ime.rs`) under
+the fixed pseudo-window `ime::ANDROID_WINDOW` (`"android-ime"`), which is the same
+bridge `Shell.svelte`'s keyboard uses — a bridge is one `PinyinCore` (dictionary + L0
+learner + fuzzy preferences) plus **one buffer per window label**. So a word learned
+in a third-party app and a word learned in the WebView land in the same learner and the
+same `amos-ime.json`; there is no second profile to diverge.
+
+| Layer | File | Responsibility |
+| --- | --- | --- |
+| Service | `android-glue/.../AmosImeService.kt` | `: InputMethodService`; builds the keyboard view programmatically (no dependency on git-ignored `res/layout`), `onStartInput`/`onFinishInput` reset the per-session buffer, each keystroke routes through `ImeRouting` and commits through `InputConnection`. |
+| Wire | `android-glue/.../ImeWire.kt` | Decodes the line/tab wire the Rust bridge answers. Not JSON, so the parser is host-JVM testable (`ImeWireTest.kt`). |
+| Layout | `android-glue/.../ImeLayout.kt` | The key rows, the ASCII→Chinese punctuation table and the 8-per-page pager, mirrored from `frontend-ts/src/lib/ime.ts`. |
+| Routing | `android-glue/.../ImeRouting.kt` | §Key behaviours as a pure function — the one place "a non-letter commits the code first" lives. |
+| JNI | `crates/amos-tauri/src/android_ime.rs` | The eight `Java_com_amos_ai_glue_AmosImeService_native*` trampolines into `ime::ImeBridge::shared_or_boot()`. |
+
+The wire format is `\n`-separated records, `\t`-separated fields, with `\\`/`\t`/`\n`
+escaped:
+
+```
+input\t<code>
+composing\t<0|1>
+strict\t<0|1>
+commit\t<text>            (empty = nothing was inserted)
+undo\t<code>              (the undoable dictionary pick's code; empty = nothing to forget)
+cand\t<kind>\t<text>      (0..n; kind is dict | sentence | predict)
+```
+
+**Duplicate key rules are a real cost, and named here.** The engine is the single
+source of truth for *candidates*, but *which keys exist* and *what a punctuation key
+means in Chinese mode* are platform facts Kotlin cannot import from TypeScript, so
+`ImeLayout`/`ImeRouting` are a second copy of `frontend-ts/src/lib/ime.ts` +
+`ImeOverlay.svelte`. `ImeLayoutTest`/`ImeRoutingTest` pin every value against the TS
+literals so the two cannot drift unnoticed.
+
 ## Honest boundaries
 
+* **The system IME is device-verified end to end, including the profile path; the
+  cross-surface *ranking* is still host-only.** On a real device (K-Touch S5,
+  Android 14, `com.amos.ai`, the arm64 debug APK that carries the corrected action)
+  the service is enumerated, enabled, bound and drawn, and a Chinese word goes all
+  the way through: `ime list -a -s` lists `com.amos.ai/.glue.AmosImeService`;
+  `dumpsys input_method` shows `mId=com.amos.ai/.glue.AmosImeService`,
+  `mShowInInputMethodPicker=true`, the subtype `中文（中国）`, and
+  `mCurIntent=… act=android.view.InputMethod`, `mHaveConnection=true
+  mBoundToMethod=true`; in **third-party apps** the keyboard renders (Google
+  Messages' compose field, Chrome's omnibox) and real engine candidates come back —
+  `n` raises `嗯`, `nihao` raises `你好` first — and tapping a candidate commits it
+  into the host app (`你好` landed in Chrome's omnibox). The **profile path is
+  confirmed**: `/data/user/0/com.amos.ai/files/amos-ime.json` is the app's
+  `filesDir`, i.e. exactly what the service hands `nativeAttach` and what Tauri joins
+  as `app_data_dir()/files`, and after the commit it held
+  `"l0": { "pins": [], "pick_counts": [["nihao","你好",1]] }` — one file, written by
+  the system IME, no second profile. What is **not** device-exercised is the
+  *behavioural* half of sharing: that a word learned through the system IME visibly
+  re-ranks in the WebView keyboard (they are one `ImeBridge` in one process by
+  construction — `ime::install_shared` + `shared_or_boot` — but no device read
+  traversed both surfaces). The Latin direct-insert path, the punctuation page's
+  Chinese-glyph commit and the pager are pinned by the host JUnit suite
+  (`ImeRoutingTest`/`ImeLayoutTest`) and exercised by tap on device, but the
+  host-JVM suite remains their authority.
+* **The IME lives in the app's process, so the app's lifecycle is the keyboard's.**
+  The service is declared in `com.amos.ai` with no `android:process`, so it is
+  hosted by the same process as the Tauri Activity — the price of reaching the same
+  `ImeBridge` without cross-process plumbing. Device-observed consequence: a
+  `force-stop com.amos.ai` (or a reinstall) makes the platform disable the IME and
+  **fall back to the previously-selected keyboard**, logging `Input method
+  uninstalled, disabling: ComponentInfo{com.amos.ai/…AmosImeService}` and
+  `Current input method removed`. It comes back on `ime enable` + `ime set` (or the
+  user re-picking it in Settings) once the app is launched again. The same is true,
+  more slowly, of any low-memory kill of the UI process. A dedicated
+  `android:process=":ime"` would decouple this, at the cost of a second process
+  holding the engine.
 * **联想 is a *context* feature, and it says so.** Suggestions need two committed
   words of context and a trigram hit in the embedded corpus, so there is nothing
   after the first word, nothing for rare word pairs, and nothing while a code is
@@ -280,15 +404,19 @@ pretending.
 * **The keyboard is a letters/digits/punctuation keyboard.** There is no emoji or
   full symbol plane, no long-press accents, no swipe typing, and shift is a
   one-shot key that only affects English mode (it is **disabled** in Chinese mode;
-  no caps-lock, no auto-capitalisation at the start of a sentence).
+  no caps-lock, no auto-capitalisation at the start of a sentence). Chinese
+  punctuation is one mode-aware page + a fixed one-to-one ASCII→Chinese table
+  (§Chinese punctuation) — not a smart-quote engine, so a quotation's opening and
+  closing glyphs are chosen by the user, not alternated automatically.
 * **`contenteditable` hosts are not targeted** — only real `<input>` (text-like
   types) and `<textarea>` elements. `isTextEntry` says so explicitly.
-* **This is an in-app input method**, not an Android system IME that other apps
-  can select: the System UI types into its own WebView (`insertTextAtCursor`
-  dispatches a real `input` event, so the host component's `bind:value` updates).
-  A system-wide IME would be a separate APK with
-  `android.inputmethodservice.InputMethodService` — see `docs/android-compat.md`
-  for the container/keyboard-sharing design.
+* **The WebView keyboard is in-app; the system IME is the other half.** The keyboard
+  described above types into AmOS's own WebView (`insertTextAtCursor` dispatches a real
+  `input` event, so the host component's `bind:value` updates). Other apps on the device
+  type into `AmosImeService` instead (see §System IME), which shares the same engine and
+  profile. Note this is *not* the same thing as the Android container's host-side
+  `input text` forwarding (`docs/android-compat.md` option 1) — that injects text into
+  the container from outside and never involves this engine.
 * **Off by default on a fine-pointer device** (`(pointer: coarse)` decides), since
   a desktop already has a physical keyboard; the ⌨ button enables it and the
   preference is persisted (`amos-ui.ime`).
@@ -353,7 +481,7 @@ pretending.
   and the 联想 contract (REQ-A260): two words of context are required, suggestions are
   silent while composing, a picked suggestion continues the chain **without** teaching
   the learner, an out-of-range pick is a no-op, and the context is per session.
-* `crates/amos-tauri/src/ime.rs` — **31** tests: the command surface, persistence
+* `crates/amos-tauri/src/ime.rs` — **35** tests: the command surface, persistence
   round-trip across a simulated restart, corrupt/newer profile handling, the per-word
   undo (only a dictionary pick is undoable, and the next word retires it), **a fuzzy
   toggle not erasing the learner on disk** (REQ-A254), the write path (unique staging
@@ -364,16 +492,21 @@ pretending.
   abandons their buffers, the window map is bounded and prunes what holds nothing, and
   two windows answer from one profile; and the 联想 surface (REQ-A260): an empty buffer
   offers `kind: "predict"` suggestions for what *this* window committed, picking one
-  inserts it and teaches nothing (no undo was invented), and suggestions are per window.
+  inserts it and teaches nothing (no undo was invented), and suggestions are per window;
+  and the **shared instance** the system IME rides (REQ-A1893): a `Clone` is the same
+  `ImeInner` (a word taught through `"android-ime"` reaches the WebView's learner), and
+  the pseudo-window keeps its own buffer (a half-typed code there is invisible to `MAIN`).
 * `crates/amos-ime/examples/size_probe.rs` — the reproducible size measurement quoted
   in §Next-word suggestions: build it with and without `--no-default-features` and
   compare; it also prints whether the engine still composes and what it suggests.
-* `frontend-ts/src/__tests__/ime.test.ts` — 15 tests: the wire contract (command
+* `frontend-ts/src/__tests__/ime.test.ts` — 18 tests: the wire contract (command
   names + camelCase args), field detection, caret insertion/deletion (including a
   field with no caret, a field **at its `maxlength`** and a clamp that never splits
-  a surrogate pair), paging.
-* `frontend-ts/svelte-tests/ime-keyboard.svelte.test.ts` (30) and
-  `ime-overlay.svelte.test.ts` (39) — the key grid, candidate bar, pager (clamped,
+  a surrogate pair), paging, and the Chinese punctuation table (the mapped glyphs,
+  the pass-through for letters/digits/twinless symbols, and the Chinese page's
+  contents).
+* `frontend-ts/svelte-tests/ime-keyboard.svelte.test.ts` (31) and
+  `ime-overlay.svelte.test.ts` (42) — the key grid, candidate bar, pager (clamped,
   ends disabled), settings panel with the dictionary/mode readout, commit hint,
   the bridge-failure notice, the 联想 bar (tagged suggestions render with an empty
   buffer and no pinyin chip, picking one reports its absolute index, and typing takes
@@ -386,8 +519,23 @@ pretending.
   Space with nothing to commit, and Tab/arrows being left to the field —
   confirmation before forgetting everything, abandoning the code when
   the field goes away, and a field that was **removed from the document** never
-  being written to).
+  being written to). The Chinese punctuation contract is here too: the
+  Chinese-mode page types `，。？` (and keeps digits ASCII), the English page keeps
+  `.`, a physical `,` commits first and reads as `，` with *and* without a
+  composition, and a twinless `@` is left to the field.
 * `frontend-ts/svelte-tests/settings-ime.svelte.test.ts` (5) — the Settings page:
   the switch writes the keyboard's preference **and follows the keyboard's own
   change**, the fuzzy controls call the same
   commands, the destructive reset asks first, and no engine ⇒ no inert controls.
+* `crates/amos-tauri/src/android_ime.rs` — **7** host tests: the wire encoder's exact
+  bytes for a composing session, the `commit`/`undo` records, the honest empty buffer,
+  a candidate containing a newline staying one record, and a key through the service
+  window encoding real candidates.
+* `android-glue/tests/.../ImeWireTest.kt` (9), `ImeLayoutTest.kt` (10),
+  `ImeRoutingTest.kt` (14) — the system IME's host-JVM half: the wire decoder
+  (every record, the escaping round trip, an unknown record tolerated, a null/empty
+  answer meaning *unavailable*), the layout/punctuation/pager tables pinned against
+  the `frontend-ts/src/lib/ime.ts` literals, and every arm of §Key behaviours
+  (space/enter commit-or-literal, backspace order, the `1–9` shortcut and its
+  off-page/digit-zero fallbacks, punctuation becoming Chinese after the commit).
+  Run by `make android-glue-check` (`scripts/android-glue-nv21-check.sh`).

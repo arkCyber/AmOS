@@ -33,7 +33,9 @@ use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 
-pub use amos_clipboard::proto::{encode, EchoGuard, FrameDecoder, GuestToHost, HostToGuest};
+pub use amos_clipboard::proto::{
+    encode, EchoGuard, FrameDecoder, GuestToHost, HostToGuest, MAX_MIRROR_TEXT,
+};
 
 use crate::clipboard::{ClipboardEntry, ClipboardNative};
 
@@ -116,7 +118,9 @@ impl<W: Write + Send> ClipboardNative for GuestSink<W> {
     /// Encode `entry` as a [`HostToGuest::PushText`] and write+flush it to the
     /// guest. Arms the echo guard *before* sending so it is ready for the
     /// (near-immediate) echo. Image-only payloads cannot be mirrored to a text
-    /// container clipboard and are rejected rather than silently dropped.
+    /// container clipboard and are rejected rather than silently dropped, and a text
+    /// over [`MAX_MIRROR_TEXT`] is refused by name here — the declared bound on a
+    /// mirrored copy is this path's to establish.
     fn push_out(&self, entry: &ClipboardEntry) -> Result<(), String> {
         let text = entry.plain_text().ok_or_else(|| {
             "clipboard-guest: image-only payload can't mirror to a text container clipboard"
@@ -124,6 +128,12 @@ impl<W: Write + Send> ClipboardNative for GuestSink<W> {
         })?;
         if text.trim().is_empty() {
             return Ok(()); // nothing text-bearing to mirror — not an error
+        }
+        if text.len() > MAX_MIRROR_TEXT {
+            return Err(format!(
+                "clipboard-guest: mirrored text is {} bytes, over the {MAX_MIRROR_TEXT}-byte cap",
+                text.len()
+            ));
         }
         let snap = self.guard.lock().map_err(|e| e.to_string())?.snap();
         {
@@ -492,6 +502,70 @@ mod tests {
             "an image-only payload cannot be mirrored to a text container clipboard"
         );
         assert!(wire.is_empty(), "nothing must be written on rejection");
+    }
+
+    #[test]
+    fn sink_mirrors_a_text_at_the_declared_mirror_cap() {
+        // MAX_MIRROR_TEXT is the declared bound on a mirrored copy and the kernel's
+        // own text cap is the same 1 MiB, so a copy at the cap is one the host
+        // accepts and the wire must carry. (Before REQ-A629 the frame cap equalled
+        // MAX_MIRROR_TEXT with no envelope headroom, so this very copy was refused
+        // by `encode` — the declared cap was unreachable.)
+        let guard = Arc::new(Mutex::new(EchoGuard::new()));
+        let mut wire: Vec<u8> = Vec::new();
+        let sink = GuestSink::over(&mut wire, guard.clone());
+        let entry = ClipboardEntry {
+            seq: 1,
+            source: "s".into(),
+            owner: "o".into(),
+            timestamp_ms: 0,
+            payload: ClipboardPayload::Text {
+                text: "a".repeat(MAX_MIRROR_TEXT),
+            },
+        };
+        sink.push_out(&entry)
+            .expect("a copy at the declared cap must mirror");
+
+        let mut d = FrameDecoder::<HostToGuest>::new();
+        let got = d.push(&wire).unwrap();
+        assert_eq!(got.len(), 1, "exactly one PushText frame on the wire");
+        let HostToGuest::PushText { text, .. } = &got[0];
+        assert_eq!(text.len(), MAX_MIRROR_TEXT, "the whole copy arrived");
+    }
+
+    #[test]
+    fn sink_refuses_a_text_over_the_declared_mirror_cap() {
+        // One byte over the cap: `encode` would carry it (the frame cap reserves
+        // headroom past MAX_MIRROR_TEXT), so the only thing that can refuse it is the
+        // cap check in `push_out` — which is what makes this path the bound's
+        // establishing site rather than a copy of the frame cap.
+        let guard = Arc::new(Mutex::new(EchoGuard::new()));
+        let mut wire: Vec<u8> = Vec::new();
+        let sink = GuestSink::over(&mut wire, guard.clone());
+        let entry = ClipboardEntry {
+            seq: 1,
+            source: "s".into(),
+            owner: "o".into(),
+            timestamp_ms: 0,
+            payload: ClipboardPayload::Text {
+                text: "a".repeat(MAX_MIRROR_TEXT + 1),
+            },
+        };
+        let err = sink
+            .push_out(&entry)
+            .expect_err("a text over the declared cap must be refused");
+        assert!(
+            err.contains("over the"),
+            "the refusal must name the cap it exceeded: {err}"
+        );
+        assert!(wire.is_empty(), "nothing must be written on refusal");
+        assert!(
+            !guard
+                .lock()
+                .unwrap()
+                .is_self_echo_now(&"a".repeat(MAX_MIRROR_TEXT + 1)),
+            "a refused push must not arm the echo guard"
+        );
     }
 
     #[test]

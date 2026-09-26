@@ -32,12 +32,14 @@
     insertTextAtCursor,
     isTextEntry,
     readImeEnabled,
+    toChinesePunctuation,
     writeImeEnabled,
     type ImeState,
   } from "../lib/ime";
   import { STORE_CHANGED_EVENT } from "../lib/amosStore";
   import { amosWarn } from "../lib/debugLog";
   import ImeKeyboard from "./ImeKeyboard.svelte";
+  import StoreErrorBar from "./StoreErrorBar.svelte";
   import { t } from "./locale.svelte";
 
   /** The keyboard's own root, used to tell "focus moved into the keyboard" from
@@ -56,6 +58,12 @@
   let online = $state(false);
   /** A command that never reached the engine — shown, never swallowed. */
   let bridgeError = $state(false);
+  /**
+   * The store refused the on/off preference this keyboard just wrote (REQ-A1432). Its own fact,
+   * not folded into `bridgeError`: that one means "a command never reached the engine", and one
+   * flag standing for two causes is how a message ends up describing the wrong one.
+   */
+  let storeErr = $state(false);
   let focusTimer: ReturnType<typeof setTimeout> | null = null;
 
   const visible = $derived(enabled && !!active && !hidden);
@@ -89,12 +97,21 @@
     bridgeError = false; // the offline banner says it, so no second notice
   }
 
-  /** Turn the IME on/off and remember it. */
+  /**
+   * Turn the IME on/off and remember it. The preference moves only once it has landed
+   * (REQ-A1432): `amos-ui.ime` is what the *next* focus session reads back, and the very key
+   * the Settings page's switch draws — so a refused write that still raised (or dropped) this
+   * dock would make the keyboard testify to a preference the store never took.
+   */
   function setEnabled(on: boolean): void {
+    if (!writeImeEnabled(on)) {
+      storeErr = true;
+      return;
+    }
+    storeErr = false;
     enabled = on;
     hidden = !on;
     settingsOpen = false;
-    writeImeEnabled(on);
     if (!on) abandon();
   }
 
@@ -267,7 +284,10 @@
       void imeKey(ch).then((s) => apply(s));
       return;
     }
-    typeNonLetter(ch);
+    // Chinese mode: a punctuation key is the **Chinese** glyph (a physical `,`
+    // becomes `，`, and an already-Chinese symbol-page key passes through). The
+    // English page's half-width forms are reached by switching to English mode.
+    typeNonLetter(toChinesePunctuation(ch));
   }
 
   function onBackspace(): void {
@@ -329,6 +349,17 @@
       consume(e);
       page = 0; // a new letter means a new candidate list, so start at page one
       void imeKey(e.key).then((s) => apply(s));
+      return;
+    }
+
+    // Chinese punctuation is a Chinese-IME behaviour, not only a composing one: a
+    // physical `,` typed into a focused field in Chinese mode must read as `，`
+    // even with an empty buffer (the browser would otherwise insert a half-width
+    // `,`). Only the keys with a Chinese form are taken over here — a twinless
+    // symbol like `@` and Space/Enter keep the field's own handling below.
+    if (e.key.length === 1 && toChinesePunctuation(e.key) !== e.key) {
+      consume(e);
+      press(e.key);
       return;
     }
 
@@ -403,6 +434,9 @@
     const onStore = (e: Event) => {
       const key = (e as CustomEvent<{ key?: string }>).detail?.key;
       if (key !== IME_ENABLED_KEY) return;
+      // A landed write (this event is dispatched only then) proves the store is writable
+      // again, so the refusal sentence no longer describes the current state.
+      storeErr = false;
       enabled = readImeEnabled();
       hidden = false;
       if (!enabled) abandon();
@@ -425,6 +459,12 @@
 
 {#if visible}
   <div class="absolute inset-x-0 bottom-0 z-40" data-testid="ime-dock">
+    {#if storeErr}
+      <!-- 紧挨着它拒绝的那次写入所驱动的这个面板（REQ-A1432）。 -->
+      <div class="px-3 pb-1" data-testid="ime-store-error">
+        <StoreErrorBar message={t("common.storeWriteFailed")} />
+      </div>
+    {/if}
     <ImeKeyboard
       session={session}
       {online}
@@ -459,4 +499,10 @@
   >
     ⌨
   </button>
+  {#if storeErr}
+    <!-- The ⌨ tap did not land: said where the tap was made (no dock is on screen to hold it). -->
+    <div class="absolute inset-x-0 bottom-[4.5rem] z-40 px-3" data-testid="ime-store-error">
+      <StoreErrorBar message={t("common.storeWriteFailed")} />
+    </div>
+  {/if}
 {/if}

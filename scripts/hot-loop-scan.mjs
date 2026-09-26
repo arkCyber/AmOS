@@ -38,6 +38,9 @@
 import { readFileSync, writeFileSync, readdirSync, existsSync } from "node:fs";
 import { join, dirname, relative } from "node:path";
 import { fileURLToPath } from "node:url";
+// REQ-A530: the shared "production part of a Rust file" (strips `#[cfg(test)]` items, keeps
+// comments — the rule below reads them).
+import { stripTestRegions } from "./tauri-reply-scan.mjs";
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const cratesDir = join(repoRoot, "crates");
@@ -77,10 +80,20 @@ const rustFiles = readdirSync(cratesDir, { withFileTypes: true })
   .filter((f) => !f.includes("/tests/"))
   .sort();
 
-/** Drop everything from the first `#[cfg(test)]` (test modules hold loops too). */
+/**
+ * Production part of a Rust source (REQ-A530).
+ *
+ * This used to drop everything from the **first** `#[cfg(test)]`, which silently discarded
+ * production code whenever a file carries an inline test helper above it (`wm.rs` has one at line
+ * 816, above 1 400 lines of window-manager code). The shared `stripTestRegions` removes the test
+ * *items* instead, so a loop below such a helper is still seen.
+ */
 function stripTestModules(src) {
-  const i = src.indexOf("#[cfg(test)]");
-  return i < 0 ? src : src.slice(0, i);
+  // Comments are **kept**: this scan's rule reads the termination comment above a loop, so the
+  // comment-stripping variant of the shared helper would silently disable it (measured: the four
+  // `spawn_*` watch loops below all carry the sentence the rule asks for, and were flagged the
+  // moment their comments were stripped).
+  return stripTestRegions(src);
 }
 
 /**

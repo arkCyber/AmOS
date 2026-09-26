@@ -27,6 +27,10 @@ const byAria = (container: HTMLElement, aria: string) =>
   container.querySelector(`[aria-label="${aria}"]`);
 const settle = () => new Promise((r) => setTimeout(r, 40));
 
+/** The battery span, by TEST ID rather than by its accessible name: the name is the
+ *  thing under test here, so selecting by it would make the assertions circular. */
+const battEl = (c: HTMLElement) => c.querySelector('[data-testid="statusbar-battery"]');
+
 /** Install a Tauri bridge whose `system_health` returns the given payload. */
 function installBridge(systemHealth: unknown) {
   const invoke = async (cmd: string) => {
@@ -46,9 +50,12 @@ describe("StatusBar.svelte", () => {
     await tick();
     await settle();
     expect(container.textContent ?? "").toMatch(/\d{1,2}:\d{2}/); // fmtClock
-    const batt = container.querySelector(`[aria-label="${zh["a11y.batteryLevel"]}"]`);
+    const batt = battEl(container);
     expect(batt?.querySelector("svg")).toBeTruthy(); // vector battery outline
     expect(batt?.textContent ?? "").toContain("—"); // never a fabricated %
+    // With no reading there is no percentage to name: the honest name is the
+    // "Battery level" label, not an invented one.
+    expect(batt?.getAttribute("aria-label")).toBe(zh["a11y.batteryLevel"]);
   });
 
   test("shows a REAL battery % when the daemon reports a level", async () => {
@@ -62,7 +69,7 @@ describe("StatusBar.svelte", () => {
     const { container } = render(StatusBar);
     await tick();
     await settle();
-    const batt = byAria(container, zh["a11y.batteryLevel"]);
+    const batt = battEl(container);
     expect(batt?.textContent ?? "").toContain("80%");
   });
 
@@ -77,10 +84,17 @@ describe("StatusBar.svelte", () => {
     const { container } = render(StatusBar);
     await tick();
     await settle();
-    const batt = byAria(container, zh["a11y.batteryLevel"]);
+    const batt = battEl(container);
     expect(batt?.textContent ?? "").toContain("64%");
     // The title is localised copy (it used to be a hard-coded English sentence).
     expect(batt?.getAttribute("title")).toBe(zh["a11y.batteryCharging"].replace("{pct}", "64%"));
+    // …and the reading is the ACCESSIBLE NAME, not just the tooltip: the drawn "64%"
+    // is `aria-hidden`, so before this a screen reader heard only "Battery level"
+    // while the level sat one attribute away, unreadable (REQ-A1016).
+    expect(batt?.getAttribute("aria-label")).toBe(
+      zh["a11y.batteryCharging"].replace("{pct}", "64%"),
+    );
+    expect(batt?.getAttribute("aria-label")).toBe(batt?.getAttribute("title"));
   });
 
   test("shows the flashlight glyph when the torch store is on", async () => {
@@ -99,12 +113,12 @@ describe("StatusBar.svelte", () => {
     const { container } = render(StatusBar);
     await tick();
     await settle();
-    expect(byAria(container, "do not disturb")).toBeFalsy();
+    expect(byAria(container, zh["a11y.doNotDisturb"])).toBeFalsy();
 
     writeStoreValue(SETTINGS_KEY, { dnd: true });
     await tick();
     await settle();
-    expect(byAria(container, "do not disturb")).toBeTruthy();
+    expect(byAria(container, zh["a11y.doNotDisturb"])).toBeTruthy();
   });
 });
 
@@ -136,7 +150,8 @@ describe("StatusBar.svelte — the Dynamic Island is iPhone hardware (REQ-A249)"
     await settle();
     expect(island(mac.container)).toBeNull();
     // The honest battery reading survives the change (no fabricated %).
-    const batt = mac.container.querySelector(`[aria-label="${zh["a11y.batteryLevel"]}"]`);
+    const batt = battEl(mac.container);
     expect(batt?.textContent ?? "").toContain("—");
+    expect(batt?.getAttribute("aria-label")).toBe(zh["a11y.batteryLevel"]);
   });
 });

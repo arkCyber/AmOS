@@ -5,6 +5,7 @@
   import { t } from "../locale.svelte";
   import type { QuickSettings, RadioKey } from "../../lib/settings";
   import { readStoreValue, writeStoreValueChecked } from "../../lib/amosStore";
+  import { radioDisplayOn } from "../../lib/quickRadio";
   import {
     WIFI_KEY,
     NEIGHBORHOOD,
@@ -17,6 +18,7 @@
     normalizeWifi,
     signalBars,
     sortNetworks,
+    wifiLink,
     type WifiCfg,
   } from "../../lib/wifi";
   import {
@@ -56,22 +58,35 @@
   import { radioManagedState, type RadioRefusalView } from "../../lib/radioControl";
   import { GROUP, LABEL, SUB, HINT } from "./kit";
   import ToggleRow from "./ToggleRow.svelte";
+  import StoreErrorBar from "../StoreErrorBar.svelte";
 
   let {
     which,
     qs,
     onToggle,
     refusal,
+    storeError = "",
   }: {
     which: "wifi" | "bluetooth";
     qs: QuickSettings;
     onToggle: (k: RadioKey) => void;
     /** The last refused write (REQ-A203), or `null` when nothing was refused. */
     refusal?: RadioRefusalView | null;
+    /**
+     * The **store's** refusal for this page's switch, if any (REQ-A1381). It is not
+     * `radioErr` (that one is this page's own config write) and not `refusal` (the device's
+     * answer) — the switch is the tap's success report, so the write's verdict is said here.
+     */
+    storeError?: string;
   } = $props();
 
   const title = $derived(which === "wifi" ? t("settings.wifi") : t("settings.bluetooth"));
-  const on = $derived(which === "wifi" ? !!qs.wifi : !!qs.bluetooth);
+  // "Is this radio on?" — the shared predicate, not the stored bit. Airplane mode owns the
+  // other radios, so a gated one is off; the page's own sentence (`settings.airplaneBlocks`,
+  // below) says exactly that, and the switch above it must not say the opposite (REQ-A1082).
+  // The page had answered this two ways at once: its effects and its section guards each
+  // spelled the gate out by hand, while the switch drew the raw bit.
+  const on = $derived(radioDisplayOn(qs, which));
 
   // ---- Platform-managed switch (REQ-A202) ----
   // On modern Android the platform owns the Wi-Fi (API 29+) and Bluetooth (API 33+)
@@ -81,17 +96,41 @@
   let ctl = $state<RadioControlReply | null>(null);
   let ctlOpenFailed = $state(false);
   const ctlState = $derived(radioManagedState(ctl, which));
-  let ctlRead = false;
   $effect(() => {
-    if (ctlRead || !bridged()) return;
-    ctlRead = true;
+    if (!bridged()) return;
+    // Ask about **the radio on screen**, and re-ask when it changes. The platform's
+    // answer is per radio (`radioControl(key)`), while one instance serves both: the
+    // page is not remounted when the user moves between Wi‑Fi and Bluetooth, because
+    // `SettingsApp` renders both from a single `page === "wifi" || page === "bluetooth"`
+    // branch. Latching the read to the instance therefore described the Bluetooth
+    // switch with the Wi‑Fi radio's answer (REQ-A1211). The previous answer — and the
+    // open-failure verdict of a tap made on the other page — is dropped first, so
+    // neither haunts the radio now on screen.
+    const key = which;
+    ctl = null;
+    ctlOpenFailed = false;
     void (async () => {
-      ctl = (await radioControl(which)) ?? null;
+      const reply = (await radioControl(key)) ?? null;
+      // The reply belongs to `key`; the screen may have moved on to another radio while it
+      // was in flight. Writing it back here would re-create exactly the defect this effect
+      // was changed to fix — a Bluetooth page wearing the Wi‑Fi answer (its `noteKey` is
+      // re-worded for the *current* `which`, and `surface` is the other radio's panel) —
+      // so it is dropped unless the answer's own radio is still the one on screen. Same
+      // rule as `MessagesApp`'s `smsFolderSnapshot` guard (REQ-A1216 / F-SH-502).
+      if (key !== which) return;
+      ctl = reply;
     })();
   });
   const openRadioSettings = async () => {
     // `which` is the page's own radio key, and `hotspot` never reaches this page.
-    const opened = await radioOpenSettings(which);
+    const key = which;
+    const opened = await radioOpenSettings(key);
+    // The verdict belongs to the page the tap was made on: starting a system Activity is
+    // a platform round trip, and the user can move to the other radio while it is in
+    // flight. Writing it back here would put a Wi-Fi tap's failure under the Bluetooth
+    // switch — the same landing `radioControl`'s reply is already guarded against, two
+    // lines up (REQ-A1218).
+    if (key !== which) return;
     ctlOpenFailed = !opened;
   };
 
@@ -100,34 +139,55 @@
   // shape. Only open / already-current networks can be "joined" (never a faked
   // passworded join).
   let cfg = $state<WifiCfg>(normalizeWifi(readStoreValue<unknown>(WIFI_KEY, undefined)));
-  let scanning = $state(false);
+  let scanNote = $state(false);
   // A rejected config write must be visible: the "已保存" label describes the store.
   let radioErr = $state("");
-  const saveCfg = (next: WifiCfg) => {
+  const saveCfg = (next: WifiCfg): boolean => {
     // The "已保存" label is a claim about the store, so the in-memory config only
-    // moves when the write landed.
+    // moves when the write landed. The verdict is also *returned*: a caller whose own
+    // gesture says "done" (the password sheet closing) must not report a write the
+    // store refused (REQ-A1241).
     if (!writeStoreValueChecked(WIFI_KEY, next)) {
       radioErr = t("settings.radioSaveFailed");
-      return;
+      return false;
     }
     radioErr = "";
     cfg = next;
+    return true;
   };
+  // There is no Wi-Fi scan to run. The list above is `sortNetworks(NEIGHBORHOOD, …)` — a
+  // `$derived` over a static constant — and no scan command exists on the host (the
+  // Bluetooth half of this same page has `bluetooth_scan_state`). This used to be a 700 ms
+  // `…` busy state that scanned nothing and could change nothing: a tap claimed work had
+  // happened, and the user could not tell "found nothing new" from "did nothing". The
+  // button stays (it is the affordance the user looks for, as the Bluetooth half keeps its
+  // own `搜索` under `btScanDenied`) and now answers the tap with what is missing
+  // (REQ-A1195 / F-SH-484).
   const runScan = () => {
-    scanning = true;
-    window.setTimeout(() => {
-      scanning = false;
-    }, 700);
+    scanNote = true;
   };
   const sorted = $derived.by(() =>
     sortNetworks(NEIGHBORHOOD, cfg.current, cfg.saved),
+  );
+
+  // The 「当前网络」 row asks *which network*, so its value is the link state — not the
+  // radio's own bit. It used to answer 「开」 (the radio is on) under that label, which
+  // is a different question; the same three-state rule the Settings index uses lives
+  // in `lib/wifi.ts` so the two screens word the same fact the same way (REQ-A1123).
+  const link = $derived(wifiLink(on, cfg.current));
+  const linkText = $derived(
+    link.kind === "joined"
+      ? link.ssid
+      : link.kind === "unjoined"
+        ? t("settings.notConnected")
+        : t("settings.off"),
   );
 
   // ---- remembered-password / auto-rejoin ----
   // Auto-reconnect the strongest remembered (open or passworded) network when the
   // page opens with Wi‑Fi on and nothing connected yet — iOS behaviour.
   $effect(() => {
-    if (which === "wifi" && on && !qs.airplane) {
+    if (which === "wifi" && on) {
       const next = autoRejoin(cfg, NEIGHBORHOOD);
       if (next.current !== cfg.current) saveCfg(next);
     }
@@ -138,19 +198,33 @@
   let pwVal = $state("");
   const joinNet = (net: { ssid: string; secure: boolean }) => {
     if (net.ssid === cfg.current) return;
-    if (net.secure) {
-      if (hasPassword(cfg, net.ssid)) {
-        saveCfg(connectOpenOrSaved(cfg, NEIGHBORHOOD, net.ssid));
-      } else {
-        pwFor = net.ssid;
-        pwVal = "";
-      }
-    } else {
-      saveCfg(connectOpenOrSaved(cfg, NEIGHBORHOOD, net.ssid));
+    // A tap on a network is a new question, and the password sheet answers exactly one:
+    // once it moves to another network, the sheet that was asking about the previous one
+    // is no longer what the user is looking at. Left standing, it kept asking for the
+    // network just walked away from — and 连接, the only control it has, moved the
+    // connection back there on one press. The Bluetooth half of this page states the
+    // same rule for its own pending question (`btPairTarget = ""` at the top of
+    // `startBtScan`, before the attempt is even made); the Wi-Fi half had no reset.
+    const asks = net.secure && !hasPassword(cfg, net.ssid) ? net.ssid : null;
+    if (pwFor !== asks) {
+      pwFor = asks;
+      pwVal = "";
     }
+    if (asks === null) saveCfg(connectOpenOrSaved(cfg, NEIGHBORHOOD, net.ssid));
   };
   const submitPassword = () => {
-    if (pwFor) saveCfg(connectWithPassword(cfg, NEIGHBORHOOD, pwFor, pwVal));
+    // Nothing to try with an empty (or whitespace-only) field: `connectWithPassword`
+    // returns the config unchanged, so closing the sheet here would read as "the join
+    // happened" while nothing did (REQ-A1127). Keep the sheet open — the disabled 连接
+    // below is the verdict, and Enter must honour the same gate the button does.
+    const pw = pwVal.trim();
+    if (pw === "" || !pwFor) return;
+    // The same rule for the *other* way this can end without joining: a refused store
+    // write. Closing the sheet is this screen's "the join worked" gesture, so it may
+    // only happen when the write landed — otherwise the user's typed password is
+    // discarded and the screen reports a join that never happened, while the banner
+    // `saveCfg` raised is left explaining a sheet that is no longer up (REQ-A1241).
+    if (!saveCfg(connectWithPassword(cfg, NEIGHBORHOOD, pwFor, pw))) return;
     pwFor = null;
     pwVal = "";
   };
@@ -190,7 +264,7 @@
   // Ask the device when the Bluetooth page is actually on screen (and re-ask if the
   // radio or airplane mode changes, since the adapter may have moved).
   $effect(() => {
-    if (which === "bluetooth" && on && !qs.airplane) {
+    if (which === "bluetooth" && on) {
       void loadBtDevice();
       // Read the scan state up front as well: "this app may not scan" (no
       // BLUETOOTH_SCAN) and "the last list was capped" must be visible before the user
@@ -361,7 +435,7 @@
   // running scan: the platform would end it silently after ~12 s anyway, and until then
   // it keeps the radio busy.
   $effect(() => {
-    if (!(which === "bluetooth" && on && !qs.airplane)) return;
+    if (!(which === "bluetooth" && on)) return;
     return () => {
       void bluetoothStopScan();
     };
@@ -388,6 +462,10 @@
       disabled={qs.airplane || ctlState.managed}
       ontoggle={() => (ctlState.managed ? void openRadioSettings() : onToggle(which))}
     />
+    {#if storeError}
+      <div class={SUB}></div>
+      <div class="px-4 pb-2"><StoreErrorBar message={storeError} /></div>
+    {/if}
     {#if ctlState.managed}
       <div class={SUB}></div>
       <div class="flex items-center justify-between gap-3 px-4 py-2">
@@ -420,6 +498,17 @@
             data-testid="radio-refused-open-settings"
             class="mt-1 text-xs text-accent"
           >{t("radio.openSettings")}</button>
+          <!-- The same verdict `ctlOpenFailed` carries, rendered where *this* button can
+               raise it. It used to be drawn only inside `{#if ctlState.managed}` — and a
+               refusal is only ever raised when the radio is NOT managed (a platform-owned
+               switch never reaches `radio_set`), so on this path the tap's failure was
+               recorded and then shown nowhere. The desktop Control Center reports the
+               identical verdict outside any managed block (REQ-A1196 / F-SH-485). -->
+          {#if ctlOpenFailed}
+            <p role="status" data-testid="radio-refused-open-failed" class={HINT}>
+              {t("radio.openSettingsFailed")}
+            </p>
+          {/if}
         {/if}
       </div>
     {/if}
@@ -433,24 +522,33 @@
         <div class={SUB}></div>
         <div class="flex items-center justify-between gap-3 px-4 py-3">
           <span class={LABEL}>{t("settings.currentNetwork")}</span>
-          <span class="truncate text-[15px] opacity-60">{which === "wifi" && on && cfg.current ? cfg.current : on ? t("settings.on") : t("settings.off")}</span>
+          <span data-testid="wifi-current-network" class="truncate text-[15px] opacity-60">{linkText}</span>
         </div>
       {/if}
     {/if}
   </section>
 
-  {#if which === "wifi" && on && !qs.airplane}
+  {#if which === "wifi" && on}
     <section class={GROUP}>
       <div class="flex items-center justify-between gap-2 px-4 py-2">
         <span class="text-[13px] font-semibold text-neutral-800 dark:text-neutral-100">{t("settings.wifiNearby")}</span>
         <button
           onclick={runScan}
-          disabled={scanning}
           aria-label={t("settings.wifiScan")}
-          class="rounded-full px-2 py-0.5 text-xs text-accent disabled:opacity-40"
-        >{scanning ? "…" : t("settings.wifiScan")}</button>
+          class="rounded-full px-2 py-0.5 text-xs text-accent"
+        >{t("settings.wifiScan")}</button>
       </div>
       <div class={SUB}></div>
+      {#if scanNote}
+        <!-- The tap's answer, in the same shape the Bluetooth half gives a refused
+             scan: a sentence naming what is absent, never a busy state (REQ-A1195). -->
+        <div class="px-4 py-2">
+          <p role="status" data-testid="wifi-scan-note" class={HINT}>
+            {t("settings.wifiScanDenied")}
+          </p>
+        </div>
+        <div class={SUB}></div>
+      {/if}
       {#if cfg.current}
         <div class="flex items-center justify-between gap-3 px-4 py-3">
           <span class="flex items-center gap-2">
@@ -515,7 +613,7 @@
           />
           <div class="flex gap-2">
             <button onclick={() => { pwFor = null; pwVal = ""; }} aria-label={t("settings.wifiCancel")} class="flex-1 rounded-lg bg-black/5 px-3 py-1.5 text-sm text-neutral-700 dark:bg-white/10 dark:text-neutral-200">{t("settings.wifiCancel")}</button>
-            <button onclick={submitPassword} aria-label={t("settings.wifiConnect")} class="flex-1 rounded-lg bg-accent px-3 py-1.5 text-sm text-white">{t("settings.wifiConnect")}</button>
+            <button onclick={submitPassword} disabled={pwVal.trim() === ""} aria-label={t("settings.wifiConnect")} class="flex-1 rounded-lg bg-accent px-3 py-1.5 text-sm text-white disabled:opacity-40">{t("settings.wifiConnect")}</button>
           </div>
         </div>
       {/if}
@@ -526,7 +624,7 @@
     </section>
   {/if}
 
-  {#if which === "bluetooth" && on && !qs.airplane}
+  {#if which === "bluetooth" && on}
     <section class={GROUP}>
       <div class="flex items-center justify-between gap-3 px-4 py-3">
         <span class={LABEL}>{t("settings.btDeviceName")}</span>

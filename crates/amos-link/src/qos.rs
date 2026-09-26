@@ -143,7 +143,7 @@ impl Qos {
         Self::state()
     }
 
-    /// The profile a [`Channel`](crate::keyexpr::Channel) implies.
+    /// The profile a [`Channel`] implies.
     ///
     /// This is the policy table the topic grammar was designed around, in one place, so a
     /// caller subscribing to `amos/*/control/**` cannot silently pick the sensor profile

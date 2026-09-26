@@ -341,6 +341,13 @@ impl AudioSink for AAudioSink {
         if n < 0 {
             return Err(result_to_err("aaudio: write", n));
         }
+        // `Ok(())` means the device took all of it; a short write (timeout / underrun) must
+        // not be reported as success — see `sink::accepted_all_frames` (REQ-A1450/F-AUD-001).
+        if !crate::sink::accepted_all_frames(i64::from(n), frames as usize) {
+            return Err(AudioError::Device(format!(
+                "aaudio: write accepted {n}/{frames} frames"
+            )));
+        }
         Ok(())
     }
 }

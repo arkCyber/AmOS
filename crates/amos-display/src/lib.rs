@@ -22,6 +22,11 @@
 //!   alive longer on a charger), and a "hold the screen" input (an active call /
 //!   foreground-heavy task) disables auto-off entirely.
 //!
+//! It also owns the **device-orientation policy** ([`orientation`]): what the
+//! rotation lock / forced-orientation choice means, its mapping to Android's
+//! `ActivityInfo` requested-orientation codes, and the measured
+//! [`ScreenOrientation`] derived from a display's dimensions.
+//!
 //! The crate also owns the **screen-state file contract** ([`host`]) shared by
 //! the daemon energy beat (`amos-ai::energy::telemetry_from_env`, which makes
 //! `screen_on` reflect a real *off* instead of an env default) and the System UI
@@ -37,8 +42,10 @@
 
 pub mod host;
 pub mod idle;
+pub mod orientation;
 pub mod spec;
 
 pub use host::{parse_screen_state, read_screen_state_from, screen_state_path, SCREEN_STATE_ENV};
 pub use idle::{IdlePolicy, ScreenController};
+pub use orientation::{orientation_of, RotationMode, ScreenOrientation, ROTATION_MODES};
 pub use spec::{ScreenChange, ScreenState};

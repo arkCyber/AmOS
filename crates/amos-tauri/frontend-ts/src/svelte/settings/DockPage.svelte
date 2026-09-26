@@ -1,7 +1,7 @@
 <script lang="ts">
-  import { onMount } from "svelte";
   import { t } from "../locale.svelte";
   import { readStoreValue, writeStoreValueChecked } from "../../lib/amosStore";
+  import { createStoreValue } from "../store";
   import { DOCK_PREFS_KEY, normalizeDockPrefs, DEFAULT_DOCK_PREFS } from "../../lib/dockPrefs";
   import type { DockPrefs, DockPosition } from "../../lib/dockPrefs";
   import StoreErrorBar from "../StoreErrorBar.svelte";
@@ -15,19 +15,36 @@
   const magnificationId = nextFieldId();
   const iconSizeId = nextFieldId();
 
+  // REQ-A1281：这枚键有**两个**写者，且分处两扇 `WebviewWindow`。这只页面此前只在挂载时读
+  // 一次，于是两个方向都会僵住：Dock 那边（右键菜单）改了偏好，这页的控件停在新值到来之前的
+  // 读数上；更糟的是 `persist()` 写的是**整个对象** —— 从陈旧快照出发的那半，会把用户刚在
+  // Dock 里改好的另一项原样覆盖回去（例如在 Dock 里把图标调到 64，再回来点一下位置，图标就
+  // 退回 48）。订阅这枚键（与 `Dock.svelte` 对同一枚键、`layoutStore` 对布局所用的是同一枚
+  // 原语）让两个方向都活起来：跨窗口那半由同源 `storage` 事件与宿主的 `store-updated` 推送
+  // 送达，`createStoreValue` 把两条都接上。
+  const prefsStore = createStoreValue<DockPrefs>(DOCK_PREFS_KEY, { ...DEFAULT_DOCK_PREFS });
   let prefs = $state<DockPrefs>({ ...DEFAULT_DOCK_PREFS });
   let storeError = $state<string>("");
   let loaded = $state(false);
-
-  onMount(() => {
-    const raw = readStoreValue<unknown>(DOCK_PREFS_KEY, {});
-    prefs = normalizeDockPrefs(raw);
-    loaded = true;
+  $effect(() => {
+    const un = prefsStore.subscribe((v) => {
+      prefs = normalizeDockPrefs(v);
+      loaded = true;
+    });
+    return un;
   });
 
   function persist(): void {
-    const success = writeStoreValueChecked(DOCK_PREFS_KEY, prefs);
-    storeError = success ? "" : t("common.storeWriteFailed");
+    if (writeStoreValueChecked(DOCK_PREFS_KEY, prefs)) {
+      storeError = "";
+      return;
+    }
+    // 写入被拒时要把控件回滚到存储里**真正**持有的值：只挂一条横幅、却让位置按钮的
+    // `aria-pressed`、开关的 `aria-checked` 和两支滑杆的读数停在新值上，屏幕就等于
+    // 显示了一次并未发生的更改（用户下次进来会看到它又变回去）。`Dock.svelte` 对同一枚
+    // 键的写入早已这么做 —— 两处的语义必须一致。
+    storeError = t("common.storeWriteFailed");
+    prefs = normalizeDockPrefs(readStoreValue<unknown>(DOCK_PREFS_KEY, {}));
   }
 
   function setPosition(pos: DockPosition): void {

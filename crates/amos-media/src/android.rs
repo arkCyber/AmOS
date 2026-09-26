@@ -22,6 +22,7 @@ use base64::Engine as _;
 use jni::objects::{GlobalRef, JObject, JString, JValue};
 use jni::{JNIEnv, JavaVM};
 use serde_json::Value as Json;
+use std::path::Path;
 
 use crate::error::{MediaError, Result};
 use crate::mapping::{kind_and_mime_for_name, mime_for};
@@ -165,6 +166,65 @@ impl MediaProvider for AndroidMediaProvider {
             Ok(item) => Ok(item),
             Err(_) => Err(glue_err(&json).unwrap_or_else(|| {
                 MediaError::Provider("glue save returned an unparseable reply".to_string())
+            })),
+        }
+    }
+
+    /// Stream a file already on disk into MediaStore — the override the trait
+    /// documents as the memory-safe one.
+    ///
+    /// The default would read the whole file into a `Vec<u8>` and base64 it across
+    /// JNI: for a WebMan download (up to 4 GiB) that is roughly 2.3× the file in
+    /// peak memory across two address spaces. Here only the **path** crosses the
+    /// boundary and the Kotlin glue copies in 64 KiB chunks, so neither side ever
+    /// holds the payload whole. No [`crate::MAX_SAVE_BYTES`] check applies — that
+    /// cap guards an allocation, and this path makes none.
+    fn save_from_path(
+        &self,
+        dir: StandardDir,
+        kind: MediaKind,
+        name: &str,
+        src: &Path,
+    ) -> Result<MediaItem> {
+        // The same single name guard `save` runs, so the two entry points cannot
+        // drift on what a legal name is.
+        let name = crate::provider::validate_save_name(name)?;
+        let mut env = self.attach()?;
+        let glue = self.glue.0.as_obj();
+        let mk = |s: &str| env.new_string(s).map_err(jerr);
+        let tag: JObject = mk(dir.tag())?.into();
+        let nm: JObject = mk(&name)?.into();
+        let kd: JObject = mk(kind.as_str())?.into();
+        // Same MIME reasoning as `save`: MediaStore normalises the display name to
+        // the MIME, so it must agree with the name we were handed.
+        let mime = kind_and_mime_for_name(&name)
+            .map(|(_, m)| m)
+            .unwrap_or_else(|| mime_for(kind));
+        let mi: JObject = mk(mime)?.into();
+        let sp: JObject = mk(&src.to_string_lossy())?.into();
+        let args = [
+            JValue::Object(&tag),
+            JValue::Object(&nm),
+            JValue::Object(&kd),
+            JValue::Object(&mi),
+            JValue::Object(&sp),
+        ];
+        let out = env
+            .call_method(
+                glue,
+                "saveFileFromPath",
+                "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+                &args,
+            )
+            .map_err(jerr)?;
+        let jstr = JString::from(out.l().map_err(jerr)?);
+        let json: String = env.get_string(&jstr).map_err(jerr)?.into();
+        match serde_json::from_str::<MediaItem>(&json) {
+            Ok(item) => Ok(item),
+            Err(_) => Err(glue_err(&json).unwrap_or_else(|| {
+                MediaError::Provider(
+                    "glue saveFileFromPath returned an unparseable reply".to_string(),
+                )
             })),
         }
     }

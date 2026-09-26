@@ -439,6 +439,29 @@ pub struct DeviceMicStatus {
     pub submitted: usize,
 }
 
+/// The foreground rule for opening the device mic — **the only way a command may start
+/// a live capture**.
+///
+/// Opening the platform mic captures the user's surroundings, so it is a *read* of the
+/// most private kind and follows the same rule `clipboard_read` and the in-call recording
+/// toggle follow: only the window the user is actually looking at may start it. Without
+/// this, any window's WebView can reach `device_mic_start` with an `invoke` — the
+/// frontend's capability ledger is a `$state` in the very JS context that would be doing
+/// the reaching, so it can never be the guard.
+///
+/// Named and compiled on **every** target (not `#[cfg(feature = "android")]`) so a host
+/// test can pin both directions — the same reason `incall::set_recording_for_window` is a
+/// named function rather than an inline check. The device seam is what is device-pending;
+/// the rule is not.
+pub fn require_mic_foreground(wm: &crate::wm::WmState, caller: &str) -> Result<(), String> {
+    crate::clipboard::require_foreground(wm, caller).map_err(|e| {
+        format!(
+            "device mic denied: {e} (only the window the user is looking at may open the \
+             device mic; F-AI-018)"
+        )
+    })
+}
+
 /// Open the platform microphone for the always-on listen. On an Android build this
 /// opens the real AAudio (or TinyALSA) capture via [`amos_audio::PlatformMic`]; on
 /// a host with no native backend it fails honestly (no silent fake mic).
@@ -456,6 +479,10 @@ pub fn open_platform_mic() -> Result<amos_audio::PlatformMic, String> {
 /// (AAudio/TinyALSA on device), open a daemon `Chat` stream, and spawn the
 /// resident capture worker that streams speech + auto-finalizes each utterance.
 ///
+/// `wm`/`window` are injected by Tauri (not part of the JS call): on an Android
+/// build they gate the start to the **focused** window (F-AI-018), the same rule
+/// `clipboard_read` and the in-call recording toggle use.
+///
 /// On a host this returns the honest "no native mic" error; the host path for
 /// exercising the same worker is `VoiceLink::spawn_resident(mock, …)`.
 #[tauri::command]
@@ -464,8 +491,19 @@ pub async fn device_mic_start(
     state: State<'_, AiBridge>,
     voice: State<'_, VoiceSession>,
     mic: State<'_, DeviceMic>,
+    wm: tauri::State<'_, crate::wm::WmState>,
+    window: tauri::WebviewWindow,
     session_id: Option<String>,
 ) -> Result<String, String> {
+    // Foreground gate, **before** any teardown: opening the platform mic is a live
+    // capture of the user's surroundings, so it follows the same rule every private
+    // read follows — only the window the user is actually looking at may start it. A
+    // background WebView could otherwise reach `device_mic_start` by `invoke`, which
+    // the frontend's capability ledger (a `$state` the same JS context can set) is
+    // not a guard against. Placed first so a refused call never tears down a
+    // legitimately running capture.
+    require_mic_foreground(wm.inner(), window.label())?;
+
     // One listener at a time. Tear down any prior session/capture *first* —
     // opening a second live mic while the old one still runs would double-open the
     // device. Cancel the daemon stream before joining so a resident worker blocked
@@ -1173,6 +1211,62 @@ mod tests {
                 ),
             }
         }
+    }
+
+    // ── F-AI-018: the device mic's foreground gate ──────────────────────────────────────
+
+    /// A **background** window may not open the device mic. The refusal names the gate and the
+    /// failure mode, and the cause chain keeps `require_foreground`'s own words — proof the
+    /// device seam (`open_platform_mic`) was never reached.
+    #[test]
+    fn opening_the_device_mic_from_a_background_window_is_denied() {
+        let wm = crate::wm::WmState::new(); // the launcher ("main") owns focus
+        let err = require_mic_foreground(&wm, "settings")
+            .expect_err("a background window must not open the device mic");
+        assert!(err.contains("device mic denied"), "{err}");
+        assert!(err.contains("not the foreground window"), "{err}");
+        assert!(
+            err.contains("F-AI-018"),
+            "the refusal names the failure mode: {err}"
+        );
+        // …and it is not the "no native mic" boundary answering.
+        assert!(!err.contains("no native audio capture backend"), "{err}");
+    }
+
+    /// The **focused** window passes the gate — and the honest host boundary is then what
+    /// answers, i.e. the gate is not the thing that refused.
+    #[test]
+    fn opening_the_device_mic_from_the_focused_window_passes_the_gate() {
+        let wm = crate::wm::WmState::new();
+        require_mic_foreground(&wm, "main")
+            .expect("the focused window must pass the mic foreground gate");
+    }
+
+    /// The gate is only worth anything if the command still calls it: a later edit that drops
+    /// the call would leave both tests above green while the leak returned. Pin the call inside
+    /// `device_mic_start`'s own body (presence **and** position — before the teardown, so a
+    /// refused call cannot stop a legitimately running capture).
+    #[test]
+    fn device_mic_start_still_calls_the_gate_before_it_tears_anything_down() {
+        const SRC: &str = include_str!("assistant_voice.rs");
+        let body = {
+            let start = SRC
+                .find("pub async fn device_mic_start(")
+                .expect("the command still exists");
+            let rest = &SRC[start..];
+            let end = rest.find("\n}\n").expect("the command body is delimited");
+            &rest[..end]
+        };
+        let gate = body
+            .find("require_mic_foreground(")
+            .expect("device_mic_start must call the mic foreground gate (F-AI-018)");
+        let teardown = body
+            .find("voice.stop()")
+            .expect("the command still tears down a prior session");
+        assert!(
+            gate < teardown,
+            "the gate must run before the teardown, or a refused call stops a live capture"
+        );
     }
 
     /// A pull `AudioCapture` backed by the same bounded [`SampleRing`] a device

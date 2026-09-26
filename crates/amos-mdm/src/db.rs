@@ -1237,23 +1237,39 @@ impl Database {
         .map_err(|e| MdmError::Internal(format!("spawn_blocking failed: {}", e)))?;
         Ok(rows? > 0)
     }
-    pub async fn fail_command(&self, command_id: &str, error: &str) -> Result<bool, MdmError> {
+    /// Record that **this device's own** command **failed** (REQ-A410).
+    ///
+    /// Scoped by `device_id` exactly like [`Self::ack_command`], and for the same reason: the
+    /// version this replaces took only a command id, so *any* caller — including another device,
+    /// or another organisation — could mark any command as failed. It had no caller, so that
+    /// scoping hole was never exercised; wiring it (the ack endpoint's `ok: false`) would have
+    /// handed it a real one.
+    ///
+    /// `error` becomes the `result` an operator reads, so a failed lock/wipe is no longer recorded
+    /// as if it had been carried out.
+    pub async fn fail_command(
+        &self,
+        command_id: &str,
+        device_id: &str,
+        error: &str,
+    ) -> Result<bool, MdmError> {
         let command_id = command_id.to_string();
+        let device_id = device_id.to_string();
         let error_owned = error.to_string();
         let conn = self.conn.clone();
         let rows = tokio::task::spawn_blocking(move || -> Result<usize, rusqlite::Error> {
             let conn = conn.blocking_lock();
             let now = chrono::Utc::now().timestamp_millis();
             let rows = conn.execute(
-                "UPDATE remote_commands SET status = 'failed', executed_at = ?, result = ? WHERE id = ?",
-                params![now, error_owned, command_id],
+                "UPDATE remote_commands SET status = 'failed', executed_at = ?, result = ?
+                 WHERE id = ? AND device_id = ?",
+                params![now, error_owned, command_id, device_id],
             )?;
             Ok(rows)
         })
         .await
-        .map_err(|e| MdmError::Internal(format!("spawn_blocking failed: {}", e)))?
-        .map_err(MdmError::Database)?;
-        Ok(rows > 0)
+        .map_err(|e| MdmError::Internal(format!("spawn_blocking failed: {}", e)))?;
+        Ok(rows? > 0)
     }
 }
 
@@ -1639,5 +1655,82 @@ mod tests {
             .ack_command("no-such-command", "device-1", None)
             .await
             .expect("the ack ran"));
+    }
+
+    /// REQ-A410: a device that reports **failure** must not be recorded as having carried the
+    /// command out. `fail_command` existed but had no caller, and it was scoped by command id
+    /// alone — so it could mark *any* device's command failed. Wiring it (the ack endpoint's
+    /// `ok: false`) gives it a real caller, so it gets the same per-device scoping `ack_command`
+    /// has had since REQ-A411.
+    #[tokio::test]
+    async fn a_failed_command_is_recorded_for_its_own_device_only() {
+        let fx = TempDb::new().await;
+        let org = fx.org_id().await;
+        for device in ["device-1", "device-2"] {
+            let token = fx.db.create_token(&org, 86_400_000).await.expect("a token");
+            fx.db
+                .enroll_device(
+                    params(&token.token, device, &org),
+                    &config(),
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await
+                .expect("enrolled");
+        }
+        let command = fx
+            .db
+            .create_command("device-1", "lock", None)
+            .await
+            .expect("a command");
+        let status_sql = "SELECT status FROM remote_commands WHERE id = ?";
+
+        // Another device's report must not touch it — and must not be reported as having landed.
+        assert!(!fx
+            .db
+            .fail_command(&command.id, "device-2", "not mine")
+            .await
+            .expect("the report ran"));
+        assert_eq!(
+            fx.text_where(status_sql, command.id.clone()).await,
+            "pending",
+            "another device's report left the row alone"
+        );
+
+        // Its own device's report lands, with the device's words and the `failed` status — **not**
+        // `acknowledged`, which is what every failure used to become.
+        assert!(fx
+            .db
+            .fail_command(
+                &command.id,
+                "device-1",
+                "lock refused: device policy forbids it"
+            )
+            .await
+            .expect("the report ran"));
+        assert_eq!(
+            fx.text_where(status_sql, command.id.clone()).await,
+            "failed"
+        );
+        assert_eq!(
+            fx.text_where(
+                "SELECT result FROM remote_commands WHERE id = ?",
+                command.id.clone(),
+            )
+            .await,
+            "lock refused: device policy forbids it"
+        );
+        // A reported failure is terminal: the device is not asked to run it again.
+        assert!(fx
+            .db
+            .get_pending_commands("device-1", DEFAULT_LIST_LIMIT)
+            .await
+            .expect("pending")
+            .is_empty());
+        // An unknown id is "not found", not a silent success.
+        assert!(!fx
+            .db
+            .fail_command("no-such-command", "device-1", "gone")
+            .await
+            .expect("the report ran"));
     }
 }

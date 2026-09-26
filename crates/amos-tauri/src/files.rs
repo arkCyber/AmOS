@@ -136,7 +136,14 @@ pub struct CloudSnapshot {
     pub label: String,
     pub saved_at: u64,
     pub collections: Vec<String>,
-    pub total_bytes: u64,
+    /// Total bytes across `files`, or `None` when **any** entry's size is unknown
+    /// (`files[*].size_bytes == None`).
+    ///
+    /// A partial sum is not "the total": the Files screen prints 「—」 for a file whose
+    /// size the platform never reported (`lib/externalFiles.ts::totalExternalBytes`), and
+    /// the snapshot's own header must not carry a fabricated byte count for the same row.
+    /// `Some(0)` therefore means every file really reads 0 (or the list is empty).
+    pub total_bytes: Option<u64>,
     pub file_count: usize,
     pub files: Vec<CloudFile>,
 }
@@ -157,9 +164,9 @@ impl CloudSnapshot {
     ///
     /// `serde_json` is happy with any JSON object matching the shape, but
     /// will accept garbage like `{"label": "", "savedAt": -1, "files": null}`
-    /// or a `totalBytes` that does not equal the sum of `files[*].sizeBytes`.
-    /// Both happen to be plausible corruption patterns after localStorage
-    /// partial writes, so we surface them as errors here.
+    /// or a `totalBytes` that disagrees with `files[*].sizeBytes`. Both happen
+    /// to be plausible corruption patterns after localStorage partial writes,
+    /// so we surface them as errors here.
     ///
     /// Returns `Err` with a human-readable Chinese reason; the frontend
     /// forwards it to the i18n error banner.
@@ -177,9 +184,13 @@ impl CloudSnapshot {
                 self.files.len()
             ));
         }
-        // Recompute the byte total from the entries and refuse if it
-        // disagrees with the recorded value.
+        // Recompute the byte total from the entries and refuse if it disagrees with the
+        // recorded value. A size the platform did not report (`None`) withholds the whole
+        // total — the same rule `lib/externalFiles.ts::totalExternalBytes` states for the
+        // sibling view, so a partial sum can never be recorded (and then displayed) as
+        // "the total". An empty list is not partial: it is a real `Some(0)`.
         let mut acc: u64 = 0;
+        let mut all_known = true;
         for (i, f) in self.files.iter().enumerate() {
             if f.id.is_empty() {
                 return Err(format!("files[{i}].id 为空"));
@@ -190,14 +201,16 @@ impl CloudSnapshot {
             if f.collection.is_empty() {
                 return Err(format!("files[{i}].collection 为空"));
             }
-            if let Some(n) = f.size_bytes {
-                acc = acc.saturating_add(n);
+            match f.size_bytes {
+                Some(n) => acc = acc.saturating_add(n),
+                None => all_known = false,
             }
         }
-        if acc != self.total_bytes {
+        let expected_total = if all_known { Some(acc) } else { None };
+        if self.total_bytes != expected_total {
             return Err(format!(
-                "total_bytes ({}) 与 files 累计字节数 ({}) 不一致",
-                self.total_bytes, acc
+                "total_bytes ({:?}) 与 files 累计字节数 ({:?}) 不一致",
+                self.total_bytes, expected_total
             ));
         }
         Ok(())
@@ -353,18 +366,39 @@ const PREVIEW_TEXT_MAX: usize = 256 * 1024; // 256 KiB of text
 const PREVIEW_DATA_URL_CAP: usize = 5 * 1024 * 1024; // cap data-URL at 5 MiB
 
 fn preview_core(name: &str, mime_arg: Option<&str>, bytes: &[u8]) -> PreviewResult {
+    // An **empty** MIME is the wire's sentinel for "the caller has none", not a MIME type:
+    // `frontend-ts/src/lib/backend.ts` sends `mime: mime ?? ""`, and this command's
+    // `Option<String>` deserialises `""` as `Some("")` — present-but-blank. `Option::or_else`
+    // only runs its closure for `None`, so the old `mime_arg.or_else(|| mime_from_ext(name))`
+    // never reached the extension table from the **only** production caller
+    // (`files_preview_bytes`, the line below): every caller that identified the file by name
+    // and had no MIME got `classify_mime(Some(""))` → `("binary", Some(""))`, and the whole
+    // image/audio/video branch was unreachable. The test suite missed it because
+    // `plain_text_preview` calls `preview_core(.., None, ..)` directly — a value the wired
+    // command cannot produce (REQ-A971 / F-SH-307).
+    //
+    // Filtering blank → absent can only *add* information in the safe direction: a name with
+    // no known extension still yields `None` here and classifies as `binary`, exactly as
+    // `Some("")` did before.
+    let raw_mime = mime_arg
+        .filter(|m| !m.trim().is_empty())
+        .or_else(|| mime_from_ext(name));
+
     if bytes.is_empty() {
         return PreviewResult {
             kind: "empty".into(),
             data: String::new(),
-            mime: mime_arg.map(String::from),
+            // The same sentinel, one branch earlier: an empty `.png` used to report `""` as
+            // its MIME. `kind: "empty"` renders a notice and nothing reads this field, so
+            // this is consistency rather than a fix — but leaving one blank and fixing the
+            // other would make the sentinel look half-handled.
+            mime: raw_mime.map(String::from),
             is_text: true,
             size_label: size_label(0),
             error: None,
         };
     }
 
-    let raw_mime = mime_arg.or_else(|| mime_from_ext(name));
     let (kind, effective_mime) = classify_mime(raw_mime);
 
     match kind {
@@ -651,6 +685,80 @@ mod tests {
         assert!(!r.is_text);
     }
 
+    /// REQ-A971 / F-SH-307 — the **command**, not `preview_core`.
+    ///
+    /// The old suite proved extension inference with `preview_core(.., None, ..)`, a value
+    /// the wired command cannot produce: `backend.ts` sends `mime: mime ?? ""`, so the only
+    /// reachable shapes are `Some("")` and a real MIME. This test goes through the seam the
+    /// frontend actually calls, so the blank sentinel is measured rather than assumed.
+    #[test]
+    fn files_preview_bytes_command_treats_a_blank_mime_as_absent() {
+        let jpeg: Vec<u8> = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10];
+        let r = files_preview_bytes("photo.jpg".into(), Some(String::new()), jpeg.clone());
+        assert_eq!(
+            r.kind, "image",
+            "a blank MIME must not defeat the extension table"
+        );
+        assert_eq!(r.mime.as_deref(), Some("image/jpeg"));
+        assert!(r.data.starts_with("data:image/jpeg;base64,"));
+        // The `null` shape, for a future caller that sends it properly.
+        let r = files_preview_bytes("photo.jpg".into(), None, jpeg);
+        assert_eq!(r.kind, "image");
+    }
+
+    /// The other direction of the same rule: blank is absent, but a **real** MIME still wins
+    /// over a name that disagrees. Without this control, "blank falls back to the extension"
+    /// and "the extension always wins" are indistinguishable.
+    #[test]
+    fn a_real_mime_still_overrides_the_name() {
+        let r = preview_core("photo.jpg", Some("text/plain"), b"hello world");
+        assert_eq!(r.kind, "text");
+        // Whitespace is the same sentinel as blank, and it is *trimmed* before matching —
+        // `classify_mime` already trims, so `"  "` must not become a MIME named two spaces.
+        let bytes: Vec<u8> = vec![0xFF, 0xD8, 0x00, 0x01];
+        let r = preview_core("photo.jpg", Some("   "), &bytes);
+        assert_eq!(r.kind, "image");
+        // Negative control for the whole rule: the same blank MIME with **no** name hint
+        // stays binary, so the assertions above measure inference and not a blanket default.
+        let r = preview_core("blob", Some(""), &bytes);
+        assert_eq!(r.kind, "binary");
+    }
+
+    /// Every media kind, reached by name alone — this is what makes the host browser's
+    /// preview possible (REQ-A971). One case per branch, because a single `image` case would
+    /// pass even if `AUDIO_MIMES`/`VIDEO_MIMES` were unreachable from `mime_from_ext`.
+    #[test]
+    fn blank_mime_reaches_every_media_branch_by_name() {
+        let bytes: Vec<u8> = vec![0xFF, 0xD8, 0x00, 0x01, 0x02, 0x03];
+        for (name, kind, mime) in [
+            ("photo.png", "image", "image/png"),
+            ("song.mp3", "audio", "audio/mpeg"),
+            ("clip.mp4", "video", "video/mp4"),
+        ] {
+            let r = preview_core(name, Some(""), &bytes);
+            assert_eq!(r.kind, kind, "{name}");
+            assert_eq!(r.mime.as_deref(), Some(mime), "{name}");
+            assert!(!r.is_text, "{name}");
+        }
+    }
+
+    /// The empty-bytes early return sits **above** the old `raw_mime` line, so it reported
+    /// the blank sentinel verbatim as a MIME type. `kind: "empty"` renders a notice and
+    /// nothing reads the field — this is consistency, pinned so it cannot silently regress.
+    #[test]
+    fn empty_bytes_report_the_inferred_mime() {
+        let r = preview_core("note.txt", Some(""), &[]);
+        assert_eq!(r.kind, "empty");
+        assert_eq!(r.mime.as_deref(), Some("text/plain"));
+        // Negative control: nothing to infer from a name with no known extension.
+        let r = preview_core("noext", Some(""), &[]);
+        assert_eq!(r.kind, "empty");
+        assert_eq!(r.mime.as_deref(), None);
+        // A declared MIME still survives the empty path unchanged.
+        let r = preview_core("noext", Some("image/png"), &[]);
+        assert_eq!(r.mime.as_deref(), Some("image/png"));
+    }
+
     #[test]
     fn mime_override_guides_classification() {
         // `application/octet-stream` + text bytes → NUL sniff is applied → "text".
@@ -741,6 +849,15 @@ mod tests {
         assert_eq!(size_label(1024 * 1024), "1 MB");
         assert_eq!(size_label(1024 * 1024 * 2), "2 MB");
         assert_eq!(size_label(1024 * 1024 * 1024), "1 GB");
+        // The three branches, pinned at a point each: exact integer ("256 KB"),
+        // one decimal below 100 ("3.5 KB"), and the >= 100 rounding branch
+        // (100.5 KB -> "101 KB"). These vectors are read by the frontend's
+        // `filesPreview.test.ts`, which runs `previewBytesLabel` on the same
+        // inputs — the JS/Rust byte-label rule has no shared implementation.
+        assert_eq!(size_label(256 * 1024), "256 KB");
+        assert_eq!(size_label(3 * 1024 + 512), "3.5 KB");
+        assert_eq!(size_label(102_912), "101 KB");
+        assert_eq!(size_label(1024 * 1024 * 1024 + 512 * 1024 * 1024), "1.5 GB");
     }
 
     #[test]
@@ -905,7 +1022,7 @@ mod tests {
             label: "测试".into(),
             saved_at: 1_700_000_000_000,
             collections: vec!["docs".into()],
-            total_bytes: 100,
+            total_bytes: Some(100),
             file_count: 2,
             files: vec![
                 CloudFile {
@@ -960,7 +1077,7 @@ mod tests {
     #[test]
     fn cloud_snapshot_validate_rejects_size_total_mismatch() {
         let mut s = sample_snapshot();
-        s.total_bytes = 1_000_000; // actual sum is 100
+        s.total_bytes = Some(1_000_000); // actual sum is 100
         let err = s.validate().unwrap_err();
         assert!(err.contains("total_bytes"), "got {err:?}");
     }
@@ -974,13 +1091,47 @@ mod tests {
     }
 
     #[test]
-    fn cloud_snapshot_validate_accepts_files_without_size() {
-        // Files with `size_bytes: None` are excluded from the sum; the test
-        // exercises the optional-size path.
+    fn cloud_snapshot_validate_withholds_total_when_a_size_is_unknown() {
+        // One unmeasured size withholds the whole total: `None`, never the partial sum.
         let mut s = sample_snapshot();
         s.files[0].size_bytes = None;
         s.files[1].size_bytes = None;
-        s.total_bytes = 0;
+        s.total_bytes = None;
+        assert!(s.validate().is_ok());
+    }
+
+    #[test]
+    fn cloud_snapshot_validate_rejects_a_partial_total() {
+        // The pre-fix shape: the known sizes summed (40) and recorded as "the total"
+        // while `f2`'s size was never reported. The validator must refuse it, or the
+        // Files screen prints a byte count the platform never measured.
+        let mut s = sample_snapshot();
+        s.files[1].size_bytes = None;
+        s.total_bytes = Some(40);
+        let err = s.validate().unwrap_err();
+        assert!(err.contains("total_bytes"), "got {err:?}");
+    }
+
+    #[test]
+    fn cloud_snapshot_validate_rejects_zeroed_total_for_unknown_sizes() {
+        // The exact fold the defect produced (`?? 0` on every entry): both sizes unknown,
+        // total recorded as `Some(0)`. That is a fabricated "0 B", not a measurement.
+        let mut s = sample_snapshot();
+        s.files[0].size_bytes = None;
+        s.files[1].size_bytes = None;
+        s.total_bytes = Some(0);
+        let err = s.validate().unwrap_err();
+        assert!(err.contains("total_bytes"), "got {err:?}");
+    }
+
+    #[test]
+    fn cloud_snapshot_validate_accepts_an_empty_snapshot_as_zero() {
+        // Positive control for the withholding rule: an empty list is not "partial", so
+        // `Some(0)` is the honest total (and `None` would be a lie in the other direction).
+        let mut s = sample_snapshot();
+        s.files.clear();
+        s.file_count = 0;
+        s.total_bytes = Some(0);
         assert!(s.validate().is_ok());
     }
 }

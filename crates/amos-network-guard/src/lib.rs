@@ -18,8 +18,9 @@
 //! Crate layout:
 //! * [`policy`] — the pure, host-testable rule model: [`Destination`] (Domain /
 //!   `Ip` / TLS SNI — deliberately **not** raw URL strings, which iptables `-d`
-//!   cannot match), [`Policy`] (uid + effect + destination), and a [`RuleSet`]
-//!   with first-match-wins evaluation.
+//!   cannot match), [`Policy`] (uid + effect + destination), a [`RuleSet`]
+//!   with first-match-wins evaluation, and [`is_valid_egress_host`] (the shared
+//!   allow-list grammar an app manifest's `allowed_domains` is validated against).
 //! * [`guard`] — the [`NetworkGuard`] seam + deterministic [`MockNetworkGuard`].
 //! * [`audit`] — structured outbound events ([`EgressEvent`]) + a running
 //!   [`audit::EgressCounter`] of per-uid/per-domain bytes.
@@ -51,7 +52,7 @@ pub mod vpn;
 pub use audit::{EgressCounter, EgressEvent, EgressKind};
 pub use error::{Error, Result};
 pub use guard::{MockNetworkGuard, NetworkGuard};
-pub use policy::{normalize_domain, Destination, Effect, Policy, RuleSet};
+pub use policy::{is_valid_egress_host, normalize_domain, Destination, Effect, Policy, RuleSet};
 
 #[cfg(feature = "nftables")]
 pub use nftables::NftablesNetworkGuard;

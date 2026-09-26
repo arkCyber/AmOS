@@ -1,6 +1,35 @@
 # AmOS 与 iOS/macOS 功能对比分析 - 缺失功能清单
 
-**分析日期**: 2026年9月17日 16:14  
+> ⚠️ **本文件已被取代（superseded）。** 它是 2026-09-17 的一次快照，其「缺失」结论**已与仓库现状不符**；保留它是因为它记录了当时的判断，而不是因为它现在正确。**请以代码与现行台账为准**（`TABLET_OS_COMPLETION_20260920.md`、`docs/FMEA.md`、`docs/TRACEABILITY_MATRIX.md`）。
+>
+> 2026-09-23 复核并确认**已交付**的条目（括号内是现行实现位置）：
+>
+> | 本文称「缺失」 | 现状 |
+> | --- | --- |
+> | 1. Safari / 浏览器 | 已交付 —— `crates/amos-tauri/frontend-ts/src/svelte/WebManApp.svelte`（WebMan，Tauri WebView） |
+> | 3. 通知推送服务（APNs） | 已交付（非 APNs，走本地 daemon）—— `crates/amos-notifier/`（`dispatcher.rs` ∕ `webhook.rs` ∕ `smtp.rs` ∕ `throttle.rs`）＋ `settings/PushManagementPage.svelte` ＋ `svelte/osPushWatcher.ts` |
+> | 13. 快捷指令（Shortcuts） | 已交付 —— `ShortcutsApp.svelte`、`lib/shortcuts.ts`、`osShortcutTriggers.ts`、`ShortcutHud.svelte` |
+> | 17. 隔空播放（AirPlay） | 已交付（面板层）—— `AirPlayPanel.svelte` |
+> | 18. 测距仪（Measure） | 已交付 —— `MeasureApp.svelte` |
+> | 19. 指南针（Compass） | 已交付 —— `CompassApp.svelte` |
+> | 25. 热角（Hot Corners） | 已交付 —— `settings/HotCornersPage.svelte` ＋ `HotCornersListener.svelte` |
+> | 2. iCloud Drive / 云同步 | **部分** —— `amos-files` 的云快照与设置内的备份页；跨设备同步仍未做 |
+> | 4. 定位服务 | **部分** —— 据现行审计仍受设备侧精度限制 |
+> | 5. Siri / 语音助手 | **部分** —— AI 对话与 ASR 链路已存在；系统级语音助手仍未做 |
+> | 14. 屏幕使用时间 | **部分** —— 设备关怀/专注等页面已存在；完整的 Screen Time 报表未做 |
+>
+> **内建应用数现为 36**（`crates/amos-tauri/frontend-ts/src/lib/appMeta.ts::APP_META`），不是 29。
+>
+> **本文仍然成立的部分**（据 `TABLET_OS_COMPLETION_20260920.md` §60.5 的现行审计，仍未交付）：外接显示器 ∕ 第二屏、系统级手写笔、触控板 ∕ 指针层、AirDrop ∕ Handoff ∕ 通用控制；以及 Apple Pay ∕ Health ∕ Fitness ∕ Podcasts ∕ Books ∕ Wallet ∕ Apple Watch 配套等仅苹果生态才有的服务。
+>
+> **2026-09-25 更正**——本条此前把下面两项列为「未交付」，两项都不再成立：
+>
+> | 本文称「缺失」 | 现状 |
+> | --- | --- |
+> | Stage Manager 式自由窗口 | **已交付**。原判读取了「没有自由拖拽的多窗」，而**自由拖拽 + 缩放早已存在**（`crates/amos-tauri/src/wm.rs` 的桌面形态 `.resizable(policy.free_resize)`，`LayoutPolicy::of(Desktop).free_resize == true`；自绘标题栏逐元素 `data-tauri-drag-region`，见 `svelte/DesktopAppWindow.svelte`）。真正缺的是 Stage Manager 的**语义**——常驻窗口栏（`StageRail.svelte`）、舞台分组（`stage_park` ∕ `stage_bring`）、一键整理（`stage_arrange`）——已在 `crates/amos-wm/src/stage.rs`、`crates/amos-tauri/src/stage.rs` 交付 |
+> | 系统级录屏 | **已交付（macOS 已实测；Android 设备侧未验证）**。macOS 走 `ffmpeg -f avfoundation`（`crates/amos-tauri/src/screen_record.rs`，端到端测试真录并用 `ffprobe` 读出时长），Android 走 `MediaProjection` + `MediaRecorder` glue（`android-glue/.../ScreenRecordGlue.kt`，**仅在主机上类型检查过，没有设备跑过**） |
+
+**分析日期**（**本文写作当时**，已过时）: 2026年9月17日 16:14  
 **对比基准**: iOS 17 / macOS Sonoma  
 **AmOS版本**: 当前开发版
 

@@ -279,3 +279,104 @@ fn error_media_error_display_variants() {
         assert!(!e.to_string().is_empty(), "MediaError must be Display-able");
     }
 }
+
+// ---------- protocol :: the *crate-root* re-exports (the bridge's contract) ----------
+//
+// These call the symbols through the crate root (`amos_media::media_url`), which is the
+// path an external consumer uses — **not** `amos_media::protocol::media_url`. The
+// distinction is the whole test: `protocol.rs`'s own tests reach these functions through
+// `super::*`, so a symbol silently dropped from the crate-root re-export list compiles
+// green *inside this crate* and only breaks the downstream build (`amos-tauri`'s
+// `media_stream_url`, REQ-A601). A re-export is a contract with other crates; this is the
+// only place in this crate that exercises it.
+
+#[test]
+fn protocol_crate_root_reexports_the_url_round_trip() {
+    assert_eq!(amos_media::base_url_for(false), "amos-media://");
+    assert_eq!(amos_media::SCHEME, "amos-media");
+    assert_eq!(amos_media::MAX_BODY_BYTES, amos_media::MAX_RANGE_BYTES);
+    assert!(!amos_media::base_url().is_empty());
+
+    // The emitter (what the bridge calls) and the parser are two halves of one grammar;
+    // a URL the host hands out must read back as the same item.
+    let url = amos_media::media_url(
+        &amos_media::base_url_for(false),
+        StandardDir::Camera,
+        "clip.mp4",
+    )
+    .expect("a plain id is representable");
+    assert_eq!(
+        amos_media::parse_uri(&url),
+        Ok((StandardDir::Camera, "clip.mp4".to_string()))
+    );
+}
+
+#[test]
+fn protocol_crate_root_reexports_serve() {
+    let m = manager_over(Arc::new(MockMediaProvider::empty()));
+    let saved = m
+        .save(
+            StandardDir::Camera,
+            MediaKind::Image,
+            "clip.mp4",
+            b"\x00\x01\x02",
+        )
+        .unwrap();
+    let url = amos_media::media_url(
+        &amos_media::base_url_for(false),
+        StandardDir::Camera,
+        &saved.id,
+    )
+    .expect("a saved id is representable");
+
+    let reply: amos_media::MediaReply = amos_media::serve(&m, &url, None);
+    assert_eq!(reply.status, 200);
+    assert_eq!(reply.bytes, b"\x00\x01\x02".to_vec());
+    assert!(reply.accept_ranges, "a player will not seek without it");
+}
+
+// ---------- range :: the crate-root re-exports (both planners) ----------
+
+#[test]
+fn range_crate_root_reexports_both_planners() {
+    // Length-known planner + its supporting helpers, all via the crate root.
+    assert_eq!(
+        amos_media::parse_range(None, 100),
+        amos_media::RangeSpec::Full
+    );
+    assert_eq!(amos_media::window_len(0, 9), 10);
+    assert_eq!(amos_media::clamp_window(0, 99, 10), (0, 9));
+    assert_eq!(amos_media::status_for(amos_media::RangeSpec::Full), 200);
+    assert_eq!(
+        amos_media::window_for(amos_media::RangeSpec::Satisfiable { start: 2, end: 5 }, 100),
+        Some((2, 5))
+    );
+    assert_eq!(amos_media::content_range(0, 9, 100), "bytes 0-9/100");
+    assert_eq!(amos_media::content_range_unsatisfied(100), "bytes */100");
+    assert_eq!(amos_media::MAX_RANGE_BYTES, 4 * 1024 * 1024);
+    assert!(matches!(
+        amos_media::plan_response(Some("bytes=0-9"), 100, 4),
+        amos_media::ResponsePlan::Partial {
+            start: 0,
+            end: 3,
+            total: 100
+        }
+    ));
+
+    // The length-unknown planner (REQ-A599) must be reachable from the same root: the
+    // two halves are useless apart, and a re-export that carries only one is the drift
+    // this pair exists to prevent.
+    assert_eq!(
+        amos_media::plan_unknown(None, 4),
+        amos_media::UnknownPlan::WholeOrTooLarge { probe: 5 }
+    );
+    assert_eq!(
+        amos_media::plan_unknown(Some("bytes=-9"), 4),
+        amos_media::UnknownPlan::NeedsLength
+    );
+    assert_eq!(
+        amos_media::plan_unknown(Some("bytes=10-19"), 4),
+        amos_media::UnknownPlan::Window { start: 10, len: 4 }
+    );
+    assert_eq!(amos_media::content_range_unknown(0, 3), "bytes 0-3/*");
+}

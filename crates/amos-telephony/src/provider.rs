@@ -24,28 +24,88 @@ use crate::session::{
 /// Signalling events a provider pushes to subscribers (the daemon drives its
 /// `CallSession`s from these). Carries just enough to build a wire snapshot
 /// without a state round-trip.
+///
+/// Every variant that carries a call also carries `emergency`: the flag is a
+/// property of the call the *provider* holds, so an event converted to a wire
+/// snapshot must report the call's real value. A constant `emergency: false`
+/// here made every streamed snapshot lie about an emergency call (the
+/// `status()` snapshot, which reads the model, told the truth — the two paths
+/// disagreed). Rides along for the same reason `muted` does on
+/// [`Self::RecordingChanged`]: an event is applied **as** the snapshot.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProviderEvent {
-    /// A new incoming call is ringing.
-    Incoming { id: CallId, peer: Number },
-    /// The far side picked up / an outgoing call connected.
-    Connected { id: CallId, peer: Number },
-    /// The remote party hung up.
-    RemoteEnded(CallId),
-    /// The local user hung up / rejected a call.
-    LocalEnded(CallId),
-    /// The call failed (network / no answer).
-    Failed(CallId),
+    /// A new incoming call is ringing. Direction is implied (there is no other kind of
+    /// ringing call), so it is not carried.
+    Incoming {
+        id: CallId,
+        peer: Number,
+        emergency: bool,
+    },
+    /// The far side picked up / an outgoing call connected (or an incoming call was
+    /// answered — the same Ringing → Active edge both ways). Carries `direction` so a
+    /// `Watch` subscriber cannot mistake an answered incoming call for an outgoing one
+    /// and drop it: the incoming overlay's guard is `direction !== "Incoming"`.
+    Connected {
+        id: CallId,
+        peer: Number,
+        direction: CallDirection,
+        emergency: bool,
+    },
+    /// The remote party hung up. Carries the peer + direction as a final snapshot, the
+    /// same way [`Self::RecordingChanged`] does: the *ended* edge is what a subscriber
+    /// uses to write a call-log row (keyed on the peer) and to dismiss the surface, and
+    /// the call is already gone from `status()` by the time it arrives.
+    RemoteEnded {
+        id: CallId,
+        peer: Number,
+        direction: CallDirection,
+        emergency: bool,
+    },
+    /// The local user hung up / rejected a call. Same enrichment as
+    /// [`Self::RemoteEnded`] (the reason differs, not the shape).
+    LocalEnded {
+        id: CallId,
+        peer: Number,
+        direction: CallDirection,
+        emergency: bool,
+    },
+    /// The call failed (network / no answer). Same enrichment as
+    /// [`Self::RemoteEnded`].
+    Failed {
+        id: CallId,
+        peer: Number,
+        direction: CallDirection,
+        emergency: bool,
+    },
     /// Recording on a live call changed (started / stopped / failed). Carries enough
     /// snapshot fields (peer + state + new recording state) for a Watch subscriber to
     /// rebuild the call without a state round-trip — recording is a first-class,
     /// broadcast call-state, not just a private RPC response.
+    ///
+    /// `muted` rides along because a subscriber applies these events **as a
+    /// snapshot**: a call has two independent mutable flags now, so an event carrying
+    /// only one of them would silently clear the other on every recording change.
     RecordingChanged {
         id: CallId,
         peer: Number,
         state: CallState,
         direction: CallDirection,
         recording: RecordingState,
+        muted: bool,
+        emergency: bool,
+    },
+    /// The call's mute flag changed. Same shape as [`Self::RecordingChanged`] (and
+    /// carrying `recording` for the same reason): mute is a first-class, broadcast
+    /// call-state, so every `Watch` subscriber (the lock screen, a future
+    /// incoming-call overlay, the AI assistant) learns it without a state round-trip.
+    MutedChanged {
+        id: CallId,
+        peer: Number,
+        state: CallState,
+        direction: CallDirection,
+        muted: bool,
+        recording: RecordingState,
+        emergency: bool,
     },
 }
 
@@ -70,6 +130,11 @@ pub trait TelephonyProvider: Send + Sync {
 
     /// Stop recording a live call (no-op refusal when it is not recording).
     async fn stop_recording(&self, id: &CallId) -> Result<()>;
+
+    /// Set whether the call's outbound audio is muted. Refused when the call is not
+    /// live (there is no microphone to mute on a call that is over). Idempotent, and
+    /// — unlike recording — legal on an emergency call.
+    async fn set_muted(&self, id: &CallId, muted: bool) -> Result<()>;
 
     /// Current live calls (dialling/ringing/active).
     async fn status(&self) -> Result<Vec<Call>>;
@@ -161,58 +226,87 @@ impl MockTelephonyProvider {
             state: snap.state,
             direction: snap.direction,
             recording: snap.recording,
+            muted: snap.muted,
+            emergency: snap.emergency,
+        });
+    }
+
+    /// Broadcast a mute-state change for a call from its current snapshot so every
+    /// `Watch` subscriber learns the new mute flag (and re-reads the current recording
+    /// flag, so applying the event cannot clear an in-progress recording).
+    fn broadcast_muted(&self, snap: &Call) {
+        self.broadcast(ProviderEvent::MutedChanged {
+            id: snap.id.clone(),
+            peer: snap.peer.clone(),
+            state: snap.state,
+            direction: snap.direction,
+            muted: snap.muted,
+            recording: snap.recording,
+            emergency: snap.emergency,
         });
     }
 
     /// Simulate a ringing incoming call arriving from the network.
     pub async fn simulate_incoming(&self, peer: Number) -> CallId {
-        let id = {
+        let (id, emergency) = {
             let mut st = self.inner.lock().await;
             let id = Self::next_id(&mut st);
             let sess = CallSession::start_incoming(id.clone(), peer.clone());
+            let emergency = sess.snapshot().emergency;
             st.calls.insert(id.clone(), sess);
-            id
+            (id, emergency)
         };
         self.broadcast(ProviderEvent::Incoming {
             id: id.clone(),
             peer,
+            emergency,
         });
         id
     }
 
     /// Simulate "the far side connected" for an outgoing call.
     pub async fn simulate_connected(&self, id: &CallId) -> Result<()> {
-        let peer = {
+        let (peer, direction, emergency) = {
             let mut st = self.inner.lock().await;
             let sess = st
                 .calls
                 .get_mut(id)
                 .ok_or_else(|| TelephonyError::UnknownCall(id.to_string()))?;
-            let peer = sess.snapshot().peer.clone();
+            let snap = sess.snapshot();
             sess.connect()?;
-            peer
+            (snap.peer, snap.direction, snap.emergency)
         };
         self.broadcast(ProviderEvent::Connected {
             id: id.clone(),
             peer,
+            direction,
+            emergency,
         });
         Ok(())
     }
 
     /// Simulate the remote party hanging up.
     pub async fn simulate_remote_ended(&self, id: &CallId) -> Result<()> {
-        {
+        let (peer, direction, emergency) = {
             let mut st = self.inner.lock().await;
-            {
+            let snap = {
                 let sess = st
                     .calls
                     .get_mut(id)
                     .ok_or_else(|| TelephonyError::UnknownCall(id.to_string()))?;
+                let snap = sess.snapshot();
                 sess.end(EndReason::Remote)?;
-            }
+                snap
+            };
             st.calls.remove(id);
-        }
-        self.broadcast(ProviderEvent::RemoteEnded(id.clone()));
+            (snap.peer, snap.direction, snap.emergency)
+        };
+        self.broadcast(ProviderEvent::RemoteEnded {
+            id: id.clone(),
+            peer,
+            direction,
+            emergency,
+        });
         Ok(())
     }
 
@@ -249,41 +343,53 @@ impl TelephonyProvider for MockTelephonyProvider {
     }
 
     async fn answer(&self, id: &CallId) -> Result<()> {
-        let peer = {
+        let (peer, direction, emergency) = {
             let mut st = self.inner.lock().await;
             let sess = st
                 .calls
                 .get_mut(id)
                 .ok_or_else(|| TelephonyError::UnknownCall(id.to_string()))?;
-            let peer = sess.snapshot().peer.clone();
+            let snap = sess.snapshot();
             sess.answer()?;
-            peer
+            (snap.peer, snap.direction, snap.emergency)
         };
         // Answering is the incoming analogue of `simulate_connected`: the call goes
         // Ringing → Active, so every Watch subscriber must observe it (the UI turns
-        // the incoming surface into an active/recordable call from this event).
+        // the incoming surface into an active/recordable call from this event). The
+        // direction rides along so that subscriber can tell it is an incoming call —
+        // it drops events tagged Outgoing.
         self.broadcast(ProviderEvent::Connected {
             id: id.clone(),
             peer,
+            direction,
+            emergency,
         });
         Ok(())
     }
 
     async fn end(&self, id: &CallId) -> Result<()> {
-        {
+        let (peer, direction, emergency) = {
             let mut st = self.inner.lock().await;
-            {
+            let snap = {
                 let sess = st
                     .calls
                     .get_mut(id)
                     .ok_or_else(|| TelephonyError::UnknownCall(id.to_string()))?;
+                let snap = sess.snapshot();
                 sess.end(EndReason::Local)?;
-            }
+                snap
+            };
             st.calls.remove(id);
-        }
+            (snap.peer, snap.direction, snap.emergency)
+        };
         // Local hang-up is a state change every Watch subscriber must observe
         // (symmetric with `answer` → `Connected` and `simulate_remote_ended`).
-        self.broadcast(ProviderEvent::LocalEnded(id.clone()));
+        self.broadcast(ProviderEvent::LocalEnded {
+            id: id.clone(),
+            peer,
+            direction,
+            emergency,
+        });
         Ok(())
     }
 
@@ -319,6 +425,20 @@ impl TelephonyProvider for MockTelephonyProvider {
             sess.snapshot()
         };
         self.broadcast_recording(&snap);
+        Ok(())
+    }
+
+    async fn set_muted(&self, id: &CallId, muted: bool) -> Result<()> {
+        let snap = {
+            let mut st = self.inner.lock().await;
+            let sess = st
+                .calls
+                .get_mut(id)
+                .ok_or_else(|| TelephonyError::UnknownCall(id.to_string()))?;
+            sess.set_muted(muted)?;
+            sess.snapshot()
+        };
+        self.broadcast_muted(&snap);
         Ok(())
     }
 
@@ -449,7 +569,11 @@ mod tests {
         let evt = rx.recv().await;
         assert_eq!(
             evt,
-            Some(ProviderEvent::Incoming { id, peer }),
+            Some(ProviderEvent::Incoming {
+                id,
+                peer,
+                emergency: false,
+            }),
             "incoming simulation reports a ringing call with its peer"
         );
     }
@@ -545,16 +669,20 @@ mod tests {
         );
 
         // Answering must surface the Ringing → Active transition to Watch
-        // subscribers (like `simulate_connected` does for outgoing calls).
+        // subscribers (like `simulate_connected` does for outgoing calls) — and it
+        // must keep the call's true direction, or a subscriber that filters on
+        // `direction == Incoming` never sees the answer.
         p.answer(&id).await.unwrap();
         let evt = rx.recv().await;
         assert_eq!(
             evt,
             Some(ProviderEvent::Connected {
                 id: id.clone(),
-                peer
+                peer,
+                direction: CallDirection::Incoming,
+                emergency: false,
             }),
-            "answer broadcasts the Active/Connected transition"
+            "answer broadcasts the Active/Connected transition, still Incoming"
         );
 
         let status = p.status().await.unwrap();
@@ -640,20 +768,173 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mute_flow_is_reflected_in_status() {
+        let p = MockTelephonyProvider::with_common_emergency();
+        let id = connect_regular(&p).await;
+
+        assert!(
+            !p.status().await.unwrap()[0].muted,
+            "a live call starts unmuted"
+        );
+
+        p.set_muted(&id, true).await.unwrap();
+        assert!(
+            p.status().await.unwrap()[0].muted,
+            "status carries the muted flag"
+        );
+
+        p.set_muted(&id, false).await.unwrap();
+        assert!(!p.status().await.unwrap()[0].muted);
+    }
+
+    #[tokio::test]
+    async fn mute_on_unknown_call_is_refused() {
+        let p = MockTelephonyProvider::with_common_emergency();
+        assert!(matches!(
+            p.set_muted(&CallId::new("nope"), true).await,
+            Err(TelephonyError::UnknownCall(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn mute_change_is_broadcast_to_subscribers() {
+        let p = MockTelephonyProvider::with_common_emergency();
+        let mut rx = p.subscribe();
+        let id = connect_regular(&p).await;
+        // connect_regular emits a Connected event; drain it first.
+        assert!(matches!(
+            rx.recv().await,
+            Some(ProviderEvent::Connected { .. })
+        ));
+
+        p.set_muted(&id, true).await.unwrap();
+        let evt = rx.recv().await;
+        assert_eq!(
+            evt,
+            Some(ProviderEvent::MutedChanged {
+                id: id.clone(),
+                peer: regular(),
+                state: crate::session::CallState::Active,
+                direction: crate::session::CallDirection::Outgoing,
+                muted: true,
+                recording: RecordingState::Off,
+                emergency: false,
+            }),
+            "muting broadcasts a MutedChanged(true) carrying the call's snapshot fields"
+        );
+
+        p.set_muted(&id, false).await.unwrap();
+        assert!(
+            matches!(
+                rx.recv().await,
+                Some(ProviderEvent::MutedChanged { muted: false, .. })
+            ),
+            "unmuting broadcasts a MutedChanged(false)"
+        );
+    }
+
+    #[tokio::test]
+    async fn mute_broadcast_preserves_incoming_direction() {
+        let p = MockTelephonyProvider::with_common_emergency();
+        let mut rx = p.subscribe();
+        let peer = Number::new("02112345678").unwrap();
+        let id = p.simulate_incoming(peer).await;
+        assert!(matches!(
+            rx.recv().await,
+            Some(ProviderEvent::Incoming { .. })
+        ));
+        p.answer(&id).await.unwrap();
+        assert!(matches!(
+            rx.recv().await,
+            Some(ProviderEvent::Connected { .. })
+        ));
+
+        p.set_muted(&id, true).await.unwrap();
+        assert!(
+            matches!(
+                rx.recv().await,
+                Some(ProviderEvent::MutedChanged {
+                    direction: crate::session::CallDirection::Incoming,
+                    muted: true,
+                    ..
+                })
+            ),
+            "the mute broadcast keeps the true (Incoming) direction"
+        );
+    }
+
+    #[tokio::test]
+    async fn emergency_call_may_be_muted_at_provider() {
+        // The asymmetry with recording, at the provider seam: 110 may be muted.
+        let p = MockTelephonyProvider::with_common_emergency();
+        let id = p.emergency_call(Number::new("110").unwrap()).await.unwrap();
+        p.simulate_connected(&id).await.unwrap();
+        assert!(
+            p.set_muted(&id, true).await.is_ok(),
+            "an emergency call can be muted"
+        );
+        assert!(p.status().await.unwrap()[0].muted);
+    }
+
+    #[tokio::test]
     async fn local_hangup_broadcasts_local_ended() {
         let p = MockTelephonyProvider::with_common_emergency();
         let mut rx = p.subscribe();
         let id = p.dial(&regular()).await.unwrap();
 
         p.end(&id).await.unwrap();
+        // The ended edge is a *final snapshot*: the call is already gone from
+        // `status()`, so a subscriber can only learn the peer/direction from the event.
         let evt = rx.recv().await;
-        assert!(
-            matches!(evt, Some(ProviderEvent::LocalEnded(ref cid)) if *cid == id),
-            "a local hang-up broadcasts a LocalEnded event to Watch subscribers"
+        assert_eq!(
+            evt,
+            Some(ProviderEvent::LocalEnded {
+                id: id.clone(),
+                peer: regular(),
+                direction: CallDirection::Outgoing,
+                emergency: false,
+            }),
+            "a local hang-up broadcasts a LocalEnded event carrying the final snapshot"
         );
         assert!(
             p.status().await.unwrap().is_empty(),
             "ended call is released"
+        );
+    }
+
+    #[tokio::test]
+    async fn ended_events_for_an_answered_incoming_call_stay_incoming() {
+        // The mirror of the outgoing case above: an incoming call that is answered and
+        // then hung up locally must report Incoming (with its peer) on the ended edge.
+        // `IncomingCall.svelte` drops `direction !== "Incoming"` events and writes its
+        // call-log row from this edge's peer, so getting either wrong loses the call.
+        let p = MockTelephonyProvider::with_common_emergency();
+        let mut rx = p.subscribe();
+        let peer = Number::new("02112345678").unwrap();
+        let id = p.simulate_incoming(peer.clone()).await;
+        assert!(matches!(
+            rx.recv().await,
+            Some(ProviderEvent::Incoming { .. })
+        ));
+        p.answer(&id).await.unwrap();
+        assert!(matches!(
+            rx.recv().await,
+            Some(ProviderEvent::Connected {
+                direction: CallDirection::Incoming,
+                ..
+            })
+        ));
+
+        p.end(&id).await.unwrap();
+        assert_eq!(
+            rx.recv().await,
+            Some(ProviderEvent::LocalEnded {
+                id,
+                peer,
+                direction: CallDirection::Incoming,
+                emergency: false,
+            }),
+            "an answered incoming call's hang-up stays Incoming and keeps its peer"
         );
     }
 }

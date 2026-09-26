@@ -19,6 +19,11 @@
 //!
 //! The shell window itself is declared in `tauri.conf.json`, which can only carry a fixed
 //! colour, so it is out of reach of this module (see `docs/UI_APPLE_HIG_AUDIT.md` §15.3).
+//!
+//! The call site is `wm.rs::new_window_background` — it feeds [`window_background`] the store
+//! value and the OS answer and passes the result to the window builder. Until REQ-A509 wired
+//! it there, this module had **no caller at all**: the fix was documented as landed while the
+//! builder was still told no colour.
 
 /// The frontend's persisted appearance key (`src/lib/themeCore.ts::THEME_KEY`, written through
 /// `store_set`). One spelling, two consumers — a frontend test pins that they still agree.

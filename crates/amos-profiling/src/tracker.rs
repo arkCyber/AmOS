@@ -108,10 +108,18 @@ impl ProfileTracker {
         Some(1000.0 / tps)
     }
 
-    /// Time-to-first-token estimate (ms): dominated by the prompt-eval wall of
-    /// the most recent stretch. Reported as the prefill wall time.
+    /// Time-to-first-token (ms): the **mean** prefill wall per prompt-eval
+    /// stretch (`prompt_wall / prompt_records`), i.e. one request's latency —
+    /// not a running sum. It stays flat as more stretches are folded in (the
+    /// tracker keeps lossless sums; the per-call average is what is derivable
+    /// from them), and an empty tracker is `0`, never `NaN`/`inf`.
+    ///
+    /// This is the same definition the daemon's `amos-ai` profiler reports
+    /// (`ttft_us_total / ttft_samples`), so the two agree.
     pub fn ttft_ms(&self) -> f64 {
-        self.prompt_wall.as_secs_f64() * 1000.0
+        safe_div(self.prompt_wall.as_secs_f64(), self.prompt_records as f64)
+            .map(|secs| secs * 1000.0)
+            .unwrap_or(0.0)
     }
 
     /// Merge another tracker's sums into this one.
@@ -153,6 +161,34 @@ mod tests {
         assert!((t.decode_ms_per_token().unwrap() - 20.0).abs() < 1e-9);
         // TTFT is the prefill wall (150 ms).
         assert!((t.ttft_ms() - 150.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ttft_is_a_per_request_latency_not_a_running_sum() {
+        let mut t = ProfileTracker::new();
+        t.record(Phase::PromptEval, 512, Duration::from_millis(150));
+        t.record(Phase::PromptEval, 512, Duration::from_millis(250));
+        // Mean of the two prefills is 200 ms; a cumulative sum would read 400 ms
+        // and would keep growing with every further stretch.
+        assert!((t.ttft_ms() - 200.0).abs() < 1e-9, "{}", t.ttft_ms());
+        t.record(Phase::PromptEval, 512, Duration::from_millis(400));
+        assert!((t.ttft_ms() - 800.0 / 3.0).abs() < 1e-9, "{}", t.ttft_ms());
+    }
+
+    #[test]
+    fn merged_ttft_stays_a_mean_not_a_sum() {
+        let mut a = ProfileTracker::new();
+        a.record(Phase::PromptEval, 64, Duration::from_millis(150));
+        let mut b = ProfileTracker::new();
+        b.record(Phase::PromptEval, 64, Duration::from_millis(150));
+        a.merge(&b);
+        // Two identical 150 ms prefills: the mean is 150 ms, not 300 ms.
+        assert!((a.ttft_ms() - 150.0).abs() < 1e-9, "{}", a.ttft_ms());
+    }
+
+    #[test]
+    fn empty_tracker_ttft_is_zero_not_nan() {
+        assert_eq!(ProfileTracker::new().ttft_ms(), 0.0);
     }
 
     #[test]

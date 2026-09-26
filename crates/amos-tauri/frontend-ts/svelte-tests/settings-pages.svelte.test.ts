@@ -95,6 +95,25 @@ function failWritesFor(key: string): () => void {
 }
 
 describe("Settings real sub pages (interactions)", () => {
+  /**
+   * REQ-A488 — 「键盘快捷键」 had a type, a title key, a render branch and (now) aliases, but **no
+   * index row**: the sidebar had nothing to click and the search only walks the index rows, so the
+   * one page that can rebind or disable a desktop shortcut was unreachable in the real UI (only a
+   * `#keyboard` deep link could open it). `navigate` asserts the row exists *and* is clickable — the
+   * reading a user gets from the sidebar — and the page's own search field proves the render branch
+   * ran, which a row alone cannot (a row pointing at a page with no branch is the mirror defect,
+   * pinned by `src/__tests__/settingsReach.test.ts`).
+   */
+  test("键盘快捷键: reachable from the index, and the page really renders (REQ-A488)", async () => {
+    const host = render(SettingsApp);
+    await navigate(host, "键盘快捷键");
+    expect(
+      controlByName<HTMLInputElement>(host.container, "input", "搜索快捷键或功能"),
+    ).toBeTruthy();
+    // The group the system chords live in — this is the surface `keyboardConfig` writes from.
+    expect(txt(host)).toContain("窗口管理");
+  });
+
   test("通知: Do-Not-Disturb persists via the quick-settings store", async () => {
     const host = render(SettingsApp);
     await navigate(host, "通知");
@@ -150,6 +169,39 @@ describe("Settings real sub pages (interactions)", () => {
       expect(
         host.container.querySelector('[data-testid="store-write-error"]')?.textContent,
       ).toBe(zh["common.storeWriteFailed"]);
+    } finally {
+      restore();
+    }
+  });
+
+  test("程序坞(Dock)设置页: a refused write rolls the control back, not just reports it (REQ-A1037)", async () => {
+    // REQ-A414 fixed the *banner* but left the control mutated: after a refused
+    // position/auto-hide write the buttons' `aria-pressed`, the switch's `aria-checked`
+    // and the two slider readouts all showed a change the store never accepted — the
+    // screen displayed a setting that would be gone on the next open. `Dock.svelte`
+    // already rolls back on the same key; the page must match it.
+    const positionBtn = (h: { container: HTMLElement }, label: string) =>
+      [...h.container.querySelectorAll("button")].find(
+        (b) => (b.textContent ?? "").trim() === label,
+      ) as HTMLButtonElement;
+
+    // Seed a real prior choice so the rollback has something specific to restore to.
+    writeStoreValue(DOCK_PREFS_KEY, { position: "left", autoHide: false, magnification: 1.5, iconSize: 48 });
+    const host = render(DockPage);
+    await tick(); // onMount reads the seeded store
+    expect(positionBtn(host, zh["settings.dock.left"]).getAttribute("aria-pressed")).toBe("true");
+
+    const restore = failWritesFor(DOCK_PREFS_KEY);
+    try {
+      await fireEvent.click(positionBtn(host, zh["settings.dock.right"]));
+      expect(
+        host.container.querySelector('[data-testid="store-write-error"]')?.textContent,
+      ).toBe(zh["common.storeWriteFailed"]);
+      // The refused choice must not read as the active one...
+      expect(positionBtn(host, zh["settings.dock.right"]).getAttribute("aria-pressed")).toBe("false");
+      // ...and the previously stored one must still be the active one.
+      expect(positionBtn(host, zh["settings.dock.left"]).getAttribute("aria-pressed")).toBe("true");
+      expect(readStoreValue(DOCK_PREFS_KEY, {})).toMatchObject({ position: "left" });
     } finally {
       restore();
     }
@@ -220,6 +272,29 @@ describe("Settings real sub pages (interactions)", () => {
     await navigate(host, "无线局域网");
     // Wi‑Fi master is now gated: the switch is disabled (toggling is a no-op).
     expect(switchByLabel(host, "无线局域网")?.disabled).toBe(true);
+  });
+
+  test("飞行模式 makes a radio whose own bit is still set read OFF on its page", async () => {
+    // The state that tells the two answers apart: airplane mode on while Wi‑Fi's bit is
+    // still set (a device snapshot, or a store restored from a backup — `flipRadio` is not
+    // the only writer). The switch must read off, because the page's own
+    // 「无线局域网与蓝牙已关闭」 sentence says exactly that; reading the raw bit put a lit
+    // switch directly above it (REQ-A1082).
+    writeStoreValue<QuickSettings>(SETTINGS_KEY, { wifi: true, bluetooth: true, airplane: true });
+    const host = render(SettingsApp);
+    await navigate(host, "无线局域网");
+    const sw = switchByLabel(host, "无线局域网");
+    expect(sw?.disabled).toBe(true);
+    expect(
+      sw?.getAttribute("aria-checked"),
+      "a gated radio cannot read ON beside the sentence that says it is closed",
+    ).toBe("false");
+    // And the same for the sibling page (the same predicate, the same bits). The index is
+    // only reachable from the index, so this is a fresh mount rather than a second jump.
+    cleanup();
+    const bt = render(SettingsApp);
+    await navigate(bt, "蓝牙");
+    expect(switchByLabel(bt, "蓝牙")?.getAttribute("aria-checked")).toBe("false");
   });
 
   test("iCloud: 立即同步 writes a readable backup and 恢复本地备份 puts a content store back", async () => {
@@ -691,6 +766,30 @@ describe("RadioPage — remembered Wi‑Fi + Bluetooth device name", () => {
     const host = render(RadioPage, { props: { which: "wifi", qs: qs(), onToggle: () => {} } });
     expect(txt(host)).toContain("Home-2.4G");
     expect(txt(host)).toContain("已保存");
+  });
+
+  test("扫描 says the capability is missing instead of faking the work (REQ-A1195)", async () => {
+    // The nearby list is `NEIGHBORHOOD` — a `$derived` over a static constant — and this
+    // build has no Wi-Fi scan bridge (the Bluetooth half below has `bluetooth_scan_state`).
+    // The button used to answer a tap with a 700 ms `…` busy state that scanned nothing
+    // and could change nothing, so a tap told the user work had happened. Its twin two
+    // sections down says `btScanDenied` instead; this must answer the tap the same way.
+    const host = render(RadioPage, { props: { which: "wifi", qs: qs(), onToggle: () => {} } });
+    const scan = host.container.querySelector(
+      'button[aria-label="扫描"]',
+    ) as HTMLButtonElement | null;
+    expect(scan).toBeTruthy();
+    expect(host.container.querySelector('[data-testid="wifi-scan-note"]')).toBeNull();
+
+    await fireEvent.click(scan as HTMLButtonElement);
+    await tick();
+
+    const note = host.container.querySelector('[data-testid="wifi-scan-note"]');
+    expect(note).toBeTruthy();
+    // It is a sentence naming what is absent — not a busy label on the control.
+    expect(note?.getAttribute("role")).toBe("status");
+    expect(note?.textContent ?? "").toContain("扫描");
+    expect((scan as HTMLButtonElement).textContent ?? "").toContain("扫描");
   });
 
   test("renaming this device persists through lib/bluetooth.renameDevice", async () => {
@@ -1370,6 +1469,44 @@ describe("AiPage — client diagnostics ledger (audit P1-3)", () => {
     expect(counts).toContain(`级别过滤 ${s.suppressed}`);
   });
 
+  test("the row shows the reason and the time, not just the name (REQ-A839)", async () => {
+    // A recorded failure used to reach the panel as `warn · backend · get_status failed` and
+    // stop there: `detail` (the reason) and `ts` (when) were stored, capped, and then dropped
+    // at exactly this render point. The row is where the diagnosis has to be readable.
+    amosWarn("backend", "get_status failed", new Error("host refused: amos.spaces.delete_last"));
+    const host = render(AiPage);
+    await vi.waitFor(() =>
+      expect(host.container.querySelector('[data-testid="ai-diag-item"]')).toBeTruthy(),
+    );
+
+    const items = [...host.container.querySelectorAll('[data-testid="ai-diag-item"]')].map(
+      (el) => el.textContent ?? "",
+    );
+    const row = items.find((t) => t.includes("get_status failed"));
+    expect(row).toBeTruthy();
+    // The timestamp is on the row...
+    expect(row!).toMatch(/\d{2}:\d{2}:\d{2} · warn · backend · get_status failed/);
+
+    // ...and so is the reason, which `JSON.stringify(Error)` would have rendered as `{}`.
+    const detail = host.container.querySelector('[data-testid="ai-diag-detail"]')?.textContent ?? "";
+    expect(detail).toContain("host refused: amos.spaces.delete_last");
+    expect(detail).not.toContain("{}");
+  });
+
+  test("a row logged without a detail stays one line", async () => {
+    amosWarn("backend", "no-detail-row");
+    const host = render(AiPage);
+    await vi.waitFor(() =>
+      expect(host.container.querySelector('[data-testid="ai-diag-item"]')).toBeTruthy(),
+    );
+    // `detail` is `""` for an entry logged without one — the optional span must not render,
+    // or every row would carry a dangling " — ".
+    const rows = [...host.container.querySelectorAll('[data-testid="ai-diag"] li')];
+    const row = rows.find((el) => (el.textContent ?? "").includes("no-detail-row"));
+    expect(row).toBeTruthy();
+    expect(row!.querySelector('[data-testid="ai-diag-detail"]')).toBeNull();
+  });
+
   test("the level selector really changes the policy (and persists it)", async () => {
     const host = render(AiPage);
     const select = (await vi.waitFor(() => {
@@ -1536,6 +1673,122 @@ describe("RadioPage — a switch the platform owns (REQ-A202)", () => {
     );
   });
 
+  test("a refused-write surface that will not open is reported, not swallowed (REQ-A1196)", async () => {
+    // `ctlOpenFailed` has ONE writer (the page's `openRadioSettings()`) and its only render
+    // point sat INSIDE `{#if ctlState.managed}` — while a refusal can only be raised when
+    // the radio is *not* managed (a platform-owned switch never reaches `radio_set`). So on
+    // this path the verdict was written and then drawn nowhere: the user taps 「打开系统设置」
+    // and nothing is said, which is the exact shape `lib/quickRadio.ts` exists to remove.
+    // The desktop Control Center reports the same verdict outside any managed block.
+    installBridge({ managed: false, openOk: false });
+    const host = render(RadioPage, {
+      props: {
+        which: "wifi",
+        qs: qs(),
+        onToggle: () => {},
+        refusal: { noteKey: "radio.refused.device", surface: "wifi_panel" },
+      },
+    });
+    await vi.waitFor(() =>
+      expect(
+        host.container.querySelector('[data-testid="radio-refused-open-settings"]'),
+      ).toBeTruthy(),
+    );
+    // Nothing is claimed before the tap: the surface has not been tried yet.
+    expect(host.container.querySelector('[data-testid="radio-refused-open-failed"]')).toBeNull();
+    await fireEvent.click(
+      host.container.querySelector(
+        '[data-testid="radio-refused-open-settings"]',
+      ) as HTMLButtonElement,
+    );
+    await vi.waitFor(() =>
+      expect(
+        host.container.querySelector('[data-testid="radio-refused-open-failed"]')?.textContent,
+      ).toContain(zh["radio.openSettingsFailed"]),
+    );
+  });
+
+  test("the verdict drawn is the one asked about the radio on screen (REQ-A1211)", async () => {
+    // `radio_control` answers **per radio**, but this page asked it once per component
+    // instance (`ctlRead` latch) — and the instance is *not* remounted when the user
+    // moves between 无线局域网 and 蓝牙, because `SettingsApp` renders both from the one
+    // `{#if page === "wifi" || page === "bluetooth"}` branch (the tablet sidebar swaps
+    // `page` directly). So the Bluetooth page drew the Wi-Fi radio's answer: `managed`
+    // came from the other radio while the sentence was re-worded for this one, greying
+    // out a switch the app may in fact move and claiming the platform owns it.
+    // The shared `installBridge` cannot express this: it answers one value for every key.
+    (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string, args?: Record<string, unknown>) => {
+        if (cmd !== "radio_control") return null;
+        return args?.key === "wifi"
+          ? { radio: "wifi", app_controlled: false, surface: "wifi_panel", reason: "switch_removed" }
+          : { radio: "bluetooth", app_controlled: true, surface: null, reason: null };
+      },
+      listen: async () => () => {},
+    };
+    const host = render(RadioPage, { props: { which: "wifi", qs: qs(), onToggle: () => {} } });
+    await vi.waitFor(() =>
+      expect(
+        host.container.querySelector('[data-testid="radio-managed-note"]')?.textContent,
+      ).toContain(zh["radio.managed.wifi"]),
+    );
+    // The same instance is moved to the Bluetooth page.
+    await host.rerender({ which: "bluetooth" });
+    await vi.waitFor(() =>
+      expect(host.container.querySelector('[data-testid="radio-managed-note"]')).toBeNull(),
+    );
+    expect((switchByLabel(host, zh["settings.bluetooth"]) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  test("an open-settings attempt reports on the page it was made from (REQ-A1218)", async () => {
+    // REQ-A1216 guarded the `radio_control` reply that lands after the page moved on
+    // (`if (key !== which) return;`) — but `openRadioSettings` writes its own verdict
+    // (`ctlOpenFailed`) after *its* await with no such check, and it is offered by the
+    // very same managed block. On Android 13+ both radios are usually the platform's, so
+    // a tap on the Wi-Fi page's 「打开系统设置」 that lands after the user moved to
+    // Bluetooth reports a Wi-Fi tap's failure under the Bluetooth switch — a claim about
+    // a tap nobody made on this page.
+    let release: ((ok: boolean) => void) | null = null;
+    (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {
+      invoke: (cmd: string) => {
+        if (cmd === "radio_control") {
+          return Promise.resolve({
+            radio: "wifi",
+            app_controlled: false,
+            surface: "wifi_panel",
+            reason: "switch_removed",
+          });
+        }
+        if (cmd === "radio_open_settings") {
+          return new Promise<boolean>((r) => (release = r));
+        }
+        return Promise.resolve(null);
+      },
+      listen: async () => () => {},
+    };
+    const host = render(RadioPage, { props: { which: "wifi", qs: qs(), onToggle: () => {} } });
+    await vi.waitFor(() =>
+      expect(host.container.querySelector('[data-testid="radio-open-settings"]')).toBeTruthy(),
+    );
+    // Tap 「打开系统设置」, then leave the page while the platform is still answering.
+    await fireEvent.click(
+      host.container.querySelector('[data-testid="radio-open-settings"]') as HTMLButtonElement,
+    );
+    await host.rerender({ which: "bluetooth" });
+    await vi.waitFor(() =>
+      expect(host.container.querySelector('[data-testid="radio-open-settings"]')).toBeTruthy(),
+    );
+    // The Wi-Fi tap is answered — after the user is no longer on the Wi-Fi page.
+    (release as unknown as (ok: boolean) => void)(false);
+    await tick();
+    await new Promise<void>((r) => setTimeout(r, 0));
+    await tick();
+    expect(
+      host.container.querySelector('[data-testid="radio-open-failed"]'),
+      "the Wi-Fi tap's failure must not be reported under the Bluetooth switch",
+    ).toBeNull();
+  });
+
   test("a refusal nobody understands still says something was refused (REQ-A203)", async () => {
     // The reason may not be invented, but "the tap did nothing" is itself a fact the
     // screen owes the user.
@@ -1558,6 +1811,8 @@ describe("RadioPage — a switch the platform owns (REQ-A202)", () => {
 describe("NotificationsPage — the push backend section (REQ-A383)", () => {
   type PushStatusReply = {
     available: boolean;
+    /** REQ-A865 — `null` = this build binds no OS permission API. See `RustPushStatus`. */
+    permission_backend: string | null;
     device_token: { token: string; environment: string; registered_at: string } | null;
     permission: string;
     badge_count: number;
@@ -1570,8 +1825,17 @@ describe("NotificationsPage — the push backend section (REQ-A383)", () => {
     };
   };
 
+  /**
+   * `permission_backend: null` is the default **because that is what the Rust side really
+   * answers** — `permission_backend()` returns `None` on every target this tree builds, so
+   * a fixture that names one is describing a host this build cannot produce. Tests about
+   * the request button therefore have to say so out loud (`push_permission_backend`), which
+   * is the point: the fixture that used to stand here quietly assumed the fabricated
+   * `authorized` was reachable.
+   */
   const status = (over: Partial<PushStatusReply> = {}): PushStatusReply => ({
     available: true,
+    permission_backend: null,
     device_token: null,
     permission: "notdetermined",
     badge_count: 0,
@@ -1579,8 +1843,20 @@ describe("NotificationsPage — the push backend section (REQ-A383)", () => {
     ...over,
   });
 
-  /** A host that answers the push commands, so the page's wiring is observable. */
-  function installPushBridge(initial: PushStatusReply, after: Partial<PushStatusReply> = {}) {
+  /**
+   * A host that answers the push commands, so the page's wiring is observable.
+   *
+   * `permissionReply` is the `PushResult` the host gives `push_request_permission`, and it
+   * is required rather than defaulted: the real host refuses (`Unavailable`, no permission
+   * backend), so a test that wants to see the granted branch has to ask for it — and a new
+   * caller cannot inherit a silent `{kind:"ok"}` the way the old default did.
+   */
+  function installPushBridge(
+    initial: PushStatusReply,
+    opts: { permissionReply: unknown; after?: Partial<PushStatusReply> } = {
+      permissionReply: { kind: "unavailable", reason: "no backend in this build" },
+    },
+  ) {
     const calls: string[] = [];
     let current = initial;
     (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {
@@ -1590,8 +1866,12 @@ describe("NotificationsPage — the push backend section (REQ-A383)", () => {
           case "push_get_status":
             return current;
           case "push_request_permission":
-            current = status({ ...after, permission: after.permission ?? "authorized" });
-            return { kind: "ok" };
+            // A host only moves the permission when the reply is a grant — which is what
+            // the real command now refuses to do without a backend.
+            if ((opts.permissionReply as { kind?: string } | null)?.kind === "ok") {
+              current = status({ ...opts.after, permission: "authorized" });
+            }
+            return opts.permissionReply;
           case "push_clear_history":
             return null;
           default:
@@ -1623,18 +1903,67 @@ describe("NotificationsPage — the push backend section (REQ-A383)", () => {
     expect(txt(host)).not.toContain(zh["pushPermission.description"]);
   });
 
-  test("the permission request goes to the backend and the page re-reads the device", async () => {
+  // REQ-A865 / F-DEV-116. The production truth: no target in this tree binds a permission
+  // API, so this is the branch the shipped build actually takes.
+  test("a host with no permission API offers no request button, and says why", async () => {
     const calls = installPushBridge(status());
     const host = render(NotificationsPage);
     await vi.waitFor(() => expect(txt(host)).toContain(zh["pushPermission.description"]));
 
+    // The sentence, not a silent gap: the panel is otherwise fully populated (token,
+    // statistics, history all render), so an absent button with no explanation would read
+    // as a broken page rather than as the one capability this build lacks.
+    expect(txt(host)).toContain(zh["pushPermission.noBackend"]);
+    expect(buttonContaining(host, zh["pushPermission.request"])).toBeUndefined();
+    // And nothing claims a grant. This is the assertion the old code failed: the panel used
+    // to print the success sentence off the `authorized` the host wrote into itself.
+    expect(txt(host)).not.toContain(zh["pushPermission.successDescription"]);
+    // Not even asked — a button that cannot work must not spend a round trip.
+    expect(calls).not.toContain("push_request_permission");
+  });
+
+  test("a declared permission backend draws the button, and a grant renders the success sentence", async () => {
+    // A host that *does* have a backend: the only shape in which `authorized` is reachable,
+    // and therefore the only honest way to test what the page does with it.
+    const calls = installPushBridge(status({ permission_backend: "UNUserNotificationCenter" }), {
+      permissionReply: { kind: "ok" },
+    });
+    const host = render(NotificationsPage);
+    await vi.waitFor(() => expect(txt(host)).toContain(zh["pushPermission.request"]));
+
     await fireEvent.click(buttonContaining(host, zh["pushPermission.request"]) as HTMLButtonElement);
-    await vi.waitFor(() =>
-      expect(txt(host)).toContain(zh["pushPermission.successDescription"]),
-    );
+    await vi.waitFor(() => expect(txt(host)).toContain(zh["pushPermission.successDescription"]));
     expect(calls).toContain("push_request_permission");
     // The authorized state no longer offers the request button.
     expect(buttonContaining(host, zh["pushPermission.request"])).toBeUndefined();
+  });
+
+  test("a refused permission request is reported under the button that was pressed", async () => {
+    installPushBridge(status({ permission_backend: "UNUserNotificationCenter" }), {
+      permissionReply: { kind: "unavailable", reason: "no UNUserNotificationCenter glue" },
+    });
+    const host = render(NotificationsPage);
+    await vi.waitFor(() => expect(txt(host)).toContain(zh["pushPermission.request"]));
+
+    await fireEvent.click(buttonContaining(host, zh["pushPermission.request"]) as HTMLButtonElement);
+    await vi.waitFor(() =>
+      expect(txt(host)).toContain(zh["pushPermission.requestFailed"].replace("{reason}", "")),
+    );
+    // In the block that owns the control — not at the bottom of the section where the
+    // clear-history refusal lives, where the user would not connect it to this button.
+    const block = host.container.querySelector('[data-testid="push-permission"]');
+    expect(block?.querySelector('[data-testid="push-permission-error"]')).not.toBeNull();
+    // And the reason the host gave has a reader, rather than being dropped one layer down.
+    expect(block?.textContent ?? "").toContain("no UNUserNotificationCenter glue");
+    // A refusal is not a grant: no success is claimed …
+    expect(txt(host)).not.toContain(zh["pushPermission.successDescription"]);
+    // … and the button comes back, on the settled view rather than the busy one. Waiting on
+    // the verdict instead of a timer: the refusal sentence is set *before* `loadPush()`, so
+    // asserting immediately would read the button mid-request — where it correctly says
+    // 「正在请求权限...」 — and call a working control a missing one.
+    await vi.waitFor(() =>
+      expect(buttonContaining(host, zh["pushPermission.request"])).toBeTruthy(),
+    );
   });
 
   test("a denied permission says so, and points at the system settings", async () => {

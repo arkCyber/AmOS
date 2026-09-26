@@ -2,7 +2,15 @@
  * Pure unit tests for the offline-safe AmOS terminal line model (lib/terminal.ts).
  */
 import { describe, expect, test } from "bun:test";
-import { runTermLine, pushHistory, capLines, termBanner, ptySizeFor } from "../lib/terminal";
+import {
+  runTermLine,
+  pushHistory,
+  capLines,
+  termBanner,
+  ptySizeFor,
+  termRefused,
+  termRefusalReason,
+} from "../lib/terminal";
 
 const last = (ls: unknown[]): unknown => ls[ls.length - 1];
 const lastText = (ls: readonly { text: string }[]): string | undefined =>
@@ -110,5 +118,28 @@ describe("terminal PTY window size", () => {
     expect(ptySizeFor({ width: 0, height: 400, charW: 8, charH: 16 })).toBeNull();
     expect(ptySizeFor({ width: 800, height: 400, charW: 0, charH: 16 })).toBeNull();
     expect(ptySizeFor({ width: 800, height: NaN, charW: 8, charH: 16 })).toBeNull();
+  });
+});
+
+describe("terminal TermOut failure channel", () => {
+  test("a refusal is a value: id 0 + a non-empty error, never a throw", () => {
+    expect(termRefused({ id: 0, error: "unknown or ended session", running: false })).toBe(true);
+    expect(termRefusalReason({ id: 0, error: "unknown or ended session", running: false })).toBe(
+      "unknown or ended session",
+    );
+    // No bridge at all is the same failure, with no reason to quote.
+    expect(termRefused(null)).toBe(true);
+    expect(termRefusalReason(null)).toBe("");
+  });
+
+  test("a successful term_kill answers id 0 with an EMPTY error — not a refusal", () => {
+    // `term_kill` on success answers `ok(0, None, false)` (terminal.rs:372): the session it
+    // named is gone, so there is no id to return. A predicate that read `id === 0` as the
+    // failure test would log a completed kill as unconfirmed — a false reason, which is
+    // worse than none.
+    expect(termRefused({ id: 0, error: "", running: false })).toBe(false);
+    expect(termRefusalReason({ id: 0, error: "", running: false })).toBe("");
+    // The other four succeed with a live id.
+    expect(termRefused({ id: 7, error: "", running: true })).toBe(false);
   });
 });

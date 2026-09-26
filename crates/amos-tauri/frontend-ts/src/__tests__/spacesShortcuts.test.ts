@@ -1,31 +1,25 @@
 /**
  * Spaces 快捷键导航逻辑测试
  *
- * 测试 DesktopShell 中 Ctrl+←/→/↑ 三个全局快捷键的**纯决策**部分：
+ * 测试桌面壳 Ctrl+← / Ctrl+→ 两条导航快捷键的**纯决策**部分：
  *   * `Ctrl+←`: prevSpaceIndex(current, count) — 循环到上一个
  *   * `Ctrl+→`: nextSpaceIndex(current, count) — 循环到下一个
- *   * `Ctrl+↑`: newSpaceName(count) + indexOfCreatedSpace(list, id) — 新建并跳转
  *
- * 这些函数是从 DesktopShell.svelte 抽出来的(REQ-A340),之前 inline 在
- * handler 里,测试只能 re-implement 同样的表达式,根本测不到 production
- * 代码 —— 修这一处就是把"测试在测自己"这种 defect 关闭掉,让测试
- * 真的钉住 production 的行为。
+ * 这两条函数从 handler 里抽出来(REQ-A340)是为了让测试真的钉住
+ * production 的行为,而不是 re-implement 同样的表达式("测试在测自己")。
+ * 同一个 `SpacesPanel` 也复用它们 (REQ-A554) —— 一份循环规则,两个消费者。
+ *
+ * 注意:快捷方式表里**没有**新建桌面这一条 —— `Ctrl+↑` 是 `spacesPanel`
+ * (打开/关闭本面板),新建走面板上的按钮。从前这里断言过一对
+ * `newSpaceName` / `indexOfCreatedSpace` 辅助函数,而它们描述的那条
+ * "Ctrl+↑ 新建并跳转"的流程在宿主侧根本不存在,已删除 (REQ-A554)。
  *
  * 桥的部分(`switchSpace` / `createSpace` / `listSpaces`)在
- * svelte-tests/spaces-shell-shortcuts.svelte.test.ts 里通过 fake bridge
- * 验。
+ * svelte-tests/spaces.svelte.test.ts 里通过 fake bridge 验。
  */
 
 import { describe, it, expect } from "bun:test";
-import {
-  indexOfCreatedSpace,
-  newSpaceName,
-  nextSpaceIndex,
-  prevSpaceIndex,
-} from "../lib/spaces";
-
-const sample = (n: number): readonly { id: string }[] =>
-  Array.from({ length: n }, (_, i) => ({ id: `space-${i}` }));
+import { nextSpaceIndex, prevSpaceIndex } from "../lib/spaces";
 
 describe("Spaces navigation logic", () => {
   describe("Previous space (Ctrl+←) — prevSpaceIndex", () => {
@@ -74,28 +68,6 @@ describe("Spaces navigation logic", () => {
 
     it("returns 0 when there are no spaces at all (right)", () => {
       expect(nextSpaceIndex(0, 0)).toBe(0);
-    });
-  });
-
-  describe("New space creation (Ctrl+↑) — newSpaceName", () => {
-    it("appends one to the current count", () => {
-      expect(newSpaceName(2)).toBe("Space 3");
-    });
-
-    it("starts from one when the listing is empty", () => {
-      expect(newSpaceName(0)).toBe("Space 1");
-    });
-  });
-
-  describe("Locate the just-created space — indexOfCreatedSpace", () => {
-    it("returns the index of the matching id in the refreshed list", () => {
-      const list = sample(3).map((s, i) => ({ ...s, id: i === 2 ? "space-3" : `space-${i}` }));
-      expect(indexOfCreatedSpace(list, "space-3")).toBe(2);
-    });
-
-    it("returns -1 when the host snapshot does not contain the new id", () => {
-      const list = sample(2);
-      expect(indexOfCreatedSpace(list, "space-999")).toBe(-1);
     });
   });
 

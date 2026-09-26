@@ -102,6 +102,18 @@ export function mergePushHistory(
 }
 
 /**
+ * Pure: keep **only** the push-delivered rows (immutable) — the exact complement of
+ * `dropPushNotifs` above, and the reason the rule ("a push row is one whose `source` is
+ * `"push"`") lives here rather than being re-written by each surface that needs it.
+ *
+ * Used by the 「推送通知管理」page's history list: system-made notifications are the
+ * 「通知」page's business, not this one's.
+ */
+export function pushOnly(list: Notif[]): Notif[] {
+  return list.filter((n) => n.source === "push");
+}
+
+/**
  * Pure: drop every **push** notification from the list (immutable). This is the
  * local half of "clear push history" — the Rust history is cleared separately, and
  * doing one without the other would leave the list showing what the store no

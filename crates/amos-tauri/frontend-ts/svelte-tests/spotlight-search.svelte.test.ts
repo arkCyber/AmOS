@@ -139,4 +139,27 @@ describe("SpotlightOverlay — calculation + file rows (REQ-A458)", () => {
     await search(container, "7 days");
     expect(row(container, "calc")).toBeNull();
   });
+  test("a file row whose wm_open is refused says so (the reveal was reported, the door was not)", async () => {
+    // REQ-A1187: `activate`'s `file` branch reports the **store-write** refusal and then
+    // fired `void wmOpen("files")`, dropping the door's verdict — a refused open there was a
+    // closed panel over the desktop with a reason only the shared ledger recorded.
+    const internals = (
+      window as unknown as { __TAURI_INTERNALS__: { invoke: (c: string, a?: unknown) => unknown } }
+    ).__TAURI_INTERNALS__!;
+    const inner = internals.invoke;
+    internals.invoke = (cmd: string, args?: Record<string, unknown>) =>
+      cmd === "wm_open" ? Promise.reject({ code: "amos.wm.window_cap" }) : inner(cmd, args);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const { container } = render(SpotlightOverlay, { props: { onclose: () => {} } });
+    await tick();
+    await search(container, "报告");
+    await fireEvent.click(row(container, "file")!);
+    await settle();
+
+    expect(warn.mock.calls.map((c) => c.join(" ")).join("\n")).toContain(
+      "[Spotlight] wm_open(files) refused",
+    );
+    warn.mockRestore();
+  });
 });

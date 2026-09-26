@@ -59,32 +59,43 @@ pub mod error;
 pub mod hostfs;
 pub mod manager;
 pub mod mapping;
+pub mod protocol;
 pub mod provider;
 pub mod range;
 pub mod spec;
 
-// `protocol.rs` exists in this tree as a **draft** for REQ-A302 (stream media
-// bytes over `amos-media://`). It is NOT yet wired into the lib nor a
-// `pub mod` declaration: the file uses a half-finished API surface
-// (`range::UnknownPlan`, `MediaRequest`, `MediaManager::read_range`) that
-// `range.rs` and `manager.rs` do not export today. Once those are settled
-// the module declaration lands here, the file's first 1–2 lines change to
-// `use crate::…` to match the actual current crate shape, and a *narrow*
-// re-export set re-applies the public types callers will need. Until then,
-// `protocol.rs` stays in the tree so the design notes next to it survive
-// and can be picked up by the next round — but it is not part of the build.
+// `protocol.rs` used to be an **orphan draft** (REQ-A302): the file sat in `src/` for many
+// rounds with `pub mod` commented out, because it was written against an API surface that
+// did not exist yet. Its own banner listed what was missing, and the list went stale as
+// later rounds landed the pieces:
 //
-// pub mod protocol;
+//   * `MediaManager::read_range` — landed (`manager.rs`, granted exactly like `load`);
+//   * `Vec<MediaItem>.items` — a real mismatch, and the activation is what exposed it:
+//     `manager.rs::list` returns a plain `Vec<MediaItem>`; the `MediaListing` the draft
+//     meant is the *frontend* paging wrapper (`frontend-ts/src/lib/media.ts`, REQ-A316);
+//   * `MediaRequest` / `ProtocolError` — *never* declared by the draft either; nothing in
+//     the tree referenced them, so the activation simply does not export them;
+//   * `range::UnknownPlan` / `plan_unknown` / `content_range_unknown` — the one real gap,
+//     and the reason the activation round could not be a mere `pub mod`: the unknown-length
+//     planning the file documents (RFC 7233 §4.2 `bytes a-b/*`) now lives in `range.rs`,
+//     beside the length-known planner, with its own tests.
 //
-// pub use protocol::{base_url, parse_uri, MediaReply, MediaRequest, ProtocolError};
+// The module is now part of the build and part of the test matrix. What is still *not*
+// done is the wiring above this layer: `amos-tauri` does not register the `amos-media://`
+// scheme yet, and the player still resolves a whole-item blob URL, so `MAX_PLAY_BYTES`
+// remains in force. See docs/media-player.md §8.
 
 pub use error::{MediaError, Result};
 pub use hostfs::HostFsProvider;
 pub use manager::{Grant, MediaManager};
+pub use protocol::{
+    base_url, base_url_for, media_url, parse_uri, serve, MediaReply, MAX_BODY_BYTES, SCHEME,
+};
 pub use provider::{MediaProvider, MockMediaProvider, MAX_LOAD_BYTES, MAX_SAVE_BYTES};
 pub use range::{
-    clamp_window, content_range, content_range_unsatisfied, parse_range, plan_response, status_for,
-    window_for, window_len, RangeSpec, ResponsePlan, MAX_RANGE_BYTES,
+    clamp_window, content_range, content_range_unknown, content_range_unsatisfied, parse_range,
+    plan_response, plan_unknown, status_for, window_for, window_len, RangeSpec, ResponsePlan,
+    UnknownPlan, MAX_RANGE_BYTES,
 };
 pub use spec::{AccessKind, MediaItem, MediaKind, StandardDir};
 

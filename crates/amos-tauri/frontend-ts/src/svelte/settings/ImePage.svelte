@@ -27,9 +27,16 @@
   import { t } from "../locale.svelte";
   import { GROUP, ROW, LABEL, HINT, SUB } from "./kit";
   import ToggleRow from "./ToggleRow.svelte";
+  import StoreErrorBar from "../StoreErrorBar.svelte";
 
   let enabled = $state(readImeEnabled());
   let engine = $state<ImeState | null>(null);
+  /**
+   * The store's refusal of this page's own switch (REQ-A1432). The switch **is** the success
+   * report — it shows the value just written — so it may not move when the write was refused.
+   * Its own sentence is said here, next to the control that carries it.
+   */
+  let storeErr = $state("");
   /** The readout the last command answered with; `null` until the engine replies. */
   let asked = $state(false);
   // "Forget every learned word" cannot be undone, so it asks once.
@@ -43,8 +50,15 @@
   }
 
   function toggleEnabled(): void {
-    enabled = !enabled;
-    writeImeEnabled(enabled);
+    const next = !enabled;
+    // The switch only moves once the preference has landed: it draws the value just written,
+    // and a refused `setItem` leaves `amos-ui.ime` on the old one (REQ-A1432).
+    if (!writeImeEnabled(next)) {
+      storeErr = t("common.storeWriteFailed");
+      return;
+    }
+    storeErr = "";
+    enabled = next;
   }
 
   function togglePair(pair: string): void {
@@ -73,6 +87,10 @@
     const onStore = (e: Event) => {
       const key = (e as CustomEvent<{ key?: string }>).detail?.key;
       if (key !== IME_ENABLED_KEY) return;
+      // This event is dispatched **only after** a write landed, so the store has just proved
+      // itself writable: the refusal sentence describes a condition that no longer holds
+      // (the same reason `RadioPage`'s `saveCfg` clears its own refusal on success).
+      storeErr = "";
       enabled = readImeEnabled();
     };
     window.addEventListener(STORE_CHANGED_EVENT, onStore);
@@ -86,6 +104,13 @@
     on={enabled}
     ontoggle={toggleEnabled}
   />
+  {#if storeErr}
+    <!-- 渲染在**它自己的控件那一块**里（这里是那个开关的正下方），不是页面别处：一条用户
+         接不到刚按下的那个开关上的拒绝，读起来就是「什么也没发生」（F-SH-270 的形状）。 -->
+    <div class="px-4 pb-3" data-testid="settings-ime-store-error">
+      <StoreErrorBar message={storeErr} />
+    </div>
+  {/if}
 </section>
 <div class="px-1">
   <p class={HINT}>{t("settings.imeHint")}</p>

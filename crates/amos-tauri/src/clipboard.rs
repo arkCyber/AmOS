@@ -18,10 +18,15 @@
 //!   path lets the container feed native copies back in (`clipboard_glue`,
 //!   feature `android`).
 //!
+//! * **Bounded delivery** — a window opts in with `clipboard_subscribe` (its label is injected
+//!   by Tauri, never caller-supplied) and then receives at most [`CLIPBOARD_EVENTS_PER_SEC`]
+//!   `clipboard-changed` notices per second; a JS copy loop can not flood the WebView
+//!   (F-CLB-002). A `Uris` copy is capped at [`MAX_RECIPIENTS_PER_COPY`] entries.
+//!
 //! Commands: `clipboard_write`, `clipboard_read`, `clipboard_history`,
-//! `clipboard_clear`.
+//! `clipboard_clear`, `clipboard_subscribe`.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -39,13 +44,66 @@ const MAX_TEXT_LEN: usize = 1 << 20;
 const MAX_HTML_LEN: usize = 2 << 20;
 /// Upper bound on an image payload's base64 size.
 const MAX_IMAGE_B64_LEN: usize = 24 << 20;
-/// Upper bound on the number of URIs in a single copy.
-const MAX_URIS: usize = 64;
+
+/// Maximum number of URIs — "recipients"/files attached to a single copy — one
+/// `clipboard_write` may carry.
+///
+/// The `Uris` flavour is the only payload whose size is a **list** rather than a
+/// string, so it is the one place a caller could hand in an unbounded collection
+/// (each URI is re-validated, serialized into the history entry, mirrored out, and
+/// re-broadcast). A real multi-select copy is a handful of files, so 64 is generous
+/// while keeping the validation work and the retained entry bounded (F-CLB-002's
+/// sibling: the copy itself must not be able to DoS the bridge).
+pub const MAX_RECIPIENTS_PER_COPY: usize = 64;
+/// Upper bound on the number of URIs in a single copy (the validator's spelling of
+/// [`MAX_RECIPIENTS_PER_COPY`]).
+const MAX_URIS: usize = MAX_RECIPIENTS_PER_COPY;
+
+/// Maximum `clipboard-changed` notices a **single subscribed window** may receive per
+/// second.
+///
+/// A tight JS loop calling `clipboard_write` would otherwise emit one WebView event per
+/// call, so a copy that fails to coalesce into the history still floods the renderer
+/// (F-CLB-002). 100/s is far above any human copy cadence and far below the rate that
+/// would starve the WebView's event loop.
+pub const CLIPBOARD_EVENTS_PER_SEC: u32 = 100;
+
+/// Hard cap on the number of windows tracked by the clipboard event bus.
+///
+/// Each shell window subscribes with its **own** label (injected by Tauri, never
+/// caller-supplied), so the registry is bounded by the window manager's own window count;
+/// this constant is the backstop that turns a hypothetical leak into an audited eviction
+/// instead of unbounded growth.
+pub const MAX_CLIPBOARD_SUBSCRIBERS: usize = 32;
 /// Upper bound on a clipboard `source` label the WebView hands in via
 /// `clipboard_write` (the label is mirrored into every clipboard history entry
 /// and broadcast on `clipboard-changed`, so a paste-sized label would inflate
 /// every subsequent notice).
 const MAX_CLIPBOARD_SOURCE_BYTES: usize = 256;
+
+/// (Policy helper, pure) Validate a clipboard `source` label before it is stored.
+///
+/// Two refusals, both deliberate:
+/// - **Empty** — a blank label makes a history row indistinguishable from a
+///   WebView that simply forgot to pass one (`source=""` and "no source given"
+///   would render the same). The default is the caller's window label, so an
+///   empty string here is always an explicit, and meaningless, value.
+/// - **Over the cap** — the label is mirrored into every history entry and every
+///   `clipboard-changed` notice, so an unbounded one inflates all of them.
+///
+/// Extracted so the boundary is unit-testable without a live Tauri `AppHandle`.
+fn check_source(src: &str) -> Result<(), String> {
+    if src.is_empty() {
+        return Err("clipboard source must not be empty".to_string());
+    }
+    if src.len() > MAX_CLIPBOARD_SOURCE_BYTES {
+        return Err(format!(
+            "clipboard source too long: {} bytes (max {MAX_CLIPBOARD_SOURCE_BYTES})",
+            src.len()
+        ));
+    }
+    Ok(())
+}
 
 /// One copy operation's payload. The OS clipboard is multi-format: one copy can
 /// carry several representations, and the pasting app picks the richest one it
@@ -200,6 +258,193 @@ impl From<&ClipboardEntry> for ClipboardNotice {
             seq: e.seq,
             timestamp_ms: e.timestamp_ms,
             source: e.source.clone(),
+        }
+    }
+}
+
+/// Opaque handle a window receives from `clipboard_subscribe`, identifying its
+/// subscription for the lifetime of the process (ids are never reused).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct SubscriptionId(
+    /// Monotonic id; `0` is never handed out (the `next` counter starts at 1).
+    pub u64,
+);
+
+/// Per-window event accounting: a token bucket (100 notices/s, burst 100) plus the
+/// subscription's identity. Kept as a plain struct so the whole policy is testable without a
+/// running Tauri app or a wall clock.
+struct Subscriber {
+    id: u64,
+    /// Tokens available now (filled at continuous [`CLIPBOARD_EVENTS_PER_SEC`]).
+    tokens: f64,
+    /// Wall-clock ms of the last refill/consume.
+    last_ms: u64,
+}
+
+/// The clipboard event bus: which windows asked to hear `clipboard-changed`, and how much
+/// each of them has been told recently.
+#[derive(Default)]
+struct EventBus {
+    next_id: u64,
+    subs: HashMap<String, Subscriber>,
+    /// Notices dropped because a window was over budget (diagnostics; never silent).
+    dropped: u64,
+    /// Subscriptions dropped because the registry was at [`MAX_CLIPBOARD_SUBSCRIBERS`].
+    evicted: u64,
+}
+
+impl EventBus {
+    /// Register (or refresh) `label`, returning its stable subscription id.
+    ///
+    /// Idempotent per label: the same window re-subscribing keeps its id and its bucket, so a
+    /// JS loop cannot inflate the registry. A **new** label while the registry is full evicts the
+    /// least-recently-seen subscription (counted in `evicted`) rather than growing unbounded.
+    fn subscribe(&mut self, label: &str, now: u64) -> SubscriptionId {
+        if let Some(s) = self.subs.get_mut(label) {
+            s.last_ms = now;
+            return SubscriptionId(s.id);
+        }
+        if self.subs.len() >= MAX_CLIPBOARD_SUBSCRIBERS {
+            if let Some(oldest) = self
+                .subs
+                .iter()
+                .min_by_key(|(_, s)| s.last_ms)
+                .map(|(k, _)| k.clone())
+            {
+                self.subs.remove(&oldest);
+                self.evicted += 1;
+            }
+        }
+        self.next_id += 1;
+        let id = self.next_id;
+        self.subs.insert(
+            label.to_string(),
+            Subscriber {
+                id,
+                tokens: CLIPBOARD_EVENTS_PER_SEC as f64,
+                last_ms: now,
+            },
+        );
+        SubscriptionId(id)
+    }
+
+    /// Refill `label`'s bucket to `now` and consume one token if there is one.
+    fn allow(&mut self, label: &str, now: u64) -> bool {
+        let cap = CLIPBOARD_EVENTS_PER_SEC as f64;
+        let Some(s) = self.subs.get_mut(label) else {
+            return false;
+        };
+        let elapsed = now.saturating_sub(s.last_ms);
+        s.tokens = (s.tokens + elapsed as f64 * cap / 1_000.0).min(cap);
+        s.last_ms = now;
+        if s.tokens >= 1.0 {
+            s.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Consume a token for **every** subscribed window, returning the labels that are still
+    /// within budget this instant. Over-budget windows are counted in `dropped`.
+    fn take_allowed(&mut self, now: u64) -> Vec<String> {
+        let labels: Vec<String> = self.subs.keys().cloned().collect();
+        let mut allowed = Vec::new();
+        for label in labels {
+            if self.allow(&label, now) {
+                allowed.push(label);
+            } else {
+                self.dropped += 1;
+            }
+        }
+        allowed
+    }
+
+    fn is_empty(&self) -> bool {
+        self.subs.is_empty()
+    }
+}
+
+/// The process-wide event bus (one registry for the whole app).
+static EVENT_BUS: OnceLock<Mutex<EventBus>> = OnceLock::new();
+
+fn event_bus() -> &'static Mutex<EventBus> {
+    EVENT_BUS.get_or_init(|| Mutex::new(EventBus::default()))
+}
+
+fn lock_bus() -> std::sync::MutexGuard<'static, EventBus> {
+    // Poison-recover: a panic while counting events is not a statement about the user's
+    // clipboard, and the commands must not deadlock on it (same rule as `GlobalClipboard::read`).
+    event_bus().lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Register `label` for `clipboard-changed` notices and return its subscription id.
+///
+/// Infallible by construction: `label` is the **calling window's own** label, injected by Tauri
+/// (see [`clipboard_subscribe`]), never a caller-supplied string — so there is no unbounded input
+/// to reject. The registry is bounded by [`MAX_CLIPBOARD_SUBSCRIBERS`] with an audited eviction.
+pub fn subscribe_window(label: &str) -> SubscriptionId {
+    lock_bus().subscribe(label, now_ms())
+}
+
+/// A snapshot of the event bus's counters (diagnostics / tests).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct ClipboardBusStats {
+    pub subscribers: usize,
+    pub dropped: u64,
+    pub evicted: u64,
+}
+
+/// Read the bus counters (never fabricates: all-zero when nothing subscribed).
+pub fn bus_stats() -> ClipboardBusStats {
+    let b = lock_bus();
+    ClipboardBusStats {
+        subscribers: b.subs.len(),
+        dropped: b.dropped,
+        evicted: b.evicted,
+    }
+}
+
+/// Deliver one `clipboard-changed` notice with per-window throttling.
+///
+/// * **No window has subscribed** → the legacy global broadcast (`app.emit`), so a shell that
+///   never calls `clipboard_subscribe` keeps working exactly as before.
+/// * **At least one window subscribed** → each subscribed window gets `emit_to` **iff** its token
+///   bucket allows it this instant; an over-budget window is counted in `bus_stats().dropped`
+///   rather than flooded. The notice is metadata-only either way ([`ClipboardNotice`]).
+fn broadcast_changed(app: &tauri::AppHandle, entry: &ClipboardEntry) {
+    let notice = ClipboardNotice::from(entry);
+    let labels = {
+        let mut bus = lock_bus();
+        if bus.is_empty() {
+            None
+        } else {
+            Some(bus.take_allowed(now_ms()))
+        }
+    };
+    match labels {
+        None => {
+            if let Err(e) = app.emit("clipboard-changed", notice) {
+                tracing::warn!(
+                    target: "amos::clipboard",
+                    event = "clipboard-changed",
+                    error = %e,
+                    "clipboard-changed notice could not be delivered to the UI"
+                );
+            }
+        }
+        Some(labels) => {
+            for label in labels {
+                if let Err(e) = app.emit_to(label.as_str(), "clipboard-changed", notice.clone()) {
+                    tracing::warn!(
+                        target: "amos::clipboard",
+                        event = "clipboard-changed",
+                        window = %label,
+                        error = %e,
+                        "clipboard-changed notice could not be delivered to the subscribed window"
+                    );
+                }
+            }
         }
     }
 }
@@ -482,28 +727,26 @@ pub fn clipboard_write(
 ) -> Result<ClipboardEntry, String> {
     let caller = window.label().to_string();
     let src = source.unwrap_or_else(|| caller.clone());
-    if src.len() > MAX_CLIPBOARD_SOURCE_BYTES {
-        return Err(format!(
-            "clipboard source too long: {} bytes (max {MAX_CLIPBOARD_SOURCE_BYTES})",
-            src.len()
-        ));
-    }
+    check_source(&src)?;
     let entry = state.write(&src, &caller, payload)?;
     // Best-effort sync to the platform (container) clipboard + notify UIs with a
-    // metadata-only notice (full content is fetched via foreground-gated read).
+    // metadata-only, per-window-throttled notice (full content is fetched via the
+    // foreground-gated read).
     mirror_to_native(&entry);
-    if let Err(e) = app.emit("clipboard-changed", ClipboardNotice::from(&entry)) {
-        // The write itself succeeded, so the copy is real — but no UI would learn that the
-        // clipboard changed. (`emit` errors only for a *registered* listener; no listener is
-        // `Ok`.) Reported rather than discarded.
-        tracing::warn!(
-            target: "amos::clipboard",
-            event = "clipboard-changed",
-            error = %e,
-            "clipboard-changed notice could not be delivered to the UI"
-        );
-    }
+    broadcast_changed(&app, &entry);
     Ok(entry)
+}
+
+/// Tauri command: subscribe the **calling window** to `clipboard-changed` notices.
+///
+/// The window label is injected by Tauri rather than accepted as a string, so a caller cannot
+/// subscribe (or forge a subscription for) another window — the parameter is the identity, not
+/// an argument. Idempotent: re-subscribing returns the same [`SubscriptionId`]. The subscription
+/// only controls *delivery* — the payload is still fetched through the foreground-gated
+/// `clipboard_read`, so subscribing never widens read access.
+#[tauri::command]
+pub fn clipboard_subscribe(window: tauri::WebviewWindow) -> SubscriptionId {
+    subscribe_window(window.label())
 }
 
 /// Tauri command: paste the newest (or a specific `seq`) entry. Foreground-only.
@@ -551,6 +794,22 @@ mod tests {
 
     fn test_clip() -> GlobalClipboard {
         GlobalClipboard::new()
+    }
+
+    #[test]
+    fn the_mirror_text_cap_matches_this_crates_text_cap() {
+        // `amos-clipboard`'s `MAX_MIRROR_TEXT` doc claims "the kernel's own text cap
+        // (`amos-tauri`'s `MAX_TEXT_LEN`) is the same 1 MiB, so a copy the host
+        // accepts is a copy the wire must be able to carry" — but nothing bound the
+        // two. If `MAX_TEXT_LEN` were raised above the wire cap, a copy the host
+        // accepts would silently fail to mirror to the guest (accepted locally,
+        // refused on the wire); the reverse is merely an unused headroom. Pin them.
+        assert_eq!(
+            MAX_TEXT_LEN,
+            amos_clipboard::proto::MAX_MIRROR_TEXT,
+            "amos-tauri MAX_TEXT_LEN ({MAX_TEXT_LEN}) drifted from amos_clipboard::proto::MAX_MIRROR_TEXT ({})",
+            amos_clipboard::proto::MAX_MIRROR_TEXT
+        );
     }
 
     #[test]
@@ -694,12 +953,241 @@ mod tests {
         );
     }
 
+    /// P1-1 from the bridge audit: the source-length boundary was enforced but
+    /// **untested**, so a future edit to "truncate instead of refuse" would have
+    /// gone green. The cap is inclusive; empty is refused outright (the caller's
+    /// window label is the default, so `""` is always an explicit blank).
+    #[test]
+    fn a_clipboard_source_is_refused_when_empty_or_over_the_cap() {
+        assert!(
+            check_source("notes").is_ok(),
+            "a normal label passes through"
+        );
+        let at_cap = "x".repeat(MAX_CLIPBOARD_SOURCE_BYTES);
+        assert!(check_source(&at_cap).is_ok(), "exactly the cap is allowed");
+
+        let over = "x".repeat(MAX_CLIPBOARD_SOURCE_BYTES + 1);
+        let err = check_source(&over).expect_err("one past the cap is refused");
+        assert!(err.contains("too long"), "unexpected message: {err}");
+
+        assert!(
+            check_source("").is_err(),
+            "an empty source is refused, not silently stored as a blank origin"
+        );
+    }
+
     #[test]
     fn ingest_and_native_sink_defaults_are_honest_noops() {
         assert!(!ingest_native_text("android:container", "from android"));
         assert!(!has_native_sink());
         let c = test_clip();
         assert!(c.latest().is_none(), "nothing fabricated");
+    }
+
+    /// The body of a `pub fn <name>(…) { … }` in this file, as source text.
+    fn command_body<'a>(src: &'a str, fname: &str) -> &'a str {
+        let marker = format!("pub fn {fname}(");
+        let start = src
+            .find(&marker)
+            .unwrap_or_else(|| panic!("{fname} must exist"));
+        let end = src[start..]
+            .find("\n}")
+            .map(|o| start + o)
+            .unwrap_or(src.len());
+        &src[start..end]
+    }
+
+    /// The single statement in `body` that calls `require_foreground`, trimmed.
+    ///
+    /// Returns the *statement*, not the match: `let _ = require_foreground(…)` and
+    /// `require_foreground(…)?` both contain the call, and only one of them denies.
+    fn gate_statement<'a>(body: &'a str, fname: &str) -> &'a str {
+        let at = body.find("require_foreground(").unwrap_or_else(|| {
+            panic!(
+                "{fname} must gate its read through require_foreground — a background window \
+                 draining the foreground's clipboard is the F-CLB-001 privacy failure"
+            )
+        });
+        let tail = &body[at..];
+        let semi = tail.find(';').unwrap_or(tail.len());
+        tail[..semi].trim()
+    }
+
+    /// The audit that every clipboard **read** command is foreground-gated. This is a
+    /// source-level pin so the negative control is a host test: deleting
+    /// `require_foreground(…)` from `clipboard_history` makes this fail (TODO 5.3).
+    ///
+    /// **Presence is not propagation.** The first version of this pin asked only whether the
+    /// call's *name* appeared anywhere in the body, so `let _ = require_foreground(…)` — the
+    /// refusal computed and then dropped — left it green (measured: 21/21 passed with the gate
+    /// neutralized) while a background window could drain the foreground's clipboard, which is
+    /// exactly the F-CLB-001 privacy failure this row's `Test Protection` column cites. The
+    /// guard is therefore pinned as the body's own statement: the call **is** the statement and
+    /// its refusal is propagated with `?`, not merely mentioned.
+    #[test]
+    fn every_read_command_propagates_require_foreground() {
+        const SRC: &str = include_str!("clipboard.rs");
+        for fname in ["clipboard_read", "clipboard_history", "clipboard_clear"] {
+            let stmt = gate_statement(command_body(SRC, fname), fname);
+            assert!(
+                stmt.starts_with("require_foreground("),
+                "{fname}'s gate must *be* the statement, not a value handed to something else \
+                 (a discarded `Result` denies nothing): got `{stmt}`"
+            );
+            assert!(
+                stmt.ends_with(")?"),
+                "{fname} must propagate the gate's refusal with `?` — computing it and dropping \
+                 it leaves a background window able to read: got `{stmt}`"
+            );
+        }
+        // …and the contrast that makes it meaningful: **write** is deliberately not gated
+        // (copying from a background app is not the attack).
+        assert!(
+            !command_body(SRC, "clipboard_write").contains("require_foreground("),
+            "clipboard_write must stay writable from any window"
+        );
+    }
+
+    /// The URIs flavour is the only list-shaped payload; its cap is what keeps a caller from
+    /// handing in an unbounded collection (each entry re-validated, retained and mirrored).
+    #[test]
+    fn uris_over_the_recipients_cap_are_refused_at_validation() {
+        let c = test_clip();
+        let over: Vec<String> = (0..=MAX_RECIPIENTS_PER_COPY)
+            .map(|i| format!("content://file/{i}"))
+            .collect();
+        let err = c
+            .write(
+                "a",
+                "a",
+                ClipboardPayload::Uris {
+                    uris: over,
+                    text: String::new(),
+                },
+            )
+            .expect_err("one past the cap must be refused");
+        assert!(err.contains("uris"), "{err}");
+        assert!(c.latest().is_none(), "nothing was stored by the refusal");
+
+        // Exactly the cap is accepted — the boundary is inclusive.
+        let at_cap: Vec<String> = (0..MAX_RECIPIENTS_PER_COPY)
+            .map(|i| format!("content://file/{i}"))
+            .collect();
+        assert!(c
+            .write(
+                "a",
+                "a",
+                ClipboardPayload::Uris {
+                    uris: at_cap,
+                    text: String::new(),
+                },
+            )
+            .is_ok());
+    }
+
+    /// An image payload past the base64 cap is refused at validation, before any decode work.
+    #[test]
+    fn image_payload_over_cap_is_rejected_at_validation() {
+        let c = test_clip();
+        let too_big = "A".repeat(MAX_IMAGE_B64_LEN + 4);
+        let err = c
+            .write(
+                "a",
+                "a",
+                ClipboardPayload::Image {
+                    mime: "image/png".to_string(),
+                    data_b64: too_big,
+                },
+            )
+            .expect_err("oversized image must be refused");
+        assert!(err.contains("too large"), "{err}");
+        assert!(c.latest().is_none());
+    }
+
+    /// With no transport installed, mirroring an outgoing copy is a silent no-op — never a panic
+    /// and never a fabricated push.
+    #[test]
+    fn mirror_to_native_when_no_sink_is_noop_no_error() {
+        let entry = ClipboardEntry {
+            seq: 1,
+            source: "a".to_string(),
+            owner: "a".to_string(),
+            timestamp_ms: 0,
+            payload: ClipboardPayload::Text {
+                text: "x".to_string(),
+            },
+        };
+        mirror_to_native(&entry); // must not panic
+        assert!(!has_native_sink(), "no sink was ever installed");
+    }
+
+    /// Subscribing is idempotent per window (a JS loop cannot inflate the registry), and the
+    /// registry is bounded with an **audited** eviction rather than unbounded growth.
+    #[test]
+    fn subscribe_is_idempotent_and_bounded() {
+        let mut bus = EventBus::default();
+        let first = bus.subscribe("main", 0);
+        let again = bus.subscribe("main", 5);
+        assert_eq!(first, again, "re-subscribing keeps the same id");
+        assert_eq!(bus.subs.len(), 1);
+
+        for i in 0..(MAX_CLIPBOARD_SUBSCRIBERS + 5) {
+            bus.subscribe(&format!("w{i}"), 100 + i as u64);
+        }
+        assert_eq!(bus.subs.len(), MAX_CLIPBOARD_SUBSCRIBERS, "hard cap holds");
+        assert!(
+            bus.evicted >= 5,
+            "every eviction is counted, none is silent: {}",
+            bus.evicted
+        );
+    }
+
+    /// The per-window token bucket: a burst of [`CLIPBOARD_EVENTS_PER_SEC`] is allowed, the rest
+    /// is dropped, and a second later the bucket has refilled.
+    #[test]
+    fn the_event_throttle_caps_a_window_at_the_configured_rate() {
+        let mut bus = EventBus::default();
+        bus.subscribe("main", 0);
+        let mut allowed = 0;
+        for _ in 0..(CLIPBOARD_EVENTS_PER_SEC + 10) {
+            if bus.allow("main", 0) {
+                allowed += 1;
+            }
+        }
+        assert_eq!(
+            allowed, CLIPBOARD_EVENTS_PER_SEC as usize,
+            "exactly one second's worth of burst"
+        );
+        // One second later the bucket is full again.
+        assert!(
+            bus.allow("main", 1_000),
+            "the bucket refills at the configured rate"
+        );
+    }
+
+    /// A flood is delivered to the subscribed windows only up to the budget; the surplus is
+    /// **counted**, not delivered and not silently forgotten (F-CLB-002).
+    #[test]
+    fn a_flood_is_capped_and_the_dropped_notices_are_counted() {
+        let mut bus = EventBus::default();
+        bus.subscribe("main", 0);
+        bus.subscribe("settings", 0);
+        let mut allowed = 0usize;
+        for _ in 0..400 {
+            allowed += bus.take_allowed(0).len();
+        }
+        assert_eq!(
+            allowed,
+            CLIPBOARD_EVENTS_PER_SEC as usize * 2,
+            "each window gets one second's budget, no more"
+        );
+        assert!(
+            bus.dropped >= 200,
+            "the surplus is counted: {}",
+            bus.dropped
+        );
+        // A window that never subscribed is never a target.
+        assert!(!bus.take_allowed(0).contains(&"ghost".to_string()));
     }
 
     #[test]

@@ -11,9 +11,7 @@
 //! Each test here is a fault-injection scenario that runs offline. No clock
 //! dependency, no tokio runtime required (the monitor is synchronous).
 
-use amos_robot::safety::{
-    FaultCode, FaultRecord, Heartbeat, SafetyLimits, SafetyMonitor, MAX_FAULT_LOG,
-};
+use amos_robot::safety::{FaultCode, Heartbeat, SafetyLimits, SafetyMonitor, MAX_FAULT_LOG};
 use std::time::Duration;
 
 fn default_limits() -> SafetyLimits {
@@ -220,20 +218,56 @@ fn the_fault_log_is_bounded_and_wrapped() {
     );
 }
 
-/// Each FaultRecord carries the sequence and the measurement the rule was
-/// tested against (the rule says "this fired against *this* value, not
-/// 'something' went wrong").
+/// Each `FaultRecord` carries the sequence and the measurement the rule was
+/// tested against (the rule says "this fired against *this* value", not
+/// "'something' went wrong"). The record is obtained **from the monitor** —
+/// the earlier version built a `FaultRecord` literal by hand and asserted its
+/// own fields, so it pinned nothing about the monitor at all.
 #[test]
-fn a_fault_record_carries_a_measurement() {
-    let rec = FaultRecord {
-        code: FaultCode::DivergenceExceeded,
-        sequence: 42,
-        measurement: 0.34,
-    };
-    assert_eq!(rec.sequence, 42);
-    assert!((rec.measurement - 0.34).abs() < 1e-12);
-    let s = rec.summary();
-    assert!(s.contains("R3"));
+fn a_fault_record_carries_the_measurement_that_fired_it() {
+    let mut mon = empty_monitor();
+    prime(&mut mon);
+
+    // R5 via `check_set_point`: the measurement is the offending value itself.
+    let rec = mon.check_set_point(5_000, (0, 1_000)).expect("a fault");
+    assert_eq!(rec.code, FaultCode::SanityFailed);
+    assert!(
+        (rec.measurement - 5_000.0).abs() < 1e-9,
+        "the record must carry the offending set point, got {}",
+        rec.measurement
+    );
+    assert!(rec.summary().contains("R5"), "summary: {}", rec.summary());
+
+    // R3: the measurement is the divergence that tripped it.
+    let fired = mon.heartbeat(Heartbeat {
+        elapsed: Duration::from_millis(10),
+        divergence_rad: Some(0.5),
+        roll_rad: 0.0,
+        pitch_rad: 0.0,
+    });
+    let r3 = fired
+        .iter()
+        .find(|f| f.code == FaultCode::DivergenceExceeded)
+        .expect("R3 must fire");
+    assert!(
+        (r3.measurement - 0.5).abs() < 1e-6,
+        "the record must carry the divergence, got {}",
+        r3.measurement
+    );
+    assert!(
+        r3.sequence > rec.sequence,
+        "sequence numbers must advance between records ({} then {})",
+        rec.sequence,
+        r3.sequence
+    );
+
+    // …and the bounded log hands back the same record, so the audit trail is the source.
+    let log = mon.faults();
+    assert!(
+        log.iter()
+            .any(|f| f.code == FaultCode::SanityFailed && (f.measurement - 5_000.0).abs() < 1e-9),
+        "the R5 record must be present in the log"
+    );
 }
 
 /// A hard-divergence tick increments the streak. An in-tolerance tick

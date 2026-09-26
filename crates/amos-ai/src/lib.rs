@@ -12,6 +12,11 @@
 
 pub mod accelerator;
 pub mod audit;
+// Bundled / user-installed GGUF model resolution chain (Gap 4 / F-AI-016/017):
+// AMOS_MODEL_PATH → bundled assets → user dir. `build_backend_from_env` turns a
+// resolved path into a real `ggml` engine and an empty chain into an honest
+// `unconfigured` backend — never the mock.
+pub mod bundled_model;
 pub mod chat_asr;
 pub mod cli;
 pub mod energy;

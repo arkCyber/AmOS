@@ -15,40 +15,68 @@ methods (Coq/SPARK-style proof), distributed consensus, RT-scheduling integratio
 | Function | Before | After |
 |---|---|---|
 | 6-DOF IMU fusion (Mahony) | ✅ | ✅ + Allan-variance health monitor + magnetometer (9-DOF) reference |
-| Path planning (A* + pure pursuit) | ✅ | ✅ + multi-resolution frontier + kinematic-feasible DWA |
+| Path planning (A* + pure pursuit) | ✅ | ✅ + multi-resolution frontier (planned) + kinematic-feasible DWA ✅ (2026-09-19) |
 | SLAM | ❌ | ✅ **EKF-SLAM 2D** (prediction, observation, data association, loop closure) |
-| Vision | ❌ | ✅ **Sparse visual odometry** (FAST corners + LK optical flow + 5-point RANSAC) |
+| Vision | ❌ | ✅ **Sparse visual odometry** (FAST corners + LK optical flow + Hartley-normalised **eight-point** RANSAC — the 5-point polynomial solver is deliberately absent, see `vision/five_point.rs`) |
 | Real motor driver | ❌ (Mock) | ✅ **Serial/CAN/UDP driver skeleton** behind `RobotHal`, Mock remains as default |
+| Local planning (DWA) | ❌ | ✅ **Dynamic Window Approach** (Fox/Burgard/Thrun, 1997): bounded candidate scan, kinematic-feasible trajectories, scored by progress + clearance + speed (2026-09-19); **reachable** — `LocalPlanner` + `DriveCommand::from_velocity` join the `(v, ω)` window to the profile's set points and drive it against a live map, with a closed-loop test **and its negative control** (2026-09-20) |
 
 ---
 
 ## New modules
 
+The tree below is checked against the filesystem **in both directions** by
+`crates/amos-robot/tests/plan_tree.rs` — every `.rs` name here must exist under `src/`, **and**
+every `.rs` file under `src/` must be named here (REQ-A682, REQ-A1027) — so neither a module the
+crate does not have can sit in this tree unnoticed, nor a module the crate *does* have stay off
+it. (The earlier revision named a `driver/traits.rs` that never existed and described three
+modules as algorithms they do not implement; the one-directional version of the test then let
+`watchdog.rs` — the external watchdog — sit outside the map entirely, FMEA `F-SH-345`.)
+
 ```
 crates/amos-robot/src/
+├── lib.rs              — the crate root: the module declarations and the crate-level docs
 ├── fusion.rs           (existing — extended with 9-DOF magnetometer + Allan variance)
-├── planning.rs         (existing — extended with DWA + multires)
+├── planning.rs         (existing — extended with DWA + the reactive join; multi-resolution
+│                        frontier is still *planned*, not shipped — see the Status table)
 ├── control.rs          (existing — extended with PID, MRAC, safety monitor)
+├── localization.rs     — Monte Carlo Localization: a bounded, deterministic particle filter on a
+│                        **known** landmark map — the *global* half of the pose question the
+│                        unimodal EKF below cannot answer. Detects a kidnapped robot (`Diverged`);
+│                        does not rescue one (no re-seeding).
 ├── slam/
 │   ├── mod.rs
-│   ├── ekf.rs          — Extended Kalman Filter core (fixed 4-D state + N landmarks)
-│   ├── landmarks.rs    — landmark observations + bounding-box gates
-│   ├── data_assoc.rs   — JCBB / nearest-neighbour, Mahalanobis-gated
-│   ├── loop_closure.rs — pose-graph relocalisation, bounding thresholds
+│   ├── ekf.rs          — Extended Kalman Filter core (state `3 + 2·N`: robot x/y/θ, then
+│   │                     one (x, y) per landmark — `ROBOT_DIM` 3, `LM_DIM` 2)
+│   ├── landmarks.rs    — the `Landmark` struct (position + 2×2 covariance + `ever_observed`)
+│   │                     and the squared-Mahalanobis metric the gate is stated in. The gate
+│   │                     itself runs in `data_assoc.rs`; there is no bounding box here.
+│   ├── data_assoc.rs   — Mahalanobis-gated **nearest neighbour** over a landmark cloud. The
+│   │                     EKF's own association is the innovation gate; JCBB (Joint Compatibility
+│   │                     Branch and Bound) runs in `ekf.rs` for whole-batch association
+│   ├── loop_closure.rs — brute-force correlative **scan match** (Olson, ICRA 2009) whose
+│   │                     accepted relative pose is a virtual observation. Not a pose graph;
+│   │                     the acceptance thresholds (`MIN_MATCH_RATIO`, `MIN_COST_DROP`) are
+│   │                     this crate's policy, not figures from a paper.
 │   └── occupancy.rs    — log-odds 2D grid mapper
 ├── vision/
 │   ├── mod.rs
 │   ├── fast.rs         — FAST-9 corner detector (machine-generated feature table)
 │   ├── lk.rs           — Lucas-Kanade sparse optical flow
-│   ├── five_point.rs   — 5-point essential matrix (Stewenius / Nistér) + RANSAC
+│   ├── five_point.rs   — Hartley-normalised **eight-point** essential matrix + RANSAC
+│   │                     (the 5-point polynomial solver is *not* implemented — the module
+│   │                     doc states why; the filename is a legacy misnomer)
 │   └── vo.rs           — Visual odometry pipeline glue (deterministic frame-to-frame)
 ├── driver/
-│   ├── mod.rs
-│   ├── traits.rs       — Re-export / extend RobotHal contract
+│   ├── mod.rs          — the `RobotHal` contract is `amos_link::robot_hal`'s; this module
+│   │                     re-exports the three drivers, it does not redeclare the trait
 │   ├── serial.rs       — UART driver (CRC-checked frames, fixed bytes)
 │   ├── can.rs          — CAN bus driver (CAN 2.0A, 11-bit ID)
 │   └── udp.rs          — UDP discovery + control port driver
-├── safety.rs           — Safety monitor (heartbeat, watchdog, redundancy, fault tree)
+├── safety.rs           — Safety monitor (heartbeat, the R1 watchdog *check*, redundancy, fault tree)
+├── watchdog.rs         — **External** watchdog (REQ-A701): a supervisor that owns its own clock
+│                        and catches the case the in-loop monitor cannot see — a control loop that
+│                        has *stopped* calling in. A separate module, not part of `safety.rs`.
 └── mrac.rs             — Model-Reference Adaptive Control for uncertain dynamics
 ```
 

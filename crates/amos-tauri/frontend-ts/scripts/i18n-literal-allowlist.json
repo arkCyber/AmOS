@@ -62,5 +62,13 @@
   {
     "literal": "ERROR",
     "reason": "An **audit log level** rendered as diagnostic data in the enterprise audit viewer — the uppercase sibling of the `error` entry above (REQ-A384)."
+  },
+  {
+    "literal": "Enter",
+    "reason": "A keyboard key glyph shown inside a `<kbd>` chip in the WindowPage split-keyboard hint (the hint renders the user's own keycap label, not localisable copy — `Enter` is what every macOS/Win/Linux keyboard labels the same key) — see `settings/WindowPage.svelte`."
+  },
+  {
+    "literal": "Esc",
+    "reason": "A keyboard key glyph shown inside a `<kbd>` chip in the WindowPage split-keyboard hint (the hint renders the user's own keycap label, not localisable copy — `Esc` / `Escape` is the conventional name on every QWERTY layout) — see `settings/WindowPage.svelte`."
   }
 ]

@@ -49,6 +49,25 @@ export function stepIndex(index: number, total: number, delta: number): number {
 
 export type RepeatMode = "off" | "all" | "one";
 
+/**
+ * i18n key naming a repeat mode's **current** value — the accessible name of the
+ * cycle button in `MusicApp` / `PlayerApp`.
+ *
+ * A three-state cycle has no ARIA attribute to carry its state (`aria-pressed` and
+ * `aria-expanded` are two-state), so the name itself must say which mode is on.
+ * Both screens previously used one constant label ("循环模式" / "Repeat mode") with
+ * the mode shown only by an opacity/colour class, so an assistive-tech user could
+ * not tell all from one from off.
+ */
+export const REPEAT_LABEL_KEY: Record<
+  RepeatMode,
+  "player.repeatAll" | "player.repeatOne" | "player.repeatOff"
+> = {
+  all: "player.repeatAll",
+  one: "player.repeatOne",
+  off: "player.repeatOff",
+};
+
 /** Next/prev index honouring the repeat mode:
  * - "one": stay on the current track (repeat single),
  * - "off": stop at either end (no wrap),

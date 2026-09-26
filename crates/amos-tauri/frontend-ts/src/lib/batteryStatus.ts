@@ -53,6 +53,39 @@ export function batteryTone(s: BatterySample): BatteryTone {
   return "ok";
 }
 
+/** The dictionary key naming a battery read-out: charging is its own sentence
+ * (`{pct}` filled in), draining the plain level. */
+export type BatteryReadoutKey = "a11y.battery" | "a11y.batteryCharging";
+
+/** What a surface must SAY about a battery reading. */
+export interface BatteryReadout {
+  key: BatteryReadoutKey;
+  /** The `{pct}` parameter, already rounded (`"80%"`). */
+  pct: string;
+}
+
+/**
+ * The ONE spoken read-out for a battery sample, or `null` when the level is
+ * unknown (never invent a number).
+ *
+ * Four surfaces show a battery — the home widget, the desktop top bar, the phone
+ * chrome and the lock screen — and each had hand-copied the same `{pct}` sentence
+ * into a `title` while naming itself with a *constant* `aria-label`. That loses the
+ * reading outright: `aria-label` overrides both the element's own content and
+ * `title` when the accessible name is computed, so a screen-reader user heard
+ * "Battery level" and never the level. Callers must put this in the ACCESSIBLE NAME
+ * (and may mirror it into `title`); the per-surface unknown fallback stays the
+ * caller's choice, because the honest name for "no reading" differs ("Battery
+ * level" in the chrome, the widget's own title on the home screen).
+ */
+export function batteryReadout(s: BatterySample): BatteryReadout | null {
+  if (s.levelPct === null) return null;
+  return {
+    key: s.charging === true ? "a11y.batteryCharging" : "a11y.battery",
+    pct: `${Math.round(s.levelPct)}%`,
+  };
+}
+
 /** Normalise a half-open shape from `system_health` / host into a sample. */
 export function normalizeSample(raw: {
   levelPct?: unknown;
@@ -130,19 +163,28 @@ export function sampleHostBattery(
  * sample and again on every level/charging change. Returns a `stop()` to detach
  * (or `null` when the host has no Battery API — SSR, happy-dom, Safari, …).
  * Guarded: never throws, no listeners when the API is absent.
+ *
+ * Detach means **detach**: the `BatteryManager` is a page-singleton, so a
+ * `stop()` that only muted the callback would leave every mount's two listeners
+ * (and the `cb` they close over) attached for the life of the document — the
+ * exact leak the `stop()` contract exists to prevent. `stop()` therefore removes
+ * both listeners, and a `stop()` that lands **before** the `getBattery()` promise
+ * resolves attaches nothing at all rather than subscribing into a dead owner.
  */
 export function watchHostBattery(cb: (s: BatterySample) => void): (() => void) | null {
   const p = hostBatteryApi();
   if (!p) return null;
   let stopped = false;
+  let attached: { manager: HostBatteryManager; onChange: () => void } | null = null;
   void p
     .then((b) => {
-      if (!b) return;
+      if (stopped) return; // detached before the API resolved — never subscribe
       const onChange = () => {
         if (!stopped) cb(sampleHostBattery(b));
       };
       b.addEventListener("levelchange", onChange);
       b.addEventListener("chargingchange", onChange);
+      attached = { manager: b, onChange };
       onChange(); // initial sample
     })
     .catch(() => {
@@ -150,5 +192,10 @@ export function watchHostBattery(cb: (s: BatterySample) => void): (() => void) |
     });
   return () => {
     stopped = true;
+    if (attached) {
+      attached.manager.removeEventListener("levelchange", attached.onChange);
+      attached.manager.removeEventListener("chargingchange", attached.onChange);
+      attached = null;
+    }
   };
 }

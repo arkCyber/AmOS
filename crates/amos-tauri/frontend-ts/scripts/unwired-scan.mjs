@@ -260,7 +260,33 @@ function runSelftest() {
       failed++;
     }
   }
-  const total = positives.length + negatives.length;
+  // The **comment stripper** is the other half of this scanner's window: the counter is a
+  // regex over source text, so whatever the stripper leaves behind is what counts as a
+  // reference. A `//`-comment mention used to survive (only `/* */` was stripped), which made
+  // a symbol whose *only* mention is the comment explaining why it is no longer called read as
+  // **wired** — the exact defect class this scan exists to catch (REQ-A1707 measured nine such
+  // exports: `wmClose`/`wmFocus`/`wmMinimize`, the four plain `wmSplit*` wrappers,
+  // `amosStore.saveLayout` and `dockConfig.isFullscreen`). The cases below pin both directions:
+  // a mention inside either comment form must NOT survive, and text inside a string literal —
+  // the stated reason line comments were kept (`content://…`) — must.
+  const stripCases = [
+    ["const a = 1; // wmClose(x)", false, "wmClose"], // line comment must not count
+    ['const a = "content://wmClose";', true, "wmClose"], // `//` inside a string is not a comment
+    ["const a = 1; /* wmClose(x) */", false, "wmClose"], // block comment must not count
+    ['const a = `x ${"//wmClose"} y`;', true, "wmClose"], // `//` inside a template literal
+    ["const a = 1; // trailing wmSplitMove", false, "wmSplitMove"],
+  ];
+  for (const [src, want, name] of stripCases) {
+    const got = stripComments(src).includes(name);
+    if (got !== want) {
+      console.error(
+        `[unwired-scan] selftest FAIL: stripComments(${JSON.stringify(src)}) ` +
+          `${got ? "kept" : "dropped"} ${name}, expected it ${want ? "kept" : "dropped"}`,
+      );
+      failed++;
+    }
+  }
+  const total = positives.length + negatives.length + stripCases.length;
   console.log(`[unwired-scan] selftest: ${total} assertion(s), ${failed} failure(s).`);
   process.exit(failed === 0 ? 0 : 1);
 }
@@ -320,20 +346,103 @@ const allowedModules = new Set(allow.filter((e) => e.module).map((e) => e.path))
 
 // --- scan -------------------------------------------------------------------
 /**
- * Block comments are stripped before any counting: a symbol mentioned only in a
- * doc comment is a *claim* about wiring, not a call site — and "the docs say it is
- * used" is exactly the failure mode this scan exists to catch (it once hid
- * `loadStoreTiles`, whose only non-test mention was its own JSDoc). Line comments
- * are deliberately kept: `//` appears inside string literals (`content://…`), so
- * stripping those would silently *under*-count real references.
+ * Comments are stripped before any counting: a symbol mentioned only in a comment is a *claim*
+ * about wiring, not a call site — and "the docs say it is used" is exactly the failure mode this
+ * scan exists to catch (it once hid `loadStoreTiles`, whose only non-test mention was its own
+ * JSDoc).
+ *
+ * The stripper used to handle **block comments only** (`/\/\*…\*\//`), and kept `//` because a
+ * `//` can appear inside a string literal (`"content://…"`), so a blind strip would silently
+ * *under*-count real references. That trade-off has a cost that was never measured: a symbol
+ * whose only surviving mention is a line comment reads as **wired**, and the comments that
+ * explain *why a call site was removed* are exactly the ones that name it — `dockConfig`'s
+ * `isFullscreen` and the four plain `wmSplit*` wrappers are hidden by nothing but that
+ * (REQ-A1707). The fix is to strip well instead of stripping less: a small string-aware
+ * scanner that removes `//`-to-EOL and `/* *\/` **outside** string literals (and regex
+ * literals, whose character classes may contain `/*`), so the string-literal worry is
+ * answered rather than traded against correctness.
+ *
+ * Kept deliberately shallow like the rest of this dependency-free scanner: `${…}` inside a
+ * template literal is *not* re-entered (a comment there survives), which errs toward
+ * over-counting — the pre-existing behaviour — rather than inventing a false "unwired".
  */
-function stripBlockComments(src) {
-  return src.replace(/\/\*[\s\S]*?\*\//g, " ");
+function stripComments(src) {
+  let out = "";
+  let i = 0;
+  const n = src.length;
+  let prev = ""; // last significant (non-space) char outside strings — for regex detection
+  // A regex literal may only start where a value is expected (`/[/*]/` is legal; `a / b` is not).
+  const regexOk = (c) => c === "" || "=(,:[!&|?{};".includes(c);
+  while (i < n) {
+    const c = src[i];
+    const c2 = src[i + 1];
+    if (c === "/" && c2 === "/") {
+      while (i < n && src[i] !== "\n") i++;
+      out += " ";
+      continue;
+    }
+    if (c === "/" && c2 === "*") {
+      i += 2;
+      while (i < n && !(src[i] === "*" && src[i + 1] === "/")) i++;
+      i += 2;
+      out += " ";
+      continue;
+    }
+    if (c === '"' || c === "'" || c === "`") {
+      const q = c;
+      out += c;
+      i++;
+      while (i < n) {
+        if (src[i] === "\\") {
+          out += src[i] + (src[i + 1] ?? "");
+          i += 2;
+          continue;
+        }
+        out += src[i];
+        if (src[i] === q) {
+          i++;
+          break;
+        }
+        i++;
+      }
+      prev = q;
+      continue;
+    }
+    // A bare `/` where a value is expected opens a regex literal; copy it through verbatim so a
+    // `/*` inside a character class is not mistaken for a comment opener.
+    if (c === "/" && regexOk(prev)) {
+      out += c;
+      i++;
+      let inClass = false;
+      while (i < n) {
+        if (src[i] === "\\") {
+          out += src[i] + (src[i + 1] ?? "");
+          i += 2;
+          continue;
+        }
+        if (src[i] === "\n") break; // an unterminated regex: bail (never spans lines)
+        if (src[i] === "[") inClass = true;
+        else if (src[i] === "]") inClass = false;
+        out += src[i];
+        if (src[i] === "/" && !inClass) {
+          i++;
+          break;
+        }
+        i++;
+      }
+      prev = "/";
+      continue;
+    }
+    out += c;
+    if (!/\s/.test(c)) prev = c;
+    i++;
+  }
+  return out;
 }
 
 const cache = new Map();
 const readProd = (f) => {
-  if (!cache.has(f)) cache.set(f, stripBlockComments(readFileSync(f, "utf8")));
+  if (!cache.has(f)) cache.set(f, stripComments(readFileSync(f, "utf8")));
   return cache.get(f);
 };
 
@@ -346,7 +455,7 @@ const typeFindings = []; // unused type exports → informational
 const unwiredKeys = new Set();
 for (const file of symbolFiles) {
   const rel = relative(root, file);
-  const src = stripBlockComments(readFileSync(file, "utf8"));
+  const src = stripComments(readFileSync(file, "utf8"));
   for (const { name, kind } of extractExports(src)) {
     const used = prodUsage(name, src, cache);
     if (used === 0) unwiredKeys.add(allowKey(rel, name));
@@ -415,6 +524,24 @@ const newValues = findings.filter((f) => !baseValues.has(valueKey(f)));
 const fixedValues = [...baseValues].filter((k) => !findings.some((f) => valueKey(f) === k));
 const newModules = deadModules.filter((m) => !baseModules.has(m));
 const newComponents = unmountedComponents.filter((m) => !baseComponents.has(m));
+/**
+ * Stale **whole-file** baseline entries (REQ-A502).
+ *
+ * The `values` list already had this check ("shrink the ratchet"), the allow-list had it
+ * (REQ-A447), but the baseline's `modules` / `components` lists were **never** checked — so a
+ * baselined module that gets wired (or a component that gets mounted) left an entry behind
+ * with nothing reporting it. That is not cosmetic: `newModules` / `newComponents` filter
+ * *through* these same sets, so the stale entry **hides the next real regression of that very
+ * file** (it goes dead again and is never reported as new). Measured before the fix: wiring
+ * `lib/mediaPaging.ts` into the photos screen removed it from `deadModules` while
+ * `baseline.modules` still counted 2, and the gate reported only the three value entries.
+ *
+ * The predicate uses the **unfiltered** sets (`unreachableModules` / `unmountedAll`), for the
+ * same reason the allow-list check does: an allow-listed file is absent from the *filtered*
+ * lists even though it is still unwired, and flagging it here would be a false positive.
+ */
+const fixedModules = [...baseModules].filter((m) => !unreachableModules.includes(m));
+const fixedComponents = [...baseComponents].filter((m) => !unmountedAll.includes(m));
 
 const updateBaseline = process.argv.includes("--update-baseline");
 const verbose = process.argv.includes("--verbose") || process.argv.includes("--json");
@@ -464,7 +591,7 @@ const allowStale = allow
     return !unwiredKeys.has(allowKey(e.path, e.name));
   })
   .map((e) => `${e.path}${e.name ? `::${e.name}` : " (module)"}`);
-const staleProblems = fixedValues.length + allowStale.length;
+const staleProblems = fixedValues.length + allowStale.length + fixedModules.length + fixedComponents.length;
 
 if (process.argv.includes("--json")) {
   console.log(
@@ -480,6 +607,8 @@ if (process.argv.includes("--json")) {
         allowed: allow.length,
         allowStale,
         fixedValues,
+        fixedModules,
+        fixedComponents,
         scanned: symbolFiles.length,
         baseline: {
           values: baseValues.size,
@@ -498,15 +627,33 @@ if (process.argv.includes("--json")) {
       `${prodFiles.length} prod + ${testFiles.length} test file(s) scanned.`,
   );
   if (deadModules.length === 0) {
-    console.log("[unwired-scan] OK — every src/lib module is reachable from production.");
+    const excused = allow.filter((e) => e.module && unreachableModules.includes(e.path)).length;
+    console.log(
+      `[unwired-scan] OK — no unreachable src/lib module is unaccounted for ` +
+        `(${excused} allow-listed with a reason).`,
+    );
   }
   if (unmountedComponents.length === 0) {
-    console.log("[unwired-scan] OK — every production .svelte component is mounted by an entry.");
+    const excused = allow.filter((e) => e.module && unmountedAll.includes(e.path)).length;
+    console.log(
+      `[unwired-scan] OK — no unmounted production .svelte component is unaccounted for ` +
+        `(${excused} allow-listed with a reason).`,
+    );
   }
   if (fixedValues.length > 0) {
     console.error(
       `[unwired-scan] FAIL — ${fixedValues.length} baseline entr(y/ies) now wired; shrink the baseline with --update-baseline (the ratchet must shrink, not rot).`,
     );
+  }
+  // REQ-A502: the whole-file half of the same rule. A stale `modules` / `components` entry is
+  // worse than a stale value entry — it filters *through* `newModules`/`newComponents`, so the
+  // file going dead again would never be reported.
+  if (fixedModules.length > 0 || fixedComponents.length > 0) {
+    console.error(
+      `[unwired-scan] FAIL — ${fixedModules.length} baseline module(s) and ${fixedComponents.length} baseline component(s) are no longer unwired (reachable, mounted, or the file is gone); shrink the baseline with --update-baseline (a stale whole-file entry hides the next regression of that very file).`,
+    );
+    for (const m of fixedModules) console.error(`       - module no longer unwired: ${m}`);
+    for (const c of fixedComponents) console.error(`       - component no longer unwired: ${c}`);
   }
   if (allowStale.length > 0) {
     console.error(

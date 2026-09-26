@@ -84,6 +84,21 @@ describe("calculateVirtualRange", () => {
     expect(r.items[0]?.index).toBe(0);
   });
 
+  it("never returns an empty window when the list shrinks under a large scrollTop", () => {
+    // The scroll offset outlives the list: a screen scrolled to 2000px whose rows are
+    // then filtered/deleted down to 10. `startIndex` (= floor(2000/50)-5 = 35) would
+    // exceed `endIndex` (= min(9, ...) = 9), so the `for` loop ran zero times and the
+    // list drew nothing — a blank screen for a non-empty list. The window must stay
+    // non-empty; clamping `startIndex` to `endIndex` is the honest floor.
+    const r = calculateVirtualRange(2000, 400, 10, 50, 5);
+    expect(r.items.length).toBeGreaterThan(0);
+    expect(r.startIndex).toBeLessThanOrEqual(r.endIndex);
+    // Positive control: an unshrunk list at the same offset still windows normally.
+    const wide = calculateVirtualRange(2000, 400, 100, 50, 5);
+    expect(wide.startIndex).toBe(35);
+    expect(wide.endIndex).toBe(53);
+  });
+
   it("handles container taller than content", () => {
     // 3 items, container tall enough to show all
     const r = calculateVirtualRange(0, 1000, 3, 50, 0);

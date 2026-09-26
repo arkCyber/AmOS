@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
   actionableLabelOf,
   deadChordMessage,
+  newWindowTarget,
   refusedChordMessage,
   runSystemIntent,
   systemIntentFor,
@@ -46,17 +47,100 @@ afterEach(() => {
 
 
 describe("systemIntentFor", () => {
-  test("maps the three focused-window ids and only those", () => {
+  test("maps the focused-window ids and only those", () => {
     expect(systemIntentFor("closeWindow")).toBe("close-window");
-    expect(systemIntentFor("minimizeWindow")).toBe("hide-window");
+    // REQ-A724: ⌘M minimizes and ⌘H hides — two chords, two intents (they used to collapse
+    // into `hide-window`, so the row labelled "Minimize" hid the window).
+    expect(systemIntentFor("minimizeWindow")).toBe("minimize-window");
     expect(systemIntentFor("hideApp")).toBe("hide-window");
     expect(systemIntentFor("preferences")).toBe("open-preferences");
+    // REQ-A473: the two per-app window chords.
+    expect(systemIntentFor("newWindow")).toBe("new-window");
+    expect(systemIntentFor("cycleWindows")).toBe("cycle-window");
     // Other domains' bindings (spaces / overlays / touch) are not ours.
     expect(systemIntentFor("spacesPanel")).toBeNull();
     expect(systemIntentFor("launchpad")).toBeNull();
     expect(systemIntentFor("")).toBeNull();
   });
 });
+
+// ─── REQ-A473: the per-app window chords ──────────────────────────────────────────────
+
+describe("newWindowTarget — which app a per-app chord acts on", () => {
+  test("the focused window's app wins (macOS: File ▸ New Window duplicates this app)", () => {
+    expect(newWindowTarget("notes")).toBe("notes");
+    expect(newWindowTarget("store:org.amos.pomodoro")).toBe("store:org.amos.pomodoro");
+  });
+
+  test("an instance window names its **app**, not the window", () => {
+    // The defect this prevents: the host refuses an instance label as an app id on purpose,
+    // so forwarding `files_2` would turn ⌘N on the second Files window into an error.
+    expect(newWindowTarget("files_2")).toBe("files");
+  });
+
+  test("nothing app-shaped focused ⇒ the shell's own file manager", () => {
+    // The launcher (`main`) is not an app, and neither is a container surface: the rule is
+    // stated here once, for the menu row, ⌘N and the native menu item alike.
+    for (const none of [null, undefined, "", "main", "legacy:waydroid_0", "app-3"]) {
+      expect(newWindowTarget(none)).toBe("files");
+    }
+  });
+});
+
+describe("runSystemIntent — the per-app chords send the app, never the label", () => {
+  test("new-window asks the host for one more window of the focused app", async () => {
+    const outcome = await runSystemIntent("new-window", "notes");
+    expect(outcome).toEqual({ command: "wm_new_window", reason: null });
+    expect(calls).toEqual([{ cmd: "wm_new_window", args: { appId: "notes" } }]);
+  });
+
+  test("new-window from an instance window resolves to its app first", async () => {
+    await runSystemIntent("new-window", "files_2");
+    expect(calls).toEqual([{ cmd: "wm_new_window", args: { appId: "files" } }]);
+  });
+
+  test("new-window with nothing focused still acts (Files), and a refusal is reported", async () => {
+    const ok = await runSystemIntent("new-window", null);
+    expect(ok).toEqual({ command: "wm_new_window", reason: null });
+    expect(calls).toEqual([{ cmd: "wm_new_window", args: { appId: "files" } }]);
+
+    calls = [];
+    installHost({ refuse: true });
+    const refused = await runSystemIntent("new-window", "notes");
+    expect(refused).toEqual({ command: "wm_new_window", reason: "host-refused" });
+  });
+
+  test("cycle-window walks the focused app's ring, forward or backward", async () => {
+    await runSystemIntent("cycle-window", "files_2");
+    expect(calls).toEqual([{ cmd: "wm_cycle_app", args: { appId: "files", forward: true } }]);
+
+    calls = [];
+    await runSystemIntent("cycle-window", "files_2", { forward: false });
+    expect(calls).toEqual([{ cmd: "wm_cycle_app", args: { appId: "files", forward: false } }]);
+  });
+
+  test("cycle-window with no app window is a dead chord, not a command", async () => {
+    // ⌘` next to the desktop has nothing to cycle within — the same honest non-event ⌘W
+    // reports rather than a command that silently does nothing (F-SH-001 family).
+    const outcome = await runSystemIntent("cycle-window", "main");
+    expect(outcome).toEqual({ command: null, reason: "no-actionable-window" });
+    expect(calls).toEqual([]);
+  });
+
+  test("every intent has a sentence for the dead-chord case", () => {
+    for (const intent of [
+      "close-window",
+      "hide-window",
+      "minimize-window",
+      "open-preferences",
+      "new-window",
+      "cycle-window",
+    ] as const) {
+      expect(deadChordMessage(intent).length).toBeGreaterThan(10);
+    }
+  });
+});
+
 
 describe("actionableLabelOf", () => {
   test("the launcher is never a target, and neither is an absent window", () => {
@@ -70,7 +154,7 @@ describe("actionableLabelOf", () => {
 });
 
 describe("runSystemIntent", () => {
-  test("close / hide go to the window; preferences needs no window at all", async () => {
+  test("close / hide / minimize go to the window; preferences needs no window at all", async () => {
     expect(await runSystemIntent("close-window", "notes")).toEqual({
       command: "wm_close",
       reason: null,
@@ -79,13 +163,21 @@ describe("runSystemIntent", () => {
       command: "wm_hide",
       reason: null,
     });
+    // REQ-A724: ⌘M must reach `wm_minimize` (the platform's minimize), NOT `wm_hide` — the
+    // one behaviour this file exists to pin, because hiding takes the window out of the
+    // model and the Dock stops showing the app as running.
+    expect(await runSystemIntent("minimize-window", "notes")).toEqual({
+      command: "wm_minimize",
+      reason: null,
+    });
     expect(await runSystemIntent("open-preferences", null)).toEqual({
       command: "wm_open",
       reason: null,
     });
-    expect(calls.map((c) => c.cmd)).toEqual(["wm_close", "wm_hide", "wm_open"]);
+    expect(calls.map((c) => c.cmd)).toEqual(["wm_close", "wm_hide", "wm_minimize", "wm_open"]);
     expect(calls[0]?.args).toEqual({ label: "notes" });
-    expect(calls[2]?.args).toEqual({ label: "settings" });
+    expect(calls[2]?.args).toEqual({ label: "notes" });
+    expect(calls[3]?.args).toEqual({ label: "settings" });
   });
 
   test("with nothing to act on it sends NO command and says WHY", async () => {
@@ -97,6 +189,10 @@ describe("runSystemIntent", () => {
       reason: "no-actionable-window",
     });
     expect(await runSystemIntent("hide-window", null)).toEqual({
+      command: null,
+      reason: "no-actionable-window",
+    });
+    expect(await runSystemIntent("minimize-window", null)).toEqual({
       command: null,
       reason: "no-actionable-window",
     });
@@ -127,9 +223,17 @@ describe("the two dead-chord sentences", () => {
     // and the rule, not repeat the machine code.
     expect(deadChordMessage("close-window")).toContain("⌘W");
     expect(deadChordMessage("close-window")).toContain("F-SH-008");
-    expect(deadChordMessage("hide-window")).toContain("⌘M");
+    // REQ-A724: the two chords name themselves — ⌘H hides, ⌘M minimizes. The sentence used
+    // to say "⌘M/⌘H" for the single collapsed intent, which read as one action.
+    expect(deadChordMessage("hide-window")).toContain("⌘H");
+    expect(deadChordMessage("minimize-window")).toContain("⌘M");
     expect(deadChordMessage("open-preferences")).toContain("⌘,");
-    for (const intent of ["close-window", "hide-window", "open-preferences"] as const) {
+    for (const intent of [
+      "close-window",
+      "hide-window",
+      "minimize-window",
+      "open-preferences",
+    ] as const) {
       expect(deadChordMessage(intent).length).toBeGreaterThan(20);
     }
   });

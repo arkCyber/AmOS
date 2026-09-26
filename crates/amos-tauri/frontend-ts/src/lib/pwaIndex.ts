@@ -22,6 +22,7 @@
  *     "there genuinely are no declared apps" — the UI must be able to say which.
  */
 import { invoke } from "./backend";
+import { bridgeDiag } from "./backend";
 import { amosWarn } from "./debugLog";
 
 /** The index document version this client understands (`amos-appstore::pwa::INDEX_SCHEMA`). */
@@ -244,6 +245,91 @@ export async function fetchPwaIndex(): Promise<PwaIndexResult> {
     return { kind: "failed", reason: "unreadable", detail: "unsupported index schema" };
   }
   return { kind: "ok", doc, base };
+}
+
+/**
+ * The `pwa_open_remote` reply as it comes off the wire (`amos-appstore::pwa::PwaManifest`).
+ *
+ * Only the fields this side reads are declared; the **top-level** set is the whole of what the
+ * reply can carry, because that struct is `deny_unknown_fields` — `app`, `display`, `mcp_tools`,
+ * `permissions`, in snake_case (it sets no `rename_all`). Naming the reply is what lets
+ * `scripts/tauri-reply-scan.mjs` compare this generic with the Rust struct (REQ-A560) instead of
+ * recording the pair as unverifiable — the same discipline `lib/wm.ts` follows for `wm_*`.
+ */
+interface PwaManifestWire {
+  app: { id: string; name: string; version: string; description: string };
+  display: { url: string; icon: string | null };
+  mcp_tools: unknown[];
+  permissions: unknown;
+}
+
+/**
+ * Why a remote manifest was not opened. `refused` is the host's **own** sentence (which host was
+ * not allow-listed, which env var is unset, why the URL is not `https://`) — never a generic
+ * "failed", because the operator has to be able to act on it.
+ */
+export type PwaRemoteFailure = "offline" | "refused";
+
+/** The outcome of [`openRemotePwa`]. Nothing throws, and nothing is fabricated. */
+export type PwaRemoteResult =
+  | { kind: "ok"; app: { id: string; name: string; version: string } }
+  | { kind: "failed"; reason: PwaRemoteFailure; detail: string };
+
+/** The host's refusal text, from an `AmosError` envelope or a bare string. */
+function refusalDetail(detail: unknown): string {
+  if (typeof detail === "string" && detail.trim() !== "") return detail;
+  if (isObject(detail)) {
+    const message = detail.message;
+    if (typeof message === "string" && message.trim() !== "") return message;
+    const code = detail.code;
+    if (typeof code === "string" && code.trim() !== "") return code;
+  }
+  if (detail instanceof Error && detail.message !== "") return detail.message;
+  return "the host refused the manifest";
+}
+
+/**
+ * Fetch, validate and **install** a remote PWA manifest (`pwa_open_remote`, Gap 6).
+ *
+ * The whole policy lives in Rust (`amos_appstore::open_remote_pwa`): `https://` only, the host must
+ * appear in the operator's `AMOS_PWA_REMOTE_ALLOW`, a 10 s timeout and a 256 KiB body cap, then the
+ * same strict `PwaManifest` parser + validator the on-disk index uses. This wrapper adds **nothing**
+ * to that policy — it trims the URL so a pasted line with a stray space is not refused for a reason
+ * the user cannot see, and turns the reply into the three honest outcomes.
+ *
+ * On success the manifest has been written into the system PWA index, so the caller must reload
+ * ([`fetchPwaIndex`]) for the new tile to appear — that reload is the visible proof it worked.
+ *
+ * Honest boundary: without `--features appstore-live` the host has no HTTPS client and answers with
+ * a typed error naming that missing feature, which arrives here as a `refused` detail. The UI shows
+ * it verbatim; it is not this module's business to guess whether a refusal was about the build, the
+ * allow-list or the manifest.
+ */
+export async function openRemotePwa(rawUrl: string): Promise<PwaRemoteResult> {
+  const url = rawUrl.trim();
+  if (url === "") return { kind: "failed", reason: "refused", detail: "no manifest URL" };
+  const reply = await invoke<PwaManifestWire>("pwa_open_remote", { url });
+  if (reply === null) {
+    const diag = bridgeDiag("pwa_open_remote");
+    if (!diag.ok) {
+      if (diag.kind === "not-bridged") {
+        return { kind: "failed", reason: "offline", detail: "no Tauri bridge" };
+      }
+      return { kind: "failed", reason: "refused", detail: refusalDetail(diag.detail) };
+    }
+    // `invoke` records a reason whenever it answers `null`, so this is the defensive branch —
+    // still a refusal, never a fabricated success.
+    return { kind: "failed", reason: "refused", detail: "the host refused the manifest" };
+  }
+  const app = isObject(reply.app) ? reply.app : null;
+  const id = app ? str(app.id) : "";
+  if (id === "") {
+    // The host answered, but not with a manifest we can name: refuse rather than add a nameless
+    // entry to the caller's list.
+    amosWarn("pwa", "the host's manifest reply carried no app id", { reply });
+    return { kind: "failed", reason: "refused", detail: "the host returned an unreadable manifest" };
+  }
+  return { kind: "ok", app: { id, name: str(app?.name, id), version: str(app?.version) } };
 }
 
 /** Tile glyph for an app with no icon: its first character (the store's rule). */

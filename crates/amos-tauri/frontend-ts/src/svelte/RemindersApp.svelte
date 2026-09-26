@@ -234,8 +234,21 @@
   };
   const deleteList = (id: string) => {
     if (id === DEFAULT_LIST_ID) return;
-    persistReminders(reminders.map((r) => (r.listId === id ? { ...r, listId: DEFAULT_LIST_ID } : r)));
-    persistLists(removeList(lists, id));
+    // Two stores, two writes — the **move must land before the list is destroyed** (REQ-A1460).
+    // Nothing else reassigns an orphaned reminder: `normalizeReminders` only defaults a *missing*
+    // `listId`, it never checks the list still exists. So destroying the list first would strand
+    // its reminders pointing at a list that is gone, silently and in storage. `CalendarApp`'s
+    // `deleteCalendar` is the same gesture and states the same rule ("nothing else may move if the
+    // calendar itself was not removed"). The `sel` reset is part of the destructive half — it must
+    // not navigate away from a list that was never removed.
+    const orphaned = reminders.some((r) => r.listId === id);
+    if (
+      orphaned &&
+      !persistReminders(reminders.map((r) => (r.listId === id ? { ...r, listId: DEFAULT_LIST_ID } : r)))
+    ) {
+      return;
+    }
+    if (!persistLists(removeList(lists, id))) return;
     if (sel.kind === "list" && sel.id === id) sel = { kind: "smart", view: "all" };
   };
 
@@ -392,6 +405,7 @@
             <button
               onclick={() => (newListColor = col)}
               aria-label={col}
+              aria-pressed={newListColor === col}
               class={"grid h-6 w-6 place-items-center rounded-full text-xs " +
                 DOT[col] +
                 (newListColor === col ? " ring-2 ring-neutral-400" : "")}
@@ -480,7 +494,7 @@
           <div class={ROW + " items-start"}>
               <button
                 onclick={() => persistReminders(toggleComplete(reminders, r.id, Date.now()))}
-                aria-label={meta.done ? "undone" : "done"}
+                aria-label={t(meta.done ? "reminder.markUndone" : "reminder.markDone", { name: r.title })}
                 class={"mt-0.5 grid h-6 w-6 shrink-0 place-items-center rounded-full border-2 text-sm leading-none transition active:scale-90 " +
                   (meta.done
                     ? "border-accent bg-accent text-white"
@@ -543,7 +557,7 @@
             <div class={ROW + " items-start"}>
                 <button
                   onclick={() => persistReminders(toggleComplete(reminders, r.id, Date.now()))}
-                  aria-label={meta.done ? "undone" : "done"}
+                  aria-label={t(meta.done ? "reminder.markUndone" : "reminder.markDone", { name: r.title })}
                   class={"mt-0.5 grid h-6 w-6 shrink-0 place-items-center rounded-full border-2 text-sm leading-none transition active:scale-90 " +
                     (meta.done
                       ? "border-accent bg-accent text-white"
@@ -598,7 +612,7 @@
           {#if !searching && baseShown.length > 0}
             <button
               onclick={completeAllVisible}
-              class="shrink-0 rounded-full bg-accent/15 px-3 py-2 text-xs text-accent"
+              class="shrink-0 rounded-full bg-accent/10 px-3 py-2 text-xs text-accent"
             >
               ✓ {t("reminder.completeAll")} ({baseShown.length})
             </button>
@@ -671,7 +685,7 @@
                   {#if canSnooze}
                     <button
                       onclick={snooze}
-                      class="w-full rounded-lg bg-accent/15 px-2 py-1.5 text-xs text-accent"
+                      class="w-full rounded-lg bg-accent/10 px-2 py-1.5 text-xs text-accent"
                     >
                       ⏰ {t("reminder.snooze")}
                     </button>
@@ -742,7 +756,7 @@
                 {/if}
               </div>
               <div class="flex items-center gap-2">
-                <button onclick={() => (showSchedule = !showSchedule)} class={btn("neutral", "sm")}>
+                <button onclick={() => (showSchedule = !showSchedule)} aria-expanded={showSchedule} class={btn("neutral", "sm")}>
                   {t("reminder.schedule")}
                 </button>
                 <button onclick={commit} disabled={!draft.title.trim()} class={btn("accent", "sm")}>

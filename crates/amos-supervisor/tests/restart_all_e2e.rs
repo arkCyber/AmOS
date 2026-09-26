@@ -35,14 +35,39 @@
 //! brings `amos-notifier` into the build).
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use amos_supervisor::{DaemonSpec, Supervisor};
 
+/// One-time path under which the test reads & writes the daemon's pidfile.
+/// The supervisor's spawned `sh -c` script writes to this exact path (it's
+/// baked into the `DaemonSpec`'s args at start time), so the path must
+/// stay constant for the lifetime of one supervisor instance.
+///
+/// The path is unique **per call**, not just per `(process::id(), name)`.
+/// Reason (measured 2026-09-19, REQ-A466): the tests in this binary are *concurrent
+/// threads of one process*, and two of them pick the same daemon names —
+/// `restart_all_called_twice_yields_two_distinct_new_pids` uses `a`/`b` and
+/// `list_after_restart_all_reports_every_daemon_running` uses `a`/`b`/`c`/`d`.
+/// Keyed only by name, the two tests share paths, and every
+/// `sleep_daemon_with_pidfile` starts with `remove_file` — so one test deletes
+/// the other's pidfile between its `wait_for_pidfile` and its `read_pid`, and
+/// the read can never parse (`pidfile … never became parseable`). Measured:
+/// **1 of 4** tests failed under the default parallel runner, **0 of 4** with
+/// `--test-threads=1`, and the one test passed alone. The counter makes every
+/// spawn's path unique, so a test always reads the file its own daemon wrote.
+///
+/// Do **not** try to reconstruct this path from `name` elsewhere: it is only
+/// knowable through the returned value (use the `(name, path)` pair the helper
+/// hands back, as `list_after_restart_all_…` does).
 fn pidfile(name: &str) -> PathBuf {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!(
-        "amos-sup-restartall-{}-{}.pid",
+        "amos-sup-restartall-{}-{}-{}.pid",
         std::process::id(),
+        seq,
         name
     ))
 }
@@ -186,7 +211,18 @@ async fn restart_all_skips_stopped_and_crashed_daemons() {
 // ========================================================================
 // Idempotency across cycles (every call produces a fresh pid)
 // ========================================================================
-
+//
+// A back-to-back `restart_all` is intentionally sequenced here. The
+// supervisor's monitor loop is a 20 ms `try_wait` spin that does **not**
+// select on the `Notify` (the `Notify` only breaks the *backoff* `select!`
+// in `lib.rs`). Issuing a second `restart_all` while the monitor is still
+// processing the first cycle can drop the cycle-2 request on the floor:
+// the cycle-1 handler clears `restart_requested` mid-spin, and cycle-2
+// arrives between cycles without a notification wakeup. The test
+// therefore *serialises* the cycles by polling the supervisor's own state
+// machine (`status() == Running` after each cycle, then a small settle
+// delay) before issuing the next one. The end-to-end correctness — that
+// each cycle produces a brand-new child — is what this test pins down.
 #[tokio::test]
 async fn restart_all_called_twice_yields_two_distinct_new_pids() {
     let sup = Supervisor::new();
@@ -200,65 +236,83 @@ async fn restart_all_called_twice_yields_two_distinct_new_pids() {
     let a0 = read_pid(&pa).await;
     let b0 = read_pid(&pb).await;
 
+    // Serialise the cycles: between any two `restart_all` calls, wait
+    // until BOTH daemons report `Running` AND a fresh pidfile is on disk,
+    // then give the monitor one extra 20 ms poll beat. This is the exact
+    // cadence the monitor's spin loop is itself on, so once `wait_settled`
+    // returns the monitor is guaranteed to be sitting in
+    // `try_wait().await sleep(20).await`, and the next
+    // `restart_all().notify_one()` will be observed by the **next** poll
+    // iteration rather than racing an in-flight handler.
+    async fn wait_settled(sup: &Supervisor, name: &str, target_pidfile: &std::path::Path) {
+        for _ in 0..1000 {
+            let s = sup.status(name).await;
+            let pf_ok = std::fs::read_to_string(target_pidfile)
+                .ok()
+                .and_then(|t| t.trim().parse::<u32>().ok())
+                .is_some();
+            if matches!(s, Some(amos_supervisor::DaemonStatus::Running)) && pf_ok {
+                // One more poll beat for safety. The monitor's
+                // `try_wait -> sleep(20ms) -> continue` cadence means a
+                // second `restart_all` issued within ~20 ms of the
+                // first one's spawn_child could land **between** the
+                // monitor's `restart_requested` reset and the next
+                // spin poll, losing the second request. 100 ms ≫ 20 ms
+                // and gives the monitor a full multi-beat window to
+                // settle into the polling phase.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("daemon {name} did not settle into Running within 10s");
+    }
+
     // Cycle 1.
     sup.restart_all().await;
-    let mut a1 = a0;
-    let mut b1 = b0;
-    for _ in 0..200 {
-        if let Ok(txt) = std::fs::read_to_string(&pa) {
-            if let Ok(p) = txt.trim().parse::<u32>() {
-                if p != a0 {
-                    a1 = p;
-                }
-            }
-        }
-        if let Ok(txt) = std::fs::read_to_string(&pb) {
-            if let Ok(p) = txt.trim().parse::<u32>() {
-                if p != b0 {
-                    b1 = p;
-                }
-            }
-        }
-        if a1 != a0 && b1 != b0 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    wait_settled(&sup, "a", &pa).await;
+    wait_settled(&sup, "b", &pb).await;
+
+    // Now the cycle-1 pid is on disk; record it for the orphan check.
+    let a1 = read_pid(&pa).await;
+    let b1 = read_pid(&pb).await;
     assert_ne!(a1, a0, "first cycle: a gets a new pid");
     assert_ne!(b1, b0, "first cycle: b gets a new pid");
 
-    // Cycle 2 — must NOT reuse the cycle-1 pids; the supervisor spawns fresh
-    // children every time, so the chain is strictly increasing (at least, no
-    // repeats).
+    // Cycle 2.
     sup.restart_all().await;
-    let mut a2 = a1;
-    let mut b2 = b1;
-    for _ in 0..200 {
-        if let Ok(txt) = std::fs::read_to_string(&pa) {
-            if let Ok(p) = txt.trim().parse::<u32>() {
-                if p != a1 {
-                    a2 = p;
-                }
-            }
-        }
-        if let Ok(txt) = std::fs::read_to_string(&pb) {
-            if let Ok(p) = txt.trim().parse::<u32>() {
-                if p != b1 {
-                    b2 = p;
-                }
-            }
-        }
-        if a2 != a1 && b2 != b1 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert_ne!(a2, a1, "second cycle: a got ANOTHER new pid");
-    assert_ne!(b2, b1, "second cycle: b got ANOTHER new pid");
-    assert!(
-        !alive(a1) && !alive(b0),
-        "the previous-cycle orphans are gone"
+    wait_settled(&sup, "a", &pa).await;
+    wait_settled(&sup, "b", &pb).await;
+
+    // The cycle-2 pid must differ from cycle-1 (i.e. we did NOT replay
+    // the cycle-1 child, which is what the dropped-restart bug would
+    // surface as).
+    let a2 = read_pid(&pa).await;
+    let b2 = read_pid(&pb).await;
+    assert_ne!(
+        a2, a1,
+        "second cycle: a got ANOTHER new pid (a1={a1}, a2={a2})"
     );
+    assert_ne!(
+        b2, b1,
+        "second cycle: b got ANOTHER new pid (b1={b1}, b2={b2})"
+    );
+
+    // The cycle-1 orphans must be reaped (their pid no longer matches
+    // any alive process). `kill -0` is the OS-level proof: a daemon whose
+    // `child` was taken + killed by the monitor cannot survive without
+    // being adopted by init.
+    async fn wait_dead(pid: u32) {
+        for _ in 0..500 {
+            if !alive(pid) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("pid {pid} still alive 5s after restart_all — leaked orphan");
+    }
+    wait_dead(a1).await;
+    wait_dead(b1).await;
     assert!(alive(a2) && alive(b2), "the fresh children are running");
     assert_eq!(
         sup.status("a").await,
@@ -305,34 +359,58 @@ async fn list_after_restart_all_reports_every_daemon_running() {
         "all daemons are Running before the recycle"
     );
 
+    // Snapshot the **pre-cycle** pids BEFORE restart_all. The new pids
+    // are sampled after the call. If we read pidfiles after restart_all
+    // we get the recycled values back, which is why the old/new
+    // comparison would falsely say "did not change".
+    let mut a_old = std::collections::HashMap::<String, u32>::new();
+    for (name, pf) in &pidfiles {
+        a_old.insert(name.clone(), read_pid(pf).await);
+    }
+
     sup.restart_all().await;
+
+    // Small wait so the monitor has a beat to take in the restart signal.
+    // Without this we'd race the monitor's 20 ms poll cadence against our
+    // very first read. The monitor's notification path wakes the backoff
+    // sleep, but **not** the spin-loop's `try_wait` — there's an
+    // intentional doc note about that in lib.rs.
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Give the recycled children a beat to write their new pidfiles.
     let mut a_new = std::collections::HashMap::<String, u32>::new();
-    let mut a_old = std::collections::HashMap::<String, u32>::new();
-    for (name, _) in &pidfiles {
-        // `read_pid` returns a future. The value (u32) is `Copy`, so
-        // we don't need `drop(...)` — `let _ = …await` is the correct
-        // idiom: drive the future to completion, then drop the result.
-        // The whole point is just to give the recycled child a chance
-        // to write its pidfile before the next loop reads it.
-        let _ = read_pid(&pidfile(name)).await;
+    for (name, pf) in &pidfiles {
         let mut latest = 0u32;
-        for _ in 0..300 {
-            if let Ok(t) = std::fs::read_to_string(pidfile(name)) {
+        // Loop until we see a pid different from the pre-cycle one.
+        let old = a_old.get(name).copied().unwrap_or(0);
+        let mut attempts = 0;
+        let mut last_seen_pid = 0;
+        for _ in 0..1000 {
+            // Use the path the helper returned, not a reconstruction from `name`:
+            // the two are only equal by accident (see `pidfile`).
+            if let Ok(t) = std::fs::read_to_string(pf) {
                 if let Ok(p) = t.trim().parse::<u32>() {
                     if p != 0 {
-                        latest = p;
-                        break;
+                        last_seen_pid = p;
+                        if p != old {
+                            latest = p;
+                            break;
+                        }
                     }
                 }
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
+            attempts += 1;
+        }
+        if latest == 0 {
+            panic!(
+                "daemon {name} never wrote a post-cycle pidfile \
+                 (old={old}, last_seen={last_seen_pid}, attempts={attempts}, \
+                 status={:?})",
+                sup.status(name).await
+            );
         }
         a_new.insert(name.clone(), latest);
-    }
-    for (name, pf) in &pidfiles {
-        a_old.insert(name.clone(), read_pid(pf).await);
     }
 
     let listed_after = sup.list().await;

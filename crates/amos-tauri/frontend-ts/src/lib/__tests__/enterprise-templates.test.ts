@@ -15,6 +15,7 @@
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from "bun:test";
 import {
   TemplateManager,
+  templateManager,
   TEMPLATES_KEY,
   TEMPLATE_INSTALLATIONS_KEY,
   TEMPLATE_CATEGORIES_KEY,
@@ -23,7 +24,7 @@ import {
 } from "../enterprise/templates";
 import { mdmManager, type MDMConfig } from "../enterprise/mdm";
 import { readStoreValue } from "../amosStore";
-import type { Shortcut } from "../shortcuts";
+import { SHORTCUTS_KEY, type Shortcut } from "../shortcuts";
 
 const memory = new Map<string, string>();
 const stub = {
@@ -241,6 +242,40 @@ describe("TemplateManager 初始化与载入", () => {
 });
 
 
+/**
+ * 惰性引导（REQ-A1320）。与 DOM 侧 `svelte-tests/template-library-catalogue.svelte.test.ts`
+ * 是同一份契约的两个面：那一面证明"面板挂载就够"，这一面证明"任何读写路径都够"。
+ *
+ * 这里用的是**单例** `templateManager`（不是 `new TemplateManager()`），因为要钉的正是
+ * 生产里那一个实例 —— 而单例的 `ensureInitialized()` 只认第一次，所以每条用例前
+ * `resetForTest()` 把它退回"从没起来过"。**故意不调 `initialize()`**。
+ */
+describe("TemplateManager 惰性引导（不调 initialize）", () => {
+  test("getTemplates 自己把落盘的目录读回来", () => {
+    seed(TEMPLATES_KEY, [makeTemplate({ id: "tpl-lazy", name: "Lazy" })]);
+    templateManager.resetForTest();
+
+    expect(templateManager.getTemplates().map((t) => t.id)).toEqual(["tpl-lazy"]);
+  });
+
+  test("写路径同样自举：未引导时 createTemplate 不得用一条模板覆盖整个目录", () => {
+    seed(TEMPLATES_KEY, [
+      makeTemplate({ id: "tpl-a", name: "A" }),
+      makeTemplate({ id: "tpl-b", name: "B" }),
+    ]);
+    templateManager.resetForTest();
+
+    const created = templateManager.createTemplate(templateInput({ name: "New" }));
+
+    // saveTemplates() 写的是 Array.from(this.templates.values())：没有引导的话，这一行
+    // 落盘的就是"只有新建的那一条"，用户原有的两条连同它们的安装统计一起没了。
+    const ids = stored<{ id: string }>(TEMPLATES_KEY).map((t) => t.id);
+    expect(ids).toContain("tpl-a");
+    expect(ids).toContain("tpl-b");
+    expect(ids).toContain(created.id);
+  });
+});
+
 describe("TemplateManager 增删改查", () => {
   test("createTemplate 生成 id/版本/时间戳并落盘；getTemplate 找不到回 null", async () => {
     const manager = await freshManager();
@@ -440,13 +475,17 @@ describe("TemplateManager 安装 / 卸载 / 更新", () => {
 
     const result = await manager.installTemplate("tpl-i", {});
     expect(result.success).toBe(true);
-    expect(result.shortcutId?.startsWith("shortcut-")).toBe(true);
+    // 前缀随 REQ-A1326 由 `shortcut-…` 变成 `sc-…`：这条指令现在由 `shortcuts.ts`
+    // 自己的 `createShortcut` 建（也就是它的 id 形状与其它快捷指令一致），而不再是
+    // 模板模块自己编的一个孤立 id。
+    expect(result.shortcutId?.startsWith("sc-")).toBe(true);
 
     const installs = stored<TemplateInstallation>(TEMPLATE_INSTALLATIONS_KEY);
     expect(installs).toHaveLength(1);
     expect(installs[0]?.templateId).toBe("tpl-i");
     expect(installs[0]?.status).toBe("active");
-    expect(installs[0]?.installedBy).toBe("user-default");
+    // 没有登录 ⇒ 缺席的身份如实标记 `unattributed`，不再写会被读成真实账号的 `user-default`（REQ-A695）。
+    expect(installs[0]?.installedBy).toBe("unattributed");
     expect(manager.getTemplate("tpl-i")?.installedCount).toBe(1);
     expect(manager.getTemplate("tpl-i")?.successCount).toBe(1);
   });
@@ -542,6 +581,90 @@ describe("TemplateManager 安装 / 卸载 / 更新", () => {
     const again = await manager.updateInstalledTemplate("tpl-upd");
     expect(again.success).toBe(true);
     expect(manager.getTemplate("tpl-upd")?.installedCount).toBe(2);
+  });
+});
+
+
+describe("TemplateManager 安装必须真的建出那条快捷指令（REQ-A1326）", () => {
+  /**
+   * 修前的形状：`installTemplate()` 把 `applyParameters()` 的结果拿在手里，改个 id、
+   * 记一条安装记录，然后回 `{success:true, shortcutId}` —— 而那条快捷指令**从来没有
+   * 被写进 `amos.shortcuts`**。回执里的 id 指向一个不存在的东西，面板照着它画「已安装」徽标
+   * （还去 `loadShortcuts()` 里找一个 `Shortcut` 类型上根本没有的 `templateId` 字段），
+   * 卸载也只把安装记录的状态改成 `uninstalled`。用户看到「安装成功」的提示，快捷指令库里
+   * 一条也没有。
+   */
+  const shortcutStore = (): Shortcut[] => stored<Shortcut>(SHORTCUTS_KEY);
+
+  test("安装成功 ⇒ amos.shortcuts 里真的多出那条快捷指令，id 就是回执里的 shortcutId", async () => {
+    const manager = await freshManager(() => {
+      seed(TEMPLATES_KEY, [
+        makeTemplate({
+          id: "tpl-real",
+          shortcutData: shortcut({ name: "给 {{who}} 发消息", tags: ["{{who}}"] }),
+          parameters: [
+            { key: "who", name: "对象", type: "text", defaultValue: "world", required: false, description: "" },
+          ],
+        }),
+      ]);
+    });
+
+    const result = await manager.installTemplate("tpl-real", { who: "alice" });
+    expect(result.success).toBe(true);
+
+    const saved = shortcutStore();
+    expect(saved).toHaveLength(1);
+    expect(saved[0]?.id).toBe(result.shortcutId);
+    // 占位符替换要落在**落盘的那一份**上，不是只活在回执的 id 里。
+    expect(saved[0]?.name).toBe("给 alice 发消息");
+    expect(saved[0]?.tags).toEqual(["alice"]);
+    // 而且它落在快捷指令自己的 id 形状上（`sc-…`）—— 因为它就是一条普通快捷指令，
+    // 不再是模板模块自己编出来的一个孤立 id（旧实现是 `shortcut-…`）。
+    expect(result.shortcutId?.startsWith("sc-")).toBe(true);
+  });
+
+  test("卸载 ⇒ 那条快捷指令真的从 amos.shortcuts 里消失", async () => {
+    const manager = await freshManager(() => {
+      seed(TEMPLATES_KEY, [makeTemplate({ id: "tpl-off" })]);
+    });
+
+    await manager.installTemplate("tpl-off", {});
+    expect(shortcutStore()).toHaveLength(1);
+
+    expect(await manager.uninstallTemplate("tpl-off")).toEqual({ success: true });
+    expect(shortcutStore()).toEqual([]);
+  });
+
+  test("重复安装（更新）⇒ 只留最新那一条，旧的不留孤儿", async () => {
+    const manager = await freshManager(() => {
+      seed(TEMPLATES_KEY, [makeTemplate({ id: "tpl-again" })]);
+    });
+
+    const first = await manager.installTemplate("tpl-again", {});
+    const second = await manager.installTemplate("tpl-again", {});
+
+    expect(second.shortcutId).not.toBe(first.shortcutId);
+    const saved = shortcutStore();
+    expect(saved).toHaveLength(1);
+    expect(saved[0]?.id).toBe(second.shortcutId);
+  });
+
+  test("快捷指令建不出来时，安装不得报成功（企业策略拒绝 ⇒ 有理由的失败、不留半截状态）", async () => {
+    const manager = await freshManager(() => {
+      seed(TEMPLATES_KEY, [makeTemplate({ id: "tpl-cap" })]);
+    });
+    // 每用户上限 0 ⇒ 走的就是 `shortcuts.ts::createShortcut` 的那条策略（REQ-A842）。
+    const config = mdmConfig();
+    mdmManager.setConfigForTest({ ...config, restrictions: { ...config.restrictions, maxShortcutsPerUser: 0 } });
+
+    const result = await manager.installTemplate("tpl-cap", {});
+
+    expect(result.success).toBe(false);
+    expect(result.shortcutId).toBeUndefined();
+    expect(result.message).toBe("快捷指令创建失败（被企业策略或数量上限拒绝）");
+    expect(shortcutStore()).toEqual([]);
+    expect(manager.getInstalledTemplates()).toEqual([]);
+    expect(manager.getTemplate("tpl-cap")?.installedCount).toBe(0);
   });
 });
 
@@ -664,6 +787,90 @@ describe("TemplateManager 占位符替换（applyParameters 是纯函数，直�
     // 深拷贝：原对象一个字都没变
     expect(source.name).toBe("Hello {{who}}");
     expect(source.tags).toEqual(["{{city}}", "static"]);
+  });
+});
+
+describe("TemplateManager 重装收不掉旧指令时必须说出来（REQ-A1528 ∕ F-SH-771）", () => {
+  /**
+   * `installTemplate()` 里那条清理（`deleteShortcut(previousShortcutId)`）此前把裁决整个丢掉。
+   *
+   * 同一份文件里，`uninstallTemplate()` 十五行之下写的就是**正确**的那条判据，还带着解释：
+   * `deleteShortcut` 的 `false` 把「本来就不在」与「被策略拒绝删除」折成同一个值，所以要看
+   * 的是**删完之后它还在不在**（`loadShortcuts().some(...)`）。重装这条路上没有这道回读，
+   * 于是「操作者禁止删除」的配置下（`restrictions.allowUserDelete:false`，而
+   * `checkCanCreate` 与 `checkCanDelete` 是两条独立判据 —— 管理员完全可以只禁一半），
+   * 上一次装出来的那条快捷指令留在库里，新的一条也建出来了：一次重装两条同名指令，
+   * 而回执是干净的 `{success:true}`，`安装记录` 只认新的那条 —— 旧的那条从此既不在册
+   * （`uninstallTemplate` 找不到它）、又删不掉（策略禁止手动删），成了用户看不懂的幽灵。
+   */
+  test("策略禁止删除时重装：新的建出来了，旧的那条还在 ⇒ 回执必须点名", async () => {
+    const manager = await freshManager(() => {
+      seed(TEMPLATES_KEY, [makeTemplate({ id: "tpl-twice" })]);
+      const base = mdmConfig();
+      mdmManager.setConfigForTest({
+        ...base,
+        restrictions: { ...base.restrictions, allowUserDelete: false },
+      });
+    });
+
+    const first = await manager.installTemplate("tpl-twice", {});
+    expect(first.success).toBe(true);
+
+    const second = await manager.installTemplate("tpl-twice", {});
+    // 新指令真的建出来了（`create` 那条判据是放行的）—— 所以这次操作**确实成功了一半**，
+    // 不能因为收不掉旧的就把它报成失败。
+    expect(second.success).toBe(true);
+    const firstId = first.shortcutId;
+    const secondId = second.shortcutId;
+    expect(firstId).toBeTruthy();
+    expect(secondId).toBeTruthy();
+    if (!firstId || !secondId) throw new Error("模板安装未返回 shortcutId");
+    expect(secondId).not.toBe(firstId);
+
+    const ids = stored<Shortcut>(SHORTCUTS_KEY).map((s) => s.id);
+    expect(ids).toContain(firstId);
+    expect(ids).toContain(secondId);
+
+    // 收不掉的那条如实带出来：这是回执里唯一能解释「库里为什么有两条」的地方。
+    expect(second.leftoverShortcutId).toBe(firstId);
+  });
+
+  test("对照组：策略放行时重装真的把上一条收掉，回执不带这个字段（不是「永远抱怨」）", async () => {
+    const manager = await freshManager(() => {
+      seed(TEMPLATES_KEY, [makeTemplate({ id: "tpl-clean" })]);
+    });
+
+    const first = await manager.installTemplate("tpl-clean", {});
+    const second = await manager.installTemplate("tpl-clean", {});
+    expect(second.success).toBe(true);
+    expect(second.leftoverShortcutId).toBeUndefined();
+
+    const secondId = second.shortcutId;
+    expect(secondId).toBeTruthy();
+    if (!secondId) throw new Error("模板安装未返回 shortcutId");
+
+    // 库里只剩新的那条 —— 这一半证明「点名」不是恒定输出，只在真的收不掉时出现。
+    expect(stored<Shortcut>(SHORTCUTS_KEY).map((s) => s.id)).toEqual([secondId]);
+    expect(secondId).not.toBe(first.shortcutId);
+  });
+
+  test("旁证：同一策略下卸载仍然如实拒绝，记录也不改 —— 重装的另一半不能反过来把它读成「删完了」", async () => {
+    const manager = await freshManager(() => {
+      seed(TEMPLATES_KEY, [makeTemplate({ id: "tpl-keep" })]);
+      const base = mdmConfig();
+      mdmManager.setConfigForTest({
+        ...base,
+        restrictions: { ...base.restrictions, allowUserDelete: false },
+      });
+    });
+
+    await manager.installTemplate("tpl-keep", {});
+    expect(await manager.uninstallTemplate("tpl-keep")).toEqual({
+      success: false,
+      message: "快捷指令删除被拒（企业策略）",
+    });
+    // 记录没被改成 uninstalled：`uninstallTemplate` 的判据本来就是「删完之后还在不在」。
+    expect(manager.getInstalledTemplates().map((i) => i.templateId)).toEqual(["tpl-keep"]);
   });
 });
 

@@ -611,6 +611,31 @@ export function kotlinTypeToJni(asWritten, imports = new Map(), glueClasses = GL
 }
 
 /**
+ * The return type of a Kotlin fun that writes **no** `: T`, read from its body form.
+ *
+ * `fun f() { … }` is a block body, which Kotlin requires to return `Unit` when no type is
+ * written — asserting `Unit` is sound there. `fun f() = expr` is an expression body whose
+ * type is inferred; asserting `Unit` there is not (that pseudo-fact is what made R3 report a
+ * `NoSuchMethodError` against the correct `call_method(&glue, "isCapturing", "()Z")`). Only
+ * the trivially-decidable expressions are inferred — `true`/`false`, a comparison, a string
+ * or integer literal. Anything else (a call, a property, an arithmetic expression) returns
+ * `null`: *this gate cannot tell*, which the caller treats as not-judged.
+ *
+ * `after` is the source immediately following the closing `)` of the parameter list.
+ */
+export function inferReturnFromBody(after) {
+  const rest = after.replace(/^\s*/, "");
+  if (rest.startsWith("{")) return "Unit";
+  if (!rest.startsWith("=")) return null; // `where`, an unfinished line, …
+  const expr = rest.slice(1).split("\n")[0].trim();
+  if (/^(true|false)\b/.test(expr)) return "Boolean";
+  if (/(^|[^=!<>])(==|!=|<=|>=|<|>)/.test(expr)) return "Boolean";
+  if (expr.startsWith('"')) return "String";
+  if (/^-?\d/.test(expr)) return "Int";
+  return null;
+}
+
+/**
  * Compare a JNI descriptor against a Kotlin declaration's parameter/return types.
  *
  * Returns `{ ok: true }`, `{ ok: false, reason }` (a real mismatch: the JVM resolves an
@@ -635,8 +660,18 @@ export function signatureVerdict(decl, signature) {
   expected.forEach((e, i) => {
     if (e === null) unreadable.push(decl.params[i]);
   });
-  const expectedReturn = kotlinTypeToJni(decl.returns ?? "Unit", decl.imports);
-  if (expectedReturn === null) unreadable.push(decl.returns ?? "Unit");
+  // A fun with **no written** return type is not the same as one that returns `Unit`:
+  // `fun f() { … }` is a block body (Kotlin makes it `Unit`), but `fun f() = expr` is an
+  // expression body whose type is *inferred* — asserting `Unit` there invented a mismatch
+  // against a correct call (`CameraGlue.isCapturing() = camera != null` is `boolean`, and
+  // this gate read it as `Unit` and reported a NoSuchMethodError; javap on the built
+  // CameraGlue.class shows `public final boolean isCapturing()`). So `returns === null`
+  // means "the gate could not tell" and is *unknown*, never agreement and never a guess.
+  if (decl.returns == null) {
+    return { unknown: true, reason: "the Kotlin declaration writes no return type and this gate cannot infer it" };
+  }
+  const expectedReturn = kotlinTypeToJni(decl.returns, decl.imports);
+  if (expectedReturn === null) unreadable.push(decl.returns);
   if (unreadable.length > 0) {
     return { unknown: true, reason: `the Kotlin type(s) ${unreadable.join(", ")} cannot be mapped by this gate` };
   }
@@ -658,17 +693,37 @@ export function signatureVerdict(decl, signature) {
  * (`incall.rs`/`blocklist.rs`'s `call_static_bool(method: &str)`), so the literals its
  * callers pass are the real answers — resolved through the file, which is exactly the
  * shape a literal-only gate would silently miss.
+ *
+ * REQ-A1632 / the `call_static_int` case: "through the file" was the window, and it was
+ * narrower than the sentence above. A wrapper is *declared* where its class handle lives
+ * and *called* wherever the caller is — `real_dial.rs`'s `pub(crate) call_static_int` is
+ * called with its one literal in `cellular.rs::cellular_status`. Searching the defining
+ * file alone finds no literal, so the site was reported `unresolved-member` and R1 never
+ * checked `cellularSignalLevelBound` at all (it exists, `@JvmStatic`, `(): Int` — verified
+ * by hand).
+ *
+ * So a caller may pass `corpus`: `{ text, ambiguous }` — the whole stripped Rust tree and
+ * the set of `fn` names declared in more than one file. A wrapper name is what maps a set
+ * of literals onto a class, so widening is only sound when the name identifies **one**
+ * declaration; `call_static_bool` is declared three times (`incall.rs`, `blocklist.rs`,
+ * `real_dial.rs`) over three different glue classes, and searching the tree for its
+ * literals would check `BlocklistGlue.screeningRoleSupported` against `TelephonyGlue`.
+ * Such a name keeps the defining-file window (its local callers are class-scoped by
+ * construction); a tree-unique name like `call_static_int` widens. A bare string corpus
+ * (the selftest fixtures) is searched as-is.
  */
-export function methodsFor(call, code) {
+export function methodsFor(call, code, corpus = code) {
   const lit = firstStringLiteral(call.methodArg);
   if (lit) return { names: [lit], how: "literal" };
   const arg = call.methodArg.trim().replace(/^&/, "");
   if (!call.fn) return { names: [], how: "unresolved" };
   const params = call.fn.params.split(",").map((p) => p.trim().split(":")[0].trim());
   if (!params.includes(arg)) return { names: [], how: "unresolved" };
+  const text =
+    typeof corpus === "string" ? corpus : corpus.ambiguous.has(call.fn.name) ? code : corpus.text;
   const names = new Set();
   const re = new RegExp(`\\b${call.fn.name}\\s*\\(\\s*"([^"]+)"`, "g");
-  for (const m of code.matchAll(re)) names.add(m[1]);
+  for (const m of text.matchAll(re)) names.add(m[1]);
   return names.size > 0
     ? { names: [...names], how: `wrapper ${call.fn.name}` }
     : { names: [], how: "unresolved" };
@@ -724,7 +779,15 @@ export function kotlinMembers(src) {
     const open = starts[i] + m[0].length - 1;
     const close = matchDelim(src, open, "(", ")");
     const params = close < 0 ? null : splitTopLevel(src.slice(open + 1, close));
-    const returns = close < 0 ? null : (/^\s*:\s*([^={\n]+)/.exec(src.slice(close + 1, close + 300))?.[1] ?? null);
+    // The return type is either written (`: T`) or read from the body form. A `{` block body
+    // is `Unit` by Kotlin's rule; a `= expr` expression body infers, so only the trivially
+    // decidable expressions are resolved and anything else (a call, a property) stays
+    // `null` — "this gate cannot tell", reported as *not judged* rather than as `Unit`.
+    const returns =
+      close < 0
+        ? null
+        : ((/^\s*:\s*([^={\n]+)/.exec(src.slice(close + 1, close + 300))?.[1] ?? "").trim() ||
+           inferReturnFromBody(src.slice(close + 1, close + 300)));
     out.push({
       name: m[2],
       line: i + 1,
@@ -784,8 +847,11 @@ export function rustExports(src) {
  * `{ findings, checked, skipped, sites }` — `skipped` is the honest count of platform
  * statics this gate does not own, `sites` every `call_static_method` it looked at.
  */
-export function checkStaticCalls(src, file, glue) {
+export function checkStaticCalls(src, file, glue, corpus = null) {
   const code = stripComments(src);
+  // The wrappers' literal callers may live in another file (REQ-A1632); `code` is the
+  // fallback so a caller that passes only one file keeps the old behaviour.
+  const methodCorpus = corpus ?? code;
   const analysis = analyzeRustFile(src);
   const findings = [];
   const checked = [];
@@ -840,7 +906,7 @@ export function checkStaticCalls(src, file, glue) {
     }
     const cls = res.cls;
     const kotlin = glue.get(cls);
-    const methods = methodsFor(call, code);
+    const methods = methodsFor(call, code, methodCorpus);
     if (methods.names.length === 0) {
       findings.push({
         file,
@@ -951,8 +1017,9 @@ export function glueHandle(recv, fnBody) {
  * `Intent#setData`, `Location#getLatitude`, `Iterator#next`, …) and counted — the rule
  * never guesses.
  */
-export function checkInstanceCalls(src, file, tree) {
+export function checkInstanceCalls(src, file, tree, corpus = null) {
   const code = stripComments(src);
+  const methodCorpus = corpus ?? code;
   const blanked = blankCode(src);
   const owners = new Set(rustExports(src).map((e) => e.className));
   const findings = [];
@@ -967,7 +1034,7 @@ export function checkInstanceCalls(src, file, tree) {
       skipped++;
       continue;
     }
-    const names = methodsFor(call, code).names;
+    const names = methodsFor(call, code, methodCorpus).names;
     if (names.length === 0) {
       findings.push({
         file,
@@ -1275,6 +1342,49 @@ export function runSelftest() {
     wrapperBroken.findings.some((f) => f.kind === "missing-jvmstatic" && f.site.includes("answerActive")),
   );
 
+  // 7b. REQ-A1632 — a wrapper called from another file (the `call_static_int` shape)
+  const telephonyGlue = new Map([
+    [
+      "TelephonyGlue",
+      {
+        file: "crates/amos-tauri/android-glue/com/amos/ai/glue/TelephonyGlue.kt",
+        members: kotlinMembers(
+          "class TelephonyGlue {\n    companion object {\n        @JvmStatic\n        fun cellularSignalLevelBound(): Int = 0\n    }\n}",
+        ),
+      },
+    ],
+  ]);
+  const crossFileWrapper = [
+    "fn call_static_int(method: &str) -> Result<i32, String> {",
+    '    let class = env.find_class("com/amos/ai/glue/TelephonyGlue").map_err(e)?;',
+    '    let value = env.call_static_method(&class, method, "()I", &[]).map_err(e)?;',
+    "    value.i()",
+    "}",
+  ].join("\n");
+  const callerInAnotherFile = 'fn cellular_status() { let _ = call_static_int("cellularSignalLevelBound"); }';
+  ok(
+    "the defining-file window alone cannot read a cross-file wrapper caller",
+    checkStaticCalls(crossFileWrapper, "real_dial.rs", telephonyGlue).findings[0]?.kind ===
+      "unresolved-member",
+  );
+  const widened = checkStaticCalls(crossFileWrapper, "real_dial.rs", telephonyGlue, {
+    text: `${crossFileWrapper}\n${callerInAnotherFile}`,
+    ambiguous: new Set(),
+  });
+  ok(
+    "a tree-unique wrapper is resolved through the tree, and its member checked",
+    widened.findings.length === 0 &&
+      widened.checked.some((c) => c.member === "cellularSignalLevelBound"),
+  );
+  const overWide = checkStaticCalls(crossFileWrapper, "real_dial.rs", telephonyGlue, {
+    text: `${crossFileWrapper}\n${callerInAnotherFile}`,
+    ambiguous: new Set(["call_static_int"]),
+  });
+  ok(
+    "a wrapper name declared in >1 file keeps the defining-file window (no cross-class over-collection)",
+    overWide.findings.some((f) => f.kind === "unresolved-member"),
+  );
+
   // 8. a site the resolver cannot read must not be silently skipped when glue is involved
   const unresolvable = checkStaticCalls(
     'fn f() { let c = pick(); env.call_static_method(c, "x", "()V", &[]); }',
@@ -1509,6 +1619,31 @@ export function runSelftest() {
     "a mismatch names the offending parameter",
     signatureVerdict(decl, "(Ljava/lang/String;I)Z").reason.includes("Kotlin Long (J) vs JNI I"),
   );
+  // A fun with no written `: T` must not be asserted as `Unit` (that false fact reported a
+  // NoSuchMethodError against the correct `call_method(&glue, "isCapturing", "()Z")`).
+  ok(
+    "an unwritten return type with an undecidable body is *unknown*, never a Unit verdict",
+    signatureVerdict({ params: [], returns: null, imports: noImports }, "()Z").unknown === true,
+  );
+  ok("a `= true` expression body infers Boolean", inferReturnFromBody(" = true") === "Boolean");
+  ok("a `= camera != null` expression body infers Boolean", inferReturnFromBody(" = camera != null") === "Boolean");
+  ok("a `= item in list` body stays undecided, not guessed", inferReturnFromBody(" = item in list") === null);
+  ok("a `{ … }` block body is Unit by Kotlin's rule", inferReturnFromBody(" {\n    doThing()\n}") === "Unit");
+  ok("a `= teardown()` call body is undecidable, not Unit", inferReturnFromBody(" = teardown()") === null);
+  ok("a `= \"str\"` body infers String", inferReturnFromBody(' = "x"') === "String");
+  ok("a `= 42` body infers Int", inferReturnFromBody(" = 42") === "Int");
+  // The whole point: the *parser* resolves the CameraGlue shape, so the site is judged.
+  const camGlue = kotlinMembers(
+    "package com.amos.ai.glue\nobject CameraGlue {\n    fun isCapturing() = camera != null\n    fun detach() = teardown()\n}\n",
+  );
+  ok(
+    "kotlinMembers reads an inferred Boolean from an expression body",
+    camGlue.find((m) => m.name === "isCapturing")?.returns === "Boolean",
+  );
+  ok(
+    "kotlinMembers leaves an undecidable body's return type null (not Unit)",
+    camGlue.find((m) => m.name === "detach")?.returns === null,
+  );
 
   const sigCall = {
     signature: "sig",
@@ -1726,6 +1861,23 @@ function runScan() {
   }
   const rustFiles = productionRust();
   const glue = glueKotlin();
+  const rustSources = new Map(rustFiles.map((f) => [f, readFileSync(join(root, f), "utf8")]));
+  // REQ-A1632: a wrapped member must be resolvable from a call site *anywhere* in the
+  // tree, not only in the file that declares the wrapper — `call_static_int`'s literal
+  // (`"cellularSignalLevelBound"`) lives in `cellular.rs` while the `fn` is in
+  // `real_dial.rs`, so a defining-file-only window reports it unresolvable and the only
+  // "fix" left is to allowlist the check away. The whole stripped tree is the corpus, and
+  // `ambiguous` (a `fn` name declared in more than one file) keeps a shared wrapper name
+  // from mapping one class's literals onto another's (see `methodsFor`).
+  const stripped = [...rustSources.values()].map((s) => stripComments(s));
+  const declCount = new Map();
+  for (const text of stripped) {
+    for (const m of text.matchAll(/\bfn\s+([A-Za-z_]\w*)/g)) {
+      declCount.set(m[1], (declCount.get(m[1]) ?? 0) + 1);
+    }
+  }
+  const ambiguous = new Set([...declCount].filter(([, n]) => n > 1).map(([name]) => name));
+  const methodCorpus = { text: stripped.join("\n"), ambiguous };
   const findings = []; // R1 + R3 + R2 sites
   const checked = []; // R1: (glue class, member) pairs verified @JvmStatic
   const instanceChecked = []; // R3: (member, arity) pairs verified on the Kotlin side
@@ -1736,14 +1888,14 @@ function runScan() {
   let instanceSites = 0;
   let instanceSkipped = 0;
   for (const f of rustFiles) {
-    const src = readFileSync(join(root, f), "utf8");
-    const statics = checkStaticCalls(src, f, glue.byClass);
+    const src = rustSources.get(f);
+    const statics = checkStaticCalls(src, f, glue.byClass, methodCorpus);
     findings.push(...statics.findings);
     checked.push(...statics.checked);
     staticReports.push(...statics.reports);
     skippedStatics += statics.skipped;
     staticSites += statics.sites;
-    const instances = checkInstanceCalls(src, f, glue);
+    const instances = checkInstanceCalls(src, f, glue, methodCorpus);
     findings.push(...instances.findings);
     instanceChecked.push(...instances.checked);
     instanceReports.push(...instances.reports);
@@ -1761,7 +1913,7 @@ function runScan() {
   }
   const exports = [];
   for (const f of rustFiles) {
-    for (const e of rustExports(readFileSync(join(root, f), "utf8"))) exports.push({ ...e, file: f });
+    for (const e of rustExports(rustSources.get(f))) exports.push({ ...e, file: f });
   }
   const r2 = pairExports(glue.byClass, exports);
   findings.push(...r2.findings);

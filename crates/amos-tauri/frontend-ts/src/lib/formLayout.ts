@@ -52,13 +52,16 @@
  *     yet) never invents a desktop or tablet density — it degrades to the phone grid,
  *     mirroring `LayoutPolicy::columns_for(0) == 1`'s "an unmeasured screen gets the
  *     most conservative answer" rule.
- *   * This module decides **launcher geometry + device chrome only**. It does not
- *     (yet) render an iPad-style side rail, nor a macOS menu-bar mirror: the shell has
- *     no per-app navigation model to put in either, and inventing one would be worse
- *     than not having it.
+ *   * This module decides **launcher geometry + device chrome** and, since the tablet
+ *     completion work (2026-09-20), two *content* families that consume the host's
+ *     measured `columns`: `masterDetail` (an iPad-style side rail, adopted by the
+ *     Settings app — the shell still has no per-app navigation model, so no other app
+ *     gets one) and `dockRecentSlots` / `dockRecents` (the iPad Dock's recently-used
+ *     section). No macOS menu-bar mirror exists; the desktop shell owns its own TopBar.
  */
 
 import type { FormFactor } from "./wm";
+import { orientationOf } from "./rotation";
 
 /** A home-screen icon grid: how many tiles per row and per page-row. */
 export interface HomeGrid {
@@ -170,6 +173,26 @@ export function pwaHubCols(form: FormFactor): number {
 }
 
 /**
+ * Whether the **browser** (`WebManApp`) hosts a live remote page **inline** — the
+ * sandboxed `iframe` — rather than showing the "open in browser" punt card.
+ *
+ * The defect this replaces (REQ-A554): the app decided this from
+ * `window.innerWidth >= 768`, i.e. "the class from the viewport", which rule 1 above
+ * forbids. The two disagree on a tablet in portrait (768 px wide — the threshold was
+ * an *approximation* of "tablet and up"), and a Mac app window narrowed below 768 px
+ * lost its page. A large-screen class hosts inline (an iPad renders a page in place,
+ * as does a Mac window whatever its width); the phone class keeps the punt card it has
+ * always shown (that path awaits a native browser WebView — this does not grant it
+ * one), and so does robot. An unmeasured class reaches here as `"phone"` (the honest
+ * "no host yet" state), keeping today's behavior.
+ *
+ * Same family as `photosCols` / `pwaHubCols`: one source of truth, one set of tests.
+ */
+export function webManInline(form: FormFactor): boolean {
+  return form === "desktop" || form === "tablet";
+}
+
+/**
  * The home-screen grid for this class at this measured screen size.
  *
  * `width`/`height` are the host's measured screen (logical px; see
@@ -200,7 +223,13 @@ export function homeGrid(form: FormFactor, width: number, height: number): HomeG
     };
   }
   if (form !== "tablet") return PHONE_GRID;
-  return height >= width ? TABLET_PORTRAIT_GRID : TABLET_LANDSCAPE_GRID;
+  // One orientation read for the whole shell (REQ-A677): `orientationOf` is the TS
+  // mirror of the Rust kernel `amos_display::orientation::orientation_of` (landscape
+  // iff strictly wider than tall; a square counts as portrait). Keeping the home grid
+  // and the rotation policy on the *same* rule is what the Rust doc-comment claims.
+  return orientationOf(width, height) === "landscape"
+    ? TABLET_LANDSCAPE_GRID
+    : TABLET_PORTRAIT_GRID;
 }
 
 /** How many tiles one page of `grid` holds — the single answer to "per page". */
@@ -258,4 +287,137 @@ export function deviceChrome(form: FormFactor): DeviceChrome {
     homeIndicator: form === "phone" || form === "tablet",
     titleBar: form === "desktop",
   };
+}
+
+/**
+ * The narrowest a **tablet** may be and still split a surface into
+ * sidebar + detail.
+ *
+ * Basis (the same 600 px band `columns_for` widens at, plus room to be useful): the
+ * host's `columns >= 2` already proves the screen is tablet-wide, but a 600 px window
+ * with a 260 px sidebar leaves a 340 px detail — narrower than the phone's own
+ * `min_pane` (360), i.e. a "sidebar" that makes the content *worse* than not having
+ * one. iPadOS collapses the sidebar in a narrow Split View for the same reason. 700
+ * clears that with margin, and every measured tablet (portrait 900 / landscape 1200)
+ * is above it.
+ */
+export const TABLET_SIDEBAR_MIN_WIDTH = 700;
+
+/** Widest the sidebar column ever grows (px) — a fixed column, like iPadOS's. */
+export const TABLET_SIDEBAR_MAX_PX = 360;
+
+/** Narrowest the sidebar column ever shrinks to (px), when the surface has one. */
+export const TABLET_SIDEBAR_MIN_PX = 260;
+
+/** The sidebar fraction of the measured width (32 % ≈ iPadOS's 320/1000). */
+const TABLET_SIDEBAR_FRACTION = 0.32;
+
+/**
+ * The master-detail decision for one surface: does this device class lay the surface
+ * out as a **sidebar + detail**, and how wide is the sidebar?
+ *
+ * This is the "a tablet is not a stretched phone" half of the layout work applied to
+ * *list → detail* surfaces (iOS Settings / Mail / Notes push a sub-page; iPadOS shows
+ * the list beside it). It is the **second behavioral consumer** of the host's measured
+ * `columns` signal (`docs/multi-window.md:79` boundary ④ — until now `columns` only
+ * gated the split surface), and it deliberately consumes **both** the class and the
+ * measurement, from one authority (`LayoutSnapshot.form` / `.columns`):
+ *
+ *   * a class that is not `tablet` ⇒ never (desktop owns its own shell; phone/robot are
+ *     single-column — the sidebar is not this module's call to make for them);
+ *   * `columns < 2` ⇒ never: the host has measured a screen too narrow for two panes,
+ *     so a sidebar would be a column this device cannot afford (the same rule
+ *     `canSplit` follows);
+ *   * an unmeasured width (0 / NaN / ∞) ⇒ never — mirroring
+ *     `LayoutPolicy::columns_for(0) == 1` and `homeGrid`'s "unmeasured ⇒ the most
+ *     conservative answer", so a preview build or a boot race never invents a sidebar;
+ *   * otherwise the sidebar appears once the measured width reaches
+ *     [`TABLET_SIDEBAR_MIN_WIDTH`].
+ *
+ * The width is a bounded fraction of the measured surface, clamped to
+ * `[TABLET_SIDEBAR_MIN_PX, TABLET_SIDEBAR_MAX_PX]` — a fixed column, never a second
+ * layout engine. `sidebarWidth` is 0 exactly when `sidebar` is false, so a caller that
+ * ignores the boolean still cannot reserve a phantom column.
+ */
+export interface MasterDetail {
+  /** Show the sidebar column at all? */
+  readonly sidebar: boolean;
+  /** The sidebar column's width (px) — `0` when `sidebar` is false. */
+  readonly sidebarWidth: number;
+}
+
+/** Decide the master-detail layout for this class at this measured size
+ * (see [`MasterDetail`] for the rule). */
+export function masterDetail(
+  form: FormFactor,
+  columns: number,
+  width: number,
+): MasterDetail {
+  const measured = Number.isFinite(width) && width > 0;
+  const fits = form === "tablet" && columns >= 2 && measured && width >= TABLET_SIDEBAR_MIN_WIDTH;
+  if (!fits) return { sidebar: false, sidebarWidth: 0 };
+  const raw = Math.round(width * TABLET_SIDEBAR_FRACTION);
+  return { sidebar: true, sidebarWidth: clamp(raw, TABLET_SIDEBAR_MIN_PX, TABLET_SIDEBAR_MAX_PX) };
+}
+
+/* ---- Dock recents (the iPad's "recently used" apps) ------------------------- */
+
+/** How many recently-used apps an iPad's Dock offers beside the pinned ones. */
+export const DOCK_RECENT_SLOTS = 3;
+
+/**
+ * Does this class's Dock carry a **recently-used** section, and how many apps may it
+ * hold?
+ *
+ * iPadOS puts up to three recently-opened apps at the right of the Dock, after a
+ * divider — the Dock is also the shell's quick app switcher, so an app you just left
+ * is one tap away instead of a hunt through the App Library. An iPhone's Dock has no
+ * such section: it is pinned apps only, and reaching a recent app there means the
+ * Recents surface (bottom-edge swipe) rather than a Dock slot. So: tablet ⇒ 3,
+ * everything else ⇒ 0.
+ *
+ * The desktop is **deliberately 0 here even though macOS's Dock does show recent
+ * apps**: the desktop class renders from its own shell (`DesktopShell.svelte` +
+ * `lib/desktopLayout.ts`) and never mounts this launcher, so answering 3 for it would
+ * be policy no production path renders — the same two-sources-of-truth boundary the
+ * module header registers (REQ-A250). When that Dock adopts this family, it is one
+ * case to add, with its own measurement.
+ *
+ * `0` is also the conservative answer for a payload with no class (see
+ * `HomeDock`'s "a missing payload never gains a capability" rule): phone behaviour
+ * is today's behaviour, and a Dock section appearing from absent data would be a new
+ * thing, not a preserved one.
+ */
+export function dockRecentSlots(form: FormFactor): number {
+  return form === "tablet" ? DOCK_RECENT_SLOTS : 0;
+}
+
+/**
+ * The recent apps a Dock section should show, in most-recent-first order.
+ *
+ * Pure, and narrow on purpose:
+ *   * `pinned` ids are dropped — an app already in the Dock must not appear twice,
+ *     and the pinned tile is the one the user placed (its position is theirs);
+ *   * duplicates in `recents` collapse to their first (most recent) occurrence;
+ *   * the answer is capped at `slots`, so a caller cannot widen the Dock's density
+ *     by passing a longer history.
+ *
+ * It does **not** filter unknown/uninstalled ids: the recents store already holds
+ * built-in ids only (`shellState.open` records a recent only for `appTitleKey` hits),
+ * and a caller rendering external tiles filters against its own tile map. Inventing a
+ * second availability check here would be the third place that decision lives.
+ */
+export function dockRecents(
+  recents: readonly string[],
+  pinned: readonly string[],
+  slots: number,
+): string[] {
+  if (!Number.isFinite(slots) || slots <= 0) return [];
+  const out: string[] = [];
+  for (const id of recents) {
+    if (out.length >= slots) break;
+    if (pinned.includes(id) || out.includes(id)) continue;
+    out.push(id);
+  }
+  return out;
 }

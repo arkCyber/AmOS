@@ -92,8 +92,42 @@ describe("sort / filter / total", () => {
     expect(filterExternalByName(files, "zzz")).toEqual([]);
     expect(filterExternalByName(files, "")).toHaveLength(3);
     expect(totalExternalBytes(files)).toBe(450);
-    // Unknown sizes count as 0.
-    expect(totalExternalBytes([toExternalFile(item({ name: "x", uri: "u", ts: 0 }))])).toBe(0);
+  });
+});
+
+// REQ-A1525 / F-SH-770: `MediaItem.size_bytes` is `number | null` — `null` means the
+// platform did not report that file's size. The old total folded it to 0, so the
+// Files screen's header printed a byte count nobody measured (`0 B` when no size was
+// reported at all) while each row on that same screen printed 「—」 for the very same
+// file. An unmeasured size withholds the total; only a real 0 sums to 0.
+describe("totalExternalBytes with unmeasured sizes (REQ-A1525)", () => {
+  const known = (name: string, uri: string, size_bytes: number) =>
+    toExternalFile(item({ name, uri, ts: 1, size_bytes }));
+  const unknown = (name: string, uri: string) => toExternalFile(item({ name, uri, ts: 1 }));
+
+  it("withholds the total when a file's size was not reported", () => {
+    expect(totalExternalBytes([unknown("a", "u-a")])).toBeNull();
+    // A partial sum is not "the total" either — one unmeasured file in the list
+    // makes the exact total unknowable.
+    expect(totalExternalBytes([known("a", "u-a", 100), unknown("b", "u-b")])).toBeNull();
+    expect(totalExternalBytes([unknown("b", "u-b"), known("a", "u-a", 100)])).toBeNull();
+  });
+
+  it("still totals when every size was reported", () => {
+    expect(totalExternalBytes([known("a", "u-a", 100), known("b", "u-b", 350)])).toBe(450);
+    // Positive control: a *measured* zero is not the same as an unmeasured one.
+    expect(totalExternalBytes([known("a", "u-a", 0), known("b", "u-b", 0)])).toBe(0);
+    expect(totalExternalBytes([])).toBe(0);
+  });
+
+  it("buildExternalFileView carries the withheld total through", () => {
+    const raw = [
+      { id: "u-a", name: "a.pdf", uri: "u-a", kind: "file", collection: "download", ts: 1, size_bytes: 10 },
+      { id: "u-b", name: "b.pdf", uri: "u-b", kind: "file", collection: "download", ts: 2 },
+    ];
+    const view = buildExternalFileView(raw);
+    expect(view.fileCount).toBe(2);
+    expect(view.totalBytes).toBeNull();
   });
 });
 

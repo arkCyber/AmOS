@@ -95,6 +95,42 @@ pub fn domain_matches(rule_domain: &str, observed: &str) -> bool {
         .is_some_and(|prefix| prefix.ends_with('.'))
 }
 
+/// Is `raw` an acceptable host in the **egress allow-list grammar** — the same
+/// shape an app manifest's `allowed_domains` is validated against?
+///
+/// Deliberately **stricter than [`domain_matches`]**, which would happily match a
+/// dotless name. An allow-list entry is a *grant*, and a bare LAN name
+/// (`localhost`, `router`) is the one grant that reaches *this* machine, so it is
+/// refused rather than stored. The accepted shape is a fully-qualified, lowercase
+/// ASCII host: at least two `.`-separated labels, each non-empty and made of
+/// `a-z` / `0-9` / `-` (no leading or trailing `-`). Wildcards (`*.example.com`),
+/// schemes, ports, paths and uppercase are all refused: [`domain_matches`] has no
+/// wildcard form, so a stored `*.x` rule would silently match nothing — the exact
+/// failure mode this validator exists to prevent.
+///
+/// Mirrors `amos-appstore::pwa::validate_domain_pattern` (the two must agree, or a
+/// host the manifest accepts would be silently dropped at the guard). Pure and
+/// total.
+pub fn is_valid_egress_host(raw: &str) -> bool {
+    if raw.is_empty() || raw.contains('*') || raw.contains('/') || raw.contains(':') {
+        return false;
+    }
+    if raw != raw.to_ascii_lowercase() {
+        return false;
+    }
+    if !raw.contains('.') {
+        return false;
+    }
+    raw.split('.').all(|label| {
+        !label.is_empty()
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    })
+}
+
 /// A uid-scoped, ordered set of rules. First match wins; evaluation is pure and
 /// never panics.
 #[derive(Debug, Default)]
@@ -204,6 +240,50 @@ mod tests {
         assert!(set.blocked(10_000, &dom("qualcomm.com")));
         assert!(set.blocked(10_000, &dom("example.mediatek.com")));
         assert!(!set.blocked(10_000, &dom("example.com")));
+    }
+
+    #[test]
+    fn egress_host_grammar_accepts_fully_qualified_lowercase_hosts() {
+        assert!(is_valid_egress_host("api.example.com"));
+        assert!(is_valid_egress_host("cdn.odds.example.net"));
+        assert!(is_valid_egress_host("a1.b-c.example"));
+    }
+
+    #[test]
+    fn egress_host_grammar_refuses_wildcards_schemes_and_dotless_names() {
+        // Every one of these would either match nothing (`*.x` — the matcher has
+        // no wildcard form) or reach *this* machine (`localhost`), so all are
+        // refused rather than stored as a rule.
+        for bad in [
+            "*.example.com",
+            "example.com/path",
+            "https://example.com",
+            "example.com:443",
+            "Example.com",
+            "localhost",
+            "example",
+            "",
+            "example..com",
+            "-example.com",
+            "example-.com",
+            "exa mple.com",
+        ] {
+            assert!(
+                !is_valid_egress_host(bad),
+                "{bad:?} must be refused by the allow-list grammar"
+            );
+        }
+    }
+
+    #[test]
+    fn accepted_hosts_are_exactly_what_the_matcher_can_use() {
+        // A host the grammar accepts must actually match itself and its
+        // subdomains — the grammar exists so a stored rule is never inert.
+        for host in ["api.example.com", "cdn.odds.example.net"] {
+            assert!(is_valid_egress_host(host));
+            assert!(domain_matches(host, host));
+            assert!(domain_matches(host, &format!("sub.{host}")));
+        }
     }
 
     #[test]

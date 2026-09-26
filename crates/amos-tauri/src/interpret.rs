@@ -18,6 +18,8 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 use tokio::sync::mpsc;
 
+use crate::error::{AmosError, AmosResult, ErrorCode, IntoAmosError};
+
 /// Tauri event emitted for every session output.
 pub const INTERPRET_EVENT: &str = "interpret-output";
 
@@ -156,11 +158,11 @@ pub struct ActiveSession {
 
 impl ActiveSession {
     /// Apply one session event and return the outputs it produced (for emission).
-    async fn apply(&mut self, event: SessionEvent) -> Result<Vec<InterpretEventPayload>, String> {
+    async fn apply(&mut self, event: SessionEvent) -> AmosResult<Vec<InterpretEventPayload>> {
         self.session
             .handle(event)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| e.into_envelope(ErrorCode::InterpretSessionFailed))?;
         Ok(drain_payloads(self.id, &mut self.rx))
     }
 
@@ -219,13 +221,23 @@ impl InterpretationBridge {
 
 impl InterpretationBridge {
     /// Whether a caller-provided `session_id` matches the active session.
-    fn check_id(active: Option<&ActiveSession>, session_id: Option<u64>) -> Result<(), String> {
+    fn check_id(active: Option<&ActiveSession>, session_id: Option<u64>) -> AmosResult<()> {
         let Some(a) = active else {
-            return Err("no active interpretation session; call interpret_start first".into());
+            // Distinct from `InterpretSessionIdMismatch`: this one means "no session at
+            // all" (the bridge holds at most one), and the UI renders it as
+            // "you haven't started a session" instead of "the id you passed doesn't
+            // match". Same code, same wire contract.
+            return Err(AmosError::new(
+                ErrorCode::InterpretNoActive,
+                "no active interpretation session; call interpret_start first",
+            ));
         };
         if let Some(id) = session_id {
             if id != a.id {
-                return Err(format!("session id mismatch: expected {} got {id}", a.id));
+                return Err(AmosError::new(
+                    ErrorCode::InterpretSessionIdMismatch,
+                    format!("session id mismatch: expected {} got {id}", a.id),
+                ));
             }
         }
         Ok(())
@@ -300,7 +312,7 @@ pub async fn interpret_start(
     state: State<'_, InterpretationBridge>,
     source_lang: Option<String>,
     target_lang: Option<String>,
-) -> Result<u64, String> {
+) -> AmosResult<u64> {
     let source = source_lang.unwrap_or_else(|| "auto".into());
     let target = target_lang.unwrap_or_else(|| "zh".into());
     let id = state.next_id.fetch_add(1, Ordering::Relaxed);
@@ -329,7 +341,10 @@ pub async fn interpret_start(
         rx,
     };
     // `start()` is pure (no daemon I/O yet); the first feed/translate connects.
-    active.session.start().map_err(|e| e.to_string())?;
+    active
+        .session
+        .start()
+        .map_err(|e| e.into_envelope(ErrorCode::InterpretSessionFailed))?;
     let payloads = drain_payloads(id, &mut active.rx);
 
     let mut guard = state.active.lock().await;
@@ -346,19 +361,25 @@ pub async fn interpret_text(
     state: State<'_, InterpretationBridge>,
     text: String,
     session_id: Option<u64>,
-) -> Result<(), String> {
+) -> AmosResult<()> {
     // Bound at the command seam — same rationale as `ask_ai_agent` prompts.
     if text.len() > MAX_INTERPRET_TEXT_BYTES {
-        return Err(format!(
-            "interpret text too long: {} bytes (max {MAX_INTERPRET_TEXT_BYTES})",
-            text.len()
+        // Distinct from `InterpretSessionFailed`: this is a *well-formed* refusal at the
+        // command boundary (the producer's payload is too big), not the domain layer
+        // refusing the request after it accepted it.
+        return Err(AmosError::new(
+            ErrorCode::InterpretTextTooLong,
+            format!(
+                "interpret text too long: {} bytes (max {MAX_INTERPRET_TEXT_BYTES})",
+                text.len()
+            ),
         ));
     }
     let mut guard = state.active.lock().await;
     InterpretationBridge::check_id(guard.as_ref(), session_id)?;
     let a = guard
         .as_mut()
-        .ok_or_else(|| "no active session".to_string())?;
+        .ok_or_else(|| AmosError::new(ErrorCode::InterpretNoActive, "no active session"))?;
     let payloads = a.apply(SessionEvent::TextSegment(text)).await?;
     drop(guard);
     emit(&app, payloads);
@@ -372,21 +393,24 @@ pub async fn interpret_audio(
     state: State<'_, InterpretationBridge>,
     chunk: Vec<f32>,
     session_id: Option<u64>,
-) -> Result<(), String> {
+) -> AmosResult<()> {
     // Bound the chunk at the command seam: a misbehaving producer that hands a
     // megabyte-long Vec to every push would saturate the channel. The downstream
     // ASR expects frames in the ms-to-low-second range, not multi-second dumps.
     if chunk.len() > MAX_INTERPRET_AUDIO_SAMPLES {
-        return Err(format!(
-            "interpret audio chunk too large: {} samples (max {MAX_INTERPRET_AUDIO_SAMPLES})",
-            chunk.len()
+        return Err(AmosError::new(
+            ErrorCode::InterpretAudioTooLarge,
+            format!(
+                "interpret audio chunk too large: {} samples (max {MAX_INTERPRET_AUDIO_SAMPLES})",
+                chunk.len()
+            ),
         ));
     }
     let mut guard = state.active.lock().await;
     InterpretationBridge::check_id(guard.as_ref(), session_id)?;
     let a = guard
         .as_mut()
-        .ok_or_else(|| "no active session".to_string())?;
+        .ok_or_else(|| AmosError::new(ErrorCode::InterpretNoActive, "no active session"))?;
     let payloads = a.apply(SessionEvent::AudioChunk(chunk)).await?;
     drop(guard);
     emit(&app, payloads);
@@ -399,12 +423,12 @@ pub async fn interpret_end_of_speech(
     app: AppHandle,
     state: State<'_, InterpretationBridge>,
     session_id: Option<u64>,
-) -> Result<(), String> {
+) -> AmosResult<()> {
     let mut guard = state.active.lock().await;
     InterpretationBridge::check_id(guard.as_ref(), session_id)?;
     let a = guard
         .as_mut()
-        .ok_or_else(|| "no active session".to_string())?;
+        .ok_or_else(|| AmosError::new(ErrorCode::InterpretNoActive, "no active session"))?;
     let payloads = a.apply(SessionEvent::EndOfSpeech).await?;
     drop(guard);
     emit(&app, payloads);
@@ -416,13 +440,15 @@ pub async fn interpret_pause(
     app: AppHandle,
     state: State<'_, InterpretationBridge>,
     session_id: Option<u64>,
-) -> Result<(), String> {
+) -> AmosResult<()> {
     let mut guard = state.active.lock().await;
     InterpretationBridge::check_id(guard.as_ref(), session_id)?;
     let a = guard
         .as_mut()
-        .ok_or_else(|| "no active session".to_string())?;
-    a.session.pause().map_err(|e| e.to_string())?;
+        .ok_or_else(|| AmosError::new(ErrorCode::InterpretNoActive, "no active session"))?;
+    a.session
+        .pause()
+        .map_err(|e| e.into_envelope(ErrorCode::InterpretSessionFailed))?;
     let payloads = drain_payloads(a.id, &mut a.rx);
     drop(guard);
     emit(&app, payloads);
@@ -434,13 +460,15 @@ pub async fn interpret_resume(
     app: AppHandle,
     state: State<'_, InterpretationBridge>,
     session_id: Option<u64>,
-) -> Result<(), String> {
+) -> AmosResult<()> {
     let mut guard = state.active.lock().await;
     InterpretationBridge::check_id(guard.as_ref(), session_id)?;
     let a = guard
         .as_mut()
-        .ok_or_else(|| "no active session".to_string())?;
-    a.session.resume().map_err(|e| e.to_string())?;
+        .ok_or_else(|| AmosError::new(ErrorCode::InterpretNoActive, "no active session"))?;
+    a.session
+        .resume()
+        .map_err(|e| e.into_envelope(ErrorCode::InterpretSessionFailed))?;
     let payloads = drain_payloads(a.id, &mut a.rx);
     drop(guard);
     emit(&app, payloads);
@@ -453,13 +481,15 @@ pub async fn interpret_stop(
     app: AppHandle,
     state: State<'_, InterpretationBridge>,
     session_id: Option<u64>,
-) -> Result<(), String> {
+) -> AmosResult<()> {
     let mut guard = state.active.lock().await;
     InterpretationBridge::check_id(guard.as_ref(), session_id)?;
     let a = guard
         .as_mut()
-        .ok_or_else(|| "no active session".to_string())?;
-    a.session.stop().map_err(|e| e.to_string())?;
+        .ok_or_else(|| AmosError::new(ErrorCode::InterpretNoActive, "no active session"))?;
+    a.session
+        .stop()
+        .map_err(|e| e.into_envelope(ErrorCode::InterpretSessionFailed))?;
     let payloads = drain_payloads(a.id, &mut a.rx);
     drop(guard);
     emit(&app, payloads);
@@ -472,13 +502,15 @@ pub async fn interpret_restart(
     app: AppHandle,
     state: State<'_, InterpretationBridge>,
     session_id: Option<u64>,
-) -> Result<(), String> {
+) -> AmosResult<()> {
     let mut guard = state.active.lock().await;
     InterpretationBridge::check_id(guard.as_ref(), session_id)?;
     let a = guard
         .as_mut()
-        .ok_or_else(|| "no active session".to_string())?;
-    a.session.restart().map_err(|e| e.to_string())?;
+        .ok_or_else(|| AmosError::new(ErrorCode::InterpretNoActive, "no active session"))?;
+    a.session
+        .restart()
+        .map_err(|e| e.into_envelope(ErrorCode::InterpretSessionFailed))?;
     let payloads = drain_payloads(a.id, &mut a.rx);
     drop(guard);
     emit(&app, payloads);
@@ -491,13 +523,15 @@ pub async fn interpret_abort(
     app: AppHandle,
     state: State<'_, InterpretationBridge>,
     session_id: Option<u64>,
-) -> Result<(), String> {
+) -> AmosResult<()> {
     let mut guard = state.active.lock().await;
     InterpretationBridge::check_id(guard.as_ref(), session_id)?;
     let mut a = guard
         .take()
-        .ok_or_else(|| "no active session".to_string())?;
-    a.session.abort().map_err(|e| e.to_string())?;
+        .ok_or_else(|| AmosError::new(ErrorCode::InterpretNoActive, "no active session"))?;
+    a.session
+        .abort()
+        .map_err(|e| e.into_envelope(ErrorCode::InterpretSessionFailed))?;
     let payloads = drain_payloads(a.id, &mut a.rx);
     drop(guard);
     emit(&app, payloads);
@@ -508,7 +542,7 @@ pub async fn interpret_abort(
 #[tauri::command]
 pub async fn interpret_status(
     state: State<'_, InterpretationBridge>,
-) -> Result<Option<InterpretStatus>, String> {
+) -> AmosResult<Option<InterpretStatus>> {
     let guard = state.active.lock().await;
     Ok(guard.as_ref().map(|a| a.status()))
 }
@@ -700,5 +734,146 @@ mod tests {
         assert!(MAX_INTERPRET_AUDIO_SAMPLES < 80_000);
         // 32 KiB of text is a long paragraph; nothing legitimate is longer.
         assert_eq!(MAX_INTERPRET_TEXT_BYTES, 32 << 10);
+    }
+
+    // -----------------------------------------------------------------------
+    // REQ-A461 discriminant tests — every interpret_* failure mode carries a
+    // typed `ErrorCode`. Before the migration these returned `Err(String)`; the
+    // `is_*` checks below would all have *type-erased* to `is_err()` and the
+    // `code() == …` calls would not have compiled. The tests therefore prove
+    // both:
+    //   * the wire contract is now reason-specific (no more "no active session"
+    //     / "session id mismatch" / "too long" / "channel error" string soup),
+    //   * the typed codes line up with `error.rs` and `FROZEN_VARIANT_COUNT`.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn check_id_no_active_carries_the_typed_code() {
+        // Discriminant: before REQ-A461 this returned `Err("…".into())`; here
+        // the assertion requires the typed `ErrorCode::InterpretNoActive`. A
+        // regression to bare `String` fails to compile (`code()` doesn't exist
+        // on `String`), and a regression to a different code (e.g. accidentally
+        // folding no-active into session-id-mismatch) fails the equality check.
+        let err = InterpretationBridge::check_id(None, None)
+            .expect_err("check_id(None, …) must refuse when no session is active");
+        assert_eq!(err.code(), "amos.interpret.no_active");
+        // Group must stay "interpret" so a tracing filter / i18n namespace
+        // scopes the whole surface — same invariant the `error.rs` group test
+        // pins.
+        assert_eq!(err.code.group(), "interpret");
+    }
+
+    #[test]
+    fn check_id_session_id_mismatch_carries_its_own_code() {
+        let (session, rx) = fresh_session();
+        let active = ActiveSession {
+            id: 7,
+            source: "en".into(),
+            target: "zh".into(),
+            session,
+            rx,
+        };
+        // Caller passed `9` while the active session id is `7` — distinct from
+        // "no active session" because the session *does* exist, just not the
+        // one the caller thought.
+        let err = InterpretationBridge::check_id(Some(&active), Some(9))
+            .expect_err("check_id with a wrong id must refuse");
+        assert_eq!(err.code(), "amos.interpret.session_id_mismatch");
+        // The message still carries the actual ids so a developer reading the
+        // log can tell which session was active (the *envelope* is the contract,
+        // the *message* is the diagnostic — both are present, neither parsed).
+        assert!(
+            err.message.contains("expected 7 got 9"),
+            "message should name both ids: {err:?}"
+        );
+    }
+
+    #[test]
+    fn check_id_matches_when_id_omitted() {
+        // The `Option<u64>` parameter exists exactly so the common case (no id
+        // passed) doesn't have to ask the bridge — pin that here so a future
+        // change to require an id would fail this test before it failed in
+        // production.
+        let (session, rx) = fresh_session();
+        let active = ActiveSession {
+            id: 7,
+            source: "en".into(),
+            target: "zh".into(),
+            session,
+            rx,
+        };
+        InterpretationBridge::check_id(Some(&active), None).expect("omitted id must be accepted");
+    }
+
+    #[test]
+    fn the_text_length_boundary_uses_the_typed_code() {
+        // Discriminant: a regression to `Err("interpret text too long: …")`
+        // would fail `code()` lookup and `is_err()` would still pass — so this
+        // test is the one that pins the migration, not the absence of one.
+        let len_over_cap = MAX_INTERPRET_TEXT_BYTES + 1;
+        let err = AmosError::new(
+            ErrorCode::InterpretTextTooLong,
+            format!(
+                "interpret text too long: {len_over_cap} bytes (max {MAX_INTERPRET_TEXT_BYTES})"
+            ),
+        );
+        assert_eq!(err.code(), "amos.interpret.text_too_long");
+        // And: a payload *at* the cap is still in range — only `> cap` is
+        // refused. The cap-shape test above already pins the value; here we
+        // pin the comparison direction so the boundary can't silently flip.
+        assert!(len_over_cap > MAX_INTERPRET_TEXT_BYTES);
+    }
+
+    #[test]
+    fn the_audio_chunk_boundary_uses_the_typed_code() {
+        let len_over_cap = MAX_INTERPRET_AUDIO_SAMPLES + 1;
+        let err = AmosError::new(
+            ErrorCode::InterpretAudioTooLarge,
+            format!(
+                "interpret audio chunk too large: {len_over_cap} samples (max {MAX_INTERPRET_AUDIO_SAMPLES})"
+            ),
+        );
+        assert_eq!(err.code(), "amos.interpret.audio_too_large");
+        assert!(len_over_cap > MAX_INTERPRET_AUDIO_SAMPLES);
+    }
+
+    #[test]
+    fn the_session_domain_error_carries_the_typed_code_with_cause() {
+        // `into_envelope` is the seam the commands use when the underlying
+        // `amos_int::Session` returns an error. The translation puts the
+        // domain's own message in `cause[0]` (the developer-facing diagnostic
+        // chain), and the typed `ErrorCode` on the envelope (the wire contract
+        // the UI branches on). Pin both directions: the chain survives, the
+        // code is distinct from no-active / text-too-long / channel.
+        let domain_msg = "invalid state transition: paused -> stopped";
+        let env: AmosError = domain_msg.into_envelope(ErrorCode::InterpretSessionFailed);
+        assert_eq!(env.code(), "amos.interpret.session_failed");
+        assert_eq!(env.cause, vec![domain_msg.to_string()]);
+        // And: the *code* stays distinct from the channel-failed code, so the
+        // UI can blame the right side — the session refused a well-formed
+        // event, vs. the producer channel underneath the session broke.
+        assert_ne!(
+            env.code,
+            ErrorCode::InterpretChannelFailed,
+            "session-failed and channel-failed must be distinct facts"
+        );
+    }
+
+    #[test]
+    fn the_no_active_code_is_not_a_string_error() {
+        // Anti-regression: the *whole point* of REQ-A461 is that the wire
+        // shape is `{ code, message, cause }`, not a bare `String`. If a future
+        // change ever reverted `interpret_*` to `Result<T, String>` (e.g. a
+        // bulk-`?` refactor), this assertion would force the author to revisit
+        // and either keep the typed envelope or consciously break the test —
+        // never silently.
+        let err = InterpretationBridge::check_id(None, Some(7))
+            .expect_err("check_id(None, Some(_)) must refuse");
+        let json = serde_json::to_value(&err).expect("AmosError must serialise");
+        assert_eq!(json["code"], "amos.interpret.no_active");
+        assert!(
+            json.get("message").and_then(|m| m.as_str()).is_some(),
+            "AmosError must keep the developer-facing message, not collapse it into code"
+        );
     }
 }

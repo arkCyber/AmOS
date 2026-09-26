@@ -14,8 +14,13 @@
  * so are links to a bare `#fragment`.
  *
  * Correctness details that matter:
- *   • **Code is stripped first** — fenced (``` / ~~~) blocks and inline `` `code` ``
- *     so transcript markers like `` `[译](auto->zh)` `` are not read as links.
+ *   • **Code is stripped first** — fenced (``` / ~~~) blocks and inline `` `code` ``,
+ *     so transcript markers like `` `[译](auto->zh)` `` are not read as links. The
+ *     inline pairing is **per paragraph** and by **equal run length**: a code span is
+ *     phrase-level content, so it cannot cross a blank line, and a run with no
+ *     same-length partner in its own paragraph renders as a literal backtick instead
+ *     of opening a span (REQ-A791 — pairing document-wide let one stray run blank out
+ *     whole files; see [`stripInline`]).
  *   • An optional `"title"` is allowed: `[x](path "Title")`.
  *   • A `#fragment` is split off before resolving; the **file** part must exist
  *     (fragment slugs are not validated — GitHub's slug rules are a separate job).
@@ -84,19 +89,86 @@ function countMarkdown(dir, acc = []) {
 }
 
 /**
+ * Remove the inline code spans of **one paragraph**.
+ *
+ * A run is paired with the next unused run of **exactly the same backtick length**
+ * (`` `` `x` `` `` is how a document quotes a backtick), left to right. A run with no
+ * such partner *in its own paragraph* is **not** code — a renderer emits it as a
+ * literal backtick — so it is left in place instead of opening a span.
+ *
+ * That last rule is the whole point (REQ-A791). Pairing **document-wide** meant one
+ * stray run stole the judgement of everything after it: `CHANGELOG.md` reported five
+ * dead links that do not exist, and `docs/TRACEABILITY_MATRIX.md` ended up with a
+ * single 422,061-character "code span" — i.e. that file's links were never judged at
+ * all, which is exactly the silent blindness this gate exists to prevent. The
+ * trigger was prose carrying an *odd* number of equal-length runs (a `String?\``
+ * written with a backslash escape, which does **not** work inside a code span).
+ *
+ * Bounding the span to its paragraph is not a weakening of the rule, it *is* the
+ * rule: an inline code span is phrase-level content, and a blank line ends the
+ * paragraph, so a span cannot cross one. (A single newline can — CommonMark folds it
+ * into the span as a space — so only blank lines split.)
+ *
+ * The opposite trade is deliberate: if a document *intends* a span and loses a
+ * backtick, the leftover text is now read as prose and a `[x](y)` inside it can be
+ * reported as a dead link. A visible false positive on the one broken line is
+ * recoverable; a gate that silently judges nothing is not.
+ */
+function stripInline(para) {
+  const runs = [...para.matchAll(/`+/g)];
+  const cut = [];
+  for (let a = 0; a < runs.length; a++) {
+    const len = runs[a][0].length;
+    let b = -1;
+    for (let c = a + 1; c < runs.length; c++) {
+      if (runs[c][0].length === len) {
+        b = c;
+        break;
+      }
+    }
+    if (b < 0) continue; // no partner in this paragraph: a literal backtick
+    cut.push([runs[a].index, runs[b].index + len]);
+    // Resume **after** the span: everything between the two runs is its content, so a
+    // backtick inside it is text, not a second opener. (Matching runs of *different*
+    // lengths independently lets two spans **overlap**, and an overlapping cut list
+    // made the emitter walk `at` backwards and re-emit a region that was already
+    // removed — that leak is how a `[x](y)` inside a code span came back as a link.)
+    a = b;
+  }
+  let out = "";
+  let at = 0;
+  for (const [s, e] of cut) {
+    out += para.slice(at, s) + " ";
+    at = e;
+  }
+  return out + para.slice(at);
+}
+
+/**
  * Remove fenced + inline code so `[x](y)` inside code is not a link.
  *
  * Fences are **line-anchored** (``` / ~~~ must open a line) — a literal run of
  * backticks mid-sentence (e.g. prose documenting ```` ```/~~~ ````) is *not* a
- * fence and must not swallow the rest of the document. Inline code is matched by
- * **backtick-run length** (`` `` `x` `` `` → the inner text goes away), which a
- * naive `` `[^`]*` `` pairing gets wrong for the double-backtick form. A fence or
- * run without a partner is simply left in place.
+ * fence and must not swallow the rest of the document. Inline code is then removed
+ * **paragraph by paragraph** ([`stripInline`]) for the same reason one level down:
+ * bounding a construct to the text it can actually cover, instead of letting one
+ * unpaired delimiter reach across the file.
  */
 export function stripCode(text) {
-  return text
-    .replace(/^[ \t]*(?:```|~~~)[^\n]*\n[\s\S]*?^[ \t]*(?:```|~~~)[ \t]*$/gm, " ")
-    .replace(/(`+)([\s\S]*?)\1/g, " ");
+  const fenced = text.replace(
+    /^[ \t]*(?:```|~~~)[^\n]*\n[\s\S]*?^[ \t]*(?:```|~~~)[ \t]*$/gm,
+    " ",
+  );
+  return fenced
+    .split(/(\n[ \t]*\n)/)
+    // Which piece is a separator is decided by the **split's own structure** (the
+    // capture group lands on the odd indices), not by looking at the text: with three
+    // consecutive newlines the regex consumes two and the *content* piece that follows
+    // starts with the third, so a `/^\n/` test silently classified a whole paragraph as
+    // a separator and left its inline code **entirely unstripped** — the links inside
+    // it came back as live links.
+    .map((p, i) => (i % 2 === 0 ? stripInline(p) : p))
+    .join("");
 }
 
 /** Inline link/image targets, in document order (`[x](t "title")` → `t`). */
@@ -131,6 +203,38 @@ export function runSelftest() {
   );
   ok("stripCode keeps real links", stripCode("see [x](real.md)").includes("real.md"));
 
+  // REQ-A791 — the pairing is bounded to a paragraph. Each of the next two cases is
+  // red on the document-wide pairing (the run reaches across the blank line and eats
+  // the link), which is how one stray backtick blanked out whole files.
+  ok(
+    "stripCode does not let a code span cross a blank line",
+    stripCode("a `run\n\n[real](r.md) and ` end").includes("r.md"),
+  );
+  ok(
+    "a run must find its partner in its own paragraph",
+    stripCode("tail: ``broken\n\n[x](real.md)\n\nhead: ``other").includes("real.md"),
+  );
+  ok(
+    "a stray run with no partner in its paragraph does not open a code span",
+    stripCode("a stray ` here and [x](real.md) after it").includes("real.md"),
+  );
+  ok(
+    "a single newline is inside the paragraph, so a span may fold it",
+    !stripCode("see `[a](auto->zh)\nstill code` end").includes("auto->zh"),
+  );
+  // The interior of a span is content: a backtick inside it is text, not a second
+  // opener. Matching each run length independently let two spans **overlap**, and the
+  // overlapping cut list made the emitter walk `at` backwards and re-emit a region it
+  // had already removed — a `[x](y)` inside the outer span came back out as a link.
+  ok(
+    "a span inside a longer span does not leak its content back out",
+    !stripCode("``start `x` [a](auto->zh) end``").includes("auto->zh"),
+  );
+  ok(
+    "a run of three newlines does not hide the paragraph after it",
+    !stripCode("a\n\n\nsee `[a](auto->zh)` end").includes("auto->zh"),
+  );
+
   const links = extractLinks("[a](a.md) and ![img](img/b.png \"T\") and [c](c.md#sec)");
   ok("extractLinks finds all three", links.join(",") === "a.md,img/b.png,c.md#sec");
 
@@ -148,9 +252,11 @@ export function runSelftest() {
   console.log(`[docs-link-scan] selftest: ${checks.length} assertion(s), ${failed} failure(s).`);
   process.exit(failed === 0 ? 0 : 1);
 }
-if (process.argv.includes("--selftest")) runSelftest();
 
 // --- scan -------------------------------------------------------------------
+/** Markdown files found under an out-of-scope path, so the run can report them. */
+const skipped = [];
+
 function walk(dir, acc = []) {
   for (const ent of readdirSync(dir, { withFileTypes: true })) {
     if (SKIP_DIRS.has(ent.name)) continue;
@@ -166,49 +272,68 @@ function walk(dir, acc = []) {
   return acc;
 }
 
-const skipped = [];
-const mdFiles = walk(repo).sort();
-const broken = [];
-let checked = 0;
-for (const file of mdFiles) {
-  const text = stripCode(readFileSync(file, "utf8"));
-  for (const raw of extractLinks(text)) {
-    if (isExternal(raw)) continue;
-    const pathPart = raw.split("#")[0];
-    if (!pathPart) continue; // `[x](#frag)` handled by isExternal, but be safe
-    let decoded;
-    try {
-      decoded = decodeURIComponent(pathPart);
-    } catch {
-      decoded = pathPart;
-    }
-    checked++;
-    if (!existsSync(resolve(dirname(file), decoded))) {
-      broken.push({ file: file.slice(repo.length + 1), link: raw });
+function runScan() {
+  skipped.length = 0;
+  const mdFiles = walk(repo).sort();
+  const broken = [];
+  let checked = 0;
+  for (const file of mdFiles) {
+    const text = stripCode(readFileSync(file, "utf8"));
+    for (const raw of extractLinks(text)) {
+      if (isExternal(raw)) continue;
+      const pathPart = raw.split("#")[0];
+      if (!pathPart) continue; // `[x](#frag)` handled by isExternal, but be safe
+      let decoded;
+      try {
+        decoded = decodeURIComponent(pathPart);
+      } catch {
+        decoded = pathPart;
+      }
+      checked++;
+      if (!existsSync(resolve(dirname(file), decoded))) {
+        broken.push({ file: file.slice(repo.length + 1), link: raw });
+      }
     }
   }
-}
 
-if (process.argv.includes("--json")) {
-  console.log(
-    JSON.stringify({ files: mdFiles.length, skipped: skipped.length, checked, broken }, null, 2),
-  );
-} else {
-  console.log(
-    `[docs-link-scan] ${mdFiles.length} markdown file(s), ${checked} relative link(s) checked.`,
-  );
-  if (skipped.length > 0) {
+  if (process.argv.includes("--json")) {
     console.log(
-      `[docs-link-scan] note — ${skipped.length} markdown file(s) under ${SKIP_PATHS.join(", ")} were NOT judged: ` +
-        "an archived snapshot's relative links describe the tree as it was, and rewriting them to today's paths would " +
-        "make it cite documents it never referenced (recorded decision, REQ-A381).",
+      JSON.stringify({ files: mdFiles.length, skipped: skipped.length, checked, broken }, null, 2),
     );
+  } else {
+    console.log(
+      `[docs-link-scan] ${mdFiles.length} markdown file(s), ${checked} relative link(s) checked.`,
+    );
+    if (skipped.length > 0) {
+      console.log(
+        `[docs-link-scan] note — ${skipped.length} markdown file(s) under ${SKIP_PATHS.join(", ")} were NOT judged: ` +
+          "an archived snapshot's relative links describe the tree as it was, and rewriting them to today's paths would " +
+          "make it cite documents it never referenced (recorded decision, REQ-A381).",
+      );
+    }
+    if (broken.length === 0) {
+      console.log("[docs-link-scan] OK — every relative link resolves.");
+    }
+    for (const b of broken) console.error(`[docs-link-scan] FAIL — ${b.file}  ->  ${b.link}`);
   }
-  if (broken.length === 0) {
-    console.log("[docs-link-scan] OK — every relative link resolves.");
-  }
-  for (const b of broken) console.error(`[docs-link-scan] FAIL — ${b.file}  ->  ${b.link}`);
+
+  process.exit(broken.length === 0 ? 0 : 1);
 }
 
-process.exit(broken.length === 0 ? 0 : 1);
+// Importing this module must not scan the repo and `process.exit()` as a side effect
+// — the same latent hazard fixed in `tauri-command-scan.mjs` (F-DEV-094): a future
+// script that imports `stripCode`/`extractLinks` (the module exports both) would lose
+// its own exit code to this gate's verdict.
+//
+// The comparison is by **basename**, matching that precedent, and deliberately not by
+// resolved path: `/tmp` is a symlink to `/private/tmp` on macOS, so a full-path compare
+// makes this script a **silent no-op** (exit 0, no output) whenever it is invoked
+// through a symlinked directory — a gate that reports nothing and says nothing is the
+// exact failure this file exists to prevent.
+const invokedDirectly =
+  process.argv[1] !== undefined && import.meta.url.endsWith(process.argv[1].split("/").pop());
+if (invokedDirectly) {
+  if (process.argv.includes("--selftest")) runSelftest();
+  runScan();
+}
 

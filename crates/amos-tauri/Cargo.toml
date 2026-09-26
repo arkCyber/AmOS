@@ -22,6 +22,7 @@ amos-scheduler = { path = "../amos-scheduler" }
 amos-int.workspace = true
 amos-mail = { path = "../amos-mail" }
 amos-appstore = { path = "../amos-appstore" }
+amos-podcast = { path = "../amos-podcast" }
 amos-translate = { path = "../amos-translate" }
 amos-tts = { path = "../amos-tts" }
 amos-asr = { path = "../amos-asr", optional = true }
@@ -50,17 +51,32 @@ amos-media = { path = "../amos-media" }
 # amos-pdf-parser: PDF text extraction backed by lopdf. Used by the files
 # preview command (files_preview_bytes) to render PDF previews in the UI.
 amos-pdf-parser = { path = "../amos-pdf-parser" }
+# amos-link: the robot middleware. The link bridge's *write* side must encode a
+# control command exactly the way the CLI does — the payload is the bincode of
+# `AgentAction { json }` and the topic comes from `Topic::channel_topic`, so this
+# crate (not a hand-rolled copy of the wire format) owns the encoding. Default
+# features are off: no zenoh, no multicast socket, nothing the UI does not use.
+amos-link = { path = "../amos-link" }
 # flate2: gzip compression for the files bundle export/import.
 flate2 = "1"
 # Shared host<->guest clipboard-sync protocol + ClipboardProvider seam + guest
 # agent core (single source of truth for the wire contract). The host transport
 # (src/clipboard_guest.rs) re-exports crate::amos_clipboard::proto from here.
 amos-clipboard = { path = "../amos-clipboard" }
+# amos-telemetry-spy: the domain core whose `as_str()` keys are the *declared*
+# wire spelling of the identifier-kind / protocol / confidence vocabularies the
+# telemetry-spy bridge forwards to the UI (src/telemetry_spy.rs derives from it,
+# so the bridge cannot drift from the authority — REQ-A650 / F-SH-118).
+amos-telemetry-spy.workspace = true
 async-trait = "0.1"
 # amos-sensor: device-sensor domain core — the System UI's own sensor read side
 # (LiveSensorProvider stream bus + SensorManager energy policy) backs the local
 # `sensor_host` commands; its `android` feature adds the on-device backend.
 amos-sensor = { path = "../amos-sensor" }
+# amos-ota: system-update decision core (offer/eligibility policy). Until
+# src/ota.rs this crate had no product caller at all — the shell could not even
+# ask "is there an update for me?" (REQ-A754 / F-SH-211).
+amos-ota = { path = "../amos-ota" }
 # Real Android radio provider (via amos-radio/android). Optional: only pulled in
 # when amos-tauri's `android` feature is on (System UI APK on-device build).
 jni = { version = "0.21", optional = true }
@@ -81,8 +97,20 @@ base64 = "0.21"
 chrono = { version = "0.4", features = ["serde"] }
 # PTY for the terminal backend; enabled only by the `terminal-pty` feature.
 portable-pty = { version = "0.8", optional = true }
+# File-system watcher for `host_fs_watch_*`. `notify` is the cross-platform event
+# stream, `notify-debouncer-mini` collapses editor-save storms (create+write+write
+# back-to-back) into one event per debounce window (120 ms).
+notify = "6"
+notify-debouncer-mini = "0.4"
 # dirs: home dir / XDG paths used by wine.rs and linux_apps.rs (both desktop-only modules).
 dirs = "5.0"
+# WebMan browser download pipeline (src/webman_download.rs): the real streaming
+# HTTP client. `ureq` is the same blocking client amos-appstore / amos-ai /
+# amos-translate already use; the `cookies` feature turns its Agent into a real,
+# persistable RFC 6265 jar (cookie_store) — the browser's cookie management.
+# Transfers run on `spawn_blocking`, never on the async reactor.
+ureq = { version = "2", features = ["cookies"] }
+cookie_store = "0.21"
 tracing.workspace = true
 
 # macOS/iOS AirPlay integration via AVFoundation
@@ -98,6 +126,16 @@ block2 = "0.5"
 # tauri (which enables this exact feature set), so this adds no new code to build.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication"] }
+
+# The **system tray** (REQ-A864). `tauri::tray` sits behind tauri's own `tray-icon` feature,
+# and that feature is desktop-only: the module does not exist on Android/iOS, which is why
+# `tray.rs` keeps every `tauri::tray` reference behind `#[cfg(desktop)]`. The predicate below
+# is that same condition — `tauri-build` sets `desktop = !(ios || android)` — so the
+# *dependency* and the *code* are switched by one rule rather than two that agree by
+# accident. `tray-icon`, `muda` and `libappindicator` were already resolved into the lock by
+# tauri, so this fetches no new crate; the feature only decides whether it is compiled.
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri = { workspace = true, features = ["tray-icon"] }
 
 # Opt-in local streaming ASR: compiles + links the native sherpa-onnx lib.
 # Enable with `--features sherpa-asr` (or via tauri), and set AMOS_SHERPA_MODEL_DIR
@@ -147,6 +185,10 @@ piper-tts = ["amos-tts/piper"]
 # Real HTTP app-store backend for the StoreBridge (remote catalog + package
 # downloads). Off by default so the UI build stays offline-green.
 appstore-live = ["amos-appstore/live"]
+# Real HTTP RSS/Atom fetcher for the PodcastBridge. Off by default so the UI
+# build stays offline-green; with it on, `AMOS_PODCAST_LIVE=1` still has to be set
+# for the process to actually reach the network.
+podcast-live = ["amos-podcast/live"]
 # On-device / host-target TCP transport for the AI daemon bridge (docs "AmOS on a
 # retail Android" bring-up): when enabled (plus/or `AMOS_TCP_ADDR` env), the System
 # UI connects to `amos-ai` over loopback TCP instead of a Unix socket. Needed on a
@@ -162,15 +204,16 @@ terminal-pty = ["dep:portable-pty"]
 # bridge command core can be exercised headlessly over UDS (no Tauri/GUI).
 [dev-dependencies]
 amos-ai = { path = "../amos-ai" }
-# The robot middleware, so the link bridge e2e can mount the daemon's *real* control
-# plane (`amos_link::service::mock_server`) on a UDS instead of stubbing the wire.
-amos-link = { path = "../amos-link" }
 # The device-care domain crate, for building audit events in the bridge e2e the
 # same way `devcare_clean` does.
 amos-devocare = { path = "../amos-devocare" }
 # Used by recording.rs tests to create ephemeral directories without needing
 # platform-specific /tmp logic.
 tempfile = "3"
+# Serializes tests that mutate process-global state (env vars, lazy statics).
+# host_fs::tests swaps `AMOS_HOST_FS_ROOT` between cases via RAII; `cargo test`
+# runs tests on multiple threads by default and `std::env::set_var` is racy.
+serial_test = "3"
 # `tauri::test::{mock_app, mock_builder, mock_context}` — the only way to drive
 # `dock_badge::apply()` through its **production** path (the ledger it writes, the
 # `dock-badge-changed` emit, the empty-label collapse) without a real window.

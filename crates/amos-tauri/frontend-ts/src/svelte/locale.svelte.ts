@@ -19,6 +19,10 @@ import { en } from "../i18n/locales/en";
 import type { Locale } from "../i18n/types";
 import { isLocale } from "../i18n/types";
 import { currentLocale, translate, LOCALE_KEY } from "./i18n";
+import { appTitleKey } from "../lib/appMeta";
+import { storeTileFor } from "../lib/appLookup";
+import type { StoreTile } from "../lib/storeApps";
+import { splitWindowLabel } from "../lib/windowRoute";
 import { systemStoreSet } from "../lib/backend";
 import { amosWarn } from "../lib/debugLog";
 import { menuSetLocale } from "../lib/wm";
@@ -31,6 +35,18 @@ const DICTS: Record<Locale, Record<string, string>> = {
   zh: zh as unknown as Record<string, string>,
   en: en as unknown as Record<string, string>,
 };
+
+/**
+ * **Every** locale's dictionary, for reverse lookups — not just the active one.
+ *
+ * A stored notification names its sender as a display string resolved at push time
+ * (`bgText.ts::bgT`), so a row written while the UI was Chinese keeps its Chinese name
+ * after a switch to English. `lib/appMeta.ts::appIdForDisplayName` is the consumer, and it
+ * must try every locale: resolving against the active one alone would stop finding older
+ * rows, and an unresolved row is a notification that can no longer be opened (or a Dock
+ * badge that silently reads zero).
+ */
+export const ALL_LABEL_DICTS: readonly Record<string, string>[] = Object.values(DICTS);
 
 // Shared reactive locale (module-level rune). All Svelte apps share one instance.
 let current = $state<Locale>(currentLocale());
@@ -90,6 +106,73 @@ export function setLocale(l: Locale): void {
 export function setLocaleSafe(v: string | null | undefined): void {
   if (v != null && isLocale(v)) setLocale(v);
 }
+
+/**
+ * How a **window** is named on screen — the app's localized name, plus which instance of
+ * it the window is (REQ-A473).
+ *
+ * The identity model made `label ≠ app id` (`files_2` is a window of Files), so every
+ * surface that lists *windows* has to resolve the label to an app before it can be
+ * localized. Three of them need exactly this (Mission Control's switcher, the Spaces
+ * panel's window list, an app window's own title bar) and each one deriving it separately
+ * is how they would start disagreeing — so this is the single implementation, in the
+ * module that already owns "how the UI says things".
+ *
+ * `label` is a window label (the host's own identifier, e.g. from `wm_windows`); `app` is
+ * the host's answer for which app that window shows, when the caller has it. The label is
+ * the fallback — a caller that only holds a label still gets a usable name, and the
+ * instance number comes from the label in both cases (the host reports `instance` too,
+ * but the label *is* its canonical spelling).
+ *
+ * `tiles` is the caller's **installed store apps** (`REQ-A1185`) — the second of the two
+ * places an app name can live, which `appTitleKey` cannot see. It is a parameter rather than
+ * a module-cache read for the same reason `lib/appLookup`'s helpers take it: the read must be
+ * reactive, or a window that mounts before the tiles land keeps its raw id forever.
+ *
+ * Boundaries, stated rather than hidden: an app this build does not know at all (neither a
+ * registry row nor an installed tile) is shown as its **id** — not capitalized, not prettified,
+ * because a made-up name is worse than the identifier the host actually uses. And a window
+ * that names no app at all (the launcher, a container surface) keeps its raw label.
+ */
+export interface WindowName {
+  /** The app the window shows (`""` when it shows none). */
+  appId: string;
+  /** 1 for the app's first window, 2.. for the ones after; 0 when there is no app. */
+  instance: number;
+  /** The **app's** own name, no instance marker: `文件` (`""` when there is no app). */
+  app: string;
+  /** **This window's** name: `文件` / `文件 — 2` / `files_2` (the last for a window with no app). */
+  text: string;
+}
+
+export function windowName(
+  label: string,
+  app?: string | null,
+  tiles: readonly StoreTile[] = [],
+): WindowName {
+  const parts = splitWindowLabel(label);
+  const appId = app && app !== "" ? app : (parts?.app ?? "");
+  const instance = parts?.instance ?? (appId ? 1 : 0);
+  // REQ-A1185: an installed store app's name lives in the **store registry**, not the i18n
+  // dictionary — asking `appTitleKey` alone answered `null` and fell through to `appId || label`,
+  // so every window of an installed app was named by its raw wire id (`store:org.amos.demo`) on
+  // its own titlebar, in Mission Control, in App Exposé and in the Spaces panel. The tile list is
+  // passed in, not read from the module cache: the read has to be reactive (an app window that
+  // mounts before the tiles land would otherwise keep the raw id forever).
+  const tile = appId ? storeTileFor(appId, tiles) : undefined;
+  const key = appId ? appTitleKey(appId) : null;
+  const base = tile ? tile.name : key ? t(key) : (appId || label);
+  if (instance > 1) {
+    return {
+      appId,
+      instance,
+      app: base,
+      text: t("desktop.windowInstance", { name: base, n: String(instance) }),
+    };
+  }
+  return { appId, instance, app: appId ? base : "", text: base };
+}
+
 
 // Shell → Svelte locale bridge: `Shell.svelte` broadcasts the shell locale as a
 // window event; apply it here so already-mounted Svelte apps re-key in place.

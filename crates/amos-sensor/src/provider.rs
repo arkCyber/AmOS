@@ -200,8 +200,8 @@ impl SensorProvider for MockSensorProvider {
         Ok(ImuSample::new(
             t,
             Vec3::new(a as f64 * 0.001, -9.8 + (t % 100) as f64 * 0.001, 0.0),
-            Vec3::new((t % 50) as f64 * 0.01, 0.0, 0.0),
-            36.5,
+            Some(Vec3::new((t % 50) as f64 * 0.01, 0.0, 0.0)),
+            Some(36.5),
         ))
     }
 }

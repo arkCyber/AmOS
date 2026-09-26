@@ -193,18 +193,22 @@ function tagEndIndex(content, from) {
 }
 
 function r2_customControlRole(file, content) {
+  // Comments are prose, not markup: a `<!-- <div onclick=…> -->` (or a `//` / `/* */`
+  // mention) must not read as a clickable div with no role. Same false-positive class
+  // as R9 (and R1, which strips for the same reason).
+  const code = stripComments(content);
   const re = /<(div|span)\b[^>]*?\bon(?:click|:click)=/g;
   const findings = [];
   let m;
-  while ((m = re.exec(content)) !== null) {
+  while ((m = re.exec(code)) !== null) {
     // **整条开始标签**（`<div` 到它的 `>`）才是"这个元素有哪些属性"的答案。
     // 这里原来只看标签起始后 80 个字符 ⇒ 本仓库里 `class="…"` 动辄一两百字符，
     // 写在 class **之后**的 `role=` / `aria-hidden` 全都落在窗口外，于是
     // `role="button"` 的卡片、`role="dialog"`+键盘路径的浮层都被报成"没有 role"
     // （REQ-A387：SpacesPanel / ContactsApp 四条假阳性就是这么来的）。
-    const end = tagEndIndex(content, m.index);
-    const tag = end === -1 ? content.slice(m.index) : content.slice(m.index, end + 1);
-    const pre = content.slice(Math.max(0, m.index - 400), m.index);
+    const end = tagEndIndex(code, m.index);
+    const tag = end === -1 ? code.slice(m.index) : code.slice(m.index, end + 1);
+    const pre = code.slice(Math.max(0, m.index - 400), m.index);
     if (/\brole=/.test(tag)) continue;
     // Skip click-outside-to-close overlay: aria-hidden + pointer-events-auto absolute inset-0
     if (/aria-hidden|pointer-events-(none|auto)\s+(absolute|fixed)\s+inset-0/.test(tag + pre)) continue;
@@ -309,10 +313,74 @@ function r4_focusVisible(file, content) {
 }
 
 /**
+ * R5 白名单 —— **普查表，不是垃圾桶**（REQ-A1028）。
+ *
+ * 每个条目都是 `路径 → 理由`，理由不是注释而是**数据**：报告会把它们逐条打印出来，
+ * 复核者可以据此反驳、撤销。理由必须说清两件事之一 ——
+ *   ① 这个 setInterval/setTimeout 根本不携带用户可感知的状态（只是重绘触发器）；或
+ *   ② 已经用了本仓**另一条**登记在案的无障碍答案。
+ *
+ * 第 ② 条是 REQ-A1028 补上的：R5 的正则只认 `aria-live` / `role=status|alert|timer`，
+ * 认不出"把变化的读数写进**可聚焦控件的无障碍名字**"（`aria-label` 里带 `{fmtClock(now)}`）。
+ * 那正是 REQ-A284 给 HomeDock 时钟磁贴选的写法，也正是 REQ-A1014 定为**每个**首页磁贴契约的
+ * 写法（"each tile names its reading, not just its app"）—— 控件一旦获得焦点，读数就会被念出，
+ * 对"变化的读数"这件事已经是完整答案，再加 aria-live 反而是每秒钟的骚扰。
+ * 正则无法区分"label 里是变化的读数"与"label 是常量"，所以这些文件只能手工登记，
+ * 每条理由都写明是哪个 REQ 定下的设计。
+ *
+ * 路径是 repo-relative（扫描器查表前会归一化成这种形式），这样这张表可以直接 `grep`。
+ */
+const R5_ALLOW = new Map([
+  ["crates/amos-tauri/frontend-ts/src/svelte/CalendarApp.svelte", "60 s tick recomputes the agenda view; no per-minute user-facing change"],
+  ["crates/amos-tauri/frontend-ts/src/svelte/DeviceMicButton.svelte", "1 s poll of the mic level for the level meter; visual only"],
+  ["crates/amos-tauri/frontend-ts/src/svelte/Dock.svelte", "5 s poll of open windows for the running dot; visual only"],
+  // REQ-A1028 删除：DesktopShell 原本在这里，理由写的是"5 s 轮询当前聚焦窗口作为 ⌘W/⌘M/⌘H 的
+  // 施力对象"。现在这个文件里 `setInterval|setTimeout` 的**计数是 0** —— 那个轮询已经不在了
+  // （`focusedWindowLabel` 改由订阅式快照喂，见 DesktopShell.svelte:150），所以 R5 的启发式
+  // 根本不会命中它。留着就是一条守着空城的理由：删掉只会让扫描更敏感，不会更迟钝。
+  // REQ-A1028 改正：这里的理由原本写的是 "role=timer on the clock card mitigates"，**两处都假**。
+  // ① HomeDock 一个 `role="timer"` 都没有（`grep -c 'role=\"timer\"' HomeDock.svelte` 在 HEAD 和工作树
+  //    都是 0）；R284 对 HomeDock 的真实改动是给磁贴 <button> 加 `aria-label={…
+  //    fmtClock(now)}`、给两行可见文本加 `aria-hidden` —— 提交信息与该理由却都写成 role=timer，
+  //    于是一条"没做过的缓解"被当成理由，留着它的人无从发现自己守的是空城。
+  // ② 那张时钟磁贴已经不在这个文件里了（widget stack 移到了 HomeWidgets.svelte，见下表），
+  //    所以这条理由解释的元素根本不存在。R5 在这里实际命中的是 `$effect(…)` + `setTimeout`
+  //    这个**组合**：7 个 `$effect` 是图标网格/最近使用/DND 的 store 订阅，3 个 `setTimeout`
+  //    是长按的按下/松开定时器（LONG_PRESS_MS）。两者都不携带屏幕阅读器等着听的读数。
+  ["crates/amos-tauri/frontend-ts/src/svelte/HomeDock.svelte", "store subscriptions (icon grid / recents / DND) + long-press press/release timers; no readout — the clock tile this entry used to excuse moved to HomeWidgets.svelte (REQ-A1028)"],
+  ["crates/amos-tauri/frontend-ts/src/svelte/ImeOverlay.svelte", "setTimeout for caret restoration, not a value change"],
+  ["crates/amos-tauri/frontend-ts/src/svelte/MonitorApp.svelte", "2 s poll of CPU/mem/battery; exposed as role=progressbar, on-demand readable"],
+  ["crates/amos-tauri/frontend-ts/src/svelte/MusicApp.svelte", "setInterval updates the playback position slider (role=slider); on-demand readable"],
+  ["crates/amos-tauri/frontend-ts/src/svelte/RemindersApp.svelte", "20 s tick re-evaluates overdue state; no announcement-worthy delta"],
+  ["crates/amos-tauri/frontend-ts/src/svelte/SystemPanel.svelte", "2.5 s poll; readings exposed as text, no critical-alert path"],
+  // REQ-A1028 删除两条**已自行缓解**的过期条目：TaskManager 现在带 `role="alert"`、
+  // VoiceMemosApp 现在带 `aria-live=` —— 它们当年被登记为"误报"，后来自己补上了答案，
+  // 条目却没人摘。一条过期的理由和一条错误的理由一样有害：下一个人看到它，会以为这里
+  // 还有人守着。这正是本轮的"过期条目"检查存在的意义（第一次跑就抓到了三条）。
+  ["crates/amos-tauri/frontend-ts/src/svelte/TerminalApp.svelte", "setInterval for the ANSI cursor blink (visual only)"],
+  ["crates/amos-tauri/frontend-ts/src/svelte/MissionControl.svelte", "the 200 ms timeout is a close-animation delay after switching space; no readout changes"],
+  ["crates/amos-tauri/frontend-ts/src/svelte/Shell.svelte", "the setTimeout(…,0) defers the back-key action by a tick so an inner consumer can claim it; no readout changes"],
+  ["crates/amos-tauri/frontend-ts/src/svelte/HomeWidgets.svelte", "REQ-A1014: the clock tile's accessible name is `${t(\"a11y.currentTime\")} · HH:MM` and the visible span is aria-hidden, so focusing the tile reads the time; a 1 Hz aria-live on a clock is exactly the hostile thing REQ-A284 rejected"],
+  ["crates/amos-tauri/frontend-ts/src/svelte/widgets/WidgetCalendar.svelte", "the same 60 s re-derivation as the CalendarApp entry above, and the reading is in the tile's accessible name (event title + when) per REQ-A1014"],
+  ["crates/amos-tauri/frontend-ts/src/svelte/RobotApp.svelte", "2 s poll of heartbeat ages; same shape as MonitorApp/SystemPanel — a per-peer last-seen reading, and re-announcing it every 2 s would bury the operator"],
+]);
+
+/** 归一化成 repo-relative 路径（ROOT 设定时 file 是绝对路径；表是 repo-relative 的，便于 grep）。 */
+function r5RepoRel(file) {
+  const idx = file.indexOf("crates/amos-tauri/frontend-ts/");
+  if (idx >= 0) return file.slice(idx);
+  const idx2 = file.indexOf("src/svelte/");
+  if (idx2 >= 0) return `crates/amos-tauri/frontend-ts/${file.slice(idx2)}`;
+  return file;
+}
+
+/**
  * 规则 R5: 有 setInterval/setTimeout/异步状态更新 的 effect,对应 DOM 缺
  * aria-live / role=status / role=alert —— 即"状态变了屏幕阅读器听不到"。
+ *
+ * **不看白名单**的判定（报告用它来判断一条白名单是否已经过期）：返回 finding 或 null。
  */
-function r5_liveRegion(file, content) {
+function r5Find(file, content) {
   // heuristic: presence of $effect + setInterval/setTimeout in <script>
   if (!/\$effect\s*\(/.test(content)) return null;
   if (!/setInterval|setTimeout/.test(content)) return null;
@@ -320,57 +388,23 @@ function r5_liveRegion(file, content) {
   // answer (polite/assertive live region, role=status/alert/timer). role="timer" is the
   // "screen reader asks on demand" answer for clocks and counters — it is the explicit
   // alternative to aria-live that we adopted for REQ-A284's clock files (ClockWidget /
-  // StageClock / LockScreen / StatusBar / HomeDock).
+  // StageClock / LockScreen / StatusBar).
   if (/aria-live=|role=["'](status|alert|timer)["']/.test(content)) return null;
   // **动态绑定也算答案**：`role={cond ? "alert" : "status"}` 是合法的 live region
   // 选择（MeasureApp 校准失败要 assertive、成功要 polite），只认静态字符串会把
   // 已经修好的文件重新报成缺口（REQ-A387）。
   if (/role=\{[^}]*["'](status|alert|timer)["']/.test(content)) return null;
-  // Files where the setInterval/setTimeout is **not** carrying user-perceivable state —
-  // it is a visual re-render trigger (Dock refreshes the running-dot set, MonitorApp polls
-  // for the progressbar values, CalendarApp re-derives the agenda, …). Screen readers do
-  // not need to be interrupted for these. Adding aria-live here would be noise. The list
-  // is maintained manually — when a file joins it, the rule that put it there is named
-  // alongside so reviewers can disagree.
-  //
-  // Paths are repo-relative (the scanner normalizes to that form before lookup).
-  const KNOWN_FALSE_POSITIVES = new Set([
-    "crates/amos-tauri/frontend-ts/src/svelte/CalendarApp.svelte",      // 60 s tick recomputes agenda view; no per-minute user-facing change
-    "crates/amos-tauri/frontend-ts/src/svelte/DeviceMicButton.svelte",   // 1 s poll of mic level for the level meter; visual only
-    "crates/amos-tauri/frontend-ts/src/svelte/Dock.svelte",              // 5 s poll of open windows for the "running" dot; visual only
-    // 5 s poll of the focused window as the *target* of the system intents (⌘W/⌘M/⌘H):
-    // `focusedWindowLabel` is read to decide which window a chord acts on and is never drawn,
-    // so there is nothing to announce — an aria-live here would read out a window title every
-    // 5 s. Visual "running" state lives in Dock.svelte (entry above).
-    "crates/amos-tauri/frontend-ts/src/svelte/DesktopShell.svelte",
-    "crates/amos-tauri/frontend-ts/src/svelte/HomeDock.svelte",          // role=timer on the clock card mitigates; the weather/grid poll stays visual
-    "crates/amos-tauri/frontend-ts/src/svelte/ImeOverlay.svelte",        // setTimeout for caret-restoration, not a value change
-    "crates/amos-tauri/frontend-ts/src/svelte/MonitorApp.svelte",        // 2 s poll of CPU/mem/battery; exposed as role=progressbar, on-demand readable
-    "crates/amos-tauri/frontend-ts/src/svelte/MusicApp.svelte",          // setInterval updates the playback position slider (role=slider); on-demand readable
-    "crates/amos-tauri/frontend-ts/src/svelte/RemindersApp.svelte",      // 20 s tick re-evaluates overdue state; no announcement-worthy delta
-    "crates/amos-tauri/frontend-ts/src/svelte/SystemPanel.svelte",       // 2.5 s poll; readings exposed as text, no critical-alert path
-    "crates/amos-tauri/frontend-ts/src/svelte/TaskManager.svelte",       // same shape as SystemPanel
-    "crates/amos-tauri/frontend-ts/src/svelte/TerminalApp.svelte",       // setInterval for ANSI cursor blink (visual only)
-    "crates/amos-tauri/frontend-ts/src/svelte/VoiceMemosApp.svelte",     // 250 ms tick drives the recording pulse animation; the recording state itself is a toggle, not a polling value
-    "crates/amos-tauri/frontend-ts/src/svelte/MissionControl.svelte",     // the 200 ms timeout is a close-animation delay after switching space; no readout changes
-    "crates/amos-tauri/frontend-ts/src/svelte/Shell.svelte",              // the setTimeout(…,0) defers the back-key action by a tick so an inner consumer can claim it; no readout changes
-  ]);
-  if (KNOWN_FALSE_POSITIVES.has(file)) return null;
-  // Allow repo-relative form too (when ROOT is set, file paths come absolute; the
-  // whitelist above is repo-relative to make the table human-grepable).
-  const repoRel = (() => {
-    const idx = file.indexOf("crates/amos-tauri/frontend-ts/");
-    if (idx >= 0) return file.slice(idx);
-    const idx2 = file.indexOf("src/svelte/");
-    if (idx2 >= 0) return `crates/amos-tauri/frontend-ts/${file.slice(idx2)}`;
-    return file;
-  })();
-  if (KNOWN_FALSE_POSITIVES.has(repoRel)) return null;
   return {
     rule: "live-region: $effect with setInterval/setTimeout but no aria-live / role=status on the readout",
     fix: "add aria-live='polite' (or role='status') to the container that displays the changing value; screen readers announce changes asynchronously",
     evidence: "$effect + setInterval detected",
   };
+}
+
+/** 规则 R5 的对外入口：先查白名单（普查表，理由会在报告里逐条打印），再判定。 */
+function r5_liveRegion(file, content) {
+  if (R5_ALLOW.has(r5RepoRel(file))) return null;
+  return r5Find(file, content);
 }
 
 /**
@@ -528,6 +562,47 @@ function readSize(cls) {
   return px;
 }
 
+/**
+ * The class list a start tag carries, in all three spellings Svelte allows:
+ * `class="…"`, `class='…'`, and `class={…}`. For the expression form every string
+ * literal inside the braces is joined — those literals are the Tailwind the build can
+ * see, so they are exactly what the size audit must read. Returns `null` when the tag
+ * has no `class=` at all (R7 does not claim a button whose size it cannot see).
+ */
+function classAttr(attrs) {
+  const i = attrs.search(/\bclass=/);
+  if (i < 0) return null;
+  let j = i + "class=".length;
+  while (j < attrs.length && /\s/.test(attrs[j])) j += 1;
+  const q = attrs[j];
+  if (q === '"' || q === "'") {
+    const close = attrs.indexOf(q, j + 1);
+    return close < 0 ? null : attrs.slice(j + 1, close);
+  }
+  if (q !== "{") return null;
+  let depth = 0;
+  let quote = null;
+  let k = j;
+  for (; k < attrs.length; k += 1) {
+    const c = attrs[k];
+    if (quote) {
+      if (c === quote) quote = null;
+      continue;
+    }
+    if (c === '"' || c === "'" || c === "`") {
+      quote = c;
+      continue;
+    }
+    if (c === "{") depth += 1;
+    else if (c === "}") {
+      depth -= 1;
+      if (depth === 0) break;
+    }
+  }
+  const literals = attrs.slice(j + 1, k).match(/"[^"]*"|'[^']*'|`[^`]*`/g) || [];
+  return literals.map((s) => s.slice(1, -1)).join(" ");
+}
+
 function isIconOnly(cls, fullAttrs) {
   // Icon-only heuristic: has aria-label OR title, AND visual content is svg/glyph.
   // We can't see children from a class-only scan, so we also accept any class that
@@ -553,19 +628,25 @@ const R7_CHROME_HIT_ZONE = /(?:CHROME_ICON_BUTTON|CHROME_MENU_BUTTON)/;
 const R7_KEYBOARD_FILE = /(?:ImeKeyboard|OnScreenKeyboard|Qwerty)\.svelte$/;
 
 function r7_targetSize(file, content) {
-  // Match `<button ...attrs>...</button>` and `<button ...attrs/>`
-  // We extract a small window to capture attrs for aria-label / title heuristics.
+  // 每个 `<button …>` 开始标签都按 `buttonTags`（括号/引号感知，R9 用的同一个）取，
+  // 而**不是** `/<button\b([^>]*)>/`：后者在箭头函数处理器的 `=>` 那个 `>` 处截断，
+  // 于是写在 `onclick={() => …}` **之后**的 `class=` 根本不在窗口里（REQ-A953）。
+  // 同理 `class="…"` 只能读字面量那一种写法，`class={…}`（本仓条件样式的常态写法）
+  // 整条被跳过。实测（HEAD）：这条规则只报出 80 条尺寸发现中的 **1** 条
+  // —— ShortcutsApp 里两个逐字节相同的 20px 开关，一个在报告里，另一个不在。
   const suspects = new Map();
-  // Capture everything between `<button` and the next `>` for attributes.
-  const re = /<button\b([^>]*)>/g;
-  let m;
   // Skip entire IME / keyboard files (key size is dictated by layout, not by a11y).
   if (R7_KEYBOARD_FILE.test(file)) return null;
-  while ((m = re.exec(content)) !== null) {
-    const attrs = m[1];
-    const classMatch = attrs.match(/\bclass="([^"]+)"/);
-    if (!classMatch) continue;
-    const cls = classMatch[1];
+  // 与 R9 同一处理：注释是散文、`<script>` 里的字符串不是控件。
+  const code = stripComments(content);
+  const end = code.lastIndexOf("</script>");
+  const after = end >= 0 ? code.slice(end) : code;
+  const style = after.indexOf("<style");
+  const html = style >= 0 ? after.slice(0, style) : after;
+  for (const tag of buttonTags(html)) {
+    const attrs = tag.slice("<button".length, -1);
+    const cls = classAttr(attrs);
+    if (cls === null) continue;
     // Chrome widget buttons live in the 44px top bar — their visible target is the
     // bar itself, not the glyph. Apple HIG allows 22pt in chrome; WCAG 2.5.5 has the
     // "essential" exception for system chrome. Skip them here.
@@ -646,6 +727,8 @@ const PALETTE = {
   black: { light: "#000000", dark: "#000000" },
   accent: { light: "#0066CC", dark: "#0A84FF" },
   danger: { light: "#D70015", dark: "#FF453A" },
+  // Theme-independent solid red for small white-on-red chips (badges), from index.css.
+  "danger-solid": { light: "#D70015", dark: "#D70015" },
   "neutral-50":  { light: "#fafafa", dark: "#fafafa" },
   "neutral-100": { light: "#f5f5f5", dark: "#f5f5f5" },
   "neutral-200": { light: "#e5e5e5", dark: "#e5e5e5" },
@@ -667,6 +750,24 @@ function extractColorToken(token) {
   const stripped = token.replace(/^(?:dark|group-hover|hover|focus|active|sm|md|lg|xl):/, "");
   // Strip the utility prefix: text- → neutral-700 / bg- → neutral-200
   return stripped.replace(UTIL_PREFIX_RE, "");
+}
+
+// Is this `text-*` / `bg-*` token a colour the palette (or an arbitrary value) can resolve?
+//
+// The prefixes `text-` / `bg-` introduce far more than colours: font sizes (`text-xs`,
+// `text-[11px]`), alignment (`text-center`), decoration (`text-balance`, `underline`),
+// gradients (`bg-gradient-to-br`), spacing (`bg-2`). Picking the **first** `text-*` token as
+// "the colour" silently dropped any pair whose class listed a non-colour first — which is the
+// common shorthand `<span class="text-xs text-accent">`: the rule resolved its colour to
+// `text-xs`, failed the palette lookup, and skipped the pair. That is a *false negative* — the
+// exact `text-accent` on an `bg-accent/15` tint the rule exists to catch went unchecked —
+// while the same pair written without `text-xs` was reported. Filtering to resolvable colours
+// makes the two spellings agree.
+function isColorToken(token) {
+  if (PALETTE[extractColorToken(token).split("/")[0]]) return true;
+  // Arbitrary colour value: `text-[#abc]`, `bg-[rgb(0_0_0)]`, `text-[hsl(...)]`. Arbitrary
+  // **non**-colours (`text-[11px]`) must not match — hence the colour-literal requirement.
+  return /^(?:text|bg)-\[(?:#|rgba?\(|hsla?\()/i.test(token);
 }
 
 function tokenHex(token, isDark) {
@@ -724,19 +825,65 @@ const SURFACE = {
   dark: hexRgb("#000000"),
 };
 
-// KNOWN DYNAMIC BACKDROP: 每个条目注明"为什么是 whitelist"和"撤销条件"。
-// Paths match what scan() passes to r6_contrast() after path normalization:
-//   `crates/amos-tauri/frontend-ts/src/svelte/HomeDock.svelte`
-const R6_FALSE_POSITIVES = new Set([
-  "crates/amos-tauri/frontend-ts/src/svelte/PhotosApp.svelte",
-  "crates/amos-tauri/frontend-ts/src/svelte/SpotlightOverlay.svelte",
-  "crates/amos-tauri/frontend-ts/src/svelte/Launchpad.svelte",
-  "crates/amos-tauri/frontend-ts/src/svelte/PlayerApp.svelte",
-  "crates/amos-tauri/frontend-ts/src/svelte/MusicApp.svelte",
-  "crates/amos-tauri/frontend-ts/src/svelte/SettingsApp.svelte",
-  "crates/amos-tauri/frontend-ts/src/svelte/IncomingCall.svelte",
-  "crates/amos-tauri/frontend-ts/src/svelte/HomeDock.svelte",
-]);
+// KNOWN-UNVERIFIABLE PAIRS — the pair is not a defect to hide, it is a pair this rule cannot
+// decide statically. Each entry says **why** (so a reader can judge whether the reason still
+// holds) and is keyed by **pair**, not by file.
+//
+// Why per-pair and not per-file: this used to be a `Set<file>` that silenced *every* pair in
+// the named file — so a real defect sitting beside a glass button went unreported, and five of
+// the eight entries had gone stale (their files no longer contain any failing pair) while still
+// suppressing the whole file's coverage. Narrowing to the pair restores checking of everything
+// the reason does not actually cover.
+//
+// Key format is the same string the rule builds for a suspect:
+//   `${mode}|${useFg}|${useBg}` — e.g. `light|text-white on bg-white/10` → `light|text-white|bg-white/10`.
+// Reason classes:
+//   • OVER MEDIA — the token sits over a photo / video / live viewfinder / the wallpaper, so the
+//     real backdrop is neither white nor black; compositing onto the flat surface is meaningless.
+//   • ALWAYS-DARK FILE — the file's own root is `bg-black`, so the light-mode row is fiction.
+//   • NON-TEXT — the token colours an **icon**, not text; WCAG SC 1.4.11 asks 3:1, not 4.5:1.
+const R6_UNVERIFIABLE = new Map(
+  Object.entries({
+    "crates/amos-tauri/frontend-ts/src/svelte/IncomingCall.svelte": {
+      "light|text-white|bg-white/10":
+        "ALWAYS-DARK FILE: root is `bg-neutral-950 text-white` (the incoming-call overlay takes the whole screen), so the flat light-mode composite is fiction; the call chips use the same translucent-with-white-text idiom. Holds only while the root stays dark.",
+    },
+    "crates/amos-tauri/frontend-ts/src/svelte/Launchpad.svelte": {
+      "light|text-white/80|bg-white/10": "OVER MEDIA: search pill on the blurred wallpaper",
+    },
+    "crates/amos-tauri/frontend-ts/src/svelte/PhotosApp.svelte": {
+      "light|text-white/90|bg-white/10": "OVER MEDIA: caption pill on the photo",
+      "light|text-white|bg-white/15": "OVER MEDIA: video-overlay controls",
+      "light|text-white|bg-black/45": "OVER MEDIA: favourite heart on the photo thumbnail",
+    },
+    "crates/amos-tauri/frontend-ts/src/svelte/PlayerApp.svelte": {
+      "light|text-white|bg-black/50": "OVER MEDIA: fullscreen button on the video/album art",
+      "light|text-white|bg-black/20": "OVER MEDIA: loading veil over the video",
+    },
+    "crates/amos-tauri/frontend-ts/src/svelte/MusicApp.svelte": {
+      "light|text-danger|bg-neutral-300/70": "NON-TEXT: remove-track control is icon-only (1.4.11 3:1 = 4.12)",
+      "dark|text-danger|dark:bg-neutral-700/70": "NON-TEXT: same icon in dark mode (1.4.11 3:1 = 4.04)",
+    },
+    "crates/amos-tauri/frontend-ts/src/svelte/CameraApp.svelte": {
+      "light|text-white|bg-white/15": "OVER MEDIA: shutter/Toolbar buttons on the viewfinder",
+      "light|text-white|bg-black/40": "OVER MEDIA: countdown on the viewfinder",
+      "light|text-white|bg-black/50": "OVER MEDIA: zoom pill on the viewfinder",
+    },
+    "crates/amos-tauri/frontend-ts/src/svelte/MagnifierApp.svelte": {
+      "light|text-white|bg-white/15": "OVER MEDIA: control over the magnified live view",
+    },
+    "crates/amos-tauri/frontend-ts/src/svelte/CalculatorApp.svelte": {
+      "light|text-white/70|bg-white/10": "ALWAYS-DARK FILE: root is `bg-black text-white`",
+    },
+    "crates/amos-tauri/frontend-ts/src/svelte/LockScreen.svelte": {
+      "light|text-white|bg-danger/20": "OVER MEDIA: emergency button on the wallpaper",
+    },
+    "crates/amos-tauri/frontend-ts/src/svelte/ClockApp.svelte": {
+      "light|text-danger|bg-neutral-300": "NON-TEXT: remove-city control is icon-only (1.4.11 3:1 = 3.63)",
+      "dark|text-danger|dark:bg-neutral-700": "NON-TEXT: same icon in dark mode (1.4.11 3:1 = 3.04)",
+    },
+  }).map(([f, pairs]) => [f, new Map(Object.entries(pairs))]),
+);
 
 function r6_contrast(file, content) {
   // Whitelist by repo-relative path (the file path passed in may already be repo-relative
@@ -744,7 +891,8 @@ function r6_contrast(file, content) {
   const rel = file.includes("crates/amos-tauri/frontend-ts/")
     ? file.slice(file.indexOf("crates/amos-tauri/frontend-ts/"))
     : file;
-  if (R6_FALSE_POSITIVES.has(rel)) return null;
+  // Pairs this file is known not to be decidable on (see R6_UNVERIFIABLE). Absent ⇒ {}.
+  const allowed = R6_UNVERIFIABLE.get(rel);
 
   const classRe = /class="([^"]+)"/g;
   let m;
@@ -756,31 +904,23 @@ function r6_contrast(file, content) {
     // up later via `darkPrefixed` so a `dark:bg-white/10` overrides the default
     // `bg-black/5` when computing the dark-mode row.
     const textToks = tokens.filter(
-      (t) =>
-        t.startsWith("text-") &&
-        !["text-transparent", "text-current", "text-inherit", "text-auto"].includes(t) &&
-        !/^dark:/.test(t) &&
-        t.match(/^text-\[(?:xs|sm|base|lg|xl|\d+px)\]/) === null, // font-size, not color
+      (t) => t.startsWith("text-") && !/^dark:/.test(t) && isColorToken(t),
     );
     const bgToks = tokens.filter(
-      (t) =>
-        t.startsWith("bg-") &&
-        !["bg-transparent", "bg-current", "bg-inherit"].includes(t) &&
-        !/^dark:/.test(t) &&
-        t.match(/^bg-\d+$/) === null && // spacing tokens
-        t.match(/^bg-\[/) === null, // arbitrary value, e.g. bg-[#fff]
+      (t) => t.startsWith("bg-") && !/^dark:/.test(t) && isColorToken(t),
     );
     if (!textToks.length || !bgToks.length) continue;
     const fgTok = textToks[0];
     const bgTok = bgToks[0];
 
     // Look for the matching `dark:` overrides (use the FIRST one of each kind).
-    const darkFgTok = tokens.find((t) => /^dark:text-/.test(t) && t.match(/^text-\[(?:xs|sm|base|lg|xl|\d+px)\]/) === null);
-    const darkBgTok = tokens.find((t) => /^dark:bg-/.test(t) && !["dark:bg-transparent", "dark:bg-current", "dark:bg-inherit"].includes(t));
+    const darkFgTok = tokens.find((t) => /^dark:text-/.test(t) && isColorToken(t));
+    const darkBgTok = tokens.find((t) => /^dark:bg-/.test(t) && isColorToken(t));
 
-    // 大字体: text-2xl+  或 font-bold + lg/xl/2xl+
+    // 大字体: text-2xl+  或 font-bold + lg/xl/2xl+. Read from `cls` (font-size utilities live
+    // there), not `fgTok` (now always a colour token, so it can no longer carry the size).
     const isLarge =
-      /\b(2?xl|3xl|4xl|5xl)\b/.test(fgTok) ||
+      /\b(2?xl|3xl|4xl|5xl)\b/.test(cls) ||
       (/\bfont-bold\b/.test(cls) && /\b(lg|xl|2xl)\b/.test(cls));
 
     // Skip bare font-size utilities that slipped through (text-xs/sm/base/etc.)
@@ -818,6 +958,7 @@ function r6_contrast(file, content) {
       const level = wcagLevel(ratio, isLarge);
       if (level === "FAIL" || (level === "AA-Large" && !isLarge)) {
         const key = `${mode}|${useFg}|${useBg}`;
+        if (allowed && allowed.has(key)) continue;
         const prev = suspects.get(key);
         if (!prev || ratio < prev.ratio) {
           suspects.set(key, {
@@ -903,8 +1044,15 @@ function buttonTags(html) {
 
 function r9_deadControl(file, content) {
   if (!file.endsWith(".svelte")) return null;
-  const end = content.lastIndexOf("</script>");
-  const after = end >= 0 ? content.slice(end) : content;
+  // Scan **markup only, with comments removed**: a `<!-- … <button> … -->` is prose, not
+  // a control. Without this, a file's own doc comment that *mentions* `<button>` (in
+  // backticks) reads as a dead button — `SplitSurface.svelte` was reported for exactly
+  // that. This is the same false-positive class R1 already fixed for `<input>` (see
+  // `stripComments`' doc); stripping once here removes JS/Svelte comments too
+  // (`//`, `/* */`, `{/* */}`).
+  const code = stripComments(content);
+  const end = code.lastIndexOf("</script>");
+  const after = end >= 0 ? code.slice(end) : code;
   const style = after.indexOf("<style");
   const html = style >= 0 ? after.slice(0, style) : after;
   if (file.replace(/\\/g, "/").includes("/src/svelte/modules/")) return null;
@@ -1138,6 +1286,42 @@ function selftest() {
     console.error("  findings:", JSON.stringify(f8b, null, 2));
     process.exit(1);
   }
+  // sample 8c (REQ-A565): a **font-size** utility must not shadow the colour token.
+  // `text-xs text-accent` used to resolve its "colour" to `text-xs`, fail the palette lookup,
+  // and drop the pair entirely — a FALSE NEGATIVE, while the SAME pair written without
+  // `text-xs` was reported. Both spellings are genuine AA failures on a 15% tint; they must
+  // agree. (This is the bug that let A387's own chip rule go unenforced in four files.)
+  for (const cls of [
+    "rounded bg-accent/15 px-3 py-1 text-xs text-accent",
+    "rounded bg-accent/15 px-3 py-1 text-accent", // the twin, reported before the fix
+  ]) {
+    const tmp = path.join("/tmp", `a11y-scan-selftest-8c-${Date.now()}-${crypto.randomUUID()}.svelte`);
+    fs.writeFileSync(tmp, `<div class="${cls}">today</div>`);
+    const f = scan(tmp);
+    fs.unlinkSync(tmp);
+    if (!f.some(x => x.rule.includes("contrast"))) {
+      console.error(`[a11y-scan selftest] FAIL: a font-size token must not shadow the colour — missed class="${cls}"`);
+      process.exit(1);
+    }
+  }
+  // sample 8d (REQ-A565): the known-unverifiable list is keyed by **pair**, not by file. The
+  // glass pair is silenced only in the file that names it, only for that exact pair; every
+  // other pair in that same file is still checked. (A whole-file whitelist — the shape this
+  // replaced — silenced all three.)
+  const launchpadRel = "crates/amos-tauri/frontend-ts/src/svelte/Launchpad.svelte";
+  const glass = `<div class="rounded bg-white/10 text-white/80">x</div>`;
+  if (r6_contrast(launchpadRel, glass) !== null) {
+    console.error("[a11y-scan selftest] FAIL: the named OVER-MEDIA pair should be silenced in Launchpad.svelte");
+    process.exit(1);
+  }
+  if (r6_contrast("crates/amos-tauri/frontend-ts/src/svelte/Elsewhere.svelte", glass) === null) {
+    console.error("[a11y-scan selftest] FAIL: the same pair must be REPORTED in a file that does not name it");
+    process.exit(1);
+  }
+  if (r6_contrast(launchpadRel, `<div class="rounded bg-accent/15 text-accent">x</div>`) === null) {
+    console.error("[a11y-scan selftest] FAIL: a DIFFERENT pair in the same file must still be checked (whole-file whitelist regressed)");
+    process.exit(1);
+  }
   // sample 9 (REQ-A290): R7 target-size.
   //   bad9: h-5 w-5 (20px) — must be flagged (AA-fail).
   //   good9a: h-11 w-11 (44px) — must stay silent (AAA-pass).
@@ -1170,6 +1354,42 @@ function selftest() {
   if (f9b.some(x => x.rule.includes("target-size"))) {
     console.error("[a11y-scan selftest] FAIL: a button with no h/w/size class is opaque to R7 — must stay silent");
     console.error("  findings:", JSON.stringify(f9b, null, 2));
+    process.exit(1);
+  }
+  // sample 9c/9d (REQ-A953): the two spellings the old `/<button\b([^>]*)>/` + `class="…"`
+  // parser could not read. Bad9c is the exact ShortcutsApp shape — `class=` written *after*
+  // an arrow-function handler, so the old window ended at the handler's `>` and the button
+  // never reached the rule (its byte-identical twin, with a bare `onclick={fn}`, was the only
+  // one the report listed). Bad9d is `class={…}`, the conditional-class idiom. Good9c is the
+  // same shape at 44px: the fix must widen what R7 *reads*, not what it *flags*.
+  const bad9c = `<button onclick={() => x()} class="relative h-5 w-9" aria-label="x">x</button>`;
+  const tmp9c = path.join("/tmp", `a11y-scan-selftest-9c-${Date.now()}.svelte`);
+  fs.writeFileSync(tmp9c, bad9c);
+  const f9c = scan(tmp9c);
+  fs.unlinkSync(tmp9c);
+  if (!f9c.some(x => x.rule.includes("target-size"))) {
+    console.error("[a11y-scan selftest] FAIL: a class written AFTER an arrow handler must still be read (the `[^>]*` window ends at the handler's `>`)");
+    console.error("  findings:", JSON.stringify(f9c, null, 2));
+    process.exit(1);
+  }
+  const bad9d = `<button onclick={noop} class={"grid h-5 w-5 " + (on ? "a" : "b")} aria-label="x">x</button>`;
+  const tmp9d = path.join("/tmp", `a11y-scan-selftest-9d-${Date.now()}.svelte`);
+  fs.writeFileSync(tmp9d, bad9d);
+  const f9d = scan(tmp9d);
+  fs.unlinkSync(tmp9d);
+  if (!f9d.some(x => x.rule.includes("target-size"))) {
+    console.error("[a11y-scan selftest] FAIL: `class={…}` (the conditional-class idiom) must be read, not skipped");
+    console.error("  findings:", JSON.stringify(f9d, null, 2));
+    process.exit(1);
+  }
+  const good9c = `<button onclick={() => x()} class={"grid h-11 w-11 " + (on ? "a" : "b")} aria-label="x">x</button>`;
+  const tmp9g = path.join("/tmp", `a11y-scan-selftest-9g-${Date.now()}.svelte`);
+  fs.writeFileSync(tmp9g, good9c);
+  const f9g = scan(tmp9g);
+  fs.unlinkSync(tmp9g);
+  if (f9g.some(x => x.rule.includes("target-size"))) {
+    console.error("[a11y-scan selftest] FAIL: an arrow handler + `class={…}` at 44px must stay silent — the fix widens what R7 reads, not what it flags");
+    console.error("  findings:", JSON.stringify(f9g, null, 2));
     process.exit(1);
   }
   // sample 10 (REQ-A291): R8 motion.
@@ -1232,6 +1452,11 @@ function selftest() {
     ["a statically disabled placeholder", `<button disabled aria-disabled="true" title="x">占位</button>`],
     ["a props-spreading component", `<button {...rest} class="x">y</button>`],
     ["a button that does act", `<button onclick={() => go()}>go</button>`],
+    // A `<button>` that only appears inside a comment is prose, not a control. This is the
+    // exact `SplitSurface.svelte` shape: the divider's doc comment names `<button>` in
+    // backticks, and R9 used to scan that prose and report a dead control on a button that
+    // actually carries pointer + key handlers.
+    ["a `<button>` mentioned only in an HTML comment", `<!-- The divider is a \`<button>\`, not a bare div. -->\n<div>x</div>`],
   ];
   for (const [name, src] of goods11) {
     const tmp = path.join("/tmp", `a11y-scan-selftest-11g-${Date.now()}.svelte`);
@@ -1241,6 +1466,51 @@ function selftest() {
     if (f.some((x) => x.rule.includes("dead-control"))) {
       console.error(`[a11y-scan selftest] FAIL: R9 must stay silent for ${name}`);
       process.exit(1);
+    }
+  }
+  // sample 12: R2 must not read a clickable div out of a comment either (same class).
+  const good12 = `<!-- legacy: <div onclick={go}> was replaced by a <button> -->\n<button onclick={() => go()}>go</button>`;
+  const tmp12 = path.join("/tmp", `a11y-scan-selftest-12-${Date.now()}.svelte`);
+  fs.writeFileSync(tmp12, good12);
+  const f12 = scan(tmp12);
+  fs.unlinkSync(tmp12);
+  if (f12.some((x) => x.rule.includes("custom-control-role"))) {
+    console.error("[a11y-scan selftest] FAIL: R2 must not flag a clickable div that lives only in a comment");
+    process.exit(1);
+  }
+  // sample 13 (REQ-A1028): the R5 allow-list is a **census with reasons**, and the staleness
+  // check in the report can only fire if `r5Find` (which ignores the allow-list) still sees
+  // the finding. Two-sided on purpose:
+  //   (a) an allow-listed file must NOT be reported by r5_liveRegion, and
+  //   (b) r5Find must STILL return a finding for it — otherwise every entry would print as
+  //       "过期" and the census would be unable to tell "self-mitigated" from "never matched".
+  // Asserting only (a) would pass just as well with the allow-list replaced by "return null".
+  {
+    const rel = "crates/amos-tauri/frontend-ts/src/svelte/HomeWidgets.svelte";
+    const abs = path.join(ROOT, rel);
+    if (!fs.existsSync(abs)) {
+      console.error(`[a11y-scan selftest] FAIL: ${rel} is gone — the R5 census entry is stale`);
+      process.exit(1);
+    }
+    const src = fs.readFileSync(abs, "utf8");
+    if (r5_liveRegion(abs, src) !== null) {
+      console.error("[a11y-scan selftest] FAIL: an allow-listed file must not be reported by r5_liveRegion");
+      process.exit(1);
+    }
+    if (r5Find(abs, src) === null) {
+      console.error("[a11y-scan selftest] FAIL: r5Find must still see the finding on an allow-listed file, else the staleness check can never fire");
+      process.exit(1);
+    }
+    // Every entry needs a real reason (a path with no reason is a bin entry, not a census one).
+    for (const [p, reason] of R5_ALLOW) {
+      if (!reason || reason.trim().length < 20) {
+        console.error(`[a11y-scan selftest] FAIL: R5 allow-list entry has no usable reason: ${p}`);
+        process.exit(1);
+      }
+      if (!fs.existsSync(path.join(ROOT, p))) {
+        console.error(`[a11y-scan selftest] FAIL: R5 allow-list names a file that does not exist: ${p}`);
+        process.exit(1);
+      }
     }
   }
   console.log("[a11y-scan] selftest: all assertions passed (0 failures).");
@@ -1291,6 +1561,30 @@ lines.push(`- 扫描文件: **${files.length}**`);
 lines.push(`- 含缺口文件: **${report.length}** (${(100 * report.length / files.length).toFixed(1)}%)`);
 lines.push(`- 总缺口数: **${totalFindings}**`);
 lines.push("");
+// R5 白名单普查（REQ-A1028）：白名单是"人工维护的普查表"，理由必须被**打印出来**才能被反驳。
+// 同时报告**过期条目**：文件现在已经带上 aria-live/role=status|alert|timer（或已不再命中
+// R5 的启发式），条目却还留着 —— 一条过期的理由和一条错误的理由一样有害，它让下一个人
+// 以为这里还有人守着。判定用 r5Find（不看白名单）。
+{
+  const stale = [];
+  for (const [rel, reason] of R5_ALLOW) {
+    const abs = path.join(ROOT, rel);
+    let content = null;
+    try { content = fs.readFileSync(abs, "utf8"); } catch { content = null; }
+    if (content === null) stale.push([rel, "文件不存在"]);
+    else if (r5Find(abs, content) === null) stale.push([rel, "该文件已不再命中 R5（已自行缓解或启发式不再匹配）"]);
+  }
+  lines.push(`## R5 白名单普查 (${R5_ALLOW.size} 条, 全部随报告打印)`);
+  lines.push("");
+  lines.push("每条都是**人工登记**的理由；这里打印出来是为了让复核者可以逐条反驳/撤销。");
+  lines.push("`⚠ 过期` 表示这条已可删除 —— 理由还留着会让下一个人以为这里有人守着。");
+  lines.push("");
+  for (const [rel, reason] of R5_ALLOW) {
+    const isStale = stale.find(([r]) => r === rel);
+    lines.push(`- ${isStale ? "**⚠ 过期** " : ""}\`${rel}\` — ${reason}${isStale ? ` ⟵ ${isStale[1]}` : ""}`);
+  }
+  lines.push("");
+}
 lines.push("## 维度");
 lines.push("");
 for (const [k, v] of Object.entries(DIMENSIONS)) {

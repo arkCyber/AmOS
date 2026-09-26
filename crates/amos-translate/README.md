@@ -37,7 +37,7 @@ It is **not** a model: no inference engine is implemented here; providers call o
 ```bash
 cargo test -p amos-translate
 cargo run -p amos-translate                       # serve on /tmp/amos-translate.sock
-cargo run -p amos-translate --example status_once -- /tmp/amos-translate.sock
+cargo run -p amos-translate --example translate_status_once -- /tmp/amos-translate.sock
 cargo run -p amos-translate --example translate_once -- /tmp/amos-translate.sock "Hello" en zh
 cargo clippy -p amos-translate --all-targets -- -D warnings
 ```
@@ -46,11 +46,11 @@ cargo clippy -p amos-translate --all-targets -- -D warnings
 
 | example | shows |
 |---|---|
-| `status_once` | one `GetStatus` against a **running** daemon: which provider is active and whether it is degraded |
+| `translate_status_once` | one `GetStatus` against a **running** daemon: which provider is active and whether it is degraded |
 | `translate_once` | one translation request end to end (text, source and target language) and the streamed result |
 
 ```bash
-cargo run -p amos-translate --example status_once -- /tmp/amos-translate.sock
+cargo run -p amos-translate --example translate_status_once -- /tmp/amos-translate.sock
 cargo run -p amos-translate --example translate_once -- /tmp/amos-translate.sock "你好" zh en
 ```
 

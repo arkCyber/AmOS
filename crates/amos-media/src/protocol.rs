@@ -1,31 +1,39 @@
-// DRAFT — REQ-A302 stream-media draft
-// =====================================
+// REQ-A302 — media byte protocol, now part of the build
+// =====================================================
 //
-// This file is intentionally NOT a `pub mod` of `lib.rs`: see the comment in
-// `lib.rs` that documents the disconnect. The orphan-draft status is *not*
-// an oversight; it is the safest place this code can live until the
-// `range` + `manager` + `spec` API surface that this file expects matches
-// what those modules actually export today. Re-introducing the
-// `pub mod protocol;` declaration re-activates the 7 rustc errors that gate
-// the merge:
+// This file spent many rounds as an **orphan draft**: `pub mod protocol;` was commented out
+// in `lib.rs`, because the module was written against an API surface that did not exist yet.
+// Its own banner listed six blockers; measured against today's tree, only *one* of them was
+// still real, and it was a gap in `range.rs` (not in this file):
 //
-//   * `range::UnknownPlan` → `range::RangeSpec` (no such thing named
-//     `UnknownPlan` — the satisfiable/unsatisfiable/full union is
-//     `RangeSpec::{Full, Satisfiable{start,end}, Unsatisfiable}` and
-//     `content_range_unknown` simply does not exist)
-//   * `MediaRequest` / `ProtocolError` — never declared in this file
-//   * `m.read_range(item, start, len)` — `MediaManager` does not expose it;
-//     the streaming plane is `load` (whole-item, bounded by
-//     `MAX_LOAD_BYTES`) — Range support lives on the provider side per
-//     `range.rs::plan_response`
-//   * `Vec<MediaItem>` has no `.items` field — that's a `MediaListing` (see
-//     `manager.rs::list`)
+//   * `range::UnknownPlan` / `plan_unknown` / `content_range_unknown` — **the real gap**;
+//     the unknown-length planning documented by `serve_unmeasured` below now lives in
+//     `range.rs` beside the length-known planner (`plan_response`), with its own tests.
+//   * `MediaManager::read_range` — landed long ago in `manager.rs`, gated by the same read
+//     grant as `load`; this file calls it as written.
+//   * `Vec<MediaItem>.items` — the draft was **wrong**, and the activation is what proved
+//     it: `manager.rs::list` returns a plain `Vec<MediaItem>`. The `.items` the draft
+//     reached for is the *frontend* paging wrapper (`MediaListing` in
+//     `frontend-ts/src/lib/media.ts`, REQ-A316) — the two sides' vocabularies had been
+//     mixed up in the draft. Fixed at the four call sites below.
+//   * `MediaRequest` / `ProtocolError` — the old banner said "never declared in this file",
+//     and nothing in the tree referenced them either; the activation exports neither.
 //
-// The 1098 lines below are a *design* for REQ-A302, not a working module.
-// Theuread will come back to it when the protocol team is ready to settle
-// the streaming wire-format. Until then, the file stays in the tree as a
-// TODO-shaped suggestion, not a compile-time participant.
+// Two consequences worth stating plainly, because the old banner got them wrong in a way
+// that would mislead the next reader:
 //
+//   * the file was never "1125 lines of design": it is a working module — the code below
+//     compiles as written and carries its own test module (the banner said 1098 lines, a
+//     count that had drifted since it was written; this comment therefore states no count);
+//   * being in `src/` while not being *of* the build is exactly the failure mode
+//     docs/FMEA.md F-DEV-049 records: a file that looks live and is never compiled. It is
+//     in the build now, so every claim below is checked by `cargo test -p amos-media`.
+//
+// Still *not* done (and deliberately not faked here — see docs/media-player.md §8): nothing
+// registers the `amos-media://` scheme with Tauri's WebView yet, and the player still
+// resolves whole-item blob URLs. The serving half is real and tested; the transport above it
+// and the frontend adoption are the next round, and `MAX_PLAY_BYTES` remains in force until
+// then.
 
 //! **Why this exists.** The player used to read a whole item into memory and hand the
 //! WebView a `blob:` URL, so anything above `MAX_PLAY_BYTES` had to be *honestly
@@ -136,7 +144,8 @@ impl MediaReply {
 /// Spelled the same as the enum's own `serde(rename_all = "snake_case")` on purpose:
 /// the string a WebView puts in a URL is the one the bridge already accepts for
 /// `media_list`, so there is one vocabulary, not two. The anti-drift test below walks
-/// `StandardDir::all()`, so adding a collection without teaching this function fails.
+/// `StandardDir::all()` through **both** directions, so adding a collection without
+/// teaching these two functions fails.
 pub fn dir_from_key(key: &str) -> Option<StandardDir> {
     Some(match key {
         "root" => StandardDir::Root,
@@ -149,6 +158,26 @@ pub fn dir_from_key(key: &str) -> Option<StandardDir> {
         "music" => StandardDir::Music,
         _ => return None,
     })
+}
+
+/// The key a [`StandardDir`] is spelled with in a URI — the **writer half** of
+/// [`dir_from_key`].
+///
+/// An exhaustive `match` rather than a table lookup: a collection added to the enum makes
+/// this function fail to compile, which is the one place that cannot be forgotten. (A
+/// table would need a fallback arm, and a silent `unwrap_or("root")` would send every
+/// request for the new collection to the wrong one.)
+pub fn dir_key(dir: StandardDir) -> &'static str {
+    match dir {
+        StandardDir::Root => "root",
+        StandardDir::Camera => "camera",
+        StandardDir::Screenshots => "screenshots",
+        StandardDir::Pictures => "pictures",
+        StandardDir::Download => "download",
+        StandardDir::Recordings => "recordings",
+        StandardDir::Movies => "movies",
+        StandardDir::Music => "music",
+    }
 }
 
 /// Decode `%XX` escapes. An incomplete or non-hex escape is rejected: guessing here
@@ -267,6 +296,52 @@ pub fn base_url_for(webview_workaround: bool) -> String {
     }
 }
 
+/// Percent-encode one path segment.
+///
+/// Conservative on purpose: everything outside RFC 3986's *unreserved* set
+/// (`A-Z a-z 0-9 - . _ ~`) is escaped, which is a strict superset of what
+/// `encodeURIComponent` escapes — so a URL this function builds is always parseable by
+/// [`parse_uri`], on both platform spellings, whatever a backend puts in an id. The two
+/// halves agree on a round trip, which is what the tests below pin; being *stricter* than
+/// the frontend's own escaping can only ever produce a longer URL, never a wrong one.
+fn percent_encode_segment(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for b in raw.as_bytes() {
+        let keep = matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~');
+        if keep {
+            out.push(*b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// The URL a page must write to read `id` out of `collection`, under `base`.
+///
+/// The **emitter half** of [`parse_uri`]: the parser's grammar is the contract, and this is
+/// the only place that spells a URL from it — so a caller (the host's `media_stream_url`
+/// command) never assembles one by hand and cannot drift from the parser. `base` is a
+/// [`base_url_for`] value, whose trailing `/` is part of the contract, so the join is a
+/// plain concatenation. The id is escaped into **one path segment**: real backends hand out
+/// ids containing `/` (`content://…` on Android, an absolute path on HostFs — REQ-A304),
+/// and a URL that kept those separators would resolve to a different (or no) item.
+///
+/// `None` when the id cannot be represented at all — empty, or containing a control
+/// character. Those are exactly the URIs [`serve`] answers with a `400`, so refusing to
+/// build one here keeps "the host handed out a URL" and "the host can serve it" the same
+/// statement.
+pub fn media_url(base: &str, collection: StandardDir, id: &str) -> Option<String> {
+    if id.is_empty() || id.chars().any(char::is_control) {
+        return None;
+    }
+    Some(format!(
+        "{base}{}/{}",
+        dir_key(collection),
+        percent_encode_segment(id)
+    ))
+}
+
 /// The MIME to serve.
 ///
 /// The stored MIME wins **unless it is the generic one**: several backends record
@@ -337,7 +412,7 @@ pub fn serve(m: &MediaManager, uri: &str, range_header: Option<&str>) -> MediaRe
         Ok(items) => items,
         Err(e) => return MediaReply::refused(status_for(&e), None, e.to_string()),
     };
-    let Some(item) = items.items.into_iter().find(|i| i.id == id) else {
+    let Some(item) = items.into_iter().find(|i| i.id == id) else {
         return MediaReply::refused(404, None, format!("no item {id:?} in {collection:?}"));
     };
     let content_type = content_type_for(&item);
@@ -514,7 +589,8 @@ mod tests {
     }
 
     /// The scheme's collection keys must cover **every** `StandardDir`, or a URL a
-    /// screen can build for that collection would be a permanent 400.
+    /// screen can build for that collection would be a permanent 400. Both directions
+    /// are walked: reading (`dir_from_key`) and writing (`dir_key`).
     #[test]
     fn dir_from_key_covers_every_collection() {
         for dir in StandardDir::all() {
@@ -524,9 +600,81 @@ mod tests {
                 .expect("string")
                 .to_string();
             assert_eq!(dir_from_key(&key), Some(*dir), "key {key:?} is not served");
+            // …and the writer half spells the very same key.
+            assert_eq!(dir_key(*dir), key, "dir {dir:?} is written differently");
         }
         assert_eq!(dir_from_key("nope"), None);
         assert_eq!(dir_from_key(""), None);
+    }
+
+    /// The emitter and the parser are two halves of one grammar: **every** collection, on
+    /// **both** platform base forms, must round-trip. A drift here is the failure this
+    /// function exists to prevent — a URL the host hands out that its own parser reads as a
+    /// different item (or refuses).
+    #[test]
+    fn media_url_round_trips_every_collection_on_both_platform_forms() {
+        for workaround in [false, true] {
+            let base = base_url_for(workaround);
+            for dir in StandardDir::all() {
+                let url = media_url(&base, *dir, "clip.mp4").expect("representable id");
+                assert_eq!(parse_uri(&url), Ok((*dir, "clip.mp4".to_string())), "{url}");
+            }
+        }
+        // The two forms are the documented pair (docs/pwa-index.md §1's shape for media).
+        assert_eq!(base_url_for(false), "amos-media://");
+        assert_eq!(base_url_for(true), "http://amos-media.localhost/");
+    }
+
+    /// A real backend's id is a path (REQ-A304): the emitter must collapse it into one
+    /// segment. The literal is the frontend's (`encodeURIComponent`) spelling, so the two
+    /// sides produce the *same* URL for the same item rather than two spellings of it.
+    #[test]
+    fn media_url_escapes_a_media_store_id_into_one_segment() {
+        let url = media_url(
+            &base_url_for(false),
+            StandardDir::Movies,
+            "content://media/external/video/media/1234",
+        )
+        .expect("representable id");
+        assert_eq!(
+            url,
+            "amos-media://movies/content%3A%2F%2Fmedia%2Fexternal%2Fvideo%2Fmedia%2F1234"
+        );
+        assert_eq!(
+            parse_uri(&url),
+            Ok((
+                StandardDir::Movies,
+                "content://media/external/video/media/1234".to_string()
+            ))
+        );
+        // A hostfs id is an absolute path: one segment too, `%2F` included.
+        assert_eq!(
+            media_url(
+                &base_url_for(false),
+                StandardDir::Download,
+                "/data/media/Download/a b.mp4"
+            ),
+            Some("amos-media://download/%2Fdata%2Fmedia%2FDownload%2Fa%20b.mp4".to_string())
+        );
+    }
+
+    /// The ids that can never be served are refused at the emitter, so "the host handed out
+    /// a URL" and "the host can serve it" stay the same statement (`serve` answers these
+    /// with a 400).
+    #[test]
+    fn media_url_refuses_an_id_that_could_never_be_served() {
+        assert_eq!(
+            media_url(&base_url_for(false), StandardDir::Camera, ""),
+            None
+        );
+        assert_eq!(
+            media_url(&base_url_for(false), StandardDir::Camera, "a\nb"),
+            None
+        );
+        assert_eq!(
+            media_url(&base_url_for(false), StandardDir::Camera, "a%00b"),
+            Some("amos-media://camera/a%2500b".into())
+        );
     }
 
     #[test]
@@ -549,15 +697,15 @@ mod tests {
     #[test]
     fn parse_uri_refuses_what_it_cannot_honour() {
         for bad in [
-            "https://example.com/x",     // wrong scheme
-            "amos-media:/camera/x",      // not authority-rooted
-            "amos-media://camera",       // no id
-            "amos-media://camera/",      // empty id
-            "amos-media://camera/a%00b", // control character
-            "amos-media://camera/a%2",   // truncated escape
-            "amos-media://camera/a%zzb", // non-hex escape
-            "amos-media://camera/a%0Ab", // embedded newline
-            "amos-media://nope/x",       // unknown collection
+            "https://example.com/x",         // wrong scheme
+            "amos-media:/camera/x",          // not authority-rooted
+            "amos-media://camera",           // no id
+            "amos-media://camera/",          // empty id
+            "amos-media://camera/a%00b",     // control character
+            "amos-media://camera/a%2",       // truncated escape
+            "amos-media://camera/a%zzb",     // non-hex escape
+            "amos-media://camera/a%0Ab",     // embedded newline
+            "amos-media://nope/x",           // unknown collection
             "amos-media://localhost",        // workaround netloc, no collection
             "amos-media://localhost/nope/x", // workaround netloc + unknown collection
             "http://amos-media.other/x",     // workaround host of *another* netloc
@@ -577,11 +725,16 @@ mod tests {
         );
         assert_eq!(
             parse_uri("amos-media://download/DCIM%2FCamera%2FIMG_0001.jpg"),
-            Ok((StandardDir::Download, "DCIM/Camera/IMG_0001.jpg".to_string()))
+            Ok((
+                StandardDir::Download,
+                "DCIM/Camera/IMG_0001.jpg".to_string()
+            ))
         );
         // The exact frontend literal (`encodeURIComponent` of a MediaStore content URI).
         assert_eq!(
-            parse_uri("amos-media://movies/content%3A%2F%2Fmedia%2Fexternal%2Fvideo%2Fmedia%2F1234"),
+            parse_uri(
+                "amos-media://movies/content%3A%2F%2Fmedia%2Fexternal%2Fvideo%2Fmedia%2F1234"
+            ),
             Ok((
                 StandardDir::Movies,
                 "content://media/external/video/media/1234".to_string()
@@ -658,7 +811,11 @@ mod tests {
         } else {
             base_url_for(false)
         };
-        assert_eq!(base_url(), expected, "base_url must follow the target platform");
+        assert_eq!(
+            base_url(),
+            expected,
+            "base_url must follow the target platform"
+        );
     }
 
     /// A traversal-shaped id is not "refused before it can name anything" by *shape* — it
@@ -677,7 +834,11 @@ mod tests {
         // The same string when *listed* is an ordinary item: a backend that offers it is
         // the only thing that could serve it, which is exactly the trust boundary.
         let looks_like_traversal = save(&m, "odd.mp4", b"payload");
-        let reply = serve(&m, &format!("{URL}download/{}", looks_like_traversal.id), None);
+        let reply = serve(
+            &m,
+            &format!("{URL}download/{}", looks_like_traversal.id),
+            None,
+        );
         assert_eq!(reply.status, 200);
 
         // An id that parses but matches nothing is a 404 — a miss, not a lookup path.
@@ -894,7 +1055,10 @@ mod tests {
             "the refusal must name the numbers: {}",
             whole.reason
         );
-        assert!(whole.bytes.is_empty(), "a truncated body must not be served");
+        assert!(
+            whole.bytes.is_empty(),
+            "a truncated body must not be served"
+        );
     }
 
     /// No declared size ⇒ the item is **streamed**, never loaded just to be measured
@@ -1003,7 +1167,6 @@ mod tests {
         let item = m
             .list(StandardDir::Download)
             .expect("list")
-            .items
             .into_iter()
             .find(|i| i.name == "song.mp3")
             .expect("the fixture must be listed");
@@ -1057,12 +1220,14 @@ mod tests {
         let item = m
             .list(StandardDir::Download)
             .expect("list")
-            .items
             .into_iter()
             .find(|i| i.name == "movie.mp4")
             .expect("listed");
         assert!(item.size_bytes.is_none(), "the fixture must hide the size");
-        let url = format!("{URL}download/{escaped}", escaped = item.id.replace('/', "%2F"));
+        let url = format!(
+            "{URL}download/{escaped}",
+            escaped = item.id.replace('/', "%2F")
+        );
 
         // An open-ended range: exactly one bounded window, honest about the length.
         let open = serve(&m, &url, Some("bytes=0-"));
@@ -1101,11 +1266,13 @@ mod tests {
         let item = m
             .list(StandardDir::Download)
             .expect("list")
-            .items
             .into_iter()
             .find(|i| i.name == "memo.mp3")
             .expect("listed");
-        let url = format!("{URL}download/{escaped}", escaped = item.id.replace('/', "%2F"));
+        let url = format!(
+            "{URL}download/{escaped}",
+            escaped = item.id.replace('/', "%2F")
+        );
 
         let whole = serve(&m, &url, None);
         assert_eq!(whole.status, 200, "{}", whole.reason);

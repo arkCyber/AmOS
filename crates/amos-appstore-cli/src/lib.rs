@@ -74,7 +74,8 @@ OPTIONS:
     --catalog <URL>           Use a real remote catalog instead of the offline demo:
                               GET <URL> as a MockCatalog JSON doc and download each
                               package's bytes from its manifest URL. Requires building
-                              with --features live (default build ignores it).
+                              with --features live; without it the command refuses
+                              loudly rather than silently falling back to the demo.
     --repo <URL>              Use an F-Droid repository (index-v1 format) as the catalog:
                               GET <URL>/index-v1.json, map its apps into the engine, and
                               download APK bytes from <URL>/<apkName>. Requires building
@@ -87,6 +88,8 @@ OPTIONS:
                               this hex digest (integrity pin until PGP verification lands).
     --repo-address <URL>      With export: the repo.address the exported index
                               advertises (default https://store.amos.local/repo).
+    --out <PATH>              With download: where to write the fetched package bytes
+                              (required — `download` refuses without it).
     download <ID>             Download the app's package bytes, verify the published sha256
                               (when present), and write them to --out <PATH>. Never installs.
 ";
@@ -390,6 +393,24 @@ fn installed_line(a: &amos_appstore::InstalledApp) -> String {
     )
 }
 
+/// The integrity clause for an install / download, from **the digest the manifest
+/// actually published**.
+///
+/// `PackageRef::sha256` is optional by design — the engine's `verify_bytes` reads
+/// `let Some(expected) = &manifest.package.sha256 else { return Ok(()) }`, so a
+/// catalog row without a digest installs and downloads *with no comparison made*.
+/// A line that unconditionally says "sha256 verified" therefore tells the operator
+/// an integrity check ran when, for that row, nothing was checked. This is the one
+/// place that decides the wording, so `install`, `download` and the demo session
+/// cannot drift apart on it.
+fn integrity_note(mf: &AppManifest) -> &'static str {
+    if mf.package.sha256.is_some() {
+        "sha256 verified"
+    } else {
+        "no digest published (UNVERIFIED)"
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Execution
 // ---------------------------------------------------------------------------
@@ -498,8 +519,10 @@ pub async fn dispatch<S: StoreProvider>(store: &AppStore<S>, op: Op) -> Result<V
         Op::Install { id } => {
             let app = store.install(&id).await?;
             Ok(vec![format!(
-                "installed {} v{} (sha256 verified)",
-                app.manifest.id, app.manifest.version
+                "installed {} v{} ({})",
+                app.manifest.id,
+                app.manifest.version,
+                integrity_note(&app.manifest)
             )])
         }
         Op::Upgrade { id } => {
@@ -516,18 +539,13 @@ pub async fn dispatch<S: StoreProvider>(store: &AppStore<S>, op: Op) -> Result<V
         Op::Download { id, out } => {
             let (mf, bytes) = store.download(&id).await?;
             write_atomic(&out, &bytes)?;
-            let note = if mf.package.sha256.is_some() {
-                "sha256 verified"
-            } else {
-                "no digest published (UNVERIFIED)"
-            };
             Ok(vec![format!(
                 "downloaded {} v{} -> {} ({} bytes, {})",
                 mf.id,
                 mf.version,
                 out.display(),
                 bytes.len(),
-                note
+                integrity_note(&mf)
             )])
         }
         Op::Export { out, repo_address } => {
@@ -558,8 +576,10 @@ async fn demo_lines() -> Result<Vec<String>> {
     out.push("  install org.amos.pomodoro ...".to_string());
     let app = store.install("org.amos.pomodoro").await?;
     out.push(format!(
-        "    -> installed {} v{} (sha256 verified)",
-        app.manifest.id, app.manifest.version
+        "    -> installed {} v{} ({})",
+        app.manifest.id,
+        app.manifest.version,
+        integrity_note(&app.manifest)
     ));
     let status = store.status("org.amos.pomodoro").await?;
     out.push(format!(
@@ -686,6 +706,39 @@ mod tests {
 
     fn s(args: &[&str]) -> Vec<String> {
         args.iter().map(|a| a.to_string()).collect()
+    }
+
+    /// The help text must not promise behavior the runner does not perform. Two
+    /// drifts are pinned here: `--catalog` used to be advertised as "default build
+    /// ignores it" (a non-`live` build in fact **refuses** it), and `download`'s
+    /// required `--out` was named in the subcommand line but never listed under
+    /// OPTIONS. Both assertions fail on the pre-fix text.
+    #[test]
+    fn usage_documents_the_catalog_refusal_and_the_download_destination() {
+        assert!(
+            USAGE.contains("--out <PATH>"),
+            "download requires --out; the OPTIONS list must name it"
+        );
+        assert!(
+            !USAGE.contains("ignores it"),
+            "a non-live build refuses --catalog, it does not silently ignore it"
+        );
+    }
+
+    /// Pin the behavior the help text now describes: a default (non-`live`) build
+    /// refuses `--catalog` instead of quietly handing back the offline demo catalog
+    /// the operator did not ask for.
+    #[cfg(not(feature = "live"))]
+    #[tokio::test]
+    async fn a_non_live_build_refuses_catalog_rather_than_falling_back() {
+        let err = run(&s(&[
+            "--catalog",
+            "http://example.invalid/c.json",
+            "catalog",
+        ]))
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("needs a live build"), "{err}");
     }
 
     #[test]
@@ -915,6 +968,75 @@ mod tests {
         );
         assert!(joined.contains("sha256 verified"), "{joined}");
     }
+
+    /// A catalog entry that publishes **no** digest is legal (`PackageRef::sha256`
+    /// is an `Option` with `#[serde(default)]`, and `AppManifest::validate` does not
+    /// require one), and `verify_bytes` returns `Ok(())` without comparing anything
+    /// for it (`let Some(expected) = … else { return Ok(()) }`). So the `install`
+    /// success line must not claim an integrity check that never ran — the same
+    /// question `Op::Download` already answers from `mf.package.sha256.is_some()`.
+    ///
+    /// Positive control in the same test: the demo catalog's entries *do* carry a
+    /// digest (its `seed()` relies on `MockStoreProvider::add` stamping one), and
+    /// their install line must still read `sha256 verified` — the fix narrows the
+    /// claim, it does not stop making it when it is true.
+    #[tokio::test]
+    async fn install_line_claims_verification_only_when_a_digest_was_published() {
+        let p = MockStoreProvider::new();
+        p.add_broken(
+            AppManifest {
+                id: "org.amos.nodigest".into(),
+                name: "No Digest".into(),
+                summary: "".into(),
+                description: String::new(),
+                author: "".into(),
+                version: Version::new(1, 0, 0),
+                category: AppCategory::Tools,
+                homepage: String::new(),
+                icon_url: String::new(),
+                package: PackageRef {
+                    format: PackageFormat::TarGz,
+                    url: "https://cdn.amos.local/nodigest.tgz".into(),
+                    sha256: None,
+                    size_bytes: None,
+                },
+                publisher: None,
+            },
+            b"unverified bytes".to_vec(),
+        )
+        .expect("digest-less catalog entry is legal");
+
+        let store = AppStore::new(p);
+        let out = dispatch(
+            &store,
+            Op::Install {
+                id: "org.amos.nodigest".into(),
+            },
+        )
+        .await
+        .expect("a digest-less install succeeds (nothing was ever checked)");
+        let line = out.join("\n");
+        assert!(
+            !line.contains("sha256 verified"),
+            "no digest was published, so no sha256 was verified: {line}"
+        );
+        assert!(line.contains("UNVERIFIED"), "{line}");
+
+        // Positive control — a real digest still reports a real check.
+        let verified = dispatch(
+            &AppStore::new(demo_provider()),
+            Op::Install {
+                id: "org.amos.pomodoro".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            verified.join("\n").contains("sha256 verified"),
+            "a published digest must still be reported as verified: {verified:?}"
+        );
+    }
+
     #[test]
     fn catalog_flag_is_read_and_stripped_from_subcommand() {
         let args = s(&[

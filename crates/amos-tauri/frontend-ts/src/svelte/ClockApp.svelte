@@ -35,13 +35,14 @@
     WEEKENDS,
   } from "../lib/time";
   import type { Alarm, WorldCity } from "../lib/time";
+  import { ALARM_FIRED_KEY, flaggedRingingIds, markRung, normalizeFired } from "../lib/alarmCore";
   import { readStoreValue, writeStoreValue, writeStoreValueChecked } from "../lib/amosStore";
   import StoreErrorBar from "./StoreErrorBar.svelte";
   import { iconSvg } from "../lib/sysIcons";
   import { locale, t } from "./locale.svelte";
   import { onDestroy, onMount } from "svelte";
   import { startAlarmRing, stopAlarmRing, previewAlarmTone, setRingtoneFilesEnabled, activeRingtone } from "../lib/ringtonePlayer";
-  import { nativeAlarmDeviceState, nativeWakeArmed } from "./osAlarmArm";
+  import { nativeAlarmDeviceState, nativeWakeArmed, unconfirmedNativeCancelIds } from "./osAlarmArm";
   import type { NativeAlarmDeviceState } from "../lib/backend";
   import { openNativeAlarmSettings } from "../lib/backend";
   import { restoreTimerState, persistFromTimer } from "../lib/timerStore";
@@ -155,32 +156,36 @@
   // --- countdown timer (persisted so an OS notifier can finish it when the Clock
   // app is closed) ---
   let tm = $state(restoreTimerState(Date.now()));
+  // A refused `amos.timer` write: say so. This is the **third** independent writer on this
+  // screen (the alarm list and the city list are the other two), so it gets its own slot —
+  // a shared one would let this write's success blank an alarm refusal landing in the same
+  // flush. The refusal matters more here than anywhere: this record exists *only* so an OS
+  // notifier can finish the countdown after the screen closes, so a refused write means the
+  // countdown the user set lives on this screen alone and rings nowhere.
+  let tmErr = $state("");
   // Persist every in-memory timer change (start/pause/set/reset/done) so the
   // shell-level notifier (lib/timerNotify.ts) can take over when this screen closes.
   $effect(() => {
-    persistFromTimer(tm);
+    tmErr = persistFromTimer(tm) ? "" : t("common.storeWriteFailed");
   });
   const timerDone = $derived(tm.totalMs > 0 && tm.remainingMs === 0 && !tm.running);
   // --- alarms (pure reducer, persisted) ---
   // Seed alarms from the store, PRESERVING any persisted `ringing:true` (e.g. one
   // the OS notifier or a previous session left ringing) — `normalizeAlarms`
-  // deliberately strips ringing for corruption-guarding, so re-apply it here.
+  // deliberately strips ringing for corruption-guarding, so re-apply it here. The bit is
+  // day-bounded *upstream*: `syncDueAlarmAlerts` retracts a ring whose day has passed
+  // (`liveRingingIds`), so the ring this seed can be handed is today's (REQ-A1392).
   const rawAl = readStoreValue<unknown>("amos.alarms", []);
-  const ringingIds = new Set<string>();
-  if (Array.isArray(rawAl)) {
-    for (const o of rawAl) {
-      if (o && typeof o === "object" && (o as { ringing?: unknown }).ringing === true) {
-        const id = (o as { id?: unknown }).id;
-        if (typeof id === "string" && id) ringingIds.add(id);
-      }
-    }
-  }
+  const ringingIds = flaggedRingingIds(rawAl);
   const initAl = alarmInit(
     normalizeAlarms(rawAl).map((a) => (ringingIds.has(a.id) ? { ...a, ringing: true } : a)),
   );
   let al = $state(initAl);
   // A rejected `amos.alarms` write (full/unavailable storage): say so.
   let storeErr = $state("");
+  // …and the same for `amos.worldclock`. Two writers, two refusal facts: a single slot would let
+  // the alarm write's success blank the city write's refusal (they run in the same flush).
+  let wcErr = $state("");
   let alH = $state("8");
   let alM = $state("0");
   let alLabel = $state("");
@@ -203,8 +208,18 @@
    * `dumpsys alarm` knew nothing about.
    */
   let nativeArm = $state<NativeAlarmDeviceState | null>(null);
+  /**
+   * Ids the host was asked to cancel and never confirmed the OS released (REQ-A875).
+   *
+   * The same question as `nativeArm`, asked in the other direction: `nativeArm` says the OS
+   * will not wake the phone for an alarm the user *wants*; this says the OS may still ring for
+   * one the user **turned off**. `nativeAlarmDeviceState().cancel` — the verdict this comes
+   * from — had no reader at all until this round, so a refused cancel was invisible.
+   */
+  let nativeCancelPending = $state<string[]>([]);
   const refreshNativeArm = () => {
     nativeArm = nativeAlarmDeviceState().arm;
+    nativeCancelPending = unconfirmedNativeCancelIds();
   };
   /** What the last "open the exact-alarm settings" attempt observed (REQ-A373; never optimistic). */
   let settingsMsg = $state("");
@@ -263,7 +278,10 @@
   });
 
   $effect(() => {
-    writeStoreValue("amos.worldclock", wc);
+    // The city list is **content the user set** (added, removed and reordered by hand), so its
+    // verdict is read exactly as the alarm list's is: the rows redraw whether or not the write
+    // landed, and that a refused one will not survive a reload is what the user must be told.
+    wcErr = writeStoreValueChecked("amos.worldclock", wc) ? "" : t("common.storeWriteFailed");
   });
   $effect(() => {
     // The alarm list is **content the user set**, so a rejected write is reported
@@ -282,6 +300,19 @@
       const d = new Date();
       now = d;
       al = alarmsReducer(al, { type: "tick", now: d });
+      // A ring latched HERE is a ring like any other: record the day it arrived, the
+      // same marker `syncDueAlarmAlerts` writes. The watcher skips the reconcile while
+      // Clock is focused, so this half is ClockApp's to write — and without it the
+      // persisted `ringing:true` would have no day marker, which `liveRingingIds` now
+      // reads as "not ringing" (REQ-A1392).
+      const rung = al.list.filter((a) => a.ringing);
+      if (rung.length > 0) {
+        const fired = normalizeFired(readStoreValue<unknown>(ALARM_FIRED_KEY, {}));
+        const next = markRung(fired, rung, d);
+        if (JSON.stringify(next) !== JSON.stringify(fired)) {
+          writeStoreValue(ALARM_FIRED_KEY, next);
+        }
+      }
       if (tm.running) tm = timerReducer(tm, { type: "tick", now: d.getTime() });
       // The host answers the arming call asynchronously (the watcher drives it), so the
       // banner below would otherwise stay stale until the next list change.
@@ -433,7 +464,7 @@
 </script>
 
 <div class="p-6">
-  <StoreErrorBar message={storeErr} />
+  <StoreErrorBar message={storeErr || wcErr || tmErr} />
   <!-- Tabs (mini Segmented) -->
   <div class="flex justify-center gap-1 pt-1 pb-3" role="tablist" data-testid="clock-tabs">
     <button role="tab" aria-selected={tab === "world"} onclick={() => (tab = "world")} class={seg(tab === "world")}>{t("clock.world")}</button>
@@ -468,7 +499,11 @@
   {#if tab === "world"}
     <div>
       <div class="text-center">
-        <div class="text-5xl font-medium tabular-nums">{fmt(now)}</div>
+        <!-- role="timer": the value changes on its own, so assistive tech can query it on
+             demand. Same contract as the four clock faces (StatusBar/LockScreen/ClockWidget/
+             StageClock) and the in-call duration — name it, but do **not** add aria-live
+             (REQ-A284 refused a per-second announcement as hostile). REQ-A1115. -->
+        <div class="text-5xl font-medium tabular-nums" role="timer" aria-label={t("a11y.currentTime")}>{fmt(now)}</div>
         <div class="mt-1 text-sm opacity-60">{fmtDate(now)}</div>
         <div class="mt-1 text-xs uppercase tracking-wide opacity-50">{t("clock.now")}</div>
       </div>
@@ -521,7 +556,7 @@
   {#if tab === "timer"}
     <div class="mt-6 rounded-xl bg-neutral-200/50 p-4 text-center dark:bg-neutral-800/50">
       <div class="text-xs uppercase tracking-wide opacity-50">{t("clock.timer")}</div>
-      <div class="mt-1 text-4xl font-medium tabular-nums {timerDone ? 'text-danger' : ''}">{fmtCountdown(tm.remainingMs)}</div>
+      <div class="mt-1 text-4xl font-medium tabular-nums {timerDone ? 'text-danger' : ''}" role="timer" aria-label={t("clock.timer")}>{fmtCountdown(tm.remainingMs)}</div>
       {#if timerDone}
         <div data-testid="timer-done" role="status" aria-live="assertive" class="timer-done mt-1 text-base font-semibold text-danger">{t("clock.timerDone")}</div>
       {/if}
@@ -549,7 +584,9 @@
         />
       </div>
       <div class="mt-3 flex items-center justify-center gap-4">
-        <button onclick={tmToggle} disabled={tm.totalMs === 0 && !tm.running} aria-label={t("clock.timer")} data-icon={tm.running ? "pause" : "play"} class={round(tm.running ? "bg-danger" : "bg-green-500")}>
+        <!-- `aria-pressed` carries the running state: the glyph/colour are the only other
+             signal, and a static `aria-label` shadows both (REQ-A962). -->
+        <button onclick={tmToggle} disabled={tm.totalMs === 0 && !tm.running} aria-label={t("clock.timer")} aria-pressed={tm.running} data-icon={tm.running ? "pause" : "play"} class={round(tm.running ? "bg-danger" : "bg-green-500")}>
           {@html iconSvg(tm.running ? "pause" : "play", "h-7 w-7")}
         </button>
         <button onclick={tmReset} disabled={tm.totalMs === 0} aria-label={t("a11y.reset")} data-icon="reset" class="grid h-12 w-12 place-items-center rounded-full bg-neutral-300 text-neutral-700 disabled:opacity-30 dark:bg-neutral-700 dark:text-neutral-100">{@html iconSvg("rotateCcw", "h-5 w-5")}</button>
@@ -593,6 +630,23 @@
               {/if}
             {/if}
           </div>
+        {/if}
+        {#if nativeCancelPending.length > 0}
+          <!-- REQ-A875 / F-ALM-004: the other direction of the same question. The banner above
+               says the OS will not wake the phone for an alarm the user *wants*; this says the OS
+               may still ring for one the user **turned off**, because the host was asked to cancel
+               and did not confirm the device let go. Saying nothing would leave that to the log,
+               and the consequence — a deleted alarm firing on a sleeping phone — is exactly what
+               the module was written to prevent. No button: the module retries on every reconcile,
+               so there is nothing for the user to do but let it. -->
+          <p
+            data-testid="alarm-native-cancel-pending"
+            data-pending={nativeCancelPending.length}
+            role="status"
+            class="mt-2 rounded-lg bg-amber-500/15 px-2 py-1 text-[11px] leading-snug text-amber-900 dark:text-amber-200"
+          >
+            {t("clock.alarmCancelPending", { n: nativeCancelPending.length })}
+          </p>
         {/if}
         {#if editingId}
           <div class="mt-2 flex items-center justify-between rounded-lg bg-accent/10 px-2 py-1 text-xs">
@@ -694,10 +748,16 @@
   {#if tab === "stopwatch"}
     <div class="mt-6 rounded-xl bg-neutral-200/50 p-4 text-center dark:bg-neutral-800/50">
       <div class="text-xs uppercase tracking-wide opacity-50">{t("clock.stopwatch")}</div>
-      <div class="mt-1 text-4xl font-medium tabular-nums">{fmtStopwatch(sw.elapsedMs)}</div>
+      <div class="mt-1 text-4xl font-medium tabular-nums" role="timer" aria-label={t("clock.stopwatch")}>{fmtStopwatch(sw.elapsedMs)}</div>
       <div class="mt-3 flex items-center justify-center gap-4">
-        <button onclick={swToggle} aria-label={t("clock.stopwatch")} data-icon={sw.running ? "pause" : "play"} class={round(sw.running ? "bg-danger" : "bg-green-500")}>{@html iconSvg(sw.running ? "pause" : "play", "h-7 w-7")}</button>
-        <button onclick={doLap} disabled={!sw.running} aria-label={t("clock.lap")} class="h-11 rounded-full bg-neutral-300 px-4 text-sm disabled:opacity-30 dark:bg-neutral-700">{t("clock.lap")}</button>
+        <!-- Same as the timer's toggle: the running state lives only in the glyph and the
+             button colour, so it must be said out loud (REQ-A962). -->
+        <button onclick={swToggle} aria-label={t("clock.stopwatch")} aria-pressed={sw.running} data-icon={sw.running ? "pause" : "play"} class={round(sw.running ? "bg-danger" : "bg-green-500")}>{@html iconSvg(sw.running ? "pause" : "play", "h-7 w-7")}</button>
+        <!-- iOS parity: 计圈 stays available while the stopwatch is **paused** (the lap
+             snapshots the frozen elapsed); it is disabled only in the fully-idle state
+             (reset to 0 and not running), same condition as reset. The old `!sw.running`
+             guard wrongly treated "paused" as "nothing to lap". -->
+        <button onclick={doLap} disabled={sw.elapsedMs === 0 && !sw.running} aria-label={t("clock.lap")} class="h-11 rounded-full bg-neutral-300 px-4 text-sm disabled:opacity-30 dark:bg-neutral-700">{t("clock.lap")}</button>
         <button onclick={resetSw} disabled={sw.elapsedMs === 0 && !sw.running} aria-label={t("a11y.reset")} data-icon="reset" class="grid h-12 w-12 place-items-center rounded-full bg-neutral-300 text-neutral-700 disabled:opacity-30 dark:bg-neutral-700 dark:text-neutral-100">{@html iconSvg("rotateCcw", "h-5 w-5")}</button>
       </div>
       {#if laps.length > 0}

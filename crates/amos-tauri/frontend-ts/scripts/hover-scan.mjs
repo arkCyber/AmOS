@@ -15,10 +15,20 @@
  *       neither paint nor hit-testing). `MessagesApp`'s per-message actions were
  *       exactly that: an invisible-but-tappable 删除/引用回复, and the audit
  *       (`docs/UI_APPLE_HIG_AUDIT.md` §4) had recorded it as an open 🟡 since the HIG
- *       pass. Rule 2 makes the trap impossible: an element that is invisible by
- *       default **and** revealed by hover must be `pointer-events-none`, so it can
- *       never be hit while the user cannot see it, and any real touch path (the long
- *       press `MessagesApp` now uses, or keyboard focus) has to be explicit.
+ *       pass. Rule 2 makes the *hit-test* half impossible: an element that is invisible
+ *       by default **and** revealed by hover must be `pointer-events-none`, so it can
+ *       never be hit while the user cannot see it.
+ *
+ *       **What rule 2 does NOT enforce** (measured 2026-09-22, REQ-A1026): the other
+ *       half of that sentence — "any real touch path … has to be explicit" — is prose.
+ *       `hoverRevealProblem` reads only the class list, so a `pointer-events-none`
+ *       reveal with **no** way to open it passes here. That is precisely how
+ *       `MessagesApp` shipped: this gate was satisfied by its
+ *       `group-hover:` + `pointer-events-none` classes while the one touch path
+ *       (a left swipe) *deleted the message outright* and 引用回复 had no path at all.
+ *       A gate cannot see a missing gesture, and a `.svelte` comment describing one is
+ *       not evidence of one — the earlier draft of this very paragraph asserted "the
+ *       long press `MessagesApp` now uses" when no long press existed there.
  *
  * Rules:
  *   1. `tailwind.config.js` still sets `future: { hoverOnlyWhenSupported: true }`
@@ -167,9 +177,10 @@ function selftest() {
     }
   };
 
-  // Rule 2 — the defect this gate was written for, plus the two legitimate shapes.
+  // Rule 2 — the defect shape this gate was written for (MessagesApp's old
+  // per-message-actions class list, fixed in REQ-A1026), plus the two legitimate shapes.
   want(
-    "hoverRevealProblem: the MessagesApp defect",
+    "hoverRevealProblem: an invisible hit-testable reveal",
     hoverRevealProblem("px-1 text-xs opacity-0 transition-opacity group-hover:opacity-60") !== null,
     true,
   );

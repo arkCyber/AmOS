@@ -7,6 +7,7 @@ import {
   nativeWakeArmed,
   reconcileNativeAlarms,
   resetArmedNativeAlarmsForTest,
+  unconfirmedNativeCancelIds,
 } from "../svelte/osAlarmArm";
 
 try {
@@ -17,11 +18,24 @@ try {
 
 let calls: Array<{ cmd: string; args: Record<string, unknown> }> = [];
 
-function installBridge(): void {
+/**
+ * The cancel reply **in the shape the producer sends** (`AlarmCanceled`:
+ * `{ id, wasRegistered, device }`, `crates/amos-tauri/src/alarm_sched.rs`).
+ *
+ * It used to be `true`. That is not a value the command can return, so
+ * `lastCancel` was assigned `undefined` and every assertion about the cancel half was
+ * reading a field nothing had written — the fixture was the reason the defect below was
+ * invisible, not the code (REQ-A875).
+ */
+function cancelReply(args: Record<string, unknown>, state: string): unknown {
+  return { id: args.id, wasRegistered: true, device: { state } };
+}
+
+function installBridge(deviceState = "cancelled"): void {
   (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
     invoke: async (cmd: string, args: Record<string, unknown> = {}) => {
       calls.push({ cmd, args });
-      return cmd === "scheduler_alarm_cancel" ? true : null;
+      return cmd === "scheduler_alarm_cancel" ? cancelReply(args, deviceState) : null;
     },
     listen: async () => async () => {},
   };
@@ -81,6 +95,65 @@ describe("osAlarmArm — native exact-alarm reconciliation", () => {
     expect(armed).toEqual([]);
     expect(armedNativeAlarmIds()).toEqual([]);
     expect(calls).toEqual([{ cmd: "scheduler_alarm_cancel", args: { id: "alarm:a1" } }]);
+    // The host's answer is what makes the id forgettable, so it is read rather than assumed.
+    expect(nativeAlarmDeviceState().cancel).toEqual({ state: "cancelled" });
+    expect(unconfirmedNativeCancelIds()).toEqual([]);
+  });
+
+  // REQ-A875 / F-ALM-004. The cancel half used to drop the id from `armed` *before* asking
+  // the host, so a cancellation the device did not carry out was forgotten permanently: the
+  // OS kept the registration, `armed` no longer knew about it, and no later reconcile could
+  // ask again. The alarm then rings from the native scheduler for a phone whose user turned
+  // it off — the second case this module's own doc says it exists to prevent.
+  test("a cancel the device did not carry out is remembered, and asked again", async () => {
+    installBridge("unavailable");
+    window.localStorage.setItem(ALARM_KEY, JSON.stringify([alarm("a1", 7, 30)]));
+    await reconcileNativeAlarms(new Date(2024, 0, 1, 6, 0).getTime());
+    calls = [];
+
+    window.localStorage.setItem(ALARM_KEY, JSON.stringify([alarm("a1", 7, 30, false)]));
+    const armed = await reconcileNativeAlarms(new Date(2024, 0, 1, 6, 5).getTime());
+
+    // Not forgotten: the OS may still hold it, so the id stays armed and stays queued.
+    expect(armed).toEqual(["alarm:a1"]);
+    expect(armedNativeAlarmIds()).toEqual(["alarm:a1"]);
+    expect(unconfirmedNativeCancelIds()).toEqual(["alarm:a1"]);
+    expect(nativeAlarmDeviceState().cancel).toEqual({ state: "unavailable" });
+
+    // …and the next reconcile asks again instead of having given up silently.
+    calls = [];
+    await reconcileNativeAlarms(new Date(2024, 0, 1, 6, 10).getTime());
+    expect(calls).toEqual([{ cmd: "scheduler_alarm_cancel", args: { id: "alarm:a1" } }]);
+  });
+
+  test("a host that never answers leaves the registration queued too", async () => {
+    window.localStorage.setItem(ALARM_KEY, JSON.stringify([alarm("a1", 7, 30)]));
+    await reconcileNativeAlarms(new Date(2024, 0, 1, 6, 0).getTime());
+
+    // No bridge at all: `invoke` answers `null` (REQ-A296), which is "we do not know",
+    // not "the device let go". Nothing recorded it before, so nothing retried it.
+    goOffline();
+    window.localStorage.setItem(ALARM_KEY, JSON.stringify([alarm("a1", 7, 30, false)]));
+    await reconcileNativeAlarms(new Date(2024, 0, 1, 6, 5).getTime());
+
+    expect(unconfirmedNativeCancelIds()).toEqual(["alarm:a1"]);
+  });
+
+  test("a re-enabled alarm stops being an unconfirmed cancellation", async () => {
+    installBridge("unavailable");
+    window.localStorage.setItem(ALARM_KEY, JSON.stringify([alarm("a1", 7, 30)]));
+    await reconcileNativeAlarms(new Date(2024, 0, 1, 6, 0).getTime());
+    window.localStorage.setItem(ALARM_KEY, JSON.stringify([alarm("a1", 7, 30, false)]));
+    await reconcileNativeAlarms(new Date(2024, 0, 1, 6, 5).getTime());
+    expect(unconfirmedNativeCancelIds()).toEqual(["alarm:a1"]);
+
+    // The user turns it back on: the alarm is wanted again, so the stale cancellation is
+    // not a fact about anything any more.
+    window.localStorage.setItem(ALARM_KEY, JSON.stringify([alarm("a1", 7, 30)]));
+    await reconcileNativeAlarms(new Date(2024, 0, 1, 6, 6).getTime());
+
+    expect(unconfirmedNativeCancelIds()).toEqual([]);
+    expect(armedNativeAlarmIds()).toEqual(["alarm:a1"]);
   });
 
   test("re-registers (idempotently) without cancelling still-enabled alarms", async () => {

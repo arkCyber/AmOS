@@ -14,6 +14,7 @@ import { cleanup, fireEvent, render } from "@testing-library/svelte";
 import { tick } from "svelte";
 import InterpApp from "../src/svelte/InterpApp.svelte";
 import { INTERP_PREFS_KEY, INTERP_LOG_KEY } from "../src/lib/interp";
+import { zh } from "../src/i18n/locales/zh";
 
 // Read-aloud's shared AudioContext must be released on teardown; spy on the
 // release so the wiring itself is pinned (the close semantics are unit-tested in
@@ -124,6 +125,84 @@ describe("InterpApp.svelte (offline shell)", () => {
     expect(stored.target).toBe("en");
   });
 
+  // The language pair + auto-speak are the user's own choice (picked from the selects / toggled),
+  // and the very same screen already reports a refused **transcript** write
+  // (`saveSegs` → `storeErr` → `StoreErrorBar`). The prefs writer was the sibling left `void`, so a
+  // refused store silently forgot the user's choice and reopened on the defaults.
+  test("a rejected prefs write is reported (opening on a store that cannot hold it)", async () => {
+    const restore = failWritesFor(INTERP_PREFS_KEY);
+    try {
+      const host = render(InterpApp);
+      await settle();
+      // The screen draws its controls either way — the sentence is the only thing that can say
+      // the choice will not survive a reload.
+      expect(selAria(host, "目标语言")).toBeTruthy();
+      expect(txt(host)).toContain("本机存储写入失败");
+      // …and disk holds nothing: that is what the next launch reads.
+      expect(window.localStorage.getItem(INTERP_PREFS_KEY)).toBeNull();
+    } finally {
+      restore();
+    }
+  });
+
+  test("changing the language on a refused store shows it and says it did not land", async () => {
+    const restore = failWritesFor(INTERP_PREFS_KEY);
+    try {
+      const host = render(InterpApp);
+      await settle();
+      await fireEvent.change(selAria(host, "目标语言") as HTMLSelectElement, {
+        target: { value: "en" },
+      });
+      await settle();
+      expect(selAria(host, "目标语言")?.value).toBe("en"); // the screen moved
+      expect(txt(host)).toContain("本机存储写入失败");
+      expect(window.localStorage.getItem(INTERP_PREFS_KEY)).toBeNull();
+    } finally {
+      restore();
+    }
+  });
+
+  test("a landed prefs write says nothing (control)", async () => {
+    const host = render(InterpApp);
+    await settle();
+    await fireEvent.change(selAria(host, "目标语言") as HTMLSelectElement, {
+      target: { value: "en" },
+    });
+    await settle();
+    expect(txt(host)).not.toContain("本机存储写入失败");
+    const stored = JSON.parse(window.localStorage.getItem(INTERP_PREFS_KEY) ?? "{}") as {
+      target?: string;
+    };
+    expect(stored.target).toBe("en");
+  });
+
+  // Two writers run on this screen (the prefs effect on mount / on a prefs change, and the
+  // transcript handlers). A prefs write's success must not blank a transcript refusal that is
+  // still true — the transcript is still unsaved, so the sentence must stay.
+  test("a landed prefs write does not blank a transcript refusal (two writers, two slots)", async () => {
+    window.localStorage.setItem(
+      INTERP_LOG_KEY,
+      JSON.stringify([{ src: "你好", target: "hello", srcLang: "zh", targetLang: "en" }]),
+    );
+    const restore = failWritesFor(INTERP_LOG_KEY);
+    try {
+      const host = render(InterpApp);
+      await settle();
+      await fireEvent.click(btnText(host, "清空") as HTMLButtonElement);
+      await settle();
+      expect(txt(host)).toContain("本机存储写入失败"); // the transcript refusal
+      // A prefs write lands now (only the transcript key is refused) — it must not clear it.
+      await fireEvent.change(selAria(host, "目标语言") as HTMLSelectElement, {
+        target: { value: "en" },
+      });
+      await settle();
+      expect(txt(host)).toContain("本机存储写入失败");
+      expect(txt(host)).toContain("你好");
+    } finally {
+      restore();
+    }
+  });
+
   test("persisted transcript renders; clear empties history + store", async () => {
     window.localStorage.setItem(
       INTERP_LOG_KEY,
@@ -168,6 +247,78 @@ describe("InterpApp.svelte (offline shell)", () => {
     await settle();
     expect(input?.value).toBe("你好"); // not cleared into a no-op
     expect(txt(host)).toContain("未连接守护进程");
+  });
+});
+
+/**
+ * REQ-A1271 — the copy has to follow the effect.
+ *
+ * `copyAll` was `try { await navigator.clipboard?.writeText(t2); copiedAll = true; } catch {}`.
+ * The optional chain short-circuits to `undefined` when `navigator.clipboard` is absent — the
+ * case `PhotosApp::copyText` names as "the normal case in a WebView without a secure context" —
+ * so the `catch` could never fire for it and `copiedAll = true` was unconditional: the button
+ * read 「✓」 while the clipboard held nothing. Same shape as `PhotosApp`'s pre-REQ-A352 share
+ * ("A claim has to follow the effect"), and the same rule `NotesApp::copySelection` reports on.
+ */
+describe("InterpApp.svelte — a copy that did not land (REQ-A1271)", () => {
+  /**
+   * Swap `navigator.clipboard` for `value` and return a restore function. `happy-dom`'s
+   * default is captured so the "absent" case can be put back exactly as it was found.
+   */
+  function withClipboard(value: unknown): () => void {
+    const before = Object.getOwnPropertyDescriptor(window.navigator, "clipboard");
+    Object.defineProperty(window.navigator, "clipboard", {
+      value,
+      configurable: true,
+      writable: true,
+    });
+    return () => {
+      if (before) Object.defineProperty(window.navigator, "clipboard", before);
+      else delete (window.navigator as unknown as { clipboard?: unknown }).clipboard;
+    };
+  }
+
+  const seeded = () =>
+    window.localStorage.setItem(
+      INTERP_LOG_KEY,
+      JSON.stringify([{ src: "你好", target: "hello", srcLang: "zh", targetLang: "en" }]),
+    );
+
+  test("with no clipboard at all, copy-all says so instead of showing ✓", async () => {
+    const restore = withClipboard(undefined);
+    try {
+      seeded();
+      const host = render(InterpApp);
+      await settle();
+      await fireEvent.click(btnText(host, "复制全部译文") as HTMLButtonElement);
+      await settle();
+      expect(txt(host)).toContain(zh["common.copyFailed"]);
+      expect(btnText(host, "✓"), "nothing was copied, so nothing may claim it was").toBeFalsy();
+    } finally {
+      restore();
+    }
+  });
+
+  test("a working clipboard copies the transcript and still shows ✓", async () => {
+    const written: string[] = [];
+    const restore = withClipboard({
+      writeText: (s: string) => {
+        written.push(s);
+        return Promise.resolve();
+      },
+    });
+    try {
+      seeded();
+      const host = render(InterpApp);
+      await settle();
+      await fireEvent.click(btnText(host, "复制全部译文") as HTMLButtonElement);
+      await settle();
+      expect(written, "the transcript really reached the clipboard").toEqual(["hello"]);
+      expect(btnText(host, "✓")).toBeTruthy();
+      expect(txt(host)).not.toContain(zh["common.copyFailed"]);
+    } finally {
+      restore();
+    }
   });
 });
 

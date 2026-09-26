@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import {
   applySensorLive,
   createSensorLive,
@@ -16,6 +16,7 @@ function imuEv(ts: number): SensorDataEvent {
     mode: "balanced",
     imu: { timestamp_ms: ts, accel_x: 0.1, accel_y: -9.8, accel_z: 0.2, gyro_x: 0, gyro_y: 0, gyro_z: 0, temperature_c: 36.5 },
     frame: null,
+    vitals: null,
     prev_mode: null,
   };
 }
@@ -27,6 +28,7 @@ function frameEv(ts: number): SensorDataEvent {
     mode: "balanced",
     imu: null,
     frame: { id: 0, width: 640, height: 480, format: "nv21", seq: ts },
+    vitals: null,
     prev_mode: null,
   };
 }
@@ -67,13 +69,40 @@ describe("lib/sensorLive (real-time System-UI sensor feed accumulator)", () => {
 
   test("applySensorLive tracks mode changes with prev_mode and clears", () => {
     let s = initialSensorLive();
-    s = applySensorLive(s, { ts_ms: 1, kind: "mode", backend: "live", mode: "power_save", imu: null, frame: null, prev_mode: "balanced" });
+    s = applySensorLive(s, { ts_ms: 1, kind: "mode", backend: "live", mode: "power_save", imu: null, frame: null, vitals: null, prev_mode: "balanced" });
     expect(s.mode).toBe("power_save");
     expect(s.modeCount).toBe(1);
     expect(s.prevMode).toBe("balanced");
-    s = applySensorLive(s, { ts_ms: 2, kind: "cleared", backend: "live", mode: "power_save", imu: null, frame: null, prev_mode: null });
+    s = applySensorLive(s, { ts_ms: 2, kind: "cleared", backend: "live", mode: "power_save", imu: null, frame: null, vitals: null, prev_mode: null });
     expect(s.clearCount).toBe(1);
     expect(s.totalEvents).toBe(2);
+  });
+
+  test("a cleared event drops the retained samples, not just bumps a counter", () => {
+    let s = initialSensorLive();
+    s = applySensorLive(s, imuEv(1));
+    s = applySensorLive(s, frameEv(2));
+    expect(s.lastImu).not.toBeNull();
+    expect(s.lastFrame).not.toBeNull();
+
+    // A producer cleared every stored sample (glue detach). The Rust bus really dropped
+    // its IMU/frame stores (`amos_sensor::LiveSensorProvider::clear_samples`), so the live
+    // view must stop presenting the pre-detach sample as the *current* one — the card
+    // renders `lastImu`/`lastFrame` as "the latest", and a detach is not a reading.
+    s = applySensorLive(s, { ts_ms: 3, kind: "cleared", backend: "live", mode: "balanced", imu: null, frame: null, vitals: null, prev_mode: null });
+    expect(s.lastImu).toBeNull();
+    expect(s.lastFrame).toBeNull();
+    // The clear is still counted, the identity survives, and the counters stay history.
+    expect(s.clearCount).toBe(1);
+    expect(s.imuCount).toBe(1);
+    expect(s.frameCount).toBe(1);
+    expect(s.mode).toBe("balanced");
+
+    // Positive control: a sample pushed *after* the clear is shown again, so the two
+    // `toBeNull()` assertions cannot be satisfied by an "always null" regression.
+    s = applySensorLive(s, imuEv(4));
+    expect(s.lastImu?.timestamp_ms).toBe(4);
+    expect(s.lastFrame).toBeNull();
   });
 
   test("createSensorLive notifies subscribers and resets", () => {
@@ -104,5 +133,55 @@ describe("lib/sensorLive (real-time System-UI sensor feed accumulator)", () => {
     expect(toHostSeed({ backend: "live" })).toEqual({ backend: "live", mode: "" });
     expect(toHostSeed(null)).toBeNull();
     expect(toHostSeed({ cameras: [] })).toBeNull();
+  });
+});
+
+describe("createSensorLive().start(): `listening` is a claim about the wire, not an intention", () => {
+  const setWin = (v: unknown) => {
+    (globalThis as { window?: unknown }).window = v;
+  };
+  afterEach(() => {
+    delete (globalThis as { window?: unknown }).window;
+  });
+
+  test("no bridge ⇒ start() resolves but `listening` stays false (REQ-A838 / F-SH-267)", async () => {
+    // `listening` is documented as "whether the `sensor-data` listener is open" and the settings
+    // card renders it as a live pulse. The old `start()` set it `true` *before* awaiting the
+    // subscription — so off-device (or on a refused listen) the card asserted that samples were
+    // flowing while nothing was on the wire, and the honest "等待实时样本…" state was unreachable.
+    const live = createSensorLive();
+    const stop = await live.start();
+    expect(live.snapshot().listening).toBe(false);
+    expect(() => stop()).not.toThrow(); // nothing to release, and that must not throw
+  });
+
+  test("refused listen ⇒ `listening` stays false, even though the bridge exists", async () => {
+    setWin({
+      __TAURI_INTERNALS__: {
+        invoke: async () => null,
+        listen: async () => {
+          throw new Error("event plugin refused the registration");
+        },
+      },
+      localStorage: { getItem: () => null, setItem: () => {} },
+    });
+    const live = createSensorLive();
+    await live.start();
+    expect(live.snapshot().listening).toBe(false);
+  });
+
+  test("established listen ⇒ `listening` is true, and the cleanup closes it", async () => {
+    setWin({
+      __TAURI_INTERNALS__: {
+        invoke: async () => null,
+        listen: async () => () => {},
+      },
+      localStorage: { getItem: () => null, setItem: () => {} },
+    });
+    const live = createSensorLive();
+    const stop = await live.start();
+    expect(live.snapshot().listening).toBe(true);
+    stop();
+    expect(live.snapshot().listening).toBe(false);
   });
 });

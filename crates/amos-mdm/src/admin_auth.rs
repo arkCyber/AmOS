@@ -94,6 +94,17 @@ pub async fn require_admin_token(
         .and_then(|v| v.strip_prefix("Bearer "))
         .unwrap_or("");
 
+    // Refuse an empty bearer **before** hashing. `digest("")` is a perfectly
+    // valid 64-char hash, so if the stored secret were ever `sha256("")` the
+    // comparison below would *succeed* and a request with no `Authorization`
+    // header at all would pass — every admin route (wipe, policy, token
+    // minting) left open. The empty-input guard inside `ct_eq` cannot catch
+    // this: both operands are non-empty (they are digests). An empty bearer is
+    // never a token.
+    if supplied.is_empty() {
+        return unauthorized();
+    }
+
     if !ct_eq(
         digest(supplied).as_bytes(),
         state.config.admin_token_hash.as_bytes(),
@@ -303,6 +314,52 @@ mod tests {
             resp.status(),
             StatusCode::UNAUTHORIZED,
             "admin endpoints must be fail-closed when admin_token_hash is empty"
+        );
+    }
+
+    /// Negative control for the empty-secret fail-open. If the stored hash
+    /// were `sha256("")`, a request with no `Authorization` header (which the
+    /// middleware reads as `supplied == ""`) would compare `digest("")` against
+    /// the stored `digest("")` and **pass**. The gate must refuse an empty
+    /// bearer before it ever hashes.
+    #[tokio::test]
+    async fn an_empty_bearer_never_matches_even_when_the_stored_secret_is_empty() {
+        let cfg = MdmConfig {
+            admin_token_hash: digest(""),
+            ..MdmConfig::default()
+        };
+        let app = make_app(cfg).await;
+
+        let no_header = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/admin/ping")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            no_header.status(),
+            StatusCode::UNAUTHORIZED,
+            "no Authorization header must not authenticate against an empty secret"
+        );
+
+        let empty_bearer = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/admin/ping")
+                    .header("Authorization", "Bearer ")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            empty_bearer.status(),
+            StatusCode::UNAUTHORIZED,
+            "an empty bearer must not authenticate against an empty secret"
         );
     }
 

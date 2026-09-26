@@ -22,17 +22,18 @@
  * Honest boundary: this delivers the *arrival* alert + badge on any screen while
  * the System UI is alive, plus marks the store so a later-open Clock screen shows
  * a live Snooze/Dismiss ring. It does NOT run when the device is asleep or the OS
- * process is dead (that needs a native `amos-scheduler AlarmExact` bridge), and the
+ * process is dead — that half is the native exact-alarm scheduler, registered and
+ * cancelled by `svelte/osAlarmArm` (which reports the host's device verdict; see
+ * `scheduler_alarm_register` in `crates/amos-tauri/src/alarm_sched.rs`) — and the
  * arrival chime follows the same effective arrival-sound policy as every other
  * notification (so Do-Not-Disturb can silence the chime while the visual banner
  * still shows). A continuously looping native-style ring while you stay on another
  * screen is out of scope for the WebView layer.
  */
-import { readStoreValue, writeStoreValue } from "./amosStore";
-import { NOTIF_KEY, NOTIF_CAP, type Notif } from "./settings";
+import { readStoreValue, writeStoreValue, writeStoreValueChecked } from "./amosStore";
+import { NOTIF_KEY, NOTIF_CAP, normalizeNotifs, removeNotif, type Notif } from "./settings";
 import { normalizeAlarms, dayAllowed, nextAlarmAtMs, type Alarm } from "./time";
-import { registerNativeAlarm } from "./backend";
-import { zh } from "../i18n/locales/zh";
+import { bgT } from "../svelte/bgText";
 
 /** Persisted alarm list key (shared with the Svelte ClockApp). */
 export const ALARM_KEY = "amos.alarms";
@@ -45,8 +46,11 @@ export const CLOCK_APP_ID = "clock";
 export const ALARM_ALERT_INTERVAL_MS = 2_000;
 
 const p2 = (n: number) => String(n).padStart(2, "0");
+/** An alarm's scheduled time as `HH:MM`. One formatter, because two identities are built out
+ *  of it — the ring-instance marker (`firedKey`) and the notification row (`ringKey`). */
+export const hhmm = (a: Alarm): string => `${p2(a.hour)}:${p2(a.min)}`;
 /** Stable "ring instance" for an alarm = its identity at one scheduled time. */
-export const firedKey = (a: Alarm): string => `${a.id}|${p2(a.hour)}:${p2(a.min)}`;
+export const firedKey = (a: Alarm): string => `${a.id}|${hhmm(a)}`;
 
 /** Calendar day (local) of a Date, e.g. "2026-09-07". */
 export function dateKey(d: Date): string {
@@ -62,6 +66,47 @@ export function normalizeFired(v: unknown): Record<string, string> {
     if (!k) continue;
     const d = o[k];
     if (typeof d === "string" && /^\d{4}-\d{2}-\d{2}$/.test(d)) out[k] = d;
+  }
+  return out;
+}
+
+/** Ids whose raw persisted entry carries `ringing:true`, before any day test. */
+export function flaggedRingingIds(raw: unknown): Set<string> {
+  const out = new Set<string>();
+  if (Array.isArray(raw)) {
+    for (const o of raw) {
+      if (o && typeof o === "object" && (o as { ringing?: unknown }).ringing === true) {
+        const id = (o as { id?: unknown }).id;
+        if (typeof id === "string" && id) out.add(id);
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * The ids whose persisted `ringing:true` is *this day's* ring — the arrival was surfaced
+ * **today**.
+ *
+ * `ringing` is a transient bit (a Snooze/Dismiss ring is live for the minutes after it
+ * fires) written into durable storage, and the only things that retract it are user
+ * gestures — `alarmsReducer`'s `toggle`/`dismiss`/`snooze`. So an alarm the user never
+ * touched stays `ringing:true` **forever**: the arrival banner ignored, or the Clock app
+ * closed while it rang. `collectDueRings` skips a ringing id, so such a bit silences the
+ * alarm for good. The `ALARM_FIRED_KEY` marker records the date a ring was surfaced, and
+ * requiring it to be *today* is what turns the bit back into what it means (REQ-A1392).
+ */
+export function liveRingingIds(
+  raw: unknown,
+  fired: Record<string, string>,
+  now: Date,
+): Set<string> {
+  const flagged = flaggedRingingIds(raw);
+  if (flagged.size === 0) return flagged;
+  const day = dateKey(now);
+  const out = new Set<string>();
+  for (const a of normalizeAlarms(raw)) {
+    if (flagged.has(a.id) && fired[firedKey(a)] === day) out.add(a.id);
   }
   return out;
 }
@@ -112,14 +157,32 @@ export function pruneRung(
   return out;
 }
 
+/**
+ * The notification row's identity for one ring **arrival**: `<alarm>:<HH:MM>:<that day>`.
+ *
+ * Derived, never minted (`localId`) — and the day is the load-bearing part. A daily alarm
+ * reaches the same `HH:MM` *every* day, so without it the second day's ring was the same row
+ * as the first: nothing on `amos.notifications` said so (the row was simply prepended again),
+ * but the arrival banner decides "new" by comparing id **sets** (`newestAddedNotif`), so a
+ * ring the user never opened kept one id forever and the OS never announced it again. The
+ * calendar producer gets this right by construction (`cal:<id>@<startAt>`); this is the same
+ * rule one producer over (REQ-A1400 ∕ F-SH-658).
+ *
+ * Being derived rather than minted is also what makes it usable as the row's *reconciliation*
+ * key: a retry must land on the same row, which a fresh id would not.
+ */
+export function ringKey(a: Alarm, nowMs: number): string {
+  return `alarm:${a.id}:${hhmm(a)}:${dateKey(new Date(nowMs))}`;
+}
+
 /** Turn ringing alarms into OS notifications (stable ids + the Clock app name,
  *  so opening the Clock app clears its badge like any other app's). */
 export function ringsToNotifs(rings: Alarm[], app: string, nowMs: number): Notif[] {
   return rings.map((a) => {
-    const hm = `${p2(a.hour)}:${p2(a.min)}`;
+    const hm = hhmm(a);
     const title = a.label && a.label.trim() ? a.label.trim() : hm;
     return {
-      id: `alarm:${a.id}:${hm}`,
+      id: ringKey(a, nowMs),
       app,
       icon: a.tone ?? "🔔",
       title: title.length > 60 ? `${title.slice(0, 60)}…` : title,
@@ -144,55 +207,83 @@ export function nextArmments(
   return out;
 }
 
-/** Side-effecting reconcile: fire due alarms (badge + mark ringing) idempotently. */
-export function syncDueAlarmAlerts(nowMs = Date.now()): void {
+/**
+ * Side-effecting reconcile: fire due alarms (badge + mark ringing) idempotently.
+ *
+ * Returns whether anything **rang** on this call, so the caller can re-arm the fired
+ * alarms for their next occurrence. That re-arm is not done here: registering with the
+ * host's exact-alarm scheduler belongs to `svelte/osAlarmArm`, the one module that also
+ * cancels and that reads the host's device verdict. This function used to hold a second,
+ * fire-and-forget copy of it — a `try`/`catch` around a bridge call that cannot throw,
+ * so the host's refusal arrived as an ordinary value nobody looked at (REQ-A875).
+ */
+export function syncDueAlarmAlerts(nowMs = Date.now()): boolean {
   const now = new Date(nowMs);
   const raw = readStoreValue<unknown>(ALARM_KEY, []);
   const alarms = normalizeAlarms(raw);
-  const ringingIds = new Set<string>();
-  if (Array.isArray(raw)) {
-    for (const o of raw) {
-      if (o && typeof o === "object" && (o as { ringing?: unknown }).ringing === true) {
-        const id = (o as { id?: unknown }).id;
-        if (typeof id === "string" && id) ringingIds.add(id);
-      }
-    }
-  }
+  // Read the day markers FIRST: whether a persisted `ringing:true` still counts as
+  // "ringing" is decided by them (`liveRingingIds`), not by the raw bit alone.
   const fired = normalizeFired(readStoreValue<unknown>(ALARM_FIRED_KEY, {}));
-  const rings = collectDueRings(alarms, ringingIds, fired, now);
+  const live = liveRingingIds(raw, fired, now);
+  const rings = collectDueRings(alarms, live, fired, now);
+
+  // Reconcile the persisted `ringing` bits to exactly the live rings: set the ones that
+  // just rang, and **retract the ones whose day has passed**. Only a user gesture
+  // (toggle/dismiss/snooze) clears the bit otherwise, so an arrival the user never
+  // touched would stay `ringing:true` forever — and since `collectDueRings` skips a
+  // ringing id, silence the alarm from then on. Retracting it here is also what lets the
+  // Clock screen's persisted-ring seed stay honest: it shows the ring it is handed, so
+  // the store must only ever hand it today's (REQ-A1392).
+  const desired = new Set<string>(live);
+  for (const a of rings) desired.add(a.id);
+  const flagged = flaggedRingingIds(raw);
+  const settled = flagged.size === desired.size && [...flagged].every((id) => desired.has(id));
+  // Mark them ringing in the shared store so a later-open Clock screen shows a
+  // live Snooze/Dismiss ring instead of a one-shot reminder. `settled` already means the
+  // store holds exactly this ringing set, so there is nothing to write and nothing to ask.
+  // Otherwise the verdict matters, because the marker below is what bounds the bit: consuming
+  // the day marker while the ring never reached the store would latch a "surfaced today" that
+  // no surface holds, and — since `liveRingingIds` is what keeps a persisted ring alive —
+  // leave the alarm silent for the rest of the day with nothing anywhere saying so.
+  const latched = settled
+    ? true
+    : writeStoreValueChecked(
+        ALARM_KEY,
+        alarms.map((a) => (desired.has(a.id) ? { ...a, ringing: true } : a)),
+      );
 
   if (rings.length > 0) {
-    const ringSet = new Set(rings.map((a) => a.id));
-    // Mark them ringing in the shared store so a later-open Clock screen shows a
-    // live Snooze/Dismiss ring instead of a one-shot reminder.
-    const nextList = alarms.map((a) =>
-      ringSet.has(a.id) ? { ...a, ringing: true } : a,
-    );
-    if (JSON.stringify(nextList) !== JSON.stringify(alarms)) {
-      writeStoreValue(ALARM_KEY, nextList);
-    }
-    const existing = readStoreValue<Notif[]>(NOTIF_KEY, []);
-    const fresh = ringsToNotifs(rings, zh["app.clock"], nowMs);
+    // Two things the two sibling producers (reminders / calendar) already do here, and this
+    // one did not — both of them about the row being the *stored* shape, not the drawn one:
+    //
+    //  - Read through the corruption guard. Spreading a raw non-array (`{…}`, a number)
+    //    throws `Spread syntax requires ...iterable`, and the throw escaped
+    //    `alarmWatcherTick`'s `catch` → every 2 s tick answered `false` while the corrupt
+    //    value stayed corrupt, so the whole alarm pipeline was wedged silently.
+    //  - Replace, don't prepend. `alarm:<id>:<HH:MM>` names one ring instance, and a daily
+    //    alarm reaches the same HH:MM every day, so each ring appended another copy of the
+    //    *same row*. `normalizeNotifs` collapses them on read, so nothing on screen said
+    //    anything — but they consumed `NOTIF_CAP` in the stored array, so enough days (or
+    //    alarms) would push every real notification out of the store.
+    const existing = normalizeNotifs(readStoreValue<unknown>(NOTIF_KEY, []));
+    const fresh = ringsToNotifs(rings, bgT("app.clock"), nowMs);
     // Newest alert first, keep the rest, respect the notification cap.
-    writeStoreValue(NOTIF_KEY, [...fresh.reverse(), ...existing].slice(0, NOTIF_CAP));
+    let list = existing;
+    for (const n of fresh) list = [n, ...removeNotif(list, n.id)];
+    writeStoreValue(NOTIF_KEY, list.slice(0, NOTIF_CAP));
   }
 
-  const next = pruneRung(markRung(fired, rings, now), alarms, dateKey(now));
+  // Consume the marker only for rings whose **ring is in the store** — that bit is the surface
+  // the marker bounds (`liveRingingIds`), so it is the one this marker is gated on. The
+  // arrival *row* is a second, additive channel: unlike the reminders ∕ calendar producers,
+  // whose only surface is the row, a refused banner must not retract a live ring the Clock
+  // app is already showing, so the row's verdict is deliberately not what decides this.
+  const next = pruneRung(markRung(fired, latched ? rings : [], now), alarms, dateKey(now));
   if (JSON.stringify(next) !== JSON.stringify(fired)) {
     writeStoreValue(ALARM_FIRED_KEY, next);
   }
 
-  // Native exact-wake: re-arm each just-fired enabled alarm for its NEXT
-  // occurrence (offline/no Tauri bridge → fire-and-forget no-op).
-  for (const arm of nextArmments(rings, nowMs)) {
-    try {
-      void registerNativeAlarm(arm.id, arm.atMs).catch(() => {
-        /* offline / unavailable */
-      });
-    } catch {
-      /* ignore */
-    }
-  }
+  return rings.length > 0;
 }
 
 

@@ -27,10 +27,19 @@ impl Language {
     /// truncated to the prefix so a paste-attack caller cannot inflate every
     /// downstream gRPC header — same rationale as `MAX_AI_PROMPT_BYTES` at the
     /// `ask_ai_agent` seam.
+    ///
+    /// The cut is on a **byte** bound at a char boundary — *not* `chars().take(n)`.
+    /// A char count let 32 CJK chars (96 bytes) pass a 32-byte cap, so a
+    /// multi-byte caller escaped the exact bound every consumer pre-checks with
+    /// `String::len` (bytes). See REQ-A593 / F-INT-001.
     pub fn new(tag: impl Into<String>) -> Self {
         let raw = tag.into();
         let truncated: String = if raw.len() > MAX_LANG_TAG_BYTES {
-            raw.chars().take(MAX_LANG_TAG_BYTES).collect()
+            let mut end = MAX_LANG_TAG_BYTES;
+            while end > 0 && !raw.is_char_boundary(end) {
+                end -= 1;
+            }
+            raw[..end].to_string()
         } else {
             raw
         };
@@ -159,6 +168,25 @@ mod tests {
         assert!(
             bounded.as_str().chars().all(|c| c == 'x'),
             "truncation keeps the prefix intact"
+        );
+    }
+
+    /// The cap is a **byte** bound ([`MAX_LANG_TAG_BYTES`]) — every caller
+    /// pre-checks it with `String::len` (bytes). Truncating by *chars* lets a
+    /// multi-byte tag pass by up to 4×: 32 CJK chars = 96 bytes, so the tag the
+    /// library hands back no longer fits the very bound the callers enforce.
+    #[test]
+    fn multibyte_tags_are_bounded_to_the_byte_cap() {
+        let huge = "中".repeat(40); // 120 bytes, 40 chars
+        let bounded = Language::new(huge);
+        assert!(
+            bounded.as_str().len() <= MAX_LANG_TAG_BYTES,
+            "byte bound must hold for multi-byte input: got {} bytes",
+            bounded.as_str().len()
+        );
+        assert!(
+            bounded.as_str().chars().all(|c| c == '中'),
+            "truncation must land on a char boundary, never split a code point"
         );
     }
 

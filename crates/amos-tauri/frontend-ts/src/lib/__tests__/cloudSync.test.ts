@@ -1,4 +1,5 @@
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
+import { fastest, PERF_ATTEMPTS } from "../../__tests__/perfBudget";
 import {
   CloudSyncScheduler,
   TimestampResolver,
@@ -363,22 +364,23 @@ describe("云同步调度器 - 航空航天级审计", () => {
 
   describe("性能测试", () => {
     test("配置更新应该是快速的（< 10ms）", () => {
-      const start = performance.now();
-      for (let i = 0; i < 100; i++) {
-        scheduler.updateConfig({ enabled: i % 2 === 0 });
-      }
-      const duration = performance.now() - start;
+      // REQ-A850 / F-DEV-106：取 K 次最小值（抢占只会给某一次**加**时间）。
+      const duration = fastest(PERF_ATTEMPTS, () => {
+        for (let i = 0; i < 100; i++) {
+          scheduler.updateConfig({ enabled: i % 2 === 0 });
+        }
+      });
       expect(duration).toBeLessThan(10);
     });
 
     test("获取配置/指标应该是快速的（< 1ms）", () => {
-      const start = performance.now();
-      for (let i = 0; i < 1000; i++) {
-        scheduler.getConfig();
-        scheduler.getMetrics();
-        scheduler.getStatus();
-      }
-      const duration = performance.now() - start;
+      const duration = fastest(PERF_ATTEMPTS, () => {
+        for (let i = 0; i < 1000; i++) {
+          scheduler.getConfig();
+          scheduler.getMetrics();
+          scheduler.getStatus();
+        }
+      });
       expect(duration).toBeLessThan(10);
     });
   });

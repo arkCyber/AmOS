@@ -38,12 +38,13 @@ fn agent_push_no_echo() -> Result<(), String> {
     let provider = MockClipboardProvider::new();
     let agent = GuestAgent::new(provider.clone());
     let reported: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let acked: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
     let out = {
         let reported = reported.clone();
-        move |m: GuestToHost| {
-            if let GuestToHost::ClipboardChanged { text, .. } = m {
-                reported.lock().unwrap().push(text);
-            }
+        let acked = acked.clone();
+        move |m: GuestToHost| match m {
+            GuestToHost::ClipboardChanged { text, .. } => reported.lock().unwrap().push(text),
+            GuestToHost::PushAcked { seq } => acked.lock().unwrap().push(seq),
         }
     };
     agent.attach(out).unwrap();
@@ -60,8 +61,12 @@ fn agent_push_no_echo() -> Result<(), String> {
         provider.text().as_deref() == Some("from-host"),
     )?;
     check(
-        "own push is not reported back",
+        "own push is not reported back as a copy",
         reported.lock().unwrap().is_empty(),
+    )?;
+    check(
+        "the applied push is confirmed to the host",
+        acked.lock().unwrap().as_slice() == [1u64],
     )?;
 
     // A genuine container copy IS reported.

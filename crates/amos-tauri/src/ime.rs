@@ -96,8 +96,72 @@ pub const MAX_IME_NAME_BYTES: usize = 64;
 pub const MAX_INPUT_CHARS: usize = 64;
 
 /// The IME bridge: **one** shared engine + learner, **one** buffer per window.
+///
+/// `Clone` is cheap and shares the *whole* inner state (one `Arc<Mutex<_>>`), which
+/// is what lets the Android system IME (`crate::android_ime`) drive the very same
+/// engine, learner and profile file as the WebView's on-screen keyboard — one
+/// process, one dictionary, one set of pinned words (REQ-A1880). See
+/// [`install_shared`] / [`shared_or_boot`].
+#[derive(Clone)]
 pub struct ImeBridge {
-    inner: Mutex<ImeInner>,
+    inner: Arc<Mutex<ImeInner>>,
+}
+
+/// The pseudo-window the Android `InputMethodService` types in.
+///
+/// The bridge files a composition buffer per window (REQ-A258) and the service is
+/// one target at a time, so it needs exactly one stable label. It is a *real*
+/// entry in the same map as the WebView's labels, so the service's half-typed code
+/// can never be consumed by a WebView window (or vice versa) — the two surfaces
+/// are separate buffers over the same engine. The `:` prefix keeps it out of the
+/// way of `WebviewWindow::label()` values, which are DOM-ish names.
+/// `cfg(test)` is here so the desktop `cargo test` (no `android` feature) still
+/// compiles the sharing tests below; a desktop *release* build has no Android
+/// service to label, so the constant would otherwise be dead code.
+#[cfg(any(feature = "android", test))]
+pub const ANDROID_WINDOW: &str = "android-ime";
+
+/// The process-wide bridge the Android IME service shares with the Tauri app.
+///
+/// Set once by [`install_shared`] when the System UI boots (so the service gets the
+/// *same* instance, path and learner), or lazily by [`shared_or_boot`] when the
+/// service is bound before the Activity ever ran.
+static SHARED: std::sync::OnceLock<ImeBridge> = std::sync::OnceLock::new();
+
+/// Publish `bridge` as the shared instance. First writer wins; a later call is a
+/// no-op (the app and the JNI service may both race to install, and they race to
+/// install the *same* thing, so "first wins" is the only answer that cannot
+/// silently split the learner in two).
+pub fn install_shared(bridge: ImeBridge) {
+    let _ = SHARED.set(bridge);
+}
+
+/// The shared bridge, booting a fallback configured at `profile` if none was
+/// installed.
+///
+/// The fallback is the honest answer to "the IME service was bound but the System
+/// UI Activity never started": the service still needs an engine, and it still
+/// wants the profile to persist. `profile` is the bridge's profile path
+/// (see [`file_in`]); `None` keeps the fallback in memory only. Never panics.
+///
+/// Only the Android service has a reason to reach for a bridge it did not already
+/// have (the Tauri commands get theirs injected by the host), so this is
+/// `android`-gated.
+#[cfg(feature = "android")]
+pub fn shared_or_boot(profile: Option<PathBuf>) -> ImeBridge {
+    SHARED
+        .get_or_init(|| {
+            let bridge = ImeBridge::boot();
+            match profile {
+                Some(path) => bridge.configure(path),
+                None => tracing::warn!(
+                    target: "amos::ime",
+                    "android IME booted without a profile path — learning will not persist"
+                ),
+            }
+            bridge
+        })
+        .clone()
 }
 
 struct ImeInner {
@@ -330,12 +394,12 @@ impl ImeBridge {
         let core = PinyinCore::new(fuzzy);
         core.import_l0(&l0);
         Self {
-            inner: Mutex::new(ImeInner {
+            inner: Arc::new(Mutex::new(ImeInner {
                 core: Arc::new(core),
                 path: None,
                 windows: HashMap::new(),
                 seq: 0,
-            }),
+            })),
         }
     }
 
@@ -1500,5 +1564,44 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// REQ-A1880: the Android IME service drives the WebView keyboard's **own**
+    /// bridge (see `crate::android_ime`), so a clone must share one engine, one
+    /// learner and one buffer map — not fork a private copy of either. If `Clone`
+    /// ever stopped being an `Arc` bump, a word taught through the system IME would
+    /// silently not reach the WebView's ranking, which this pins.
+    #[test]
+    fn clones_share_one_engine_one_learner_and_one_buffer_map() {
+        let bridge = ImeBridge::boot();
+        let service = bridge.clone();
+
+        // A composition started on one clone is the *same* buffer on the other —
+        // they are one `ImeInner`, not two.
+        service.key(ANDROID_WINDOW, "ni");
+        assert_eq!(bridge.snapshot(ANDROID_WINDOW).input, "ni");
+
+        // Learn a word through the service's pseudo-window…
+        learn_window(&service, ANDROID_WINDOW, "zhongguo", "中国");
+
+        // …and the WebView's own window reads the *same* learner: one dictionary,
+        // one set of pinned words, whichever surface taught it.
+        assert_eq!(
+            bridge.snapshot(MAIN).learned_pins,
+            1,
+            "the learner must be shared between the system IME and the WebView"
+        );
+    }
+
+    /// The service's pseudo-window is an ordinary key in the per-window map: a
+    /// half-typed code there is invisible to the WebView's windows (and vice
+    /// versa). This is the reason [`ANDROID_WINDOW`] exists rather than the
+    /// service sharing `MAIN`.
+    #[test]
+    fn the_android_window_keeps_its_own_buffer() {
+        let bridge = ImeBridge::boot();
+        bridge.key(ANDROID_WINDOW, "wo");
+        assert_eq!(bridge.snapshot(ANDROID_WINDOW).input, "wo");
+        assert_eq!(bridge.snapshot(MAIN).input, "", "MAIN must not see it");
     }
 }

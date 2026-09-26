@@ -1,0 +1,45 @@
+[package]
+name = "amos-podcast"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Amos podcasts core: transport-agnostic podcast domain — RSS 2.0 + Atom feed parsing, a pluggable FeedProvider seam with a deterministic offline MockFeedProvider, a bounded SubscriptionStore + ProgressStore (JSON, corruption-tolerant), a bounded download queue, and a PodcastManager that drives subscribe → fetch → episode → progress. The same engine drives the amos-podcast-cli terminal and the Tauri System UI bridge."
+
+[lib]
+name = "amos_podcast"
+path = "src/lib.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json = "1"
+thiserror = "1"
+async-trait = "0.1"
+tracing.workspace = true
+# The engine is async; `spawn_blocking` in the `live` HTTP provider and the
+# `#[tokio::test]` cases need the runtime. The default (offline) build uses no
+# tokio API beyond the test attribute.
+tokio.workspace = true
+
+# A real XML parser for RSS 2.0 / Atom, rather than hand-rolled string matching:
+# feed XML is the *only* untrusted text format this crate consumes, and a
+# hand-rolled splitter is exactly where a malformed feed becomes a silent
+# misparse. Already in the lock file (via the Tauri toolchain), so this adds no
+# new crate to download.
+quick-xml = "0.41"
+
+# Feed timestamps are RFC 2822 (RSS) or RFC 3339 (Atom). Already used by
+# amos-mdm / amos-tauri, so this is an accepted workspace dependency; a hand-rolled
+# date parser is precisely the kind of "demo-clean, wrong at the edges" code the
+# audit rejects. `default-features = false` keeps the Android cross-build lean.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+
+# A real networked feed fetcher plugs in behind the FeedProvider seam. Kept out
+# of the default build so the offline workspace stays green, mirroring
+# amos-appstore / amos-mail `live` gating; `socks-proxy` lets a sandboxed CI's
+# ALL_PROXY be honored instead of failing every connection.
+ureq = { version = "2", optional = true, features = ["socks-proxy"] }
+
+[features]
+default = []
+live = ["dep:ureq"]

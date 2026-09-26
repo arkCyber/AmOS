@@ -24,8 +24,9 @@ use crate::spec::SmsMessage;
 use crate::wire::MAX_BODY_CHARS;
 
 /// Upper bound on trashed entries. Eviction is FIFO by `trashed_ms`: the oldest
-/// trashed message reappears in the UI again (never silently lost — the count
-/// the bridge logs and reports makes the churn observable).
+/// trashed message reappears in the UI again. It is never *silently* lost — the
+/// evicted entry travels back in [`TrashAdd::evicted`], which is what lets the
+/// bridge log the churn (a count alone cannot: it is pinned at the cap).
 pub const DEFAULT_TRASH_CAP: usize = 256;
 
 /// Wire/file version of the trash JSON. A *newer* version is refused (we would
@@ -43,6 +44,28 @@ pub struct TrashEntry {
     pub ts_ms: i64,
     /// When the user trashed it (epoch ms; ordering key, newest first).
     pub trashed_ms: i64,
+}
+
+/// What one [`SmsTrash::add`] did — **two** facts, because "a new entry was
+/// created" and "an entry was evicted to make room" are different events and
+/// the cap makes them co-occur.
+///
+/// The eviction used to be a silent `pop()` inside `add`: the entry simply
+/// vanished from the list and the evicted message became visible again with no
+/// trace. The module's own doctrine (and `sms.rs`'s) is that churn is
+/// *logged, never silent*, but a caller that only learns "newly added" cannot
+/// log what it was never told — so the evicted entry travels in the result.
+/// (REQ-A1799 / F-SH-893.)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrashAdd {
+    /// A new entry was created. `false` = the id was already trashed and merely
+    /// moved to the front (its recency refreshed).
+    pub newly: bool,
+    /// The entry dropped to stay within the cap, if one was. Its message is
+    /// visible again. At most one add evicts one entry (the list grows by one
+    /// and the cap is fixed); a `cap` of 1 makes every add evict its own
+    /// predecessor.
+    pub evicted: Option<TrashEntry>,
 }
 
 /// What a thread list should show instead of a provider preview that points at
@@ -94,16 +117,19 @@ impl SmsTrash {
         self.cap
     }
 
-    /// Hide `(thread_id, message_id)`. `Ok(true)` when newly added, `Ok(false)`
-    /// when it was already trashed (then it is merely moved to the front, so a
-    /// re-trash refreshes its recency). Blank ids are a caller bug → error.
+    /// Hide `(thread_id, message_id)`. [`TrashAdd::newly`] is `true` when newly
+    /// added, `false` when it was already trashed (then it is merely moved to
+    /// the front, so a re-trash refreshes its recency). [`TrashAdd::evicted`]
+    /// names the entry dropped to stay within the cap, so the caller can log the
+    /// churn instead of a message silently reappearing. Blank ids are a caller
+    /// bug → error.
     pub fn add(
         &mut self,
         thread_id: &str,
         message_id: &str,
         ts_ms: i64,
         trashed_ms: i64,
-    ) -> Result<bool, SmsError> {
+    ) -> Result<TrashAdd, SmsError> {
         if thread_id.trim().is_empty() || message_id.trim().is_empty() {
             return Err(SmsError::Invalid(
                 "trash add needs a non-blank thread id and message id".into(),
@@ -117,7 +143,10 @@ impl SmsTrash {
             let mut e = self.entries.remove(pos);
             e.trashed_ms = trashed_ms;
             self.entries.insert(0, e);
-            return Ok(false);
+            return Ok(TrashAdd {
+                newly: false,
+                evicted: None,
+            });
         }
         let entry = TrashEntry {
             thread_id: thread_id.to_string(),
@@ -126,10 +155,17 @@ impl SmsTrash {
             trashed_ms,
         };
         self.entries.insert(0, entry);
+        // Evict the oldest trashed → it becomes visible again. Kept and returned,
+        // not dropped on the floor: the churn is only observable to a caller that
+        // is told which entry left.
+        let mut evicted = None;
         while self.entries.len() > self.cap {
-            self.entries.pop(); // evict the oldest trashed → it becomes visible again
+            evicted = self.entries.pop();
         }
-        Ok(true)
+        Ok(TrashAdd {
+            newly: true,
+            evicted,
+        })
     }
 
     /// Undo a trash: the message shows again. `true` when an entry was removed.
@@ -378,8 +414,8 @@ mod tests {
     #[test]
     fn add_then_contains_and_order_is_newest_first() {
         let mut t = SmsTrash::new();
-        assert!(t.add("1", "m1", 100, 1_000).unwrap());
-        assert!(t.add("1", "m2", 200, 2_000).unwrap());
+        assert!(t.add("1", "m1", 100, 1_000).unwrap().newly);
+        assert!(t.add("1", "m2", 200, 2_000).unwrap().newly);
         assert!(t.contains("1", "m1") && t.contains("1", "m2"));
         assert_eq!(t.len(), 2);
         // Newest trashed first.
@@ -398,9 +434,9 @@ mod tests {
     #[test]
     fn re_add_is_not_a_duplicate_but_refreshes_recency() {
         let mut t = SmsTrash::new();
-        assert!(t.add("1", "m1", 100, 1_000).unwrap());
-        assert!(t.add("1", "m2", 200, 2_000).unwrap());
-        assert!(!t.add("1", "m1", 100, 3_000).unwrap()); // already trashed
+        assert!(t.add("1", "m1", 100, 1_000).unwrap().newly);
+        assert!(t.add("1", "m2", 200, 2_000).unwrap().newly);
+        assert!(!t.add("1", "m1", 100, 3_000).unwrap().newly); // already trashed
         assert_eq!(t.len(), 2);
         assert_eq!(t.entries()[0].message_id, "m1"); // moved to front
         assert_eq!(t.entries()[0].trashed_ms, 3_000);
@@ -428,9 +464,28 @@ mod tests {
     }
 
     #[test]
+    fn eviction_is_reported_not_silent() {
+        let mut t = SmsTrash::with_cap(2);
+        // Under the cap nothing is dropped, so nothing is reported.
+        assert_eq!(t.add("1", "m1", 100, 1_000).unwrap().evicted, None);
+        assert_eq!(t.add("1", "m2", 200, 2_000).unwrap().evicted, None);
+        // The third entry pushes past the cap: the add must *name* the entry it
+        // dropped, because the module (and `sms.rs`) promise the churn is logged,
+        // and a caller cannot log what it is not told.
+        let add = t.add("1", "m3", 300, 3_000).unwrap();
+        assert!(add.newly);
+        let ev = add.evicted.expect("the dropped entry must be returned");
+        assert_eq!((ev.thread_id.as_str(), ev.message_id.as_str()), ("1", "m1"));
+        assert_eq!(ev.ts_ms, 100);
+        // A re-trash evicts nothing: it moves an existing entry, it does not add
+        // one, so there is nothing to report (positive control for `evicted`).
+        assert_eq!(t.add("1", "m2", 200, 4_000).unwrap().evicted, None);
+    }
+
+    #[test]
     fn a_zero_cap_is_clamped_to_one_usable_slot() {
         let mut t = SmsTrash::with_cap(0);
-        assert!(t.add("1", "m1", 0, 0).unwrap());
+        assert!(t.add("1", "m1", 0, 0).unwrap().newly);
         assert_eq!(t.len(), 1);
     }
 

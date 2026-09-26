@@ -122,9 +122,9 @@ describe("compass caching", () => {
       const result = await fetchDeclinationWithCache(40.7128, -74.006, currentDeclination, cache);
       
       expect(result.fromCache).toBe(false);
-      expect(result.cachedLocation.lat).toBe(40.7128);
-      expect(result.cachedLocation.lon).toBe(-74.006);
-      expect(result.cachedLocation.timestamp).toBeGreaterThan(cache.timestamp);
+      expect(result.cachedLocation?.lat).toBe(40.7128);
+      expect(result.cachedLocation?.lon).toBe(-74.006);
+      expect(result.cachedLocation?.timestamp).toBeGreaterThan(cache.timestamp);
     });
 
     it("returns fromCache=false when no cache exists", async () => {
@@ -134,9 +134,10 @@ describe("compass caching", () => {
       
       expect(result.fromCache).toBe(false);
       expect(result.cachedLocation).toBeDefined();
-      expect(result.cachedLocation.lat).toBe(40.7128);
-      expect(result.cachedLocation.lon).toBe(-74.006);
-      // 走到 API 时取的是**API 的值**，不是传进来的旧值（离线时这条会退化到 0）。
+      expect(result.cachedLocation?.lat).toBe(40.7128);
+      expect(result.cachedLocation?.lon).toBe(-74.006);
+      // 走到 API 时取的是**API 的值**，不是传进来的旧值（离线时这条会退化为 null
+      // —— "未知"，不是 0；见 compass.test.ts 的失败路径用例）。
       expect(result.declination).toBeCloseTo(12.5, 5);
     });
 
@@ -147,8 +148,8 @@ describe("compass caching", () => {
       const result = await fetchDeclinationWithCache(40.7128, -74.006, currentDeclination, undefined);
       const after = Date.now();
       
-      expect(result.cachedLocation.timestamp).toBeGreaterThanOrEqual(before);
-      expect(result.cachedLocation.timestamp).toBeLessThanOrEqual(after);
+      expect(result.cachedLocation?.timestamp).toBeGreaterThanOrEqual(before);
+      expect(result.cachedLocation?.timestamp).toBeLessThanOrEqual(after);
     });
   });
 });

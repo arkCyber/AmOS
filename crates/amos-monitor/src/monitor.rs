@@ -141,6 +141,29 @@ mod tests {
     }
 
     #[test]
+    fn a_live_voltage_sample_becomes_a_power_reading() {
+        // The negative control for the rule below: a measured pair *does* fold.
+        let s = amos_profiling::BatterySample::new(1_200_000, 3900); // 1.2 A @ 3.9 V
+        let b = BatteryStatus::from_sample(&s, Some(80.0));
+        assert!((b.live_power_mw.unwrap() - 4680.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_nominal_voltage_sample_is_not_shown_as_a_live_reading() {
+        // The voltage half is an *assumed* input here (no live `EXTRA_VOLTAGE`), so the mW is
+        // an estimate over that assumption and must not be drawn as a measured draw — the whole
+        // reason the crate carries the source with the sample (REQ-A1449 / F-PWR-001).
+        let s = amos_profiling::BatterySample::with_nominal_voltage(1_200_000, 3700);
+        assert!(
+            s.is_valid(),
+            "the current is real, so the fold is not decided by validity"
+        );
+        assert!(s.power_mw() > 0.0, "the estimate itself stays answerable");
+        let b = BatteryStatus::from_sample(&s, Some(80.0));
+        assert_eq!(b.live_power_mw, None);
+    }
+
+    #[test]
     fn aggregator_does_not_fabricate_unknown_cpu() {
         let sampler = Arc::new(MockSystemSampler::new(8_000_000_000, 8_000_000_000));
         let mon = SystemMonitor::new(sampler);

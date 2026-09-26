@@ -146,6 +146,7 @@ impl Rig {
 fn host_copy_reaches_guest_clipboard_without_a_copy_loop() {
     let r = rig();
     r.host_copy("from-AI-notes");
+    let host_seq = r.host_clip.latest().unwrap().seq;
 
     // Frame reached the guest agent and was applied to its ClipboardManager.
     assert_eq!(r.deliver_to_guest(), 1, "exactly one host copy applied");
@@ -154,10 +155,15 @@ fn host_copy_reaches_guest_clipboard_without_a_copy_loop() {
         Some("from-AI-notes"),
         "guest clipboard holds the host text"
     );
-    // No echo: applying our own push must not generate an outbound frame.
-    assert!(
-        r.to_host.is_empty(),
-        "guest must not echo the host's own push"
+    // No echo: the applied push must not be reported back as a container copy. It
+    // is confirmed instead, with its own seq, on the same guest→host channel.
+    let bytes = r.to_host.take();
+    let mut dec = FrameDecoder::<GuestToHost>::new();
+    let frames = dec.push(&bytes).expect("guest->host frames decode");
+    assert_eq!(
+        frames,
+        vec![GuestToHost::PushAcked { seq: host_seq }],
+        "the applied push is acked exactly once, and never echoed as a copy"
     );
 }
 

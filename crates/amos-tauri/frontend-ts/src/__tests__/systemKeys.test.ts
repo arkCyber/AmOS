@@ -167,7 +167,7 @@ describe("shellKeyIntent (touch keyboard admission, REQ-A335)", () => {
  * §16.4's boundary ⑤ said this admission was undiscoverable ("no interface hint at all"), and
  * iPadOS answers that with a panel you get by holding ⌘. The panel must not become a *second*
  * place that knows the keys, so the catalog is **generated** from the same two sources the
- * engine reads (the registry's overlay rows + `TOUCH_SYSTEM_SHORTCUTS`). These assertions are
+ * engine reads (the registry's overlay rows + the touch rows in `TOUCH_DEFAULTS`). These assertions are
  * the drift guard: add a key anywhere and this fails until the panel is told about it — and the
  * labels are i18n **keys**, so nothing here can hard-code English.
  */

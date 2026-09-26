@@ -8,7 +8,8 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use lettre::message::Mailbox;
+use lettre::message::header::ContentType;
+use lettre::message::{Attachment as MailAttachment, Mailbox, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::transport::smtp::SmtpTransport;
 use lettre::{Message, Transport};
@@ -88,7 +89,43 @@ fn build_message(draft: &SendDraft) -> std::result::Result<Message, MailError> {
     for bcc in &draft.bcc {
         builder = builder.bcc(mailbox_for(bcc).map_err(provider_err)?);
     }
-    builder.body(draft.body_plain.clone()).map_err(provider_err)
+    // The declared HTML alternative must reach the wire: when the draft carries
+    // one, transmit a `multipart/alternative` so the relay sees both bodies.
+    // Previously only `body_plain` was ever rendered, so `SendDraft::html(..)`
+    // was silently dropped — a declared capability with no code path.
+    if draft.attachments.is_empty() {
+        return match draft.body_html.clone() {
+            Some(html) => builder
+                .multipart(MultiPart::alternative_plain_html(
+                    draft.body_plain.clone(),
+                    html,
+                ))
+                .map_err(provider_err),
+            None => builder.body(draft.body_plain.clone()).map_err(provider_err),
+        };
+    }
+    // With attachments the message is `multipart/mixed`: the body first (an
+    // alternative when an HTML body exists, else a single `text/plain` part),
+    // then one part per attached file. A draft whose `attachments` were built by
+    // the caller — the CLI `--attach` path reads the file's bytes into them —
+    // used to reach `build_message` and vanish: the loop over `draft.attachments`
+    // did not exist, so the relay got a message with no files (REQ-A1691).
+    let mut mixed = match draft.body_html.clone() {
+        Some(html) => MultiPart::mixed().multipart(MultiPart::alternative_plain_html(
+            draft.body_plain.clone(),
+            html,
+        )),
+        None => MultiPart::mixed().singlepart(SinglePart::plain(draft.body_plain.clone())),
+    };
+    for att in &draft.attachments {
+        // An unparseable MIME type is a refusal, not a silent fallback to
+        // `text/plain`: the sender declared a type and we cannot honour it.
+        let content_type: ContentType = att.mime.parse().map_err(provider_err)?;
+        mixed = mixed.singlepart(
+            MailAttachment::new(att.filename.clone()).body(att.data.clone(), content_type),
+        );
+    }
+    builder.multipart(mixed).map_err(provider_err)
 }
 
 fn provider_err<E: std::fmt::Display>(e: E) -> MailError {
@@ -125,12 +162,16 @@ pub fn send(cfg: &SmtpConfig, draft: &SendDraft) -> Result<SendReceipt> {
     Ok(SendReceipt {
         id: format!("smtp-{now}"),
         date: now,
+        // `mailer.send` above returned Ok: the relay accepted the message for
+        // delivery. That is the only path that may claim `delivered`.
+        delivered: true,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Attachment;
     use std::io::{BufRead, BufReader, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::{Arc, Mutex};
@@ -203,6 +244,11 @@ mod tests {
 
         let rcpt = send(&cfg, &draft).unwrap();
         assert!(rcpt.id.starts_with("smtp-"));
+        assert!(
+            rcpt.delivered,
+            "the relay accepted the message, so this is the one path that may \
+             claim delivery"
+        );
 
         std::thread::sleep(std::time::Duration::from_millis(200));
         let text = cap.lock().unwrap().join("\n").to_lowercase();
@@ -211,6 +257,135 @@ mod tests {
         assert!(
             text.contains("body text for the sink"),
             "body missing:\n{text}"
+        );
+    }
+
+    #[test]
+    fn html_body_is_transmitted_as_a_multipart_alternative() {
+        // `SendDraft::html(..)` must actually reach the wire. Before this fix
+        // `build_message` rendered only `body_plain`, so the declared HTML body
+        // was silently dropped on the only transmit path there is.
+        let (port, cap) = run_sink();
+        let cfg = SmtpConfig::new("127.0.0.1", port);
+        let draft = SendDraft::new(
+            vec![Address::bare("bob@y.io").unwrap()],
+            "rich",
+            "plain fallback",
+        )
+        .unwrap()
+        .from(Address::bare("a@x.io").unwrap())
+        .html("<b>rich</b>");
+
+        send(&cfg, &draft).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let text = cap.lock().unwrap().join("\n").to_lowercase();
+        assert!(
+            text.contains("multipart/alternative"),
+            "no alternative part:\n{text}"
+        );
+        assert!(text.contains("<b>rich</b>"), "html body missing:\n{text}");
+        assert!(
+            text.contains("plain fallback"),
+            "plain fallback missing:\n{text}"
+        );
+    }
+
+    #[test]
+    fn an_attachment_reaches_the_wire_as_a_base64_part() {
+        // `draft.attachments` (as the CLI `--attach` builds them) must actually
+        // be transmitted. Before this fix `build_message` never looked at the
+        // field, so a file the user attached was silently dropped on the only
+        // transmit path there is.
+        let (port, cap) = run_sink();
+        let cfg = SmtpConfig::new("127.0.0.1", port);
+        // Bytes that are not 7-bit clean, so the transfer encoding is base64 and
+        // the payload is recognisable on the wire.
+        let data = vec![0x00u8, 0x01, 0x02, 0xff];
+        let draft = SendDraft::new(
+            vec![Address::bare("bob@y.io").unwrap()],
+            "with file",
+            "see attach",
+        )
+        .unwrap()
+        .from(Address::bare("a@x.io").unwrap())
+        .attach(Attachment {
+            filename: "notes.bin".into(),
+            mime: "application/octet-stream".into(),
+            data: data.clone(),
+        });
+
+        send(&cfg, &draft).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let text = cap.lock().unwrap().join("\n").to_lowercase();
+        assert!(
+            text.contains("multipart/mixed"),
+            "an attachment forces multipart/mixed:\n{text}"
+        );
+        assert!(
+            text.contains("filename=\"notes.bin\""),
+            "the attachment's name must reach the relay:\n{text}"
+        );
+        assert!(
+            text.contains("content-transfer-encoding: base64"),
+            "a binary payload must be base64-encoded as a part:\n{text}"
+        );
+        // base64 of `00 01 02 ff` is `AAEC/w==`.
+        assert!(
+            text.contains("aaec/w=="),
+            "the attachment's bytes must be transmitted:\n{text}"
+        );
+    }
+
+    #[test]
+    fn an_html_body_plus_an_attachment_keeps_both() {
+        // The alternative (plain+html) body nests inside the mixed message; the
+        // fix must not trade one for the other.
+        let (port, cap) = run_sink();
+        let cfg = SmtpConfig::new("127.0.0.1", port);
+        let draft = SendDraft::new(
+            vec![Address::bare("bob@y.io").unwrap()],
+            "rich+file",
+            "plain fallback",
+        )
+        .unwrap()
+        .from(Address::bare("a@x.io").unwrap())
+        .html("<b>rich</b>")
+        .attach(Attachment {
+            filename: "notes.txt".into(),
+            mime: "text/plain".into(),
+            data: b"payload-bytes".to_vec(),
+        });
+
+        send(&cfg, &draft).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let text = cap.lock().unwrap().join("\n").to_lowercase();
+        assert!(text.contains("multipart/mixed"), "no mixed part:\n{text}");
+        assert!(
+            text.contains("multipart/alternative"),
+            "the html alternative must survive alongside the file:\n{text}"
+        );
+        assert!(
+            text.contains("filename=\"notes.txt\""),
+            "the file must still be attached:\n{text}"
+        );
+    }
+
+    #[test]
+    fn an_unparseable_attachment_mime_is_a_refusal() {
+        // A declared type we cannot honour is an error, not a silent fallback.
+        let draft = SendDraft::new(vec![Address::bare("bob@y.io").unwrap()], "bad", "body")
+            .unwrap()
+            .from(Address::bare("a@x.io").unwrap())
+            .attach(Attachment {
+                filename: "x.bin".into(),
+                mime: "not a mime type".into(),
+                data: vec![1, 2, 3],
+            });
+        let err =
+            build_message(&draft).expect_err("an unparseable attachment MIME must be refused");
+        assert!(
+            matches!(err, MailError::Provider(_)),
+            "the refusal must name the provider error: {err:?}"
         );
     }
 }

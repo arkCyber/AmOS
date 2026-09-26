@@ -24,17 +24,13 @@
   import { createStoreValue } from "./store";
   import { batterySvg, iconSvg, radioIcon } from "../lib/sysIcons";
   import { WIFI_KEY, normalizeWifi } from "../lib/wifi";
-  import {
-    firstBattery,
-    batteryTone,
-    watchHostBattery,
-    type BatterySample,
-  } from "../lib/batteryStatus";
+  // The live battery subscription lives in `lib/batterySources` so this bar and the
+  // desktop top bar's `BatteryWidget` resolve the reading the same way.
+  import { createBatterySources } from "../lib/batterySources.svelte";
+  import { batteryReadout } from "../lib/batteryStatus";
   import { statusIcons } from "../lib/netStatus";
   import { deviceChrome } from "../lib/formLayout";
   import type { FormFactor } from "../lib/wm";
-  import { systemHealth, hostBattery } from "../lib/system";
-  import { bridged } from "../lib/backend";
   import { t } from "./locale.svelte";
 
   // Which device class the shell is drawing for. Optional and defaulting to the phone
@@ -56,12 +52,10 @@
   let now = $state(new Date());
   let online = $state(typeof navigator !== "undefined" ? navigator.onLine : true);
 
-  // Real battery sources, kept separate so the shown reading can be resolved with
-  // explicit precedence (daemon system_health first, host OS Battery API second).
-  const BATTERY_POLL_MS = 5000;
-  let systemBatt = $state<BatterySample>({ levelPct: null, charging: null });
-  let tauriBatt = $state<BatterySample>({ levelPct: null, charging: null });
-  let hostBatt = $state<BatterySample>({ levelPct: null, charging: null });
+  // The live battery subscription (daemon `system_health` first, host OS second) lives
+  // in `lib/batterySources` — shared with the desktop top bar's BatteryWidget so both
+  // resolve the reading the same way.
+  const battery = createBatterySources();
 
   $effect(() => {
     const un = settingsStore.subscribe((v) => (settingsRaw = v));
@@ -94,37 +88,6 @@
     };
   });
 
-  // Live real battery. The daemon poll only runs when actually bridged (when not
-  // bridged the call is a cheap null, but we skip the timer to keep the always-
-  // mounted chrome light); the host OS Battery API is event-driven so it needs no
-  // timer — we just forward its samples.
-  $effect(() => {
-    const stopHost = watchHostBattery((s) => {
-      hostBatt = s;
-    });
-    const poll = async () => {
-      if (!bridged()) return;
-      const raw = await systemHealth();
-      if (raw) {
-        systemBatt = {
-          levelPct: raw.battery_level_pct,
-          charging: raw.battery_charging,
-        };
-      }
-      // The host OS battery (desktop dev / any host the daemon can't see).
-      const host = await hostBattery();
-      if (host) {
-        tauriBatt = { levelPct: host.level_pct, charging: host.charging };
-      }
-    };
-    void poll();
-    const id = window.setInterval(poll, BATTERY_POLL_MS);
-    return () => {
-      if (stopHost) stopHost();
-      window.clearInterval(id);
-    };
-  });
-
   const quick = $derived(normalizeQuick(settingsRaw));
   const flashOn = $derived(torchOn(normalizeFlashlight(flashRaw)));
   const wifi = $derived(normalizeWifi(wifiRaw));
@@ -141,16 +104,12 @@
 
   // Shown battery = authoritative daemon reading, else host-OS (Tauri) reading,
   // else browser Battery API, else honestly unknown.
-  const batt = $derived(firstBattery([systemBatt, tauriBatt, hostBatt]));
-  const battTone = $derived(batteryTone(batt));
-  const battText = $derived(
-    batt.levelPct === null ? "—" : `${Math.round(batt.levelPct)}%`,
-  );
-  const battTitle = $derived(
-    batt.levelPct === null
-      ? undefined
-      : t(batt.charging === true ? "a11y.batteryCharging" : "a11y.battery", { pct: battText }),
-  );
+  const batt = $derived(battery.batt);
+  const battTone = $derived(battery.tone);
+  /** The shared read-out: the shown text AND the accessible name (see the span). */
+  const readout = $derived(batteryReadout(batt));
+  const battText = $derived(readout?.pct ?? "—");
+  const battName = $derived(readout ? t(readout.key, { pct: readout.pct }) : t("a11y.batteryLevel"));
 </script>
 
 <div class="relative flex items-center justify-between px-4 pb-1 pt-3 text-xs font-semibold text-neutral-900 dark:text-neutral-100">
@@ -171,8 +130,8 @@
     {#if alertIcon}
       <span
         data-icon={alertIcon}
-        aria-label={dnd ? "do not disturb" : "alerts muted"}
-        title={dnd ? "Do Not Disturb" : "alerts muted"}
+        aria-label={dnd ? t("a11y.doNotDisturb") : t("a11y.alertsMuted")}
+        title={dnd ? t("a11y.doNotDisturb") : t("a11y.alertsMuted")}
       >{@html iconSvg(alertIcon)}</span>
     {/if}
     {#if flashOn}
@@ -187,10 +146,14 @@
           : undefined}
       >{@html iconSvg(radioIcon(ic.kind))}</span>
     {/each}
+    <!-- The reading is the NAME: `aria-label` overrides the element's content, so the
+         previous constant label + `aria-hidden` text made the level unreadable to a
+         screen reader even though it was on screen (REQ-A1016). -->
     <span
       class="flex items-center gap-1 tabular-nums"
-      aria-label={t("a11y.batteryLevel")}
-      title={battTitle}
+      data-testid="statusbar-battery"
+      aria-label={battName}
+      title={readout ? battName : undefined}
     >
       {@html batterySvg(batt.levelPct === null ? 0 : batt.levelPct, "h-3 w-3", battTone)}
       <span aria-hidden="true">{battText}</span>

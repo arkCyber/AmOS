@@ -5,6 +5,7 @@
   // Hidden entirely when there is no data (not bridged / daemon offline), so the
   // Settings page never renders a broken card.
   import {
+    gnssAccuracyLabel,
     normalizeSnapshot,
     sensorCameraCount,
     sensorSetMode,
@@ -23,6 +24,11 @@
         : "settings.sensorPowerSave";
   }
 
+  const REFRESH_MS = 3000;
+  // The cadence while the panel has nothing to draw — same rule as `SystemPanel.svelte`
+  // (REQ-A1356) and `TaskManager.svelte` (REQ-A1364), whose comments call each poll a
+  // reconnect probe.
+  const RECONNECT_MS = 5000;
   const GROUP =
     "overflow-hidden rounded-[11px] bg-white/70 ring-1 ring-black/5 dark:bg-white/[0.07] dark:ring-white/10";
   const ROW = "flex items-center justify-between gap-3 px-4 py-3";
@@ -58,13 +64,28 @@
   const visible = $derived(
     cameraCount > 0 || !!snap.gnss || !!snap.imu || snap.mode !== "unknown",
   );
+  $effect(() => {
+    // Kept armed in **both** states, only the period changes (REQ-A1365 / F-SH-629). The
+    // pre-fix shape read the daemon exactly once, from the mount-time `$effect` above — so
+    // the state that hides the card (`{#if visible}`, no `else`) was terminal: a refused
+    // first `sensor_snapshot` left `snap` empty and the only 刷新 button is drawn *inside*
+    // that hidden branch, and nothing on the page re-reads `sensor_snapshot`. The siblings
+    // `SystemPanel.svelte` (REQ-A1356) and `TaskManager.svelte` (REQ-A1364) already carry
+    // this rule; this is the same panel, on the same screen.
+    const ms = visible ? REFRESH_MS : RECONNECT_MS;
+    const id = window.setInterval(refresh, ms);
+    return () => window.clearInterval(id);
+  });
   /** One unknown field is enough to make a position claim unstatable — the reading is
    *  shown as `—` rather than a string that mixes measured and missing numbers (REQ-A294). */
   const gnssFixLabel = (g: SensorGnss): string => {
     const { latitude_deg: lat, longitude_deg: lon, accuracy_m: acc, sats } = g;
     if (lat === null || lon === null) return "—";
     const parts = [`${lat.toFixed(5)}, ${lon.toFixed(5)}`];
-    if (acc !== null) parts.push(`±${acc.toFixed(0)}m`);
+    // The accuracy clause carries its own absence rule (REQ-A1624): a `≤ 0` value is the
+    // sentinel and is dropped, and a real sub-metre accuracy is never rounded to `±0m`.
+    const accLabel = gnssAccuracyLabel(acc);
+    if (accLabel) parts.push(accLabel);
     if (sats !== null) parts.push(`${sats}sats`);
     return parts.join(" · ");
   };
@@ -119,7 +140,7 @@
       <p>{t("settings.sensorCameras", { n: camLabel })}</p>
       <p>{t("settings.sensorGnss", { n: gnssLabel })}</p>
       {#if snap.imu}
-        <p>{t("settings.sensorImu", { hz: String(snap.imu.rate_hz), t: sample(snap.imu.temp_c, 1) })}</p>
+        <p>{t("settings.sensorImu", { hz: sample(snap.imu.rate_hz, 0), t: sample(snap.imu.temp_c, 1) })}</p>
       {/if}
     </div>
   </section>

@@ -12,12 +12,13 @@
   //  • a partial clean is reported as partial (freed bytes + failure count);
   //  • the screen only ever sends **category keys** to `devcare_clean`, never a path.
   import { onMount } from "svelte";
-  import { bridged } from "../lib/backend";
+  import { bridgeDiag, bridged } from "../lib/backend";
   import {
     areaLabelKey,
     auditComplete,
     careAreaSplit,
     devcareApps,
+    devcareBackendName,
     devcareBoost,
     devcareClean,
     devcarePermissions,
@@ -25,6 +26,7 @@
     devcareReport,
     devcareScan,
     devcareStatus,
+    devcareStatusOutcome,
     devcareStorage,
     devcareTrail,
     devcareUninstall,
@@ -34,6 +36,7 @@
     opLabelKey,
     outcomeLabelKey,
     permReviewAuthoritative,
+    printableBackend,
     reportHasData,
     resourceLabelKey,
     severityLabelKey,
@@ -57,11 +60,26 @@
   const SOFT =
     "rounded-full bg-neutral-200 px-2.5 py-1 text-xs opacity-70 disabled:opacity-40 dark:bg-neutral-700";
   const LABEL = "text-[10px] uppercase tracking-wider opacity-50";
+  /** A byte total for display: "—" when it was not read, never the `0 B` a `?? 0` invents. */
+  const sizeOrDash = (v: number | null | undefined): string =>
+    v === null || v === undefined ? "—" : fmtBytes(v);
 
   let bridgedNow = $state(bridged());
   let available = $state(false);
   /** The bridge status (carries `last_error` — never silently dropped). */
   let status = $state<DevCareStatusView | null>(null);
+  /**
+   * The `devcare_status` read **failed** (REQ-A793 / F-DEV-097).
+   *
+   * `available === false` alone collapses two different realities: the host answering
+   * "I have no backend" (a fact about the device, which `care.offlineHint` describes
+   * correctly) and the command never landing (nothing is known). A failed read must not
+   * borrow the honest answer's sentence, and it must offer a retry — the rescan button
+   * lives in the `{:else}` branch, so before this flag the failed state was a dead end.
+   */
+  let statusErr = $state(false);
+  /** The host's own words for the failed read ("" when it gave none). */
+  let statusErrDetail = $state("");
   let scan = $state<ScanView | null>(null);
   /** True when the scan itself failed (must NOT look like "nothing to clean"). */
   let scanErr = $state(false);
@@ -88,8 +106,22 @@
   let cleaning = $state(false);
   let acting = $state<string | null>(null);
   let notice = $state<{ key: string; params?: Record<string, string | number> } | null>(null);
-  /** Whether the last action reached the daemon's unified audit trail. */
+  /** Whether the last clean/uninstall reached the daemon's unified audit trail. */
   let audit = $state<AuditStatusView | null>(null);
+  /**
+   * Whether the last **boost** reached the daemon's unified audit trail.
+   *
+   * REQ-A1403 / F-SH-661.
+   *
+   *
+   * A slot of its own, not the `audit` above: that one is rendered inside the
+   * clean-backend junk card, while the governor is a *different* subsystem — a device
+   * can have a working governor and no clean backend at all (`available === false`,
+   * `backend: "none"`), and it can boost. Writing the boost's verdict into the shared
+   * slot made it render nowhere in that state, and made a boost whose governor had
+   * vanished (`audit = null`) erase a clean's still-standing verdict.
+   */
+  let boostAudit = $state<AuditStatusView | null>(null);
   let disposed = false;
 
   const observed = $derived(reportHasData(report));
@@ -101,6 +133,16 @@
    * would be "unknown shown as healthy" (aerospace P0-3).
    */
   const areas = $derived(careAreaSplit(report));
+  /**
+   * The host's own list of review-only categories (`ScanOut.review_kinds`).
+   *
+   * The single source for「需确认」here and in `validateCleanRequest`: the domain
+   * decides review-ness (`JunkKind::needs_review()`), so the screen must not
+   * re-decide it from a literal kind — that left this wire field with no reader
+   * and would have hidden the acknowledgement for a second review-only category
+   * (REQ-A1409 ∕ F-SH-667).
+   */
+  const reviewKinds = $derived(scan?.review_kinds ?? []);
   const gradeBig = $derived(observed ? String(report?.score ?? 0) : "—");
   const gradeTag = $derived(
     observed ? (report?.grade ?? "?").toUpperCase() : t("care.unknown"),
@@ -178,34 +220,56 @@
     const out = await devcareBoost();
     boosting = false;
     if (disposed) return;
-    if (out === null || !out.governor) {
+    if (out === null) {
+      // The command never landed (`invoke` answers `null` for a throw). Nothing about
+      // the device was established, so we say the boost *failed* — never
+      // `care.memoryNoGovernor`, a claim only a landed read can make (clean/uninstall
+      // speak the same way).
+      boostNote = { key: "care.boostFailed" };
+      boostAudit = null;
+    } else if (!out.governor) {
+      // The host *answered*: it has no governor to drive. That is a fact about the
+      // device, so its own sentence applies.
       boostNote = { key: "care.memoryNoGovernor" };
-      // No boost happened ⇒ nothing was (or could be) audited.
-      audit = null;
+      boostAudit = null;
     } else if (out.failures.length > 0) {
       boostNote = {
         key: "care.boostPartial",
         params: { n: out.reclaimed, failed: out.failures.length },
       };
-      audit = out.audit;
+      boostAudit = out.audit;
     } else {
       boostNote = { key: "care.boosted", params: { n: out.reclaimed } };
-      audit = out.audit;
+      boostAudit = out.audit;
     }
     await loadMemory();
+    // The boost wrote its own event to the same trail clean/uninstall use; a
+    // 「近期操作」card that omits the operation just performed is stale by
+    // construction, so re-read it here as those paths do.
+    await loadTrail();
   }
 
   async function refresh() {
     if (!bridged()) {
       bridgedNow = false;
       available = false;
+      statusErr = false;
+      statusErrDetail = "";
       return;
     }
     bridgedNow = true;
     busy = true;
     const st = await devcareStatus();
-    status = st;
-    available = st?.available ?? false;
+    // Whether the read *landed* is a separate question from what it said, and the
+    // verdict is read from the diagnostic slot, not from the value: a failed command
+    // and a `void` success both answer `null` (REQ-A296 / F-DEV-097). Read after the
+    // await so the slot belongs to this call.
+    const outcome = devcareStatusOutcome(st, bridgeDiag("devcare_status"));
+    status = outcome.kind === "read" ? outcome.status : null;
+    statusErr = outcome.kind === "failed";
+    statusErrDetail = outcome.kind === "failed" ? outcome.detail : "";
+    // `available` is only ever true on a read that landed; a failure is not "no backend".
+    available = outcome.kind === "read" && outcome.status.available;
     await loadApps();
     await loadPerms();
     await loadTrail();
@@ -219,12 +283,11 @@
       scan = s;
       selected = s ? [...s.auto_kinds] : [];
       acknowledge = false;
-      // Both counts are `null` unless the source actually answered: an unread
-      // inventory / an unreachable daemon is NOT an observation of zero.
-      report = await devcareReport(
-        grantsObserved,
-        appsErr ? null : apps.length,
-      );
+      // The grant count is `null` unless the daemon actually answered: an
+      // unreachable daemon is NOT an observation of zero. The reviewable-app
+      // count is not sent — the host derives it from the uninstall policy's own
+      // inventory, so the report cannot claim an affordance `apps` does not draw.
+      report = await devcareReport(grantsObserved);
     } else {
       scan = null;
       scanErr = false;
@@ -240,7 +303,7 @@
   }
 
   async function clean() {
-    const problem = validateCleanRequest(selected, acknowledge);
+    const problem = validateCleanRequest(selected, acknowledge, reviewKinds);
     if (problem) {
       notice = { key: problem };
       audit = null;
@@ -325,9 +388,18 @@
         <div class="text-right text-[11px] opacity-60">
           <div data-testid="devcare-backend">
             {t("care.backend")}:
-            {available ? (scan?.status.backend ?? "host-fs") : t("care.backendNone")}
+            {statusErr
+              ? t("care.unknown")
+              : available
+                ? (devcareBackendName(status, scan) ?? t("care.unknown"))
+                : t("care.backendNone")}
           </div>
-          <div>{t("care.items", { n: scan?.report.total_items ?? 0 })}</div>
+          <!-- No scan ⇒ no count. `?? 0` printed 「0 项」 over a failed scan, which
+               is the one claim a failed read must never make (the junk card below
+               already says 扫描失败). -->
+          <div data-testid="devcare-items">
+            {scan ? t("care.items", { n: scan.report.total_items }) : "—"}
+          </div>
         </div>
       </div>
       {#if observed}
@@ -346,7 +418,30 @@
           {/if}
         </div>
       {/if}
-      {#if !available}
+      {#if statusErr}
+        <!-- The read failed: we know nothing about the backend, so we say exactly that
+             plus the host's own words — never `care.offlineHint`, which asserts what the
+             device can do. A retry is offered because this state is the one that can go
+             away on its own (the daemon came up, the transport recovered). -->
+        <div class="px-3 pb-3 text-[11px] opacity-70" data-testid="devcare-status-error">
+          <span>{t("care.statusFailed")}</span>
+          {#if statusErrDetail}
+            <span class="ml-1 opacity-70" data-testid="devcare-status-detail">
+              {statusErrDetail}
+            </span>
+          {/if}
+        </div>
+        <div class="flex items-center gap-2 px-3 pb-3">
+          <button
+            class={SOFT}
+            disabled={busy}
+            onclick={() => void refresh()}
+            data-testid="devcare-status-retry"
+          >
+            {busy ? t("care.scanning") : t("care.statusRetry")}
+          </button>
+        </div>
+      {:else if !available}
         <div class="px-3 pb-3 text-[11px] opacity-70" data-testid="devcare-unavailable">
           {t("care.offlineHint")}
         </div>
@@ -383,7 +478,9 @@
     <div class={CARD} data-testid="devcare-storage">
       <div class={`flex items-center justify-between px-3 pt-3 ${LABEL}`}>
         <span>{t("care.storage")}</span>
-        <span class="normal-case tracking-normal opacity-70">{storage?.backend ?? ""}</span>
+        <span class="normal-case tracking-normal opacity-70" data-testid="devcare-storage-backend">
+          {printableBackend(storage?.backend) ?? t("care.unknown")}
+        </span>
       </div>
       {#if storageErr}
         <div class="p-3 text-xs text-amber-600" data-testid="devcare-storage-error">
@@ -396,21 +493,32 @@
       {:else}
         <div class="p-3">
           <div class="flex items-baseline justify-between text-[11px] opacity-70">
-            <span>{t("care.storageUsed", { size: fmtBytes(storage?.used_bytes ?? 0) })}</span>
-            <span>{t("care.storageTotal", { size: fmtBytes(storage?.total_bytes ?? 0) })}</span>
+            <!-- `measured` does not mean every field was read: `StorageOut` models each
+                 total as its own `Option`, so a missing one must render "—", never the
+                 `fmtBytes(0)` a `?? 0` would fabricate. -->
+            <span data-testid="devcare-storage-used">
+              {t("care.storageUsed", { size: sizeOrDash(storage?.used_bytes) })}
+            </span>
+            <span data-testid="devcare-storage-total">
+              {t("care.storageTotal", { size: sizeOrDash(storage?.total_bytes) })}
+            </span>
           </div>
-          <div class="mt-1 h-2 w-full overflow-hidden rounded-full bg-black/10 dark:bg-white/10">
-            <div
-              class="h-full rounded-full bg-accent"
-              style={`width: ${storage?.used_pct ?? 0}%`}
-              data-testid="devcare-storage-bar"
-            ></div>
-          </div>
+          {#if storage?.used_pct !== null}
+            <div class="mt-1 h-2 w-full overflow-hidden rounded-full bg-black/10 dark:bg-white/10">
+              <div
+                class="h-full rounded-full bg-accent"
+                style={`width: ${storage?.used_pct}%`}
+                data-testid="devcare-storage-bar"
+              ></div>
+            </div>
+          {/if}
           <div class="mt-1 flex items-baseline justify-between text-[10px] opacity-60">
             <span data-testid="devcare-storage-pct">
               {storage?.used_pct === null ? "—" : `${storage?.used_pct}%`}
             </span>
-            <span>{t("care.storageFree", { size: fmtBytes(storage?.free_bytes ?? 0) })}</span>
+            <span data-testid="devcare-storage-free">
+              {t("care.storageFree", { size: sizeOrDash(storage?.free_bytes) })}
+            </span>
           </div>
           {#if (storage?.groups.length ?? 0) > 0}
             <div class="mt-2 space-y-0.5">
@@ -454,15 +562,45 @@
       <div class={CARD} data-testid="devcare-junk">
         <div class="flex items-center justify-between px-3 pt-3">
           <span class={LABEL}>{t("care.reclaimable")}</span>
+          <!-- The host's own sum, read from the reply **root**: `report` is the
+               domain `JunkReport` and carries no such field, so `report.reclaimable_bytes`
+               was permanently `undefined` ⇒ a fabricated 「0 B」 over real groups
+               (REQ-A1405 ∕ F-SH-662).
+               And the same figure must stay unknown until a scan has actually landed:
+               `available` is a *capability* fact (the backend answered the status read),
+               not an *observation* fact — five device round-trips plus the scan run
+               between the two, and `scan?.reclaimable_bytes ?? 0` drew 「0 B」 for all of
+               it. The overview's item count above already tells this story
+               (`scan ? … : "—"`, "No scan ⇒ no count"); this span answers the same
+               question the same way (REQ-A1433 ∕ F-SH-691). -->
           <span class="text-xs tabular-nums opacity-70">
-            {scanErr ? "—" : fmtBytes(scan?.report.reclaimable_bytes ?? 0)}
+            {scan ? fmtBytes(scan.reclaimable_bytes) : "—"}
+            <!-- The domain splits a scan's bytes in two: `reclaimable_bytes()` is the
+                 auto-cleanable half, `review_bytes()` the half behind the explicit
+                 acknowledgement. The list below offers rows from **both**, so a
+                 headline that totalled only the first under-stated what the clean
+                 button would do — and named the acknowledgement nowhere. Read from the
+                 host's own sum, so it is unknown (not `0`) until a scan lands, exactly
+                 like the total beside it (REQ-A1445 ∕ F-SH-701). -->
+            {#if scan && scan.review_bytes > 0}
+              <span class="ml-1 text-[10px] opacity-70" data-testid="devcare-junk-review">
+                {t("care.reviewBytes", { size: fmtBytes(scan.review_bytes) })}
+              </span>
+            {/if}
           </span>
         </div>
         {#if scanErr}
           <div class="p-3 text-xs text-amber-600" data-testid="devcare-junk-error">
             {t("care.scanFailed")}
           </div>
-        {:else if (scan?.report.groups.length ?? 0) === 0}
+        {:else if !scan}
+          <!-- mid-load: the backend is attached, nothing has been looked at yet, and
+               「没有可清理的垃圾」 would be a claim about an observation that has not
+               happened (the same rule as the failed-scan branch above). -->
+          <div class="p-3 text-xs opacity-60" data-testid="devcare-junk-scanning">
+            {t("care.scanning")}
+          </div>
+        {:else if scan.report.groups.length === 0}
           <div class="p-3 text-xs opacity-60" data-testid="devcare-junk-empty">
             {t("care.nothingToClean")}
           </div>
@@ -476,7 +614,7 @@
                   onchange={() => toggleKind(g.kind)}
                 />
                 <span class="min-w-0 flex-1 truncate">{t(junkKindLabelKey(g.kind))}</span>
-                {#if !(scan?.auto_kinds ?? []).includes(g.kind)}
+                {#if reviewKinds.includes(g.kind)}
                   <span class="rounded-full bg-amber-500/15 px-2 py-0.5 text-[10px] text-amber-600">
                     {t("care.needsReview")}
                   </span>
@@ -487,7 +625,7 @@
               </label>
             {/each}
           </div>
-          {#if selected.includes("stale_download")}
+          {#if selected.some((k) => reviewKinds.includes(k))}
             <label class="flex items-center gap-2 px-3 pb-2 text-[11px]">
               <input type="checkbox" bind:checked={acknowledge} data-testid="devcare-ack" />
               <span>{t("care.needsReview")}</span>
@@ -653,6 +791,21 @@
       {#if boostNote}
         <div class="px-3 pb-3 text-[11px] opacity-80" data-testid="devcare-boost-note">
           {t(boostNote.key, boostNote.params)}
+        </div>
+      {/if}
+      {#if boostAudit && boostAudit.attempted > 0}
+        <!-- The boost's own verdict, next to the boost: the clean card's audit line
+             is inside `{#if available}` and this card is not, so a device with a
+             governor but no clean backend would otherwise record an event the
+             screen never shows. -->
+        <div
+          class="px-3 pb-3 text-[11px] opacity-60"
+          data-testid="devcare-boost-audit"
+          title={boostAudit.reason ?? ""}
+        >
+          {auditComplete(boostAudit)
+            ? `${t("care.audited")} (${boostAudit.recorded}/${boostAudit.attempted})`
+            : t("care.notAudited")}
         </div>
       {/if}
     </div>

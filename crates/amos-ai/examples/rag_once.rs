@@ -80,7 +80,11 @@ async fn main() -> Result<()> {
         .into_inner();
     println!(
         "before: indexed={} dim={} embedder={}",
-        before.indexed, before.dimension, before.embedder
+        before.indexed,
+        before
+            .dimension
+            .map_or_else(|| "none".to_string(), |d| d.to_string()),
+        before.embedder
     );
 
     let text = "设备真机离线检索的独份预算正文".to_string();
@@ -127,7 +131,11 @@ async fn main() -> Result<()> {
         .into_inner();
     println!(
         "after: indexed={} dim={} embedder={}",
-        after.indexed, after.dimension, after.embedder
+        after.indexed,
+        after
+            .dimension
+            .map_or_else(|| "none".to_string(), |d| d.to_string()),
+        after.embedder
     );
     Ok(())
 }

@@ -230,3 +230,240 @@ UI 的 `SensorHost` 是一个**实时推送源**——凡向共享流桥推入�
   cargo tauri android build --apk --debug` 装机启动后，用 adb 观测
   `dumpsys sensorservice`（活跃 IMU 连接）/ `media.camera`（CONNECT device 0）与 `logcat` 里
   `SensorGlue`/`AmosGlue`/`record*` 日志，确认样本真到达总线（runbook 见 docs/android-glue.md）。
+
+## 10. 诚实边界（Gap 3，未接线的部分绝不伪造）
+
+- **未装机 = 未验证 ⇒ 无数据时 `sensor_snapshot` 返回 `None` / `Provider`，绝不返回编造的帧**：真机生产者（Kotlin `SensorEventListener` / Camera2 `ImageReader`）的代码**已落地**（§9）且可编译，但**从未在真机跑过**，因此不得据本字段宣称"相机/IMU 已接通"。另有一条**已注册、但没有任何生产者**的旧缝：`crates/amos-sensor/src/sim.rs` 的 `native_on_camera` / `native_on_imu`（Kotlin `SensorGlue.nativeOnCamera`/`nativeOnImu` 上呼的 Rust 半）由 `sensor_host.rs` 的 `no_mangle` 蹦床**注册**，但 Kotlin 从不调用这两个 external（活路径走 `SensorGlue.recordImu` / `CameraGlue.recordFrame`，见 §9），故一律返回类型化 `SensorError::Provider`——不产出帧、不产出样本。`sensor_host.rs` 侧同样：没有样本就 `snapshot().imu == None`，不填假样本。
+- **JNI 两半"编译已验证、设备未验证"**：Kotlin 生产者 + Rust 蹦床的名字契约与载荷上限（16 MiB）是**编译期**可见并由主机单测钉住的；`SensorGlue.attachContext` / `CameraGlue.advertiseCamera` / `recordImu` / `recordVitals` / `recordFrame` 只在真机 APK 上才会真正运行。**未装机 = 未验证**，不得据此宣称"相机/IMU 已接通"。
+- **`sim.rs` 是主机确定性模拟器，不是设备测量**：它按 `t_ms`/`phase` 生成棋盘格与正弦运动，用于在无设备时覆盖整条活读路径（帧校验、每相机 `seq` 单调、陈旧 IMU 丢弃、能量门控、`SensorHost` 扇出）；生命体征经 `SimHarness::push_vitals` 走同一总线（`SimHarness` 无生成器——`Option` 字段由调用方直接给，见 §12）。它产出的帧**由测试 harness 产生**，永不被当成设备读数（见 sim.rs 模块头）。
+- **GNSS 是唯一例外**：`AndroidSensorProvider` 的 GNSS 走同步 `LocationManager#getLastKnownLocation`，不在上述流桥内。
+
+## 11. 生命体征（步数 ∕ 心率）与「健康」屏（2026-09-25，REQ-A1454）
+
+在 §6/§8 的同一流桥上新增第四族读数，供 System UI 的「健康」屏使用。走的是**流总线 + 宿主**而非
+`SensorProvider` trait —— `SensorHost::snapshot()` 读的是 `LiveSensorProvider` 总线，不是 trait 的拉取缝。
+
+- **领域层（`amos-sensor`）**：`spec.rs` 新增 `VitalsSample { timestamp_ms: u64, steps_total: Option<f64>,
+  heart_rate_bpm: Option<f64> }` 与 `SensorKind::Vitals`；`steps_total` 是**自开机累计**计数
+  （Android `TYPE_STEP_COUNTER` 语义），**不是**当日步数。`stream.rs` 新增 `VitalsLatest` 存储 ∕
+  `StreamChange::Vitals` ∕ `record_vitals` ∕ `vitals_store`，并纳入 `clear_samples`。
+- **宿主（`amos-tauri`）**：`sensor_host.rs` 的 `HostVitals`（`Option<f64>` 字段）挂在
+  `SensorHostSnapshot.vitals`（`#[serde(default)]`）与 `SensorHostEvent` 上，新增 `record_vitals` 与命令
+  `sensor_host_record_vitals`；真机样本经 §8 的同一通道广播成 `sensor-data` 事件的 `vitals` 块
+  （`lib/sensorEvents.ts` 的 `"vitals"` 种类 + `lib/sensors.ts` 的 `vitals` 快照归一化）。
+- **JNI 两侧**：`SensorGlue.recordVitals(tsMs: Long, stepsTotal: Float, hrBpm: Float)` ↔
+  `Java_com_amos_ai_glue_SensorGlue_recordVitals(env, _cls, jlong, jfloat, jfloat)`；注册
+  `TYPE_STEP_COUNTER` + `TYPE_HEART_RATE`；`SENSOR_STATUS_NO_CONTACT` 传 `Float.NaN` ⇒ `None`。权限
+  `ACTIVITY_RECOGNITION`（API 29+，步数计数必需）与 `BODY_SENSORS`（API 31+），两者均以
+  `<uses-feature required="false">` 声明并已登记 `android-permission-scan`。
+- **前端纯逻辑（`lib/health.ts`）**：`stepDelta(prev, next)`（`next < prev` ⇒ 重启 ∕ 归零 ⇒ 重设基线、
+  增量为 `0`）、`dayKey` ∕ `applyVitalsTick`（含午夜换日时关掉当天并重设基线）、`normalizeHeartRate`
+  （拒绝非有限值与 `[25,250]` 外的值 ⇒ `null`）、`stepCalories`（无用户体重 ⇒ `null`）。
+  `svelte/HealthApp.svelte` 拉 `sensorSnapshot().vitals` 并订阅 `sensor-data`。
+- **持久化拆分**：`amos.health.history`（日历史 + 锻炼 = 用户内容）在 `lib/cloud.ts` 的 `SYNC_STORES`；
+  `amos.health.counter`（原始自开机基线）在 `scripts/store-allowlist.json` 记作 `device-state`
+  —— 过期还原会让下一次增量算错。
+- **诚实规则同 §8 的 REQ-A294**：缺失读数端到端是 `Option` ∕ `null`，屏幕印 `—`，**绝不** `0`。
+  这条规则**也覆盖聚合值**（REQ-A1476）：`recentDays` 的 `RecentDay.recorded` 是 `null` 与 `0` 的判别位
+  —— 没有这一天行的日子画 2px 空槽而不是 0 长的柱，`weekRecorded === 0` 时页头印 `health.noReading`
+  而不是把伪造的 0 合计成「本周共 N 步」（**向后兼容**：`steps` 对未观测日仍是 `0`）。
+- **每帧的提交序（REQ-A1475）**：`HealthApp` 只在 `persistHealthTick(next)` **成功**后才把 `history` 与
+  `counter` 一起前移。`persistHealthTick` 先写 counter 再写 history，其 retry 契约只保证 **under-count**，
+  因此失败时必须保留**旧**基线，下一个样本才会重算这一帧丢掉的增量 —— 保留旧基线是这个契约的前提。
+- **验证**：`cargo test -p amos-sensor --lib`（50 ∕ 0）；`cargo test -p amos-tauri --lib sensor_host::`
+  （17 ∕ 0）；`bun test src/lib/__tests__/health.test.ts`（22 例）；`svelte-tests/health-tick-refusal.svelte.test.ts`
+  与 `svelte-tests/health-week-unknown.svelte.test.ts`。
+- **仍待（真机，本字段外）**：真实累计计数与它的重启归零、心率的有无接触语义、`(JFF)V` JNI 签名在运行时
+  的解析、权限弹窗与 Android 编译均**未验证**；本机只钉住了与设备无关的 `stepDelta` ∕ 分桶纯逻辑。
+
+## 12. 生命体征流的两处诚实缺口（2026-09-25，REQ-A1500 ∕ F-SEN-005）
+
+对 §11 这一族做读代码审计时发现的**两处互补**缺陷（都在纯 Rust 侧、可离线证伪），以及一处过期的
+文档断言与一条死缝：
+
+- **缺陷（读入侧，`VitalsLatest::record`）**：`spec.rs` 的 `VitalsSample::has_reading` 规定
+  「两个字段都为 `None` 的样本不值得存储 ∕ 播报」，但**没有任何生产调用者**——`record` 照存照播。
+  症状：宿主快照的 `vitals` 块在**没有任何读数**时也变成 `Some(HostVitals{None,None})`（契约说该块
+  在首个读数前保持缺席），并向 WebView 播出一条空的 `sensor-data`「vitals」事件。
+  修复：`record` 拒绝「无读数且无可撤回」的样本；**例外是撤回**——手里握着读数时，无读数样本正是
+  「传感器失去接触」的表示，必须存下并播报，否则界面永远画着上一个 bpm。
+- **缺陷（JNI 缝，`android_glue::push_vitals`）**：该函数在 `steps` 与 `hr` 都为 `None` 时**提前返回**，
+  把撤回样本在到达存储前丢掉。在「有心率、无计步器」（`ACTIVITY_RECOGNITION` 未授予）的设备上，
+  心率失去接触正是 `(NaN, NaN)`——于是 `VitalsLatest` 那条撤回契约永远不会触发，界面停在最后一个 bpm。
+  修复：缝只负责解码，**是否值得存**交给存储判定（`record_vitals_into` 不再提前返回）。
+- **两处负控（各自单点钉住）**：撤掉存储侧守卫 ⇒ 只有 `vitals_latest_ignores_a_reading_less_sample_with_nothing_to_retract` 变红；
+  在缝上恢复提前返回 ⇒ 只有 `android_glue::tests::a_lost_heart_rate_reaches_the_store_and_retracts` 变红。
+- **补全（主机 harness）**：`SimHarness` 早于生命体征（Sep 20 vs §11 的 Sep 25），其模块头自称覆盖
+  「整条活读路径」却不含第四族。新增 `push_vitals` + `vitals_announced` ∕ `vitals_ignored` 计数；
+  「是否播报」**读存储自己的 `recorded` 计数**而不是在 harness 里再抄一遍物化规则（第二份规则会漂移）。
+  无合成生成器：`Option` 字段的缺席语义应由调用方直接给出。
+- **文档订正**：§10 曾称 `native_on_camera` ∕ `native_on_imu` 上呼的 Rust 半**未注册**、真机生产者
+  「仍是桩」——与 §9（代码已落地）自相矛盾。实情是：蹦床**已注册**，但**没有生产者**接上去（Kotlin
+  从不调用 `nativeOnImu` ∕ `nativeOnCamera`，活路径是 `recordImu` ∕ `recordFrame`），且**未装机 = 未验证**。
+  这是「记录与现实不符、且无人失败」的老形状；本轮只订正措辞，**未删除**该旧缝（删它要动未编译的
+  Kotlin 模板与本模块的 `no_mangle` 名字契约，属真机决定）。
+- **验证**：`cargo test -p amos-sensor`（52 lib + 7 集成 + 1 doctest）；`cargo test -p amos-tauri
+  --features android --lib android_glue::`（8）；`cargo clippy -p amos-sensor --all-targets -- -D warnings`
+  与 fmt 干净。
+
+## 13. IMU 采样率的「尚未协商」不得冒充测量值（2026-09-25，REQ-A1612 ∕ F-SH-821）
+
+读 `sensor_snapshot` 这条桥（`crates/amos-tauri/src/sensors.rs`）做审计时发现：**同一个结构体的
+八个字段里，七个遵循「缺席即未知」，第八个（采样率）把线上的「未知」折叠成了测量值 `0 Hz`**，
+而 §10 早就写下了不许编造读数的规则。
+
+- **缺陷**：`SensorImu::rate_hz` 是裸 `u32`，`imu_payload` 逐字 `rate_hz: i.rate_hz,`。proto 的
+  `uint32 rate_hz = 5;` **没有字段存在性**，所以「尚未协商」在线上就是 `0`；而生产者的词汇自己
+  定义 `0` = 尚未协商（`stream.rs` 的 `LiveSensorProvider`、「`0` = not negotiated yet」；
+  `android.rs` 的 `AndroidSensorProvider::imu_rate_hz`、「the domain core treats 0 as unknown」；
+  `MIN_SENSOR_RATE_HZ` 的注释「Zero is not a meaningful "off"」）。于是 IMU 监听器尚未协商速率时，
+  诊断页的传感器卡印出「惯性 @0 Hz」——一个设备从未测到的采样率。
+- **为什么没被门禁看见**：这里折叠发生在**纯 normalizer 的一个字段**上，`read-fold-scan` 的清单
+  按**可空包装函数的形态**枚举（`export async function` 返回 `invoke` 直出），`write-scan` 只看存储
+  写入判决；没有一条扫描比较「同一结构体的兄弟字段是否遵循同一条缺席规则」。还有一条**同谋**：
+  `sensors.test.ts` 里一条题为「unknown, not a plausible zero」的例把折叠**当成契约**钉住
+  （`expect(s.imu!.rate_hz).toBe(0)`），它的三个兄弟断言却都是 `toBeNull()`。
+- **修复**：`SensorImu::rate_hz: Option<u32>`，payload 逐字 `(i.rate_hz != 0).then_some(i.rate_hz)`；
+  TS 接口 `rate_hz: number | null`，normalizer 逐字 `imu.rate_hz === 0 ? null : optNum(imu.rate_hz)`
+  （**两半都改**：Rust 端让新守护进程不再发 `0`，TS 端让旧守护进程发的 `0` 也不冒充速率）；
+  `SensorPanel.svelte` 渲染改用 `sample(snap.imu.rate_hz, 0)`，与同面板的 `gnssLabel` ∕ `camLabel`
+  同一个「未读即 `—`」的惯用法。
+- **判据（为什么 `0` 读作未知不丢真实读数）**：`0` 在本域**从不**是合法的已协商速率 —— 生产者、
+  `MIN_SENSOR_RATE_HZ`、proto 三处同词都把 `0` 定义为「尚未协商」。七个兄弟字段
+  （`accel_*` ∕ `gyro_*` ∕ `temp_c`）与 `MIN_SENSOR_RATE_HZ` 一字未动。
+- **验证**：`cargo test -p amos-tauri --lib sensors`（10 ∕ 10，新例
+  `an_unnegotiated_imu_rate_is_unknown_not_zero_hz`）；`bun test src/__tests__/sensors.test.ts`
+  （7 ∕ 7）；`npx vitest run svelte-tests/settings-pages-uncovered.svelte.test.ts`（16 ∕ 16，
+  新例断言 `rate_hz: 0` 的快照印 `@— Hz` 而**绝不**印 `@0 Hz`）。三条负控各自恰 1 red，
+  `cp` 快照 + `shasum -a 256` 逐字节还原。
+
+## 14. GNSS 的「未报告精度」与「未数过的卫星数」不得冒充测量值（2026-09-25，REQ-A1623 ∕ F-SH-825）
+
+读同一条 `sensor_snapshot` 桥的 GNSS 半边（`crates/amos-tauri/src/sensors.rs`）时发现：**有真实
+坐标的 fix 一行印出「±0m · 0sats」** —— 一个接收机从未声称过的亚米级精度，和一个它从未数过的
+卫星数。这正是 §13 那条规则的**卫星孪生**，只是这次落在同结构体的另外两个字段上。
+
+- **缺陷**：`SensorGnss::accuracy_m` 是裸 `f64`、`sats` 是裸 `u32`，`gnss_payload` 逐字
+  `accuracy_m: g.accuracy_m, sats: g.sats_in_view,`。proto 的 `double accuracy_m` ∕ `uint32
+  sats_in_view` **都无字段存在性**，所以「未报告」在线上就是 `0`；而生产者的词汇自己定义 `0`
+  = 未报告 —— `amos-sensor/src/android.rs` 逐字「`Location` carries no satellite count … 0 is
+  honest \"not reported\", not a claim of zero sats」（且逐字 `satellites_in_view: 0`），
+  `service.rs` 的 no-fix 分支逐字 `accuracy_m: 0.0, sats_in_view: 0`，Android 的
+  `Location.getAccuracy()` 对没有精度估计的 fix 回 `0.0`。于是**仅仅「有 fix」**时渲染的
+  `gnssFixLabel` 两道 `!== null` 门恒真，印出「31.23000, 121.47000 · ±0m · 0sats」。
+- **判据（为什么 `0` 读作未知不丢真实读数，两处兄弟）**：①**同一结构体**的兄弟字段
+  `SensorImu::rate_hz` 刚按同一条规则改成 `Option<u32>`（§13，REQ-A1612）；②**前端一个字段
+  之外** `frontend-ts/src/lib/gps.ts::accuracyLabel` 逐字
+  `if (!Number.isFinite(m) || m <= 0) return "—";`，其文档逐字称这是**卫星计数一个字段之外**
+  已经遵守的同一条规则 —— 那句在诊断页这条线上此前**不成立**。`0` 在本域**从不**是合法读数。
+- **为什么没被门禁看见**：`read-fold-scan` 的清单按**可空包装函数的形态**枚举（`export async
+  function` 返回 `invoke` 直出），而这里折叠在 **Rust 载荷的两个字段 + TS 纯 normalizer 的两个
+  字段**上；`write-scan` 只看存储写入判决；没有一条扫描比较「同一事件的兄弟面是否遵循同一条
+  缺席规则」。
+- **修复（真实实现，两半都改）**：`SensorGnss::accuracy_m: Option<f64>` ∕ `sats: Option<u32>`，
+  payload 逐字 `(g.accuracy_m != 0.0).then_some(g.accuracy_m)` ∕
+  `(g.sats_in_view != 0).then_some(g.sats_in_view)`；TS 接口两字段改 `number | null`，
+  normalizer 逐字 `g.accuracy_m === 0 ? null : optNum(g.accuracy_m)` ∕
+  `g.sats === 0 ? null : optNum(g.sats)`。`SensorPanel.svelte::gnssFixLabel` **一字未改** —— 它
+  的 `!== null` 门本来就对，只是从未收到过 `null`（与 §13 的 IMU 不同，那次渲染半也承重）。
+- **边界**：本轮只改 `SensorGnss`（`sensor_snapshot` → 诊断页）这条线；**姊妹结构**
+  `sensor_host.rs::HostGnss`（`sensor_host_snapshot` → `gps.ts`）的
+  `accuracy_m: fix.map(..).unwrap_or(0.0)` **一字未动** —— 它是另一个结构体、另一条路径
+  （`GnssStatus` 无 `sats` 字段，消费者须读 `status`），已按 `<= 0` 如实门禁，与本轮是不同两面。
+- **验证**：`cargo test -p amos-tauri --lib sensors`（**11 ∕ 11**，新例
+  `an_unreported_accuracy_and_satellite_count_are_unknown_not_0m_and_0sats`）；`bun test
+  src/__tests__/sensors.test.ts`（**8 ∕ 8**）；`bunx vitest run
+  svelte-tests/settings-pages-uncovered.svelte.test.ts svelte-tests/sensor-live.svelte.test.ts`
+  （**26 ∕ 26**，新例断言有 fix 的快照印坐标而**绝不**印 `±0m` ∕ `0sats`）。三条负控各自恰
+  1 ∕ 2 ∕ 2 red（`cp` 快照 + `shasum -a 256` 逐字节还原）。**工作树为并发共享**：本轮的**后继**
+  （`REQ-A1624 ∕ F-SH-826`，同日）随后在同一批前端文件上作业（`lib/sensors.ts` 新增
+  `gnssAccuracyLabel`、`SensorPanel.svelte` 改用之，并在 `sensors.test.ts` 加 2 例 ⇒ 现值 10 ∕ 10），
+  故上文计数为**本轮的时点值**；本轮交付时点 `crates/amos-tauri/src/sensors.rs` 的 sha256 =
+  `574068327a380b51d64128c03bfe5f73201e2fd79882ad9107001c638009c53a`（本轮只动该文件）。
+
+## 15. 折叠了零哨兵之后，定线的格式器不得把真实的次米精度印回 `±0m`（2026-09-25，REQ-A1624 ∕ F-SH-826）
+
+§14 把 GNSS 两条零哨兵线的线上 `0` 折成未知，并断言 `SensorPanel.svelte::gnssFixLabel` 一字未改也
+照样对（「它的 `!== null` 门本来就对，只是从未收到过 `null`」）。再读一遍这条渲染路径会发现：
+**那半只对了一半** —— 门是对的，取整不是。
+
+- **缺陷**：折叠去掉的是哨兵的**值**，不是格式器的取整。`gnssFixLabel` 仍逐字
+  `if (acc !== null) parts.push(\`±${acc.toFixed(0)}m\`);`，而 `acc` 此刻是 `null` 或一个**真正的**
+  读数（normalizer 已折过 `0`）。`(0.4).toFixed(0)` 得 `"0"` —— 一次 **0.4 m 的真实高精度定位**照样
+  印出「31.23000, 121.47000 · ±0m · 9sats」：§14 要终结的「完美精度」串又回来了，且这一次连哨兵都
+  不是。一个负 ∕ 非有限的 `accuracy`（`optNum` 只保证有限、不保证非负）则印成 `±-1m`。§14 的渲染例
+  逐字 `expect(text).not.toContain("±0m")`，但它**只喂哨兵 `0`**，对「`0.4` ⇒ `±0m`」这条路径是盲的。
+- **判据（同一字段的兄弟格式器）**：`lib/gps.ts::accuracyLabel` 逐字
+  `if (!Number.isFinite(m) || m <= 0) return "—"; if (m <= 5) return "±5 m"; …` —— 它把正精度
+  **分档**、`m <= 0` 回 `—`，任何正数都不会舍成 `0`。这正是 §14 逐字点名要照做的兄弟（「前端
+  `gps.ts::accuracyLabel` 早就把同一个 `0` 渲染成 `—`」）。
+- **为什么没被门禁看见**：`read-fold-scan` 的清单按**可空包装函数的形态**枚举（折叠永远不在格式器
+  里）；`write-scan` 只看存储写入判决；§14 的负控只喂哨兵 `0`；没有一条扫描比较「同一字段的格式器
+  是否与它的分档兄弟遵循同一条缺席 ∕ 取整规则」。
+- **修复**：把精度子句抽成纯函数 `lib/sensors.ts::gnssAccuracyLabel(acc: number | null): string | null`，
+  逐字 `if (acc === null || !Number.isFinite(acc) || acc <= 0) return null;
+  return \`±${Math.max(1, Math.round(acc))}m\`;` —— `≤ 0` ∕ 非有限是哨兵与非法值，子句**丢弃**（与一个
+  缺席字段被丢弃进同一规则）；正精度用 `Math.max(1, Math.round(acc))` **向上**取整、绝不落到 `0`
+  （`±1m` 对一个 0.4 m 的 fix 仍成立，是保守方向）。`gnssFixLabel` 逐字改为
+  `const accLabel = gnssAccuracyLabel(acc); if (accLabel) parts.push(accLabel);`。
+- **验证**：`bun test src/__tests__/sensors.test.ts`（**10 ∕ 10**，新 `describe` 2 条，含正控
+  `4.2 ⇒ "±4m"` ∕ `12.6 ⇒ "±13m"` ∕ `5 ⇒ "±5m"` —— 「永远回 ±1m」会挂在这三条上）；
+  `bunx vitest run svelte-tests/sensor-panel-gnss-accuracy.svelte.test.ts`（**3 ∕ 3**，DOM 级：`0.4`
+  不含 `±0m` 且含 `±1m`，`-1` 不含 `±-1m`，正控 `4.2` 仍含 `±4m`）；相关 svelte 套件 **26 ∕ 26**；
+  `npx svelte-check --fail-on-warnings --output machine` **1511 FILES 0 ∕ 0**；`npx tsc --noEmit`
+  rc=0。两条负控各恰 **2 red** ∕ **1 red**，`cp` 快照 + `shasum -a 256` 逐字节还原。
+- **如实边界**：①无真机 ∕ 浏览器复核，证据是纯函数单测 + happy-dom 假桥；②本轮只改诊断页
+  `SensorPanel` 这条线的**格式器** —— 姊妹 `LiveSensors.svelte` 走 `gps.ts::accuracyLabel`（本就分档，
+  不受影响）；③`±1m` 是向上取整的**保守**陈述而非精确值；④`SensorGnss` 接口、Rust ∕ proto ∕
+  normalizer 一字未动。
+
+## 16. IMU 的模温不得伪造：缺席是一个事实，`25.0` 不是（2026-09-25，REQ-A1796 ∕ F-SEN-006）
+
+- **缺陷**：`crates/amos-tauri/android-glue/com/amos/ai/glue/SensorGlue.kt` 修前逐字
+  `private val DEFAULT_DIE_TEMP_C = 25.0f`，`TYPE_ACCELEROMETER` 与 `TYPE_GYROSCOPE` **两个**
+  `recordImu(...)` 调用点都传它。胶水只读这两类传感器，Android 在两者背后**没有**模温传感器 ——
+  诚实的值是「没有读数」。`0 °C` 一看就假，`25.0 °C` 却完全像室温读数：面板上那个数**没人测过**，
+  排障时无法区分「这台设备没有该传感器」与「温度真的就是室温」。
+- **缝的第二重错**：`crates/amos-tauri/src/android_glue.rs::finite_sample` 修前把模温也纳入
+  整条样本的有限性校验，于是即便胶水改送 `NaN`，「没有模温源」也会因**整条样本被拒**而连带丢掉
+  加速度 ∕ 陀螺这两条**本身即完整测量**的轴 —— 一个**可选**字段不配把关它的兄弟。
+- **孪生面（同一文件、约 30 行之外）**：`android_glue.rs::reading(v, valid)` 的文档逐字
+  「The Kotlin glue sends `Float.NaN` for 'this value is not available' … A `NaN` therefore means
+  **absent**, and must become `None` — never `0`」—— 生命体征那两个标量正是这么做的，
+  `crates/amos-sensor/src/spec.rs::VitalsSample` 用 `Option<f64>` 建模缺席并逐字写着
+  「`None` is a distinct fact from `0`」。规则实现了一处、没施于兄弟。
+- **消费面早已诚实**：`frontend-ts/src/lib/sensors.ts` ∕ `sensorEvents.ts` ∕ `svelte/SensorPanel.svelte`
+  ∕ `svelte/LiveSensors.svelte` 都已是 `number | null` 并画 `—` —— 折的只有**生产者**这一半。
+- **修复（真实实现，非桩）**：`ImuSample::temperature_c: Option<f32>`（`new(…, Option<f32>)`）；
+  `SensorGlue.kt` 改送 `NO_DIE_TEMP_C = Float.NaN`；缝拆成 `finite_accel`（只校验加速度向量）、
+  `decode_gyro`（三轴全 `NaN` = 「无陀螺仪」哨兵 → `None`）与 `die_temp_c`（`NaN` → `None`），
+  `decode_imu` 只在加速度被毒 ∕ 陀螺三轴既非全有限又非全 `NaN` 时拒整条；`amos-sensor/src/service.rs`
+  的纯 `imu_reply` 对 `None` 写本消息族既有的**零哨兵**（`rate_hz` ∕ GNSS 的 `accuracy_m` ∕
+  `sats_in_view` 同一约定），`amos-tauri/src/sensors.rs::imu_payload` 把线上 `0` 读回 `None`
+  （**未知**，绝不画成测量的 `0 °C`）；`sensor_host.rs::HostImu::temperature_c: Option<f32>`。
+- **同族的兄弟字段（REQ-A1872 / F-SEN-008）**：模温修好之后，**陀螺仪三条轴**仍是同一个折
+  —— `ImuSample::gyro_rad_s` 修前是裸 `Vec3`（缺席不可表达），而 `SensorGlue.kt` 的加速度分
+  支把陀螺六个槽位硬写成 `0f, 0f, 0f`，于是**没有陀螺仪**的机型（实机 K-Touch S5，
+  `dumpsys sensorservice` 逐字 `geomag fusion (no gyro)`）每一条加速度样本都带上「没有在旋转」
+  这个**测量**。修法：`gyro_rad_s: Option<Vec3>`；胶水改为与加速度分支镜像地回放
+  「最近一次陀螺读数」（`lastGyroX/Y/Z` 初值 `Float.NaN`，无陀螺传感器则永远是哨兵）；
+  Tauri 宿主侧的 `HostImu::gyro_x/y/z: Option<f64>`。前端的 `sensors.ts` ∕ `sensorEvents.ts`
+  **早已**是 `number | null` 并画 `—` —— 折的只有生产者这一半，消费面一直等着一个它拿不到的缺席。
+- **源码钉**：`sensor_host.rs::tests::the_glue_reports_an_absent_die_temperature_as_nan_not_a_plausible_number`
+  用 `include_str!` 读 `SensorGlue.kt`，断言声明行含 `Float.NaN`、`DEFAULT_DIE_TEMP_C` 不得存在、
+  两个 `recordImu` 调用点都传哨兵 —— 占位符不得回流。
+- **验证**：`cargo test -p amos-sensor` ⇒ **53 ∕ 53**；`cargo test -p amos-tauri --features android --lib
+  android_glue:: sensor_host:: sensors::` ⇒ 全绿。**负控 ×6，逐条指名、互不相交**（`cp` 快照 +
+  `shasum -a 256` 逐字节还原）：①拆掉 `die_temp_c` 的 `is_finite` 闸；②让 `decode_imu` 因非有限温度
+  拒整条；③`sensors.rs` 折回 `Some(i.temperature_c)`；④`service.rs` 改 `unwrap_or(25.0)`；
+  ⑤`From<ImuSample> for HostImu` 折 `or(Some(25.0))`；⑥`SensorGlue.kt` 把 `Float.NaN` 改回 `25.0f`
+  —— 每一条**恰 1 红**，且落在不同的一条用例上。`make android-glue-check` 编译 Kotlin 半边
+  （编译 + `-Werror` + Lint，0 finding）。
+- **如实边界**：①**真机未复核** —— 本环境只能经 `make android-glue-check` 验证 Kotlin 半边；②
+  `cargo test -p amos-tauri`（不带 `--features android`）在本工作区被**并轮**未提交的半迁移挡住，
+  本轮在 `/tmp` 的隔离源码副本（仅中和那两文件）中跑通，副本不进任何提交。
+
+## 相关文档
+
+- [`android-glue.md`](./android-glue.md) —— Kotlin ↔ Rust 名字契约与真机 runbook。
+- [`AEROSPACE_SOFTWARE_AUDIT.md`](./AEROSPACE_SOFTWARE_AUDIT.md) —— §5 P2-3（诚实 seam 登记）。

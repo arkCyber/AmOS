@@ -178,3 +178,27 @@ export function normalizeWifi(v: unknown): WifiCfg {
 
 /** The default, untouched Wi‑Fi config (single source — mirrors `bluetooth.btInit`). */
 export const wifiInit = (): WifiCfg => ({ current: null, saved: [], passwords: {} });
+
+/**
+ * The **link** state a Wi‑Fi row shows — deliberately *not* the radio state.
+ *
+ * A Wi‑Fi row answers "what are we connected to?", which has three answers, and the
+ * app's own surfaces used to give three different ones: the Settings index said
+ * 「未连接」 even while joined (it never read `amos.wifi` at all), the Wi‑Fi page
+ * answered the radio's own bit (「开」) under the label 「当前网络」, and the desktop
+ * status bar passed a value that could never be an SSID. This is the single rule they
+ * now share; each caller supplies its own wording, exactly as `statusIcons` keeps its
+ * sentences and `tapRadio` keeps its outcomes.
+ *
+ * `enabled` is the radio bit with airplane mode already folded in by the caller;
+ * `ssid` is the joined network (`WifiCfg.current`), or null.
+ */
+export type WifiLink =
+  | { kind: "off" }
+  | { kind: "unjoined" }
+  | { kind: "joined"; ssid: string };
+
+export function wifiLink(enabled: boolean, ssid: string | null): WifiLink {
+  if (!enabled) return { kind: "off" };
+  return ssid ? { kind: "joined", ssid } : { kind: "unjoined" };
+}

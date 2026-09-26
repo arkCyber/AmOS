@@ -50,7 +50,38 @@ object BiometricGlue {
 
     /**
      * Check biometric hardware and enrollment status.
-     * Returns a JSON object: { kind, label, enrolled, hardware_present }.
+     * Returns a JSON object: { state, can_authenticate, kind, label, enrolled, hardware_present }.
+     *
+     * ## Why `state` and not two booleans (REQ-A779 / F-AND-008)
+     *
+     * This function used to answer with `hardware_present` / `enrolled`, computed by a
+     * `when (canAuth)` — and the two answers that matter were **exchanged**:
+     *
+     * ```
+     * BiometricManager.BIOMETRIC_SUCCESS,
+     * BiometricManager.BIOMETRIC_ERROR_NO_HARDWARE,      // 12 — the phone has NO sensor
+     * BiometricManager.BIOMETRIC_ERROR_HW_UNAVAILABLE -> true
+     * else -> false                                      // 11 NONE_ENROLLED landed here
+     * ```
+     *
+     * `BIOMETRIC_ERROR_NO_HARDWARE` (12) was on the arm that reports the sensor as **present**,
+     * and `BIOMETRIC_ERROR_NONE_ENROLLED` (11) fell into `else`. The screen derives its two
+     * sentences from those two booleans, so a phone *without* a sensor was told
+     * "设备有生物识别硬件，但还没有登记任何生物特征" — enrol a fingerprint it cannot have — while
+     * the one phone the enrollment sentence was written for was told "此设备没有生物识别".
+     *
+     * A boolean pair cannot say "we could not ask", so the three codes that answer *nothing*
+     * about the hardware (`BIOMETRIC_ERROR_SECURITY_UPDATE_REQUIRED` 15, `BIOMETRIC_STATUS_
+     * UNKNOWN` -1, `BIOMETRIC_ERROR_UNSUPPORTED` -2) were silently folded into "no sensor" too.
+     *
+     * The state vocabulary is exhaustive by construction: every androidx code this build knows
+     * gets its own arm, anything this build has never seen falls to `unknown` (never to
+     * `no-hardware`), and `can_authenticate` carries the raw code so the Rust side and the
+     * screen never have to trust this translation. Values below are dumped from the linked
+     * artifact with `javap -constants androidx.biometric.BiometricManager` — not from memory.
+     * `state` spellings are a cross-language contract: they are mirrored by `BiometricState` in
+     * `crates/amos-tauri/src/ble.rs` and by the TS union in `src/lib/biometric.ts`, and
+     * `scripts/biometric-glue-const-scan.mjs` fails the build if the three drift apart.
      */
     @JvmStatic
     fun getAvailability(context: Context): String {
@@ -58,22 +89,40 @@ object BiometricGlue {
         val canAuth = biometricManager.canAuthenticate(
             BiometricManager.Authenticators.BIOMETRIC_STRONG
         )
-        val hardwarePresent = when (canAuth) {
-            BiometricManager.BIOMETRIC_SUCCESS,
-            BiometricManager.BIOMETRIC_ERROR_NO_HARDWARE,
-            BiometricManager.BIOMETRIC_ERROR_HW_UNAVAILABLE -> true
-            else -> false
-        }
-        val enrolled = canAuth == BiometricManager.BIOMETRIC_SUCCESS
 
-        // Determine the kind based on available strong biometrics
+        val state = when (canAuth) {
+            BiometricManager.BIOMETRIC_SUCCESS -> "enrolled"
+            BiometricManager.BIOMETRIC_ERROR_NONE_ENROLLED -> "not-enrolled"
+            BiometricManager.BIOMETRIC_ERROR_HW_UNAVAILABLE -> "hw-unavailable"
+            BiometricManager.BIOMETRIC_ERROR_NO_HARDWARE -> "no-hardware"
+            // SECURITY_UPDATE_REQUIRED / STATUS_UNKNOWN / ERROR_UNSUPPORTED and any code a
+            // future androidx adds: this says nothing about whether a sensor exists, and the
+            // one answer we must never invent is "no sensor".
+            else -> "unknown"
+        }
+
+        // Null — not false — when the code did not answer the question. `hardware_present` is
+        // the field the UI's "does this device have biometrics at all?" sentence reads, so a
+        // guess here is a false statement to the user.
+        val hardwarePresent: Boolean? = when (state) {
+            "enrolled", "not-enrolled", "hw-unavailable" -> true
+            "no-hardware" -> false
+            else -> null
+        }
+        val enrolled = state == "enrolled"
+
+        // Determine the kind from the system feature flags. Only meaningful once something is
+        // enrolled; the previous `else -> "fingerprint" // default assumption` named a sensor
+        // the device may not have, and that string is what the user sees ("指纹").
         val kind = if (enrolled) {
             when {
                 Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
                         context.packageManager.hasSystemFeature("android.hardware.biometrics.face") -> "face"
                 context.packageManager.hasSystemFeature("android.hardware.fingerprint") -> "fingerprint"
                 context.packageManager.hasSystemFeature("android.hardware.biometrics.iris") -> "iris"
-                else -> "fingerprint" // default assumption
+                // Enrolled with no feature flag we recognise: say so generically rather than
+                // pick one. The label below is what the screen prints.
+                else -> "biometric"
             }
         } else {
             "none"
@@ -83,14 +132,17 @@ object BiometricGlue {
             "face" -> "面容 ID"
             "fingerprint" -> "指纹"
             "iris" -> "虹膜"
+            "biometric" -> "生物识别"
             else -> "生物识别"
         }
 
         return JSONObject()
+            .put("state", state)
+            .put("can_authenticate", canAuth)
             .put("kind", kind)
             .put("label", label)
             .put("enrolled", enrolled)
-            .put("hardware_present", hardwarePresent)
+            .put("hardware_present", hardwarePresent ?: JSONObject.NULL)
             .toString()
     }
 

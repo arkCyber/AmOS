@@ -62,6 +62,11 @@ Public surface (`src/lib.rs`):
 * **Soft-failure policy.** One bad page ⇒ warning + empty text, not a failed
   document (what an ingestion queue wants). Missing `%PDF-` header is rejected
   early with a clear error.
+* **Encrypted input is refused, not decoded.** `lopdf` loads an encrypted file's
+  *structure* but not its (still encrypted) streams, so continuing would emit
+  garbled or silently empty pages as success. `extract_document` checks
+  `Document::is_encrypted()` and returns the typed `PdfError::Encrypted`
+  (integration-tested: a real PDF with an `/Encrypt` trailer entry is refused).
 * **Honest tokens.** `estimate_tokens` is a documented *planner* heuristic, not
   a real BPE tokeniser.
 
@@ -70,6 +75,7 @@ Public surface (`src/lib.rs`):
 | Boundary | Reality | Consequence |
 | --- | --- | --- |
 | Table cell text | decoded per-`Tf` font via lopdf encodings / `ToUnicode` cmaps → real Unicode (incl. CJK); ASCII fallback when no font/encoding resolvable | Real (CJK) cell text *is* kept when the font embeds a `ToUnicode` cmap (same power as page text); otherwise fallback is ASCII |
+| Encrypted PDFs | **refused** with the typed `PdfError::Encrypted` — this crate has no password API and never decodes ciphertext as text | even owner-password-only files (empty user password) are refused, not opened |
 | `cm` transforms / exact glyph widths | not modelled | Columns estimated from text-origin x; best for generated tables (reportlab/iText/weasyprint) |
 | Scanned / image-only PDFs | have **no text layer** | need OCR (out of scope — see `docs/` backlog) |
 | Token count | approximate | use for planning/window sizing only |

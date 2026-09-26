@@ -35,7 +35,15 @@ export interface NetGuardStatus {
   backend: string;
   /** True ONLY when a real backend is actually enforcing on this device. */
   enforced: boolean;
+  /**
+   * Egress policy rules the daemon's guard holds — the **configured** count,
+   * populated by `SetAppEgress` / `RevokeAppEgress`. Do not read it as "rules
+   * enforced" (that is `enforced`, and it needs a real backend). See
+   * `proto/netguard.proto`.
+   */
   policy_rules: number;
+  /** Apps holding a declared egress set (the daemon's registry size). */
+  declared_apps: number;
   top_egress: NetGuardEgressSample[];
 }
 

@@ -728,13 +728,83 @@ impl AiAgentService {
     }
 }
 
+/// What a raw `AMOS_BACKEND` value **asks for** — the one classification every
+/// reader of that env var goes through.
+///
+/// It exists because the value used to be matched by hand in four places (the
+/// builder's `match`, [`is_real_backend`], the seam-refusal list and
+/// [`is_deployment_unconfigured`]) and the copies had already drifted in two
+/// ways that each cost the same thing — the operator's engine request being read
+/// as "not an engine request":
+///
+///   * **spelling** — the builder accepted `llamacpp` / `llama_cpp`, while
+///     `is_real_backend` accepted only `llama-cpp`;
+///   * **case** — the builder lowercased the value (`AMOS_BACKEND=OLLAMA` is a
+///     request for Ollama), while `is_real_backend` was called with the raw
+///     bytes, so every upper-case spelling read as "not a real backend".
+///
+/// Either way the daemon served a real request as the deterministic mock while
+/// `get_status.degraded` said `false`, which suppresses the banner that exists
+/// to warn about exactly that.
+///
+/// [`BackendRequest::Unknown`] is the arm that matters most for honesty: a value
+/// naming no engine we know (a typo, e.g. `olama`) is **not** the dev default.
+/// See `build_backend_from_env`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BackendRequest {
+    /// `""` / `auto` — the device default: resolve a bundled model, else be
+    /// honestly `unconfigured`.
+    Auto,
+    /// `unconfigured` / `none` / `disabled` / `off` — the operator explicitly
+    /// asked for no engine.
+    NoOp,
+    /// The explicit dev/test mock.
+    Mock,
+    /// A real engine, canonicalised to the spelling the builder matches on.
+    Real(&'static str),
+    /// A value naming no engine we know (a typo).
+    Unknown,
+}
+
+/// The canonical `AMOS_BACKEND` spellings that name a **real** engine. Also the
+/// set an operator is told about when their value is not recognised.
+const REAL_BACKEND_NAMES: &[&str] = &[
+    "ggml",
+    "rknn",
+    "llama-cpp",
+    "api",
+    "ollama",
+    "hermes",
+    "anthropic",
+    "gemini",
+];
+
+/// Classify a raw `AMOS_BACKEND` value. Case-insensitive, matching the leniency
+/// the value already got in the builder.
+fn classify_backend(raw: &str) -> BackendRequest {
+    match raw.to_ascii_lowercase().as_str() {
+        "" | "auto" => BackendRequest::Auto,
+        "unconfigured" | "none" | "disabled" | "off" => BackendRequest::NoOp,
+        "mock" => BackendRequest::Mock,
+        "ggml" => BackendRequest::Real("ggml"),
+        "rknn" => BackendRequest::Real("rknn"),
+        // Every accepted spelling of the in-process llama.cpp seam collapses to
+        // one canonical name, so the builder and the degraded flag cannot
+        // disagree about what was asked for.
+        "llama-cpp" | "llamacpp" | "llama_cpp" => BackendRequest::Real("llama-cpp"),
+        "api" => BackendRequest::Real("api"),
+        "ollama" => BackendRequest::Real("ollama"),
+        "hermes" => BackendRequest::Real("hermes"),
+        "anthropic" => BackendRequest::Real("anthropic"),
+        "gemini" => BackendRequest::Real("gemini"),
+        _ => BackendRequest::Unknown,
+    }
+}
+
 /// A real inference backend kind (as named by `AMOS_BACKEND`), as opposed to the
 /// dev/test `mock` (or an empty/unknown value).
 fn is_real_backend(kind: &str) -> bool {
-    matches!(
-        kind,
-        "api" | "ollama" | "hermes" | "ggml" | "anthropic" | "gemini"
-    )
+    matches!(classify_backend(kind), BackendRequest::Real(_))
 }
 
 /// Trim + parse a non-negative integer; `None` for empty / malformed input.
@@ -816,15 +886,18 @@ fn fold_system_health(
 
 /// Human label of the voice ASR recognizer that `ChatAsr` would build from the
 /// environment — "off" (disabled), "sherpa" (explicit), "mock" (explicit), or
-/// the unset-default which is "sherpa(auto)" when the `asr-sherpa` feature is
-/// compiled in, else "mock". Mirrors `crate::chat_asr::ChatAsr::from_env`.
+/// the unset-default: "sherpa(auto)" when a model dir actually resolves from the
+/// chain, else "mock" (the recognizer the daemon really falls back to). Mirrors
+/// `crate::chat_asr::ChatAsr::from_env` — including its honest default: with no
+/// staged sherpa model the daemon runs the deterministic mock, so the status must
+/// say "mock", not claim an ASR engine the build cannot serve (Gap 8).
 fn asr_label_from_env() -> String {
     match std::env::var("AMOS_ASR_BACKEND").as_deref() {
         Ok("off") | Ok("none") | Ok("disabled") => "off".to_string(),
         Ok("sherpa") => "sherpa".to_string(),
         Ok("mock") => "mock".to_string(),
         _ => {
-            if cfg!(feature = "asr-sherpa") {
+            if crate::chat_asr::resolve_sherpa_model_dir().is_some() {
                 "sherpa(auto)".to_string()
             } else {
                 "mock".to_string()
@@ -886,20 +959,139 @@ fn accel_label_for_active(active: &str) -> Option<String> {
 ///
 /// Env vars:
 ///   AMOS_BACKEND = "mock" | "api" | "ollama" | "hermes" | "ggml"
-///                 | "anthropic" | "gemini"                     (default "mock")
-///   AMOS_MODEL_PATH                                       (ggml)
+///                 | "anthropic" | "gemini" | "rknn" | "llama-cpp"
+///                 | "auto"                                     (default "auto")
+///                 | "unconfigured"                             (explicit, see below)
+///   AMOS_MODEL_PATH                                       (ggml, rknn, llama-cpp)
 ///   AMOS_API_KEY / AMOS_API_ENDPOINT / AMOS_MODEL         (api, anthropic, gemini)
 ///   AMOS_OLLAMA_HOST / AMOS_MODEL                         (ollama)
 ///   AMOS_HERMES_ENDPOINT / AMOS_MODEL                     (hermes)
 ///
-/// **Honesty rule**: `mock` is a *dev/test* default only. When the operator
-/// explicitly selects a real backend (`api`/`ollama`/`hermes`/`ggml`) and it
-/// fails to initialise (unreachable server, missing model, bad key…), we keep
-/// the daemon serving so the System UI and health probes stay up, but log the
+/// **`auto` / unset** (Gap 4 / F-AI-016/017): with the compile-time
+/// `bundled-model` feature (default OFF, see `Cargo.toml`) the daemon resolves
+/// the bundled-model path (`crate::bundled_model::bundled_model_resolver`:
+/// `AMOS_MODEL_PATH` → bundled assets → user dir) and, when that path names a
+/// file that exists, serves a **real** `ggml` engine — no operator knob needed.
+/// Without the feature, or when no model file exists at the resolved path, the
+/// daemon reports an explicit [`crate::inference::real::UnconfiguredBackend`]
+/// (`get_status.engine == "unconfigured"`, so the UI renders the "no AI
+/// available" banner). Neither state ever silently serves the deterministic mock,
+/// because shipping a phone that "looks like AI but answers with placeholders" is
+/// the single largest user-visible lie of an "AI-first" OS.
+///
+/// **Honesty rule**: `mock` is a *dev/test* engine, selected only by an explicit
+/// `AMOS_BACKEND=mock`. When the operator explicitly selects a real backend
+/// (`api`/`ollama`/`hermes`/`ggml`/`rknn`/`llama-cpp`) and it fails to
+/// initialise (unreachable server, missing model, unlinked SDK…), we keep the
+/// daemon serving so the System UI and health probes stay up, but log the
 /// failure at **error** level and make clear the running engine is the
 /// deterministic mock — never silently pretending mock is real inference.
 async fn build_backend_from_env() -> Arc<dyn InferenceBackend> {
-    let kind = std::env::var("AMOS_BACKEND").unwrap_or_else(|_| "mock".to_string());
+    let kind_raw = std::env::var("AMOS_BACKEND").unwrap_or_default();
+    let request = classify_backend(&kind_raw);
+
+    // `auto` / unset is the **device-default** path: this is how an image that
+    // *bundles* a GGUF gets a real engine with no operator knob (F-AI-017).
+    //
+    // It is a compile-time seam (`bundled-model`, default OFF): only a build that
+    // opts in resolves the model path and constructs the real `ggml` engine. A
+    // build without the feature must not *guess* a backend out of whatever file
+    // happens to be on disk. Neither state ever falls back to the mock — shipping
+    // a phone that "looks like AI but answers with placeholders" is exactly the
+    // lie F-AI-016 exists to prevent.
+    if matches!(request, BackendRequest::Auto) {
+        #[cfg(feature = "bundled-model")]
+        {
+            // `bundled_model_resolver()` names the exact path a device image
+            // stages (AMOS_MODEL_PATH → bundled assets → user dir → the documented
+            // bundle template). Only a path that actually resolves to a file
+            // becomes a backend; a missing file is the honest `unconfigured` below.
+            let model = crate::bundled_model::bundled_model_resolver();
+            if model.is_file() {
+                tracing::info!(
+                    model = %model.display(),
+                    "bundled-model: ggml auto-selected from the model resolution chain \
+                     (AMOS_MODEL_PATH → bundled assets → user dir)"
+                );
+                match BackendKind::Ggml(model.display().to_string()).build().await {
+                    Ok(b) => return Arc::from(b),
+                    Err(e) => tracing::error!(
+                        model = %model.display(),
+                        "the resolved bundled model failed to initialise: {e:#} — reporting \
+                         `unconfigured` rather than falling back to the deterministic mock"
+                    ),
+                }
+            } else {
+                tracing::error!(
+                    model = %model.display(),
+                    "bundled-model is compiled in but no model file exists at the resolved \
+                     path — reporting `unconfigured`, never the deterministic mock"
+                );
+            }
+        }
+        #[cfg(not(feature = "bundled-model"))]
+        tracing::error!(
+            "AMOS_BACKEND={:?} is unset/auto but this build has no `bundled-model` feature, so \
+             no local model is auto-selected — reporting `unconfigured`, never the \
+             deterministic mock (set AMOS_BACKEND explicitly, or build with \
+             `--features bundled-model`)",
+            kind_raw
+        );
+        // Return the honest `unconfigured` backend: `get_status.engine` reports
+        // "unconfigured" (UI banner), `infer` fails with a stated reason, and the
+        // daemon keeps the UDS up so health probes still answer. Never a mock.
+        return Arc::new(crate::inference::real::UnconfiguredBackend::new());
+    }
+
+    // A value that names *no engine we know* is not a request we can honour by
+    // guessing. Serving the deterministic mock here is the exact lie F-AI-016
+    // exists to prevent: the operator asked for `olama` (a typo for `ollama`),
+    // the daemon answers with canned text, and `get_status.degraded` used to say
+    // `false` because the *intent* reader (`is_real_backend`) did not recognise
+    // the spelling either. Refuse out loud instead (F-AI-021).
+    if matches!(request, BackendRequest::Unknown) {
+        tracing::error!(
+            requested = %kind_raw,
+            accepted = ?REAL_BACKEND_NAMES,
+            "AMOS_BACKEND names no inference engine we know — reporting `unconfigured` rather \
+             than serving the deterministic mock; fix the spelling or unset the variable"
+        );
+        return Arc::new(crate::inference::real::UnconfiguredBackend::new());
+    }
+
+    // The "explicit unconfigured" case: the operator set AMOS_BACKEND to a no-op
+    // value ("unconfigured"/"none"/"disabled"/"off") — they asked for **no
+    // engine**, so that is what they get, whatever else happens to be staged.
+    //
+    // The guard used to be `&& is_deployment_unconfigured()`, which honoured the
+    // request only while the deployment was *also* bare. As soon as a model file
+    // or a cloud key happened to be present, the value fell through to the mock
+    // arm below and the daemon answered chat with canned text — with
+    // `get_status.degraded` still `false` (`is_real_backend("off")` is false), so
+    // the banner that exists to warn about placeholder answers stayed down. An
+    // explicit "no engine" is a *more* deliberate instruction than the typo the
+    // `Unknown` arm already refuses unconditionally; it cannot be the weaker one
+    // (F-AI-016 / F-AI-021).
+    if matches!(request, BackendRequest::NoOp) {
+        if is_deployment_unconfigured() {
+            tracing::error!(
+                "no inference backend is configured (AMOS_BACKEND={:?}); no model was found on the \
+                 resolution chain (AMOS_MODEL_PATH → bundled assets → user dir) and no cloud backend \
+                 was selected — refusing to serve the deterministic mock engine",
+                kind_raw
+            );
+        } else {
+            tracing::error!(
+                "AMOS_BACKEND={:?} asks for no inference engine, but a backend is staged (a model \
+                 on the resolution chain, or a cloud key/endpoint) — reporting `unconfigured` \
+                 rather than quietly serving the deterministic mock",
+                kind_raw
+            );
+        }
+        return Arc::new(crate::inference::real::UnconfiguredBackend::new());
+    }
+
+    let kind = kind_raw;
     // Surface which chip/accelerator the local-inference path would use, resolved
     // honestly (never "auto", never an uncompiled vendor SDK). See accelerator.rs.
     let accel = crate::accelerator::AccelProfile::from_env();
@@ -918,9 +1110,32 @@ async fn build_backend_from_env() -> Arc<dyn InferenceBackend> {
             "local-inference accelerator profile"
         ),
     }
-    let backend = match kind.as_str() {
-        "ggml" => BackendKind::Ggml(std::env::var("AMOS_MODEL_PATH").unwrap_or_default()),
-        "api" => BackendKind::Api {
+    // The engine family is decided by the classifier's *canonical* name, not by
+    // re-matching the raw bytes: that is what keeps this builder and
+    // `is_real_backend` from drifting apart again.
+    let backend = match request {
+        // Local GGUF engine. The path comes from the resolution chain
+        // (AMOS_MODEL_PATH → bundled assets → user dir), so a bundled model is
+        // found even when the operator only said `AMOS_BACKEND=ggml`.
+        BackendRequest::Real("ggml") => BackendKind::Ggml(
+            crate::bundled_model::bundled_model_resolver()
+                .display()
+                .to_string(),
+        ),
+        // Rockchip RK3588 NPU / in-process llama.cpp: honest bring-up seams.
+        // Their `build()` returns a typed error until the SDK is linked *and* the
+        // binding is written (never a fabricated success).
+        BackendRequest::Real("rknn") => BackendKind::Rknn {
+            model_path: crate::bundled_model::bundled_model_resolver()
+                .display()
+                .to_string(),
+        },
+        BackendRequest::Real("llama-cpp") => BackendKind::LlamaCppInProcess {
+            model_path: crate::bundled_model::bundled_model_resolver()
+                .display()
+                .to_string(),
+        },
+        BackendRequest::Real("api") => BackendKind::Api {
             api_key: std::env::var("AMOS_API_KEY").unwrap_or_default(),
             endpoint: std::env::var("AMOS_API_ENDPOINT")
                 .unwrap_or_else(|_| "https://api.openai.com/v1/chat/completions".into()),
@@ -930,7 +1145,7 @@ async fn build_backend_from_env() -> Arc<dyn InferenceBackend> {
         // not pin a model, auto-select the first model the running Ollama has
         // actually installed (so the daemon serves real tokens instead of
         // erroring on a hard-coded default that may not be pulled yet).
-        "ollama" => BackendKind::Ollama {
+        BackendRequest::Real("ollama") => BackendKind::Ollama {
             host: std::env::var("AMOS_OLLAMA_HOST")
                 .unwrap_or_else(|_| "http://localhost:11434".into()),
             model: resolve_ollama_model().await,
@@ -939,14 +1154,14 @@ async fn build_backend_from_env() -> Arc<dyn InferenceBackend> {
                 .ok()
                 .filter(|k| !k.is_empty()),
         },
-        "hermes" => BackendKind::Hermes {
+        BackendRequest::Real("hermes") => BackendKind::Hermes {
             base_url: std::env::var("AMOS_HERMES_ENDPOINT")
                 .unwrap_or_else(|_| "http://127.0.0.1:11438".into()),
             model: std::env::var("AMOS_MODEL").unwrap_or_else(|_| "hermes-rust".into()),
         },
         // Claude (Anthropic Messages, native protocol). Endpoint defaults to the
         // official API; model + key come from AMOS_MODEL / AMOS_API_KEY.
-        "anthropic" => BackendKind::Anthropic {
+        BackendRequest::Real("anthropic") => BackendKind::Anthropic {
             api_key: std::env::var("AMOS_API_KEY").unwrap_or_default(),
             endpoint: std::env::var("AMOS_API_ENDPOINT")
                 .ok()
@@ -957,7 +1172,7 @@ async fn build_backend_from_env() -> Arc<dyn InferenceBackend> {
         },
         // Google Gemini native REST. AMOS_API_ENDPOINT (optional) is the v1beta
         // base URL the model id is appended to.
-        "gemini" => BackendKind::Gemini {
+        BackendRequest::Real("gemini") => BackendKind::Gemini {
             api_key: std::env::var("AMOS_API_KEY").unwrap_or_default(),
             base: std::env::var("AMOS_API_ENDPOINT")
                 .ok()
@@ -965,12 +1180,29 @@ async fn build_backend_from_env() -> Arc<dyn InferenceBackend> {
                 .unwrap_or_else(|| "https://generativelanguage.googleapis.com/v1beta".into()),
             model: std::env::var("AMOS_MODEL").unwrap_or_else(|_| "gemini-2.0-flash".into()),
         },
-        _ => BackendKind::Mock,
+        // An explicit `mock` — the one value that asks for the deterministic
+        // engine. (`NoOp`/`Auto` never reach here: both return above.)
+        BackendRequest::Mock | BackendRequest::Auto => BackendKind::Mock,
+        // Unreachable by construction — `Unknown` was refused above and every
+        // member of [`REAL_BACKEND_NAMES`] has an arm (a test pins that). Named
+        // honestly rather than with `unreachable!()`: this crate denies
+        // `clippy::panic` under `not(test)`, and a panic in the daemon's startup
+        // path is worse than an honest `unconfigured`.
+        other => {
+            tracing::error!(
+                requested = %kind,
+                classified = ?other,
+                accepted = ?REAL_BACKEND_NAMES,
+                "AMOS_BACKEND classified to an engine with no builder arm — reporting \
+                 `unconfigured` rather than serving the deterministic mock"
+            );
+            return Arc::new(crate::inference::real::UnconfiguredBackend::new());
+        }
     };
     // Ollama manages its own offload, so the accelerator can't be passed as CLI
     // args — surface the resolved profile as the operator/device hint (which
     // chip Ollama should use). See accelerator.rs / docs/qcom-mtk-bringup.md.
-    if kind == "ollama" {
+    if request == BackendRequest::Real("ollama") {
         tracing::info!(
             accel = %accel_eff.label(),
             vendor = accel.vendor.label(),
@@ -981,21 +1213,91 @@ async fn build_backend_from_env() -> Arc<dyn InferenceBackend> {
     match backend.build().await {
         Ok(b) => Arc::from(b),
         Err(e) => {
-            if matches!(
-                kind.as_str(),
-                "api" | "ollama" | "hermes" | "ggml" | "anthropic" | "gemini"
-            ) {
-                tracing::error!(
-                    backend = %kind,
-                    "requested inference backend failed to initialise: {e:#}; serving the \
-                     deterministic mock engine instead — this is NOT real inference"
-                );
-            } else {
-                tracing::debug!("mock backend ready");
+            // The RKNN / in-process-llama.cpp seams always fail until their SDK
+            // is linked *and* bound. An explicit request for them must report the
+            // honest `unconfigured` state — substituting the deterministic mock
+            // would let the daemon claim an NPU/engine it does not have
+            // (F-NPU-001).
+            match request {
+                BackendRequest::Real("rknn" | "llama-cpp") => {
+                    tracing::error!(
+                        backend = %kind,
+                        "requested native backend is unavailable: {e:#} — reporting \
+                         `unconfigured` (never the deterministic mock)"
+                    );
+                    return Arc::new(crate::inference::real::UnconfiguredBackend::new());
+                }
+                BackendRequest::Real(_) => {
+                    tracing::error!(
+                        backend = %kind,
+                        "requested inference backend failed to initialise: {e:#}; serving the \
+                         deterministic mock engine instead — this is NOT real inference"
+                    );
+                }
+                _ => tracing::debug!("mock backend ready"),
             }
             Arc::new(MockBackend::new())
         }
     }
+}
+
+/// Is the deployment **honestly** without an inference backend? Used by
+/// `build_backend_from_env` to decide whether to bail to
+/// `BackendKind::Unconfigured` instead of falling through to `Mock`.
+///
+/// A deployment is unconfigured when **all** of the following are true:
+/// 1. `AMOS_BACKEND` is unset or names a no-op value
+///    (`""`/`"auto"`/`"mock"`/`"none"`/`"off"`/...).
+/// 2. No local model resolves on the chain
+///    ([`crate::bundled_model::resolve_model_path`]: `AMOS_MODEL_PATH` → bundled
+///    assets → user dir).
+/// 3. None of the cloud presets have a non-empty API key
+///    (`AMOS_API_KEY`, `AMOS_OLLAMA_HOST` ≠ default localhost, etc.).
+///
+/// The check is intentionally narrow: any single operator-pinned knob means
+/// "the deployment knows what it wants" and we honour that. We only treat
+/// "everything is at defaults" as unconfigured.
+fn is_deployment_unconfigured() -> bool {
+    // 1) AMOS_BACKEND set to anything but the dev defaults → "configured".
+    // Same classifier as the builder and `is_real_backend`: one spelling table,
+    // so "does this value name an engine?" cannot be answered three ways.
+    let backend = std::env::var("AMOS_BACKEND").unwrap_or_default();
+    match classify_backend(&backend) {
+        // Dev defaults / explicit "no-op" values stay subject to the model and
+        // cloud-key checks below.
+        BackendRequest::Auto | BackendRequest::NoOp | BackendRequest::Mock => {}
+        // A name that asks for a real engine — or one we do not recognise — is
+        // the operator stating an intent; the deployment is not "unconfigured".
+        BackendRequest::Real(_) | BackendRequest::Unknown => return false,
+    }
+
+    // 2) A local model resolves on the documented chain → ggml is configured.
+    // One resolver, one place to change — the previous ad-hoc dir scan drifted
+    // from what `build_backend_from_env` actually loaded (Gap 4).
+    if crate::bundled_model::resolve_model_path().is_some() {
+        return false;
+    }
+
+    // 3) Cloud presets have non-default keys / endpoints → configured.
+    if std::env::var("AMOS_API_KEY")
+        .map(|s| !s.is_empty())
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    if let Ok(host) = std::env::var("AMOS_OLLAMA_HOST") {
+        if !host.trim().is_empty() && host != "http://localhost:11434" {
+            return false;
+        }
+    }
+    if let Ok(endpoint) = std::env::var("AMOS_HERMES_ENDPOINT") {
+        if !endpoint.trim().is_empty() && endpoint != "http://127.0.0.1:11438" {
+            return false;
+        }
+    }
+
+    // All checks fell through: deployment is unconfigured.
+    true
 }
 
 /// Is `name` plausibly a *chat* model (not an embedding/test/junk model)?
@@ -1580,7 +1882,10 @@ impl AiAgent for AiAgentService {
             running: true,
             model: self.model.to_string(),
             uptime_seconds: snap.uptime_secs as i64,
-            gpu_util: 0, // honest: no GPU/NPU metrics instrumented yet (0 ≠ a reading)
+            // No GPU/NPU metrics are instrumented yet, so the field is **absent**
+            // rather than a fabricated `0` that a consumer (amos-tauri `DaemonStatus`)
+            // would read as "0 % used" (AEROSPACE audit P0-3 / REQ-A1853).
+            gpu_util: None,
             active_sessions: self.active_sessions.load(Ordering::SeqCst) as u32,
             rpc_total: snap.rpc_total as i64,
             heartbeats: snap.heartbeats as i64,
@@ -2050,10 +2355,15 @@ pub async fn serve_with_sinks_full(
                                     "amos-ai dvfs applied"
                                 );
                             } else {
+                                // `applied: 0` is a *total* failure, not a partial one —
+                                // the report carries both counts, so the label must not
+                                // overstate what landed (REQ-A529).
                                 tracing::warn!(
                                     mode = o.sensor_mode,
-                                    partial = %rep,
-                                    "amos-ai dvfs partial"
+                                    applied = rep.applied,
+                                    failures = rep.failures.len(),
+                                    report = %rep,
+                                    "amos-ai dvfs not fully applied"
                                 );
                             }
                         }
@@ -2415,6 +2725,514 @@ mod tests {
         }
     }
 
+    /// The accepted spellings live in exactly one table. A value the *builder*
+    /// accepts (`llamacpp`, `OLLAMA`) must also be a value the *honesty* readers
+    /// accept, or the daemon degrades silently (F-AI-021).
+    #[test]
+    fn backend_spelling_aliases_classify_identically_however_they_are_written() {
+        // Case is not part of the name.
+        for (raw, canonical) in [
+            ("ollama", "ollama"),
+            ("OLLAMA", "ollama"),
+            ("Ollama", "ollama"),
+            ("LLAMA-CPP", "llama-cpp"),
+            ("Anthropic", "anthropic"),
+        ] {
+            assert_eq!(
+                classify_backend(raw),
+                BackendRequest::Real(canonical),
+                "{raw} must classify as the real engine {canonical} (case-insensitive)"
+            );
+        }
+        // The three historical spellings of llama.cpp are one engine.
+        for raw in ["llama-cpp", "llamacpp", "llama_cpp", "LLAMACPP"] {
+            assert_eq!(
+                classify_backend(raw),
+                BackendRequest::Real("llama-cpp"),
+                "{raw} is a spelling of llama.cpp"
+            );
+        }
+        // Dev defaults and explicit no-ops.
+        for raw in ["", "auto", "AUTO"] {
+            assert_eq!(classify_backend(raw), BackendRequest::Auto);
+        }
+        for raw in ["unconfigured", "none", "disabled", "off", "OFF"] {
+            assert_eq!(classify_backend(raw), BackendRequest::NoOp);
+        }
+        assert_eq!(classify_backend("mock"), BackendRequest::Mock);
+        // A typo is not silently one of the above: it is `Unknown`, which is
+        // what makes the daemon refuse instead of serving the mock.
+        for raw in ["olama", "llama", "gpt", "mock1", "  ", "ollama "] {
+            assert_eq!(
+                classify_backend(raw),
+                BackendRequest::Unknown,
+                "{raw:?} is not a backend we can honour"
+            );
+            assert!(
+                !is_real_backend(raw),
+                "{raw:?} must not read as a real engine"
+            );
+        }
+    }
+
+    /// [`REAL_BACKEND_NAMES`] is what the refusal message prints as "accepted",
+    /// so every name in it must actually be accepted — a list that overstates
+    /// the accepted set would misdirect the operator fixing the typo.
+    #[test]
+    fn every_advertised_backend_name_is_really_accepted() {
+        for name in REAL_BACKEND_NAMES {
+            assert_eq!(
+                classify_backend(name),
+                BackendRequest::Real(name),
+                "REAL_BACKEND_NAMES advertises {name} but the classifier does not accept it"
+            );
+        }
+    }
+
+    // ---- F-AI-016: Unconfigured deployment is detected honestly ------------
+
+    /// Every env knob the backend-resolution chain reads (`bundled_model` +
+    /// `is_deployment_unconfigured`). Wiped/restored together by the tests below.
+    const BACKEND_ENV_KEYS: &[&str] = &[
+        "AMOS_BACKEND",
+        "AMOS_MODEL_PATH",
+        "AMOS_BUNDLE_ASSETS_DIR",
+        "AMOS_BUNDLE_MODELS_DIR",
+        "AMOS_USER_MODELS_DIR",
+        "AMOS_API_KEY",
+        "AMOS_OLLAMA_HOST",
+        "AMOS_HERMES_ENDPOINT",
+    ];
+
+    /// An empty directory nothing can resolve a model out of (redirects the
+    /// chain's user/bundled roots away from whatever the host happens to have).
+    fn staged_empty_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("amos-srv-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A fresh deployment with no env overrides and no bundled model is
+    /// unconfigured — not mock. `is_deployment_unconfigured` must say so, and
+    /// the daemon must NOT silently fall through to a mock engine.
+    // These tests share `std::env` (process-wide); concurrent test threads
+    // would race on the env values. The whole block runs serially.
+    #[test]
+    #[serial_test::serial(env_lock)]
+    fn unconfigured_detection_says_unconfigured_when_nothing_is_staged() {
+        // Wipe every knob the check reads, then ask the predicate.
+        let _guard = EnvLock::wipe(BACKEND_ENV_KEYS);
+        // The predicate says "unconfigured" unless *something* is staged.
+        // On a developer workstation we expect true (nothing staged); if a
+        // real bundled model happens to be on disk, the predicate says false.
+        if is_deployment_unconfigured() {
+            // The honest, "looks like a fresh phone" outcome.
+            return;
+        }
+        // …otherwise a model resolves on the chain and that is what configures
+        // the deployment. Same resolver the daemon itself uses.
+        assert!(
+            crate::bundled_model::resolve_model_path().is_some(),
+            "is_deployment_unconfigured returned false but no model resolves on the chain"
+        );
+    }
+
+    /// `AMOS_BACKEND` pointing at any real backend wins immediately — the
+    /// operator said what they want, we honour it.
+    #[test]
+    #[serial_test::serial(env_lock)]
+    fn unconfigured_detection_keeps_amos_backend_decisive() {
+        let _guard = EnvLock::wipe(BACKEND_ENV_KEYS);
+        let _g2 = EnvLock::set("AMOS_BACKEND", "ggml");
+        assert!(
+            !is_deployment_unconfigured(),
+            "AMOS_BACKEND=ggml means the operator pinned a real engine — never treat as unconfigured"
+        );
+    }
+
+    /// `AMOS_MODEL_PATH` pointing at a real file (any file, even zero bytes)
+    /// is enough — ggml is configured.
+    #[test]
+    #[serial_test::serial(env_lock)]
+    fn unconfigured_detection_keeps_model_path_decisive() {
+        let _guard = EnvLock::wipe(BACKEND_ENV_KEYS);
+        let dir = staged_empty_dir("model-path");
+        let tmp = dir.join("stub.gguf");
+        std::fs::write(&tmp, b"stub").unwrap();
+        let _g2 = EnvLock::set("AMOS_MODEL_PATH", tmp.to_str().unwrap());
+        assert!(
+            !is_deployment_unconfigured(),
+            "AMOS_MODEL_PATH pointing at a real file means ggml is configured"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Cloud preset with a non-default endpoint or key is "configured".
+    #[test]
+    #[serial_test::serial(env_lock)]
+    fn unconfigured_detection_keeps_cloud_keys_decisive() {
+        let _guard = EnvLock::wipe(BACKEND_ENV_KEYS);
+        // …and set just an Ollama host on a non-default port.
+        let _g2 = EnvLock::set("AMOS_OLLAMA_HOST", "http://192.0.2.10:9999");
+        assert!(
+            !is_deployment_unconfigured(),
+            "AMOS_OLLAMA_HOST on a non-default host means ollama is configured"
+        );
+    }
+
+    // ---- Gap 4: `auto`/unset selects a real model, or is honestly unconfigured
+
+    /// Test 4.3-3: with `auto` (unset) and nothing staged, `build_backend_from_env`
+    /// must yield the honest `unconfigured` engine — **not** `mock`.
+    #[tokio::test]
+    #[serial_test::serial(env_lock)]
+    async fn build_backend_from_env_with_no_model_returns_unconfigured_not_mock() {
+        let _guard = EnvLock::wipe(BACKEND_ENV_KEYS);
+        let dir = staged_empty_dir("auto-none");
+        let _g1 = EnvLock::set("AMOS_BUNDLE_ASSETS_DIR", dir.to_str().unwrap());
+        let _g2 = EnvLock::set("AMOS_USER_MODELS_DIR", dir.to_str().unwrap());
+        let _g3 = EnvLock::set("AMOS_BACKEND", "auto");
+
+        // Nothing may resolve — otherwise this host has a real model staged and
+        // the assertion below would be about that, not about the fallback.
+        if crate::bundled_model::resolve_model_path().is_some() {
+            eprintln!("skip: a real model is staged on this host (HOME chain)");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+
+        let backend = build_backend_from_env().await;
+        assert_eq!(
+            backend.metadata().name,
+            "unconfigured",
+            "no model + auto must be unconfigured, never mock"
+        );
+        assert!(
+            !backend.metadata().supports_streaming,
+            "an unconfigured engine cannot stream"
+        );
+        assert!(
+            backend
+                .infer("hi", &std::collections::HashMap::new(), 8)
+                .await
+                .is_err(),
+            "an unconfigured engine must fail loudly, never emit mock tokens"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Test 4.3-4: an explicit `AMOS_BACKEND=mock` is still honoured — the mock
+    /// is a deliberate dev/test choice, not something we ever pick by default.
+    #[tokio::test]
+    #[serial_test::serial(env_lock)]
+    async fn build_backend_from_env_with_mock_explicit_is_mock() {
+        let _guard = EnvLock::wipe(BACKEND_ENV_KEYS);
+        let _g = EnvLock::set("AMOS_BACKEND", "mock");
+        let backend = build_backend_from_env().await;
+        assert_eq!(backend.metadata().name, "mock");
+    }
+
+    /// An explicit **"no engine"** (`none`/`off`/`disabled`/`unconfigured`) is
+    /// honoured whether or not anything else is staged. The mock is a *dev/test*
+    /// engine: serving it because a model file happens to sit on the resolution
+    /// chain is the same "looks like AI but answers with placeholders" lie the
+    /// `Unknown` arm refuses — and here it is worse, because the operator stated
+    /// the intent outright and `degraded` stays `false` (`is_real_backend("off")`
+    /// is false), so no banner says the answers are placeholders.
+    ///
+    /// The staged model is what used to flip this case to the mock: the guard on
+    /// the no-op arm read `&& is_deployment_unconfigured()`, so a *bare*
+    /// deployment got `unconfigured` (the test below) while a *configured* one —
+    /// the same `AMOS_BACKEND=off`, plus an unrelated `AMOS_MODEL_PATH` — got the
+    /// deterministic mock. Both are pinned so neither half can drift back.
+    #[tokio::test]
+    #[serial_test::serial(env_lock)]
+    async fn an_explicit_no_engine_is_never_served_as_the_mock() {
+        for value in ["none", "off", "disabled", "unconfigured"] {
+            // Half 1 — bare deployment: nothing staged to mistake for a backend.
+            {
+                let _guard = EnvLock::wipe(BACKEND_ENV_KEYS);
+                let dir = staged_empty_dir(&format!("noop-bare-{value}"));
+                let _g1 = EnvLock::set("AMOS_BUNDLE_ASSETS_DIR", dir.to_str().unwrap());
+                let _g2 = EnvLock::set("AMOS_USER_MODELS_DIR", dir.to_str().unwrap());
+                let _g3 = EnvLock::set("AMOS_BACKEND", value);
+                if crate::bundled_model::resolve_model_path().is_none() {
+                    let backend = build_backend_from_env().await;
+                    assert_ne!(
+                        backend.metadata().name,
+                        "mock",
+                        "AMOS_BACKEND={value:?} asks for no engine; the mock is a dev/test \
+                         engine the operator did not select"
+                    );
+                    assert_eq!(backend.metadata().name, "unconfigured");
+                }
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+            // Half 2 — the same request, but a model *is* staged. This is the
+            // half the old guard got wrong.
+            {
+                let _guard = EnvLock::wipe(BACKEND_ENV_KEYS);
+                let dir = staged_empty_dir(&format!("noop-staged-{value}"));
+                let model = dir.join("staged.gguf");
+                std::fs::write(&model, b"stub gguf").unwrap();
+                let _g1 = EnvLock::set("AMOS_MODEL_PATH", model.to_str().unwrap());
+                let _g2 = EnvLock::set("AMOS_BACKEND", value);
+                assert!(
+                    !is_deployment_unconfigured(),
+                    "a staged model path configures the deployment — this test is only about \
+                     what `{value:?}` does in that state"
+                );
+                let backend = build_backend_from_env().await;
+                assert_ne!(
+                    backend.metadata().name,
+                    "mock",
+                    "AMOS_BACKEND={value:?} still asks for no engine when a model is staged; \
+                     answering with the deterministic mock is the lie F-AI-016 exists to prevent"
+                );
+                assert_eq!(backend.metadata().name, "unconfigured");
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+    }
+
+    /// An **unrecognised** `AMOS_BACKEND` is not the dev default — the operator
+    /// pinned *something*. It must never be served as the deterministic mock
+    /// (that is the "looks like AI but answers with placeholders" lie `F-AI-016`
+    /// exists to prevent): the honest answer is the `unconfigured` state, which
+    /// drives the UI's "no AI available" banner.
+    ///
+    /// The value is a near-miss for `ollama` — exactly the shape a typo'd
+    /// `AMOS_BACKEND` in a hand-edited launcher produces.
+    #[tokio::test]
+    #[serial_test::serial(env_lock)]
+    async fn an_unrecognised_backend_name_is_never_served_as_the_mock() {
+        let _guard = EnvLock::wipe(BACKEND_ENV_KEYS);
+        let dir = staged_empty_dir("typo-backend");
+        let _g1 = EnvLock::set("AMOS_BUNDLE_ASSETS_DIR", dir.to_str().unwrap());
+        let _g2 = EnvLock::set("AMOS_USER_MODELS_DIR", dir.to_str().unwrap());
+        let _g3 = EnvLock::set("AMOS_BACKEND", "olama");
+
+        // Nothing may resolve a real model, or the assertion below would be
+        // about that model rather than about the typo.
+        if crate::bundled_model::resolve_model_path().is_some() {
+            eprintln!("skip: a real model is staged on this host (HOME chain)");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+
+        let backend = build_backend_from_env().await;
+        assert_ne!(
+            backend.metadata().name,
+            "mock",
+            "AMOS_BACKEND=olama asks for an engine; answering with the deterministic mock is \
+             the lie F-AI-016 exists to prevent"
+        );
+        assert_eq!(
+            backend.metadata().name,
+            "unconfigured",
+            "an unrecognised backend name must surface as the honest unconfigured state"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The builder reads `AMOS_BACKEND` **case-insensitively**
+    /// (`to_ascii_lowercase`), so `OLLAMA` *is* a request for the Ollama engine.
+    /// The degraded flag has to agree: when the engine that was asked for is the
+    /// one that degraded to the mock, the status must say `degraded`, because
+    /// that flag is what raises the "you asked for a real engine and you are
+    /// getting the mock" banner. A case-sensitive read reports "not degraded"
+    /// for every upper-case spelling and so suppresses exactly that warning.
+    #[test]
+    #[serial_test::serial(env_lock)]
+    fn an_uppercase_real_backend_that_degraded_is_reported_degraded() {
+        let _guard = EnvLock::wipe(BACKEND_ENV_KEYS);
+        for spelling in ["ollama", "OLLAMA", "Ollama", "llamacpp", "llama_cpp"] {
+            let _g = EnvLock::set("AMOS_BACKEND", spelling);
+            assert!(
+                EngineState::from_env("mock").degraded,
+                "{spelling} names a real engine (the builder accepts it case-insensitively), so \
+                 serving the mock is a degradation and must be reported as one"
+            );
+        }
+    }
+
+    /// Test 4.3-5, `bundled-model` **ON**: a model staged on the chain makes
+    /// `auto` select a **real** `ggml` engine — the device-image path, proving
+    /// the daemon serves the bundled model rather than the mock.
+    ///
+    /// The temp file is a stand-in: `BackendKind::Ggml`'s `build()` only checks
+    /// that the path exists (it hands the path to the external engine at infer
+    /// time), so a stub file is enough to exercise the *resolution* decision. No
+    /// GGUF is ever loaded here.
+    #[cfg(feature = "bundled-model")]
+    #[tokio::test]
+    #[serial_test::serial(env_lock)]
+    async fn build_backend_from_env_auto_uses_a_staged_model() {
+        let _guard = EnvLock::wipe(BACKEND_ENV_KEYS);
+        let dir = staged_empty_dir("auto-staged");
+        let model = dir.join("staged.gguf");
+        std::fs::write(&model, b"stub gguf").unwrap();
+        let _g1 = EnvLock::set("AMOS_MODEL_PATH", model.to_str().unwrap());
+        let _g2 = EnvLock::set("AMOS_BACKEND", "auto");
+
+        let backend = build_backend_from_env().await;
+        assert_eq!(
+            backend.metadata().name,
+            "ggml",
+            "with `bundled-model`, a staged model must select the real ggml engine under auto"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Test 4.3-5, `bundled-model` **OFF** (the default build): the same staged
+    /// model must NOT be auto-selected — a build without the feature has no
+    /// bundled-model seam, so `auto` stays honestly `unconfigured` rather than
+    /// guessing a backend out of whatever file happens to be on disk, and never
+    /// the mock.
+    #[cfg(not(feature = "bundled-model"))]
+    #[tokio::test]
+    #[serial_test::serial(env_lock)]
+    async fn build_backend_from_env_auto_without_the_feature_is_unconfigured() {
+        let _guard = EnvLock::wipe(BACKEND_ENV_KEYS);
+        let dir = staged_empty_dir("auto-staged-off");
+        let model = dir.join("staged.gguf");
+        std::fs::write(&model, b"stub gguf").unwrap();
+        let _g1 = EnvLock::set("AMOS_MODEL_PATH", model.to_str().unwrap());
+        let _g2 = EnvLock::set("AMOS_BACKEND", "auto");
+
+        let backend = build_backend_from_env().await;
+        assert_eq!(
+            backend.metadata().name,
+            "unconfigured",
+            "without `bundled-model`, auto must not auto-select a staged file (never mock)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `bundled-model` **ON** with the resolved path *missing*: the honest
+    /// outcome is still `unconfigured` — a compiled seam with no staged file must
+    /// not fabricate a backend, and must not fall back to the mock.
+    #[cfg(feature = "bundled-model")]
+    #[tokio::test]
+    #[serial_test::serial(env_lock)]
+    async fn build_backend_from_env_auto_with_missing_model_is_unconfigured() {
+        let _guard = EnvLock::wipe(BACKEND_ENV_KEYS);
+        let dir = staged_empty_dir("auto-missing");
+        let missing = dir.join("does-not-exist.gguf");
+        let _g1 = EnvLock::set("AMOS_MODEL_PATH", missing.to_str().unwrap());
+        let _g2 = EnvLock::set("AMOS_BUNDLE_ASSETS_DIR", dir.to_str().unwrap());
+        let _g3 = EnvLock::set("AMOS_USER_MODELS_DIR", dir.to_str().unwrap());
+        let _g4 = EnvLock::set("HOME", dir.to_str().unwrap());
+        let _g5 = EnvLock::set("AMOS_BACKEND", "auto");
+
+        let backend = build_backend_from_env().await;
+        assert_eq!(
+            backend.metadata().name,
+            "unconfigured",
+            "a missing bundled model is honestly unconfigured, never mock"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Gap 7 test 7.3-5: `AMOS_BACKEND=rknn` on an uncompiled build must not be
+    /// reported as a working engine and must never become the mock — the honest
+    /// outcomes are `unconfigured` (build failed) or `rknn` (SDK truly linked).
+    #[tokio::test]
+    #[serial_test::serial(env_lock)]
+    async fn build_backend_from_env_with_rknn_value_uncompiled_returns_cpu_or_provider() {
+        let _guard = EnvLock::wipe(BACKEND_ENV_KEYS);
+        let _g = EnvLock::set("AMOS_BACKEND", "rknn");
+        let backend = build_backend_from_env().await;
+        let name = backend.metadata().name;
+        if cfg!(feature = "rknn") {
+            // The feature only declares the SDK is linked; the binding is still a
+            // seam, so construction fails -> unconfigured. A real binding landing
+            // later would report "rknn".
+            assert!(
+                matches!(name.as_str(), "rknn" | "unconfigured"),
+                "got {name}"
+            );
+        } else {
+            assert_eq!(
+                name, "unconfigured",
+                "an uncompiled RKNN request must not become mock"
+            );
+        }
+    }
+
+    /// The same honesty rule for the in-process llama.cpp seam.
+    #[tokio::test]
+    #[serial_test::serial(env_lock)]
+    async fn build_backend_from_env_with_llama_cpp_value_is_unconfigured_not_mock() {
+        let _guard = EnvLock::wipe(BACKEND_ENV_KEYS);
+        let _g = EnvLock::set("AMOS_BACKEND", "llama-cpp");
+        let backend = build_backend_from_env().await;
+        let name = backend.metadata().name;
+        if cfg!(feature = "llama-cpp-inproc") {
+            assert!(matches!(name.as_str(), "llama-cpp" | "unconfigured"));
+        } else {
+            assert_eq!(name, "unconfigured", "never the deterministic mock");
+        }
+    }
+
+    /// The `unconfigured` engine reports itself truthfully and fails loudly.
+    #[tokio::test]
+    async fn unconfigured_backend_reports_itself_and_fails_loudly() {
+        let b = crate::inference::real::UnconfiguredBackend::new();
+        let meta = b.metadata();
+        assert_eq!(meta.name, "unconfigured");
+        assert!(!meta.supports_streaming);
+        assert!(b.health_check().await.is_err());
+        assert!(b
+            .infer("x", &std::collections::HashMap::new(), 4)
+            .await
+            .is_err());
+    }
+
+    /// Save/restore helper for the env tests above: locks the named vars to
+    /// a value, restores their previous state on drop, so the test cannot
+    /// leak its env mutations to the next test in the same process.
+    struct EnvLock;
+    impl EnvLock {
+        fn wipe<'a>(keys: &'a [&'a str]) -> impl Drop + 'a {
+            struct Guard<'a>(Vec<(&'a str, Option<String>)>);
+            impl<'a> Drop for Guard<'a> {
+                fn drop(&mut self) {
+                    for (k, v) in self.0.drain(..) {
+                        match v {
+                            Some(s) => std::env::set_var(k, s),
+                            None => std::env::remove_var(k),
+                        }
+                    }
+                }
+            }
+            let snapshot: Vec<_> = keys
+                .iter()
+                .map(|k| {
+                    let prev = std::env::var(k).ok();
+                    std::env::remove_var(k);
+                    (*k, prev)
+                })
+                .collect();
+            Guard(snapshot)
+        }
+        fn set<'a>(k: &'a str, v: &'a str) -> impl Drop + 'a {
+            struct Guard<'a>(&'a str, Option<String>);
+            impl<'a> Drop for Guard<'a> {
+                fn drop(&mut self) {
+                    match self.1.take() {
+                        Some(s) => std::env::set_var(self.0, s),
+                        None => std::env::remove_var(self.0),
+                    }
+                }
+            }
+            let prev = std::env::var(k).ok();
+            std::env::set_var(k, v);
+            Guard(k, prev)
+        }
+    }
+
     #[tokio::test]
     async fn status_reports_the_breaker_honestly_and_never_a_fake_closed() {
         let security = Arc::new(SecurityManager::default());
@@ -2770,12 +3588,14 @@ mod tests {
         assert_eq!(b.rejections, 0);
     }
 
+    /// An explicit `AMOS_BACKEND=mock` engine must never be passed off as a real
+    /// model. (With `AMOS_BACKEND` unset the daemon now reports `unconfigured`
+    /// instead of mock — Gap 4 — so this test pins the mock label explicitly.)
     #[tokio::test]
+    #[serial_test::serial(env_lock)]
     async fn status_reports_engine_and_degradation_honestly() {
-        // Default build boots with the deterministic mock engine; it must be
-        // reported as such (not as a real model), and never "degraded" (mock was
-        // the default, not a fallback). The ASR label reflects the env and may be
-        // any of its valid values.
+        let _guard = EnvLock::wipe(BACKEND_ENV_KEYS);
+        let _g = EnvLock::set("AMOS_BACKEND", "mock");
         let svc = AiAgentService::new().await;
         let reply = svc
             .get_status(Request::new(StatusRequest {}))
@@ -2816,6 +3636,38 @@ mod tests {
             "a mock serving reports no local-accelerator target (got {:?})",
             reply.accelerator
         );
+    }
+
+    /// Gap 8 honest-label pin: the unset-default ASR label must agree with what
+    /// `ChatAsr` would *actually* build — `"sherpa(auto)"` only when the model-dir
+    /// chain resolves a model, otherwise `"mock"`. Reporting `"sherpa(auto)"` with
+    /// nothing staged would name an engine the daemon cannot serve.
+    #[test]
+    #[serial_test::serial(env_lock)]
+    fn asr_label_matches_what_the_env_would_really_build() {
+        let _guard = EnvLock::wipe(&[
+            "AMOS_ASR_BACKEND",
+            "AMOS_SHERPA_MODEL_DIR",
+            "AMOS_BUNDLE_RES_DIR",
+            "AMOS_BUNDLE_MODELS_DIR",
+        ]);
+        let expected = if crate::chat_asr::resolve_sherpa_model_dir().is_some() {
+            "sherpa(auto)"
+        } else {
+            "mock"
+        };
+        assert_eq!(
+            asr_label_from_env(),
+            expected,
+            "the unset default must name the recognizer the chain really resolves"
+        );
+
+        // Explicit values are decided by the operator, not the chain.
+        let _g = EnvLock::set("AMOS_ASR_BACKEND", "off");
+        assert_eq!(asr_label_from_env(), "off");
+        drop(_g);
+        let _g = EnvLock::set("AMOS_ASR_BACKEND", "mock");
+        assert_eq!(asr_label_from_env(), "mock");
     }
 
     #[test]
@@ -2862,6 +3714,24 @@ mod tests {
         assert!(reply.running);
         assert!(!reply.model.is_empty());
         assert_eq!(reply.active_sessions, 0);
+    }
+
+    /// No GPU/NPU metrics are instrumented, so `get_status` must report the field
+    /// as **absent** rather than a fabricated `0` percent that a consumer
+    /// (amos-tauri `DaemonStatus`) would read as "the GPU is idle"
+    /// (AEROSPACE audit P0-3 / REQ-A1853).
+    #[tokio::test]
+    async fn status_reports_no_gpu_reading_instead_of_a_fabricated_zero() {
+        let svc = AiAgentService::new().await;
+        let reply = svc
+            .get_status(Request::new(StatusRequest {}))
+            .await
+            .expect("status")
+            .into_inner();
+        assert_eq!(
+            reply.gpu_util, None,
+            "an uninstrumented GPU must be absent, not a fabricated 0 reading"
+        );
     }
 
     #[tokio::test]
@@ -3459,7 +4329,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(env_lock)]
     async fn stream_completion_logs_tokens() {
+        // A deterministic mock engine is requested explicitly (the unset default
+        // is now an honest `unconfigured` — Gap 4 — which produces no tokens).
+        let _guard = EnvLock::wipe(BACKEND_ENV_KEYS);
+        let _g = EnvLock::set("AMOS_BACKEND", "mock");
         let svc = AiAgentService::new().await; // grants Standard to the default client
         let mut stream = svc
             .stream_chat(stream_req(DEFAULT_CLIENT_ID, "s1"))

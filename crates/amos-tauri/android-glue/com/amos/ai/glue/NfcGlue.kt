@@ -325,24 +325,75 @@ object NfcGlue {
     }
 
     /**
-     * Read raw bytes from the last tag as hex string.
+     * Read raw bytes from the tag the glue is holding, as a JSON answer:
+     * `{ state, id, hex, error }`.
+     *
+     * ## Why a state and an id, and not `String?` (REQ-A781 / F-AND-009)
+     *
+     * This used to be `fun readTagBytes(): String?`, and its single `null` was the answer to
+     * **three** different questions:
+     *
+     * ```
+     * val tag = lastTag ?: return null          // (a) no tag has been seen at all
+     * msg?.toByteArray()?.joinToString("") …    // (b) the tag WAS read, and holds no NDEF payload
+     * catch (_: Exception) { null }             // (c) the read threw (tag gone, I/O error)
+     * ```
+     *
+     * `crates/amos-tauri/src/ble.rs` added a fourth on the way out (`Ok(result.flatten())` —
+     * unbound glue, a JNI error, or the host build), and `NfcApp.svelte` had exactly one branch
+     * for `null`, so all four printed **"读取失败：系统没有返回卡片字节"** — a sentence *about the
+     * tag*. The tag that was read perfectly well and simply has nothing on it was reported as a
+     * failed read, and the case where the question never reached this glue was reported as the
+     * tag's own answer. The screen already carried the copy for the honest half
+     * (`readHex === "" ? t("nfc.readEmpty") : readHex`), and no producer could reach it.
+     *
+     * `id` is the second half, and it is not decoration: every operation here acts on `lastTag`
+     * — **one field, overwritten by each discovery** — while the screen addresses a tag the user
+     * picked out of a list. A read that does not say which tag it read cannot be shown under any
+     * tag's name without risking one tag's bytes appearing under another's.
+     *
+     * `state` spellings are a cross-language contract: they are mirrored by `NfcReadState` in
+     * `crates/amos-tauri/src/ble.rs` and by the `NfcReadStateWire` union in
+     * `frontend-ts/src/lib/nfc.ts`, and `scripts/nfc-read-glue-const-scan.mjs` fails the build if
+     * the three drift apart.
      */
     @JvmStatic
-    fun readTagBytes(): String? {
-        val tag = lastTag ?: return null
+    fun readTagBytes(): String {
+        val tag = lastTag
+            ?: return readReply("no-tag", null, null, null)
+        val tagId = tag.id.joinToString("") { "%02x".format(it) }
         return try {
             val ndef = Ndef.get(tag)
-            if (ndef != null) {
+            if (ndef == null) {
+                // No NDEF technology on the tag: its own id is the only thing there is to show.
+                readReply("bytes", tagId, tagId, null)
+            } else {
                 ndef.connect()
                 val msg = ndef.ndefMessage
                 ndef.close()
-                msg?.toByteArray()?.joinToString("") { "%02x".format(it) }
-            } else {
-                tag.id.joinToString("") { "%02x".format(it) }
+                val bytes = msg?.toByteArray()
+                if (bytes == null) {
+                    // Connected and read successfully — this tag simply carries no message.
+                    // A successful read of an empty tag, never "the read failed".
+                    readReply("empty", tagId, null, null)
+                } else {
+                    readReply("bytes", tagId, bytes.joinToString("") { "%02x".format(it) }, null)
+                }
             }
-        } catch (_: Exception) {
-            null
+        } catch (e: Exception) {
+            Log.w(TAG, "readTagBytes failed", e)
+            readReply("failed", tagId, null, e.message ?: e.javaClass.simpleName)
         }
+    }
+
+    /** The one construction of the read reply — so the field set cannot vary per arm. */
+    private fun readReply(state: String, id: String?, hex: String?, error: String?): String {
+        return JSONObject()
+            .put("state", state)
+            .put("id", id ?: JSONObject.NULL)
+            .put("hex", hex ?: JSONObject.NULL)
+            .put("error", error ?: JSONObject.NULL)
+            .toString()
     }
 
     // ── Internal helpers ────────────────────────────────────────────────────────

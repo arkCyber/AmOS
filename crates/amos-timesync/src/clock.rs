@@ -217,16 +217,29 @@ impl SyncedClock {
 
     /// How long ago the current offset was last confirmed against a source.
     ///
-    /// Returns `None` when the clock has never been synced. Consumers can use
-    /// this to decide whether the calibration is still trustworthy (e.g. refusing
-    /// to act on a stale time).
+    /// Returns `None` when no age can be established: either the clock has never
+    /// been synced, or its recorded last-sync stamp lies **ahead** of the host
+    /// clock. The latter is not a small skew to be clamped away — it is a
+    /// contradiction (the host wall clock has stepped backwards since the sync, or
+    /// the persisted state was written by a wrong clock, or tampered with), and it
+    /// bounds no age at all. Folding it to `Duration::ZERO` would turn the *least*
+    /// knowable state into the *most* reassuring answer ("just synced"), which
+    /// [`is_fresh`](Self::is_fresh) would then admit. (REQ-A539.)
+    ///
+    /// Consumers can use this to decide whether the calibration is still
+    /// trustworthy (e.g. refusing to act on a stale time).
     pub fn staleness(&self) -> Option<Duration> {
         let last = self.last_synced?;
-        Some(host_now().duration_since(last).unwrap_or(Duration::ZERO))
+        host_now().duration_since(last).ok()
     }
 
     /// Whether the clock is calibrated *and* the calibration is no older than
     /// `max_age` — a convenient guard for time-sensitive decisions.
+    ///
+    /// A clock whose age cannot be established (never synced, or the recorded
+    /// last-sync stamp is ahead of the host clock — see
+    /// [`staleness`](Self::staleness)) is **not** fresh: an unbounded age must
+    /// never be admitted as a bounded one. (REQ-A539.)
     pub fn is_fresh(&self, max_age: Duration) -> bool {
         self.staleness().is_some_and(|age| age <= max_age)
     }
@@ -536,6 +549,39 @@ mod tests {
         assert!(clock.is_fresh(Duration::from_secs(5)));
     }
 
+    /// A persisted last-sync stamp *ahead* of the host clock (a host wall clock
+    /// that stepped backwards since the sync, or a corrupt/tampered state file)
+    /// bounds no age. `staleness` must say so rather than report `Duration::ZERO`
+    /// ("just synced"), and `is_fresh` — the trust guard — must refuse.
+    /// (REQ-A539.)
+    #[test]
+    fn an_ahead_last_sync_stamp_bounds_no_age_and_is_never_fresh() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("amos-ts-ahead-stamp-{}.json", std::process::id()));
+        let future_ms = system_to_ms(SystemTime::now()) + 86_400_000; // +1 day
+        std::fs::write(
+            &path,
+            format!("{{\"offset_ns\":0,\"last_synced_ms\":{future_ms}}}"),
+        )
+        .unwrap();
+
+        let clock = SyncedClock::load(&path);
+        assert!(
+            clock.synced(),
+            "the offset itself is sane, so the record still loads and is applied"
+        );
+        assert_eq!(
+            clock.staleness(),
+            None,
+            "an ahead-of-host-clock stamp must not read as zero staleness"
+        );
+        assert!(
+            !clock.is_fresh(Duration::from_secs(3_600)),
+            "an unbounded age must never be admitted as fresh"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn apply_rejects_implausible_without_marking_synced() {
         // Year 1980 is below the default (2000) plausibility floor.
@@ -600,6 +646,192 @@ mod tests {
             -3_000_000_000
         );
         assert_eq!(signed_offset_ns(epoch, epoch), 0);
+    }
+
+    /// Strip Rust line and block comments, leaving string literals intact — the same job
+    /// `strip_kotlin_comments` does for the glue on the other side of a language boundary
+    /// (`amos-tauri/tests/alarm_device_binding_e2e.rs`).
+    ///
+    /// A gate that reads a source file for *code* must not read the file's own prose: the doc
+    /// comments around a rule exist precisely to *describe* it, so a prose mention of a name is
+    /// an answer to a `contains` question that the code never gave. (F-DEV-096, F-TAU-020.)
+    fn strip_rust_comments(src: &str) -> String {
+        let chars: Vec<char> = src.chars().collect();
+        let mut out = String::with_capacity(src.len());
+        let mut i = 0usize;
+        let mut block_depth = 0usize;
+        while i < chars.len() {
+            let c = chars[i];
+            if block_depth > 0 {
+                if c == '/' && chars.get(i + 1) == Some(&'*') {
+                    block_depth += 1;
+                    i += 2;
+                } else if c == '*' && chars.get(i + 1) == Some(&'/') {
+                    block_depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+            if c == '/' && chars.get(i + 1) == Some(&'/') {
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            if c == '/' && chars.get(i + 1) == Some(&'*') {
+                block_depth = 1;
+                i += 2;
+                continue;
+            }
+            if c == '"' {
+                out.push(c);
+                i += 1;
+                while i < chars.len() && chars[i] != '"' {
+                    if chars[i] == '\\' && i + 1 < chars.len() {
+                        out.push(chars[i]);
+                        i += 1;
+                    }
+                    out.push(chars[i]);
+                    i += 1;
+                }
+                if i < chars.len() {
+                    out.push(chars[i]);
+                    i += 1;
+                }
+                continue;
+            }
+            out.push(c);
+            i += 1;
+        }
+        out
+    }
+
+    /// Everything before the file's `#[cfg(test)]` module — the half that ships.
+    ///
+    /// "Does the guard re-declare the window?" must not be answered by a test's own fixture, and
+    /// "is this literal a bound?" is a question about code a device will run.
+    fn production_half(src: &str) -> &str {
+        src.find("#[cfg(test)]").map_or(src, |i| &src[..i])
+    }
+
+    /// The stripper is itself two-sided: prose that spells the name and the number must be gone,
+    /// the code's own copies must survive, and a `//` inside a string is not a comment.
+    #[test]
+    fn strip_rust_comments_keeps_code_and_drops_prose() {
+        let src = "\
+/// The guard reads `Plausibility::default()`; a copy would be `const MIN: u64 = 1_000_000_000;`.\n\
+// const OTHER: u64 = 2_000_000_000;\n\
+const MIN: u64 = 1_000_000_000; // a trailing comment\n\
+const NAMED: &str = \"a // is not a comment\";\n";
+        let code = strip_rust_comments(src);
+        assert!(
+            !code.contains("Plausibility"),
+            "a prose mention of the authority is not a call to it"
+        );
+        assert_eq!(
+            code.matches("1_000_000_000").count(),
+            1,
+            "only the code's own literal may survive — the prose copy and the commented-out one must not"
+        );
+        assert!(
+            code.contains("\"a // is not a comment\""),
+            "a // inside a string literal is not a comment"
+        );
+    }
+
+    /// `ntp.rs`'s network guard rejects a reply outside "a plausible epoch window
+    /// (years 2000–2100)", and its module doc says it runs that guard "before
+    /// `SyncedClock` runs its own check" — i.e. the *same* window. It was a hand-
+    /// copied pair of private constants bound to nothing: widening or narrowing
+    /// `Plausibility::default()` on one side left the NTP early-guard accepting (or
+    /// refusing) a different range, and no test touched the NTP window at all. The
+    /// guard now consults `Plausibility::default()` directly; this test reads the
+    /// source to keep it that way, since a re-declared literal *is* the defect
+    /// returning. (REQ-A664 / F-SH-129.)
+    ///
+    /// **Strengthened in REQ-A814 / F-SH-255.** The first version of this pin asked
+    /// `NTP.contains("Plausibility")` — satisfied by the module doc's own prose, so it could not
+    /// fail — and then only that the two `DEFAULT_*` *spellings* were absent. Measured: a
+    /// hand-copied window with **different** numbers (`MIN = 1_000_000_000`, `MAX =
+    /// 4_000_000_000`) left every assertion here green. That is exactly the drift this pin's own
+    /// doc names ("a copy would let a widened clock window and this early guard silently
+    /// disagree"), so the guard was pinned only against a copy that happened to reuse the clock's
+    /// numbers. Three things are read now: the **call** in comment-stripped code, no re-declared
+    /// same-value literal, and no bound-shaped literal *of any value* in the shipping half.
+    #[test]
+    fn ntp_guard_consults_the_clock_window_not_a_copy() {
+        const NTP: &str = include_str!("ntp.rs");
+        let code = strip_rust_comments(production_half(NTP));
+
+        // (1) The guard must *call* the authority. Read the comment-stripped shipping half: the
+        //     module doc says "Plausibility" in prose, which is a description of the rule, not
+        //     the rule.
+        assert!(
+            code.contains("Plausibility::default()"),
+            "the NTP network guard must take its window from the clock's `Plausibility` \
+             authority, not from a pair of its own constants"
+        );
+
+        // (2) The most likely way for this to come back: a copy spelled *with* the clock's own
+        //     numbers. Named, so the failure says which bound moved. The `_` separators are
+        //     stripped — Rust idiom here is `946_684_800`, and a literal that is *never*
+        //     compared in its underscored spelling is a check that cannot fail (measured: this
+        //     assertion was green against a hand copy that used exactly the clock's own values,
+        //     REQ-A814 — the first version compared `contains("946684800")` against source that
+        //     says `946_684_800`).
+        let digits = code.replace('_', "");
+        assert!(
+            !digits.contains(&DEFAULT_MIN_EPOCH_SECS.to_string()),
+            "the NTP guard must not re-declare the clock's epoch floor {DEFAULT_MIN_EPOCH_SECS}"
+        );
+        assert!(
+            !digits.contains(&DEFAULT_MAX_EPOCH_SECS.to_string()),
+            "the NTP guard must not re-declare the clock's epoch ceiling {DEFAULT_MAX_EPOCH_SECS}"
+        );
+
+        // (3) And no window bound of *any* value. (2) only catches a copy that reuses the clock's
+        //     digits; a copy with different ones is the same defect with a different number, and
+        //     it was green here (measured, REQ-A814). Epoch-seconds bounds are ten digits
+        //     (`4_102_444_800`), so any ≥9-digit literal in the shipping half is a re-declared
+        //     window — whatever it holds.
+        //
+        //     Counted, not set-compared: the allowlisted value is an ordinary round number, so a
+        //     bound re-declared *as* that value would otherwise hide behind the other use of it
+        //     (measured: `MIN = 1_000_000_000` was green against a set-based allowlist, REQ-A814).
+        let mut literals: Vec<String> = code
+            .split(|c: char| !(c.is_ascii_digit() || c == '_'))
+            // Strip `_` on both sides of the length test as well as the value: `trim_matches`
+            // alone leaves the interior ones, so `all(is_ascii_digit)` would reject *every*
+            // underscored literal and this scan would see almost nothing (the measured bug).
+            .map(|t| t.trim_matches('_').replace('_', ""))
+            .filter(|t| t.len() >= 9 && t.chars().all(|c| c.is_ascii_digit()))
+            .collect();
+        literals.sort();
+        // The ≥9-digit literals the shipping half may carry, with how many times each may occur
+        // and why it is not a bound. A named triple rather than a bare string: an exclusion here
+        // states *why*, so a new entry is a decision rather than noise.
+        const ALLOWED: [(&str, usize, &str); 1] = [(
+            "1000000000",
+            1,
+            "the 2^-32 NTP fraction scale in `query_one` — a nanosecond multiplier, not a bound",
+        )];
+        let mut expected: Vec<String> = ALLOWED
+            .iter()
+            .flat_map(|(v, n, _)| std::iter::repeat((*v).to_string()).take(*n))
+            .collect();
+        expected.sort();
+        let reasons: Vec<String> = ALLOWED
+            .iter()
+            .map(|(v, n, why)| format!("{v} ×{n} ({why})"))
+            .collect();
+        assert_eq!(
+            literals, expected,
+            "`ntp.rs`'s shipping half carries epoch-bound-shaped literals that are not accounted \
+             for — a re-declared window is this pin's whole subject, whatever value it holds. \
+             Allowed: {reasons:?}. If a new one is legitimate, add it here with its reason."
+        );
     }
 
     #[test]

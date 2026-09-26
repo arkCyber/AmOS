@@ -1,0 +1,54 @@
+[
+  {
+    "token": "@deprecated",
+    "reason": "Not a symbol: a **TSDoc/JSDoc tag**, not a repo identifier — the same class as `EADDRINUSE` and `NSApplication.dockTile` above. It is named in `crates/amos-tauri/frontend-ts/scripts/dead-member-allowlist.json`'s reason for `MDMManager.isActionDisabled`, to say the adapter is tagged `@deprecated` (the tag is written in a comment, and comments are exactly what `buildIndex` strips — so the claim can never resolve against the code corpus by construction)."
+  },
+  {
+    "token": "AMOS_TIMEOUT_SECS",
+    "reason": "A **historical** name, and naming it is the point: `scripts/env-doc-allowlist.json` records that a doc (`CODE_COMPLETION_SUMMARY.md`) promised this knob would configure the removed `Config.request_timeout` field, while the real timeouts are per-backend and this variable is honoured **nowhere**. The entry exists because the claim is about a knob that does not exist; 'resolve it' would mean re-inventing the dead field."
+  },
+  {
+    "token": "Config.request_timeout",
+    "reason": "The removed field the entry above is about — a doc claim, quoted so a reader can see exactly what was promised. Same class as `AMOS_TIMEOUT_SECS`: the name must stay even though no code declares it."
+  },
+  {
+    "token": "Config.memory_limit_mb",
+    "reason": "The memory half of the same historical claim (`AMOS_MEMORY_LIMIT_MB`); `env-doc-allowlist.json` says no daemon code path enforces a memory limit. Quoted deliberately — the entry documents a knob that was removed."
+  },
+  {
+    "token": "NSApplication.dockTile",
+    "reason": "A **macOS API**, not a repo symbol: the reason for `dock_badge_set` / `dock_request_attention` in `scripts/tauri-command-allowlist.json` describes where the badge is applied (`NSApplication.dockTile` inside `crates/amos-tauri/src/dock_badge.rs`). Nothing in this repository can resolve it, and it is the clearest way to say what the command does."
+  },
+  {
+    "token": "crates/amos-tauri/src/android_log.rs",
+    "reason": "A **former path**, named on purpose as evidence: `scripts/unsafe-baseline.json`'s `captured` note records that round 187 added this file's `__android_log_write` FFI site to the baseline and that the file was later renamed to `host_log.rs` (REQ-A229/REQ-A231, same site, the entry followed the path). Deleting the old name would delete the audit trail of that rename."
+  },
+  {
+    "token": "AMOS_ACCELERATION",
+    "reason": "An **epitaph**, and the clearest case for this list: `env-doc-allowlist.json` records that a doc promised a legacy strategy knob, and the entry's whole point is that the knob is honoured nowhere. The only occurrence left in the corpus is the doc note in `crates/amos-ai/src/accelerator.rs` saying exactly that — so before REQ-A828 this scanner resolved the claim against the sentence that denies it. Kept because deleting the name would delete the record of the claim being refuted."
+  },
+  {
+    "token": "macroGenerated",
+    "reason": "Not a symbol: the name of one of that baseline's own two sections — the informational set of `clippy::let_underscore_must_use` findings rustc attributes to a macro-expanded span, so the source line cannot tell them from a hand-written discard. Nothing in the workspace declares it; the only occurrence is the note in `scripts/rust-discard-scan.mjs` that explains the section to a reader, which is why the comment-stripped corpus stopped resolving it (REQ-A828)."
+  },
+  {
+    "token": "EADDRINUSE",
+    "reason": "A **POSIX errno**, not a repo symbol — the same class as `NSApplication.dockTile` above. It is named in the two `why` sentences that justify leaving a discarded socket cleanup in place, because it is what `UnixListener::bind` answers when a stale socket file is still there, and the reader needs the errno to see the stake."
+  },
+  {
+    "token": "TelephonyManager",
+    "reason": "An **Android platform class** (android.telephony.TelephonyManager), not a repo symbol — the same class as `NSApplication.dockTile` above. It is named in `crates/amos-tauri/frontend-ts/scripts/unwired-allowlist.json`'s reason for `clearCellularRadio`, to say which system service the host's `cellular_signal` reads: `crates/amos-tauri/android-glue/com/amos/ai/glue/TelephonyGlue.kt` imports it and looks it up from the context. No Rust or TS file in this workspace declares it, so the comment-stripped corpus cannot resolve it by construction."
+  },
+  {
+    "token": "FifoChannelHandler",
+    "reason": "A **Zenoh type**, not a repo symbol: named in `rust-macro-allowlist.json`'s `why` for `forward_samples` to say why that forwarding loop has to be a macro — the handler types share no trait that exposes `recv_async`. The crate is a dependency of the workspace, so nothing here declares the type."
+  },
+  {
+    "token": "RingChannelHandler",
+    "reason": "The second of the same pair of **Zenoh handler types** as `FifoChannelHandler` above, and named in the same `why` for the same reason: the forwarding loop is identical for both, and neither can be named by a trait bound. Same class: an external crate's type, unresolvable in this workspace by construction."
+  },
+  {
+    "token": "inspection-api",
+    "reason": "Not a symbol: one of the four `kind` values `rust-unwired-baseline.json` uses to classify an unwired public function — its `policy` sentence defines them, and `docs/rust-unwired-audit.md` counts the baseline by them. Nothing in the workspace declares the word; with the comment-stripped corpus even its parts survived only inside prose, which is how REQ-A828 found it."
+  }
+]

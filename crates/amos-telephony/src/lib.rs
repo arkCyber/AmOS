@@ -25,6 +25,7 @@
 )]
 
 pub mod audit;
+pub mod backend;
 pub mod error;
 pub mod number;
 pub mod provider;
@@ -33,6 +34,7 @@ pub mod route;
 pub mod session;
 
 pub use audit::{AuditEntry, AuditLog, AuditOutcome};
+pub use backend::BackendKind;
 pub use error::{Result, TelephonyError};
 pub use number::{EmergencyMap, Number, NumberKind};
 pub use provider::{

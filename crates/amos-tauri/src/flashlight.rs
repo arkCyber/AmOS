@@ -27,6 +27,99 @@ use tauri::{AppHandle, State};
 /// sync (distinct from the `amos.settings` preference quick-toggles).
 pub const FLASHLIGHT_KEY: &str = "amos.flashlight";
 
+/// The other user of AmOS's rear camera: the live NV21 preview `AmosGlue.onStart`
+/// opens at *every* foreground (`CameraGlue.attach`). The torch is the same camera
+/// device's flash unit, and Android grants only one client at a time — with the
+/// preview holding it, `CameraManager#setTorchMode` is refused ("torch mode of
+/// camera 0 is not available because camera is in use"), so a torch request has to
+/// take the sensor from AmOS's own preview and give it back (REQ-A1891 /
+/// FMEA F-AND-021).
+///
+/// Best-effort by contract: the caller must not treat a failure here as fatal, and
+/// the authoritative verdict stays the torch call's own answer.
+pub trait PreviewYield: Send + Sync {
+    /// Release the preview's hold on the camera device, if it has one.
+    ///
+    /// `Ok(true)` means a hold **was** taken and [`resume`](Self::resume) owes the
+    /// sensor back; `Ok(false)` means the preview was not the holder. The caller
+    /// needs that distinction to decide whether a torch refusal is even eligible
+    /// for a retry (see [`torch_yielding_the_preview`]).
+    fn suspend(&self) -> Result<bool, String>;
+    /// Give the sensor back, if [`suspend`](Self::suspend) took it. Idempotent.
+    fn resume(&self) -> Result<(), String>;
+}
+
+/// How many times a torch request is re-issued after the preview gave up the
+/// sensor, and the pause between attempts.
+///
+/// `CameraGlue.teardown()` publishes the release **asynchronously**: it clears its
+/// own `camera` field (so `isCapturing()` reads `false` at once) and then posts
+/// `camera.close()` onto its `amos-camera` handler thread. Between those two
+/// moments the platform still counts AmOS as the holder — device log (S5, Android
+/// 14): `AmosGlue: camera attached: id=0 640x480` at `.411`, and five milliseconds
+/// later `E CameraService: setTorchMode: torch mode of camera 0 is not available
+/// because camera is in use`. There is no accessor for "the device is really
+/// free", so the only honest observation of it is the platform's own answer to the
+/// torch request: re-ask, bounded, and report the last word (REQ-A1891 /
+/// FMEA F-AND-021).
+const YIELD_SETTLE_TRIES: u32 = 8;
+/// The pause between those attempts. Gated with the device seam: the host compiles
+/// the sequence (and its tests pass a recording no-op `settle`), but only the
+/// Android provider actually sleeps, so an ungated constant is dead code there.
+#[cfg(feature = "android")]
+const YIELD_SETTLE_STEP: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// Run one torch request with the preview stepped out of the sensor's way.
+///
+/// The ordering is the whole content: `suspend` **before** the torch is asked for
+/// (asking first is the defect — the platform then refuses for a reason the user
+/// cannot act on), and `resume` afterwards unless the torch is actually holding the
+/// sensor. A torch left lit keeps it; an extinguished or refused request frees it.
+///
+/// A refusal that follows a real hand-over is provisional, not final: the platform
+/// may still be unwinding the preview's release (see [`YIELD_SETTLE_TRIES`]), so the
+/// request is re-asked a bounded number of times (pausing via `settle`) and the
+/// **last** answer is returned. A refusal with nothing yielded is final on the first
+/// try — a torch turned down by thermal shutdown or a dead battery is not going to
+/// change because we waited.
+///
+/// `suspend`/`resume` failures are dropped rather than propagated: when the preview
+/// is not the holder (it was refused at boot, or the camera app owns the sensor)
+/// there is nothing to take, and blaming the preview for a torch that was refused
+/// for its own reason (thermal, low battery, no flash unit) would replace the
+/// platform's real answer with a wrong one. Both calls are logged by their impls.
+pub fn torch_yielding_the_preview<Y, D, W>(
+    preview: &Y,
+    on: bool,
+    mut drive: D,
+    mut settle: W,
+) -> Result<(), String>
+where
+    Y: PreviewYield,
+    D: FnMut(bool) -> Result<(), String>,
+    W: FnMut(),
+{
+    let yielded = on && matches!(preview.suspend(), Ok(true));
+    let mut verdict = drive(on);
+    if yielded {
+        for _ in 0..YIELD_SETTLE_TRIES {
+            if verdict.is_ok() {
+                break;
+            }
+            settle();
+            verdict = drive(on);
+        }
+    }
+    // Give the sensor back when the torch lost it (an extinguished torch frees it
+    // unconditionally) or when we took it and the torch did not keep it. A refusal
+    // with nothing yielded leaves the preview exactly where it was, so `resume` is
+    // not owed — and not called, which keeps the recorded order honest.
+    if !on || (yielded && verdict.is_err()) {
+        let _ = preview.resume();
+    }
+    verdict
+}
+
 /// Upper bound on the persisted `amos.flashlight` JSON value (bytes).
 ///
 /// Real values are two booleans (~32 B); 4 KiB is generous defence-in-depth —
@@ -41,14 +134,15 @@ pub const MAX_FLASHLIGHT_VALUE_BYTES: usize = 4 * 1024;
 /// Wire vocabulary for the flashlight / torch module. The UI i18n layer
 /// branches on these; renaming a variant is a wire break.
 pub mod codes {
+    use crate::error::ErrorCode;
     /// The stored `amos.flashlight` value is neither missing nor a JSON object;
     /// the next write replaces it from scratch (the corruption is logged
     /// **before** the overwrite, so a forensic read of the log shows what was
     /// lost).
-    pub const STORED_SHAPE_INVALID: &str = "amos.flashlight.stored_shape_invalid";
+    pub const STORED_SHAPE_INVALID: &str = ErrorCode::FlashlightStoredShapeInvalid.as_str();
     /// Torch request reached the provider, but the device did not confirm the
     /// change (Android: `setTorchMode` returned false / silent failure).
-    pub const PROVIDER_UNCONFIRMED: &str = "amos.flashlight.provider_unconfirmed";
+    pub const PROVIDER_UNCONFIRMED: &str = ErrorCode::FlashlightProviderUnconfirmed.as_str();
 }
 
 /// Serializable snapshot of the torch (prost-free; plain bools).
@@ -235,6 +329,138 @@ mod device {
         }
     }
 
+    /// `CameraGlue.attach`'s own defaults, i.e. the preview the boot path opens
+    /// (`AmosGlue.onStart` → `CameraGlue.attach(applicationContext)`).
+    const PREVIEW_CAMERA: i32 = 0;
+    const PREVIEW_W: i32 = 640;
+    const PREVIEW_H: i32 = 480;
+
+    /// The Kotlin `object CameraGlue` — a singleton, so the JVM method is an
+    /// *instance* method reached through the static `INSTANCE` field.
+    const CAMERA_GLUE_CLASS: &str = "com.amos.ai.glue.CameraGlue";
+    const CAMERA_GLUE_INSTANCE: &str = "Lcom/amos/ai/glue/CameraGlue;";
+
+    /// AmOS's own rear-camera preview, as the torch path sees it.
+    struct CameraGluePreview {
+        /// Set only when *we* took the sensor, so a `resume` for a preview we never
+        /// suspended — the common case, where nothing was holding the camera — cannot
+        /// start a preview the user did not have.
+        suspended: AtomicBool,
+    }
+
+    impl CameraGluePreview {
+        fn new() -> Self {
+            Self {
+                suspended: AtomicBool::new(false),
+            }
+        }
+    }
+
+    /// `CameraGlue.INSTANCE`, resolved through the **app's** loader either way.
+    ///
+    /// `find_class`/`call_static_method(<&str>)` use the *calling thread's* loader,
+    /// which on a tokio worker (every `async` Tauri command) is the bootstrap one and
+    /// cannot see `com.amos.ai.glue.*` — the `ClassNotFoundException` measured as
+    /// REQ-A1866. [`crate::ble::android_jni::glue_class`] goes through the Context.
+    fn camera_glue_instance<'local>(
+        env: &mut jni::JNIEnv<'local>,
+        ctx: &jni::objects::GlobalRef,
+    ) -> Result<jni::objects::JObject<'local>, String> {
+        let class = crate::ble::android_jni::glue_class(env, ctx, CAMERA_GLUE_CLASS)?;
+        let class: &jni::objects::JClass<'_> = class.as_obj().into();
+        amos_jni::jni_call!(
+            env,
+            env.get_static_field(class, "INSTANCE", CAMERA_GLUE_INSTANCE)
+        )
+        .map_err(|e| e.to_string())?
+        .l()
+        .map_err(|e| e.to_string())
+    }
+
+    impl PreviewYield for CameraGluePreview {
+        fn suspend(&self) -> Result<bool, String> {
+            // Ask first, take second: a preview that is not capturing must not be
+            // "resumed" later, or turning the torch off would *start* a camera the
+            // user never had open.
+            let took = crate::ble::android_jni::with_context_result(|ctx, env| {
+                let glue = camera_glue_instance(env, ctx)?;
+                let capturing =
+                    amos_jni::jni_call!(env, env.call_method(&glue, "isCapturing", "()Z", &[]))
+                        .map_err(|e| e.to_string())?
+                        .z()
+                        .map_err(|e| e.to_string())?;
+                if !capturing {
+                    return Ok(false);
+                }
+                amos_jni::jni_call!(env, env.call_method(&glue, "detach", "()V", &[]))
+                    .map_err(|e| e.to_string())?;
+                Ok(true)
+            })?;
+            if took {
+                self.suspended.store(true, Ordering::Relaxed);
+            }
+            Ok(took)
+        }
+
+        fn resume(&self) -> Result<(), String> {
+            if !self.suspended.swap(false, Ordering::Relaxed) {
+                return Ok(()); // we never took the sensor — nothing to give back
+            }
+            crate::ble::android_jni::with_context_result(|ctx, env| {
+                let glue = camera_glue_instance(env, ctx)?;
+                // The JVM signature carries all four parameters: `CameraGlue.attach`
+                // has Kotlin defaults but no `@JvmOverloads`, so only the full method
+                // exists on the class.
+                amos_jni::jni_call!(
+                    env,
+                    env.call_method(
+                        &glue,
+                        "attach",
+                        "(Landroid/content/Context;III)V",
+                        &[
+                            jni::objects::JValue::Object(ctx.as_obj()),
+                            jni::objects::JValue::Int(PREVIEW_CAMERA),
+                            jni::objects::JValue::Int(PREVIEW_W),
+                            jni::objects::JValue::Int(PREVIEW_H),
+                        ],
+                    )
+                )
+                .map_err(|e| e.to_string())?;
+                Ok(())
+            })
+        }
+    }
+
+    /// The provider installed on device: the real
+    /// [`amos_flashlight::AndroidFlashlightProvider`] with AmOS's own preview stepped
+    /// out of the sensor's way for each request. See [`torch_yielding_the_preview`].
+    struct YieldingProvider {
+        inner: amos_flashlight::AndroidFlashlightProvider,
+        preview: CameraGluePreview,
+    }
+
+    #[async_trait::async_trait]
+    impl FlashlightProvider for YieldingProvider {
+        async fn snapshot(&self) -> amos_flashlight::Result<FlashlightState> {
+            self.inner.snapshot().await
+        }
+
+        async fn set_on(&self, on: bool) -> amos_flashlight::Result<()> {
+            let inner = &self.inner;
+            torch_yielding_the_preview(
+                &self.preview,
+                on,
+                |on| inner.set_on_blocking(on).map_err(|e| e.to_string()),
+                || std::thread::sleep(YIELD_SETTLE_STEP),
+            )
+            .map_err(amos_flashlight::FlashlightError::Provider)
+        }
+
+        fn note_external_state(&self, on: bool) {
+            self.inner.note_external_state(on);
+        }
+    }
+
     /// On-device only: hand the seam an `AppHandle` for live UI pushes. Called
     /// once from `lib.rs::setup` (android feature); a second call keeps the first.
     pub fn install_ui_pusher(app: AppHandle) {
@@ -309,7 +535,15 @@ mod device {
             // Exactly-once; a redundant re-attach simply keeps the first provider. Safe because
             // the Activity is not recreated under us — the generated manifest's `configChanges`
             // is what makes that true, and `scripts/android-glue-mirror.sh` gates it (REQ-A448).
-            let _ = DEVICE.set(Arc::new(provider));
+            //
+            // Wrapped, not bare: `AmosGlue.onStart` opens the same camera as a live preview at
+            // every foreground, and Android refuses `setTorchMode` while any client owns the
+            // device — so a bare provider reports "camera in use" for a camera AmOS itself is
+            // holding. `YieldingProvider` releases that preview around each request.
+            let _ = DEVICE.set(Arc::new(YieldingProvider {
+                inner: provider,
+                preview: CameraGluePreview::new(),
+            }));
         }
     }
 
@@ -458,11 +692,26 @@ pub async fn flashlight_set(
     store: State<'_, SharedStore>,
     enabled: bool,
 ) -> Result<FlashlightPayload, String> {
-    let snap = bridge
+    let (snap, confirmed) = bridge
         .manager
-        .set_on(enabled)
+        .set_on_checked(enabled)
         .await
         .map_err(|e| e.to_string())?;
+    if !confirmed {
+        // The provider accepted the write but the resulting authoritative state
+        // disagrees with the request (a silent failure: an OS TorchCallback raced
+        // us, a driver dropped the write, or a fallback backend served a request
+        // the real hardware never saw). This is exactly what the declared
+        // `provider_unconfirmed` wire code names — emit it so the signal has a
+        // producing path instead of being a dead constant.
+        tracing::warn!(
+            target: "amos::flashlight",
+            code = codes::PROVIDER_UNCONFIRMED,
+            requested = enabled,
+            actual = snap.on,
+            "torch request reached the provider but the device did not confirm the change"
+        );
+    }
     persist_flashlight(&app, &store, snap);
     Ok(snap.into())
 }
@@ -470,6 +719,206 @@ pub async fn flashlight_set(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a recorded preview answers: `Took` (= `Ok(true)`, the sensor is now
+    /// ours to give back), `Idle` (= `Ok(false)`, we were never the holder) or
+    /// `Unreachable`.
+    #[derive(Clone, Copy, PartialEq)]
+    enum PreviewAnswer {
+        Took,
+        Idle,
+        Unreachable,
+    }
+
+    /// A [`PreviewYield`] that records the order of its calls, so the two things the
+    /// torch path must get right — *when* the sensor changes hands, and *whether* a
+    /// refusal is worth re-asking — are pinned without a device.
+    struct RecordingPreview {
+        log: std::sync::Mutex<Vec<&'static str>>,
+        answer: PreviewAnswer,
+    }
+
+    impl RecordingPreview {
+        fn new(answer: PreviewAnswer) -> Self {
+            Self {
+                log: std::sync::Mutex::new(Vec::new()),
+                answer,
+            }
+        }
+
+        fn log(&self) -> Vec<&'static str> {
+            self.log.lock().unwrap().clone()
+        }
+
+        fn count(&self, what: &str) -> usize {
+            self.log().into_iter().filter(|s| *s == what).count()
+        }
+    }
+
+    impl PreviewYield for RecordingPreview {
+        fn suspend(&self) -> Result<bool, String> {
+            self.log.lock().unwrap().push("suspend");
+            match self.answer {
+                PreviewAnswer::Took => Ok(true),
+                PreviewAnswer::Idle => Ok(false),
+                PreviewAnswer::Unreachable => {
+                    Err("CameraGlue is not on the app's class loader".to_string())
+                }
+            }
+        }
+
+        fn resume(&self) -> Result<(), String> {
+            self.log.lock().unwrap().push("resume");
+            Ok(())
+        }
+    }
+
+    /// A torch call that records itself and refuses the first `refusals` attempts,
+    /// lighting on the next one. `usize::MAX` refuses for the whole run.
+    fn torch_call<'a>(
+        log: &'a std::sync::Mutex<Vec<&'static str>>,
+        refusals: usize,
+    ) -> impl FnMut(bool) -> Result<(), String> + 'a {
+        let mut left = refusals;
+        move |_on| {
+            log.lock().unwrap().push("torch");
+            if left > 0 {
+                left -= 1;
+                Err("camera is in use".to_string())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// A pause that records itself, so the retry count is observable.
+    fn settle<'a>(log: &'a std::sync::Mutex<Vec<&'static str>>) -> impl FnMut() + 'a {
+        move || log.lock().unwrap().push("settle")
+    }
+
+    #[test]
+    fn a_torch_request_releases_the_preview_before_it_is_asked() {
+        // The ordering is the fix: asking the torch first is what the platform
+        // refuses ("camera is in use"), for a reason the user cannot act on.
+        // REQ-A1891 / F-AND-021.
+        let preview = RecordingPreview::new(PreviewAnswer::Took);
+        let out = torch_yielding_the_preview(
+            &preview,
+            true,
+            torch_call(&preview.log, 0),
+            settle(&preview.log),
+        );
+        assert!(out.is_ok());
+        assert_eq!(preview.log(), vec!["suspend", "torch"]);
+    }
+
+    #[test]
+    fn a_lit_torch_keeps_the_sensor_from_the_preview() {
+        // Resuming here would hand the camera back to the preview and put the torch
+        // out — the two users cannot both hold it, and the torch is the one the user
+        // just asked for.
+        let preview = RecordingPreview::new(PreviewAnswer::Took);
+        let out = torch_yielding_the_preview(
+            &preview,
+            true,
+            torch_call(&preview.log, 0),
+            settle(&preview.log),
+        );
+        assert!(out.is_ok());
+        assert!(!preview.log().contains(&"resume"));
+    }
+
+    #[test]
+    fn a_torch_refused_after_the_hand_over_is_re_asked_until_it_lights() {
+        // The preview's release is asynchronous (`CameraGlue.teardown` posts
+        // `camera.close()` to its own thread and returns), so the platform can refuse
+        // a request that is already valid. The device log shows exactly this: the
+        // preview attached at `.411` and `setTorchMode` was refused at `.416`. The
+        // refusal after a real hand-over is therefore re-asked — here twice — and the
+        // torch ends up lit, with the sensor kept.
+        let preview = RecordingPreview::new(PreviewAnswer::Took);
+        let out = torch_yielding_the_preview(
+            &preview,
+            true,
+            torch_call(&preview.log, 2),
+            settle(&preview.log),
+        );
+        assert!(out.is_ok());
+        assert_eq!(
+            preview.log(),
+            vec!["suspend", "torch", "settle", "torch", "settle", "torch"]
+        );
+        assert_eq!(preview.count("settle"), 2);
+        assert!(!preview.log().contains(&"resume"));
+    }
+
+    #[test]
+    fn a_torch_refused_without_the_preview_holding_it_is_asked_once() {
+        // The other half of the rule: the preview was *not* the holder, so the
+        // platform's refusal is final — thermal shutdown, a dead battery or a device
+        // with no flash unit is not going to change because we waited. No pauses, one
+        // ask.
+        let preview = RecordingPreview::new(PreviewAnswer::Idle);
+        let out = torch_yielding_the_preview(
+            &preview,
+            true,
+            torch_call(&preview.log, usize::MAX),
+            settle(&preview.log),
+        );
+        assert_eq!(out.unwrap_err(), "camera is in use");
+        assert_eq!(preview.log(), vec!["suspend", "torch"]);
+        assert_eq!(preview.count("settle"), 0);
+    }
+
+    #[test]
+    fn a_refused_torch_gives_the_preview_its_sensor_back() {
+        // The torch never lit, so nothing is holding the camera: leaving the preview
+        // suspended would cost the user the preview *and* the light. The retries are
+        // bounded, so the worst case is a bounded wait, not a hang.
+        let preview = RecordingPreview::new(PreviewAnswer::Took);
+        let out = torch_yielding_the_preview(
+            &preview,
+            true,
+            torch_call(&preview.log, usize::MAX),
+            settle(&preview.log),
+        );
+        assert_eq!(out.unwrap_err(), "camera is in use");
+        assert_eq!(preview.count("torch"), 1 + YIELD_SETTLE_TRIES as usize);
+        assert_eq!(preview.count("settle"), YIELD_SETTLE_TRIES as usize);
+        assert_eq!(preview.log().first(), Some(&"suspend"));
+        assert_eq!(preview.log().last(), Some(&"resume"));
+    }
+
+    #[test]
+    fn extinguishing_the_torch_resumes_the_preview_without_suspending_it() {
+        // The mirror of the arm above, on the ordinary path: the torch was never
+        // holding the sensor, so there is nothing to take — only to give back.
+        let preview = RecordingPreview::new(PreviewAnswer::Took);
+        let out = torch_yielding_the_preview(
+            &preview,
+            false,
+            torch_call(&preview.log, 0),
+            settle(&preview.log),
+        );
+        assert!(out.is_ok());
+        assert_eq!(preview.log(), vec!["torch", "resume"]);
+    }
+
+    #[test]
+    fn an_unreachable_preview_does_not_veto_the_torch() {
+        // Best-effort by contract: when the preview is not the holder (refused at
+        // boot, or another app owns the sensor) there is nothing to release, and the
+        // torch's own verdict must still be what the user sees.
+        let preview = RecordingPreview::new(PreviewAnswer::Unreachable);
+        let out = torch_yielding_the_preview(
+            &preview,
+            true,
+            torch_call(&preview.log, 0),
+            settle(&preview.log),
+        );
+        assert!(out.is_ok());
+        assert_eq!(preview.log(), vec!["suspend", "torch"]);
+    }
 
     #[test]
     fn seed_parses_known_torch_bits_only() {

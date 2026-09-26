@@ -618,4 +618,41 @@ REQ-A417(通知中心)/ 更早的文件应用改动带来的**回归**,不是旧
 `text-*` 与 `bg-*` 能在同一 class 串里配对的形状——**跨元素**对比(例如 chip 落在动态卡片底色上)、
 渐变/图片背景、`opacity` 叠加仍不在静态扫描器视野内(§4.2 的已知盲区不变)。
 
+### 9.2 回填(REQ-A562,2026-09-20):扫描器报的 3 条 → 0,其中 1 条是**扫描器自身的假阳性**
+
+`node scripts/a11y-scan.mjs` 当时报 3 条(2 文件)。逐条定性后:**1 条假阳性(工具缺陷)+ 2 条真缺口**。
+
+| 位置 | 规则 | 定性 / 处置 |
+|---|---|---|
+| `SplitSurface.svelte` | dead-control | **假阳性,工具缺陷**。R9(及同形的 R2)扫的是**原文**,没有先去掉注释:该文件的文档注释里用反引号写了 `` `<button>` ``,于是被当作"一个没有任何处理函数的按钮"。这与 R1 当年把 `Field.svelte` 自己的文档注释里的 `<input>` 当成控件是**同一类**缺陷。修法:R9/R2 先 `stripComments`(复用既有函数),selftest 增两条钉住——注释里的 `<button>` 不算控件、注释里的 `<div onclick>` 不算"无 role 的可点区域"。 |
+| `src/svelte/settings/WindowPage.svelte` | live-region | **真缺口**。分屏命令的**异步结果**(`wm-note`:进入 / 被拒 / 失败)在按下之后才出现,屏幕阅读器听不到。修法:`wm-note` 变为 `role="status" aria-live="polite"`,且**容器常驻**(在其文本到达的同一刻才被插入的 live region 不可靠地被播报),无话可说时渲染为空串。 |
+| `src/svelte/modules/DockTileButton.svelte` | contrast-ratio | **真缺口**。`text-white on bg-danger` 在**深色主题** = **3.41:1**(浅色 5.38:1,通过)。深色 `--danger` 是刻意保持 HIG 的 `#FF453A`,只满足 AA-**Large**——对加粗 ≥14pt 的按钮文字可以,对 `text-[11px] font-bold` 的未读角标**不行**。修法:新增**主题无关**的 `--danger-solid`(`#D70015`,白字在**两种主题**下均 5.38:1),未读角标改用它;大号实心按钮继续用 `bg-danger`。同形的另两处角标(`HomeDock.svelte`、`Launchpad.svelte`,各自因"动态底"在 R6 白名单里)一并改用,保证"一条规则、一处实现"。 |
+
+证据:`node scripts/a11y-scan.mjs --selftest` **全绿**(+2 条新断言);`node scripts/a11y-scan.mjs`
+⇒ **141 文件 / 0 缺口**;`bun run test`(bun-iso)OK;`tsc` 0 错;`vitest`
+`window-page` / `home-dock` / `launchpad` / `dock-badge` / `live-region-a11y` / `a11y-regressions`
+六套件 **全绿**。**仍未做**:真屏幕阅读器复核(与 §4.3 的不变边界一致);`R6_FALSE_POSITIVES`
+按**整文件**白名单,对不透明底(`bg-danger-solid` 这类)其实过宽——本轮未改,登记为下一步。
+
+### 9.3 回填(REQ-A565,2026-09-20):先修 R6 的**漏报**,再修它暴露出来的 8 条真缺口
+
+§9.2 把 R6 的整文件白名单登记为"下一步"。本轮去动它时,先撞上了一个**更严重**的缺陷:**R6 有漏报**。
+
+| 位置 | 规则 | 定性 / 处置 |
+|---|---|---|
+| `scripts/a11y-scan.mjs` R6 | 漏报(**工具缺陷**) | R6 取 `text-*` 里的**第一个** token 当颜色。可 `text-` 前缀引入的不只是颜色:`text-xs`(字号)、`text-center`(对齐)、`text-balance`…… 于是 `text-xs text-accent` 的"颜色"被解析成 `text-xs`,调色板查不到,整对**静默跳过**;而**同一个对**写成 `text-accent`(不带字号)却会被报出来。两种写法必须一致。修法:新增 `isColorToken()`——只接受能解析到调色板(或任意色值 `text-[#…]`)的 token,字号/对齐/渐变一律不算颜色;`isLarge`(大字豁免)改从 `cls` 读字号(它以前寄生在 `fgTok` 上,`fgTok` 现在永远是颜色)。 |
+| 同上,R6 整文件白名单 | 过宽(**工具缺陷**) | 整文件白名单会**连坐**文件里每一个对:一个真缺口只要旁边有个玻璃按钮就报不出来。收窄为**按 pair**(`文件 → { "light\|fg\|bg": 理由 }`),删掉 5 条**已过期**的项(`SpotlightOverlay`/`MusicApp`/`SettingsApp`/`IncomingCall`/`HomeDock` 已不再产生任何失败对)。收窄当场证明它是必需的:`MusicApp` 的真缺口(`text-danger on bg-neutral-300/70`)与 `PhotosApp`/`PlayerApp` 的另两个媒体覆盖对,此前都被整文件白名单一起吞掉了。 |
+| `CalendarApp` `MailApp` `PlayerApp` `RemindersApp` | contrast-ratio | **真缺口 × 6**。`text-accent on bg-accent/15` = 4.46:1、`text-danger on bg-danger/15` = 4.10:1,都差一点不到 AA 的 4.5:1。**REQ-A387 早就定过这条规则**(见 `svelte-tests/a11y-regressions.svelte.test.ts`:accent ≤12%、danger ≤8%),但那条回归测试只列了 5 个文件,而扫描器又因上面的漏报报不出其余文件——规则在 4 个文件里**从未被强制**。修法:按既有档位改成 `bg-accent/10`(4.83:1)/ `bg-danger/8`(4.68:1)——与 `MessagesApp`/`PhoneApp`/`AiApp` 同档,并把这几处补进 A387 的回归清单。 |
+| `WeatherApp.svelte` | contrast-ratio | **真缺口**。城市删除 chip 是**灰底红字**:`text-danger on bg-neutral-200` = 4.27:1(深色 3.04:1)。灰底不能再浅,`danger` 也没有更深的档位,改为 `bg-danger/8 text-danger dark:bg-danger/20`(= `PhoneApp` 既有写法,5.10:1 / 4.68:1)。 |
+| `ContactsApp.svelte` | contrast-ratio | **真缺口**。联系人分区页眉 `text-neutral-400 on bg-neutral-100/90` = **2.33:1**(`text-xs font-bold uppercase` 的真实文字)。改为 `text-neutral-600`(浅底 7.23:1)+ `dark:text-neutral-400`(深底 ≈8.5:1)。 |
+| `CameraApp` / `MagnifierApp` / `Launchpad` / `PhotosApp` / `PlayerApp` / `LockScreen` / `CalculatorApp` / `ClockApp` | contrast-ratio | **不可静态判定**(非缺陷)。前六者是**媒体之上**的控件(取景器 / 放大实况 / 壁纸 / 照片 / 视频),真实背景既不是白也不是黑;`CalculatorApp` 整个文件根就是 `bg-black`(浅色行是虚构);`ClockApp` 的那对落在**图标**上(WCAG SC 1.4.11 要 3:1,3.63 / 3.04 均过)。逐对写进 `R6_UNVERIFIABLE` 并**注明理由与判定类别**(OVER MEDIA / ALWAYS-DARK / NON-TEXT)。 |
+
+证据:`node scripts/a11y-scan.mjs --selftest` **全绿**(+2 组新断言:字号不得遮蔽颜色、白名单按 pair 且不连坐);
+`node scripts/a11y-scan.mjs` ⇒ **141 文件 / 0 缺口**(起点:修漏报后一度 **10 文件 / 10 缺口**);
+`bun run check` **EXIT=0**;`tsc` 0 错;`svelte-check` **1386 files / 0 / 0**;`vitest`
+**124 文件 / 1466 例全绿**(含 `a11y-regressions` 新增"弱色文字在浅底上够深")。
+**负控(实测)**:把 `isColorToken` 换回旧的"只排除 transparent/current" ⇒ selftest **恰 1 红**(`text-xs text-accent` 的对漏掉);
+把按 pair 的判定退回"文件里任一对都放过" ⇒ selftest **恰 1 红**(同文件里的另一对没被检查);两者 `cp` 逐字节还原后复绿。
+**仍未做**(不变边界):真屏幕阅读器复核;R6 仍**读不出**"这个 token 给的是文字还是图标"(本轮靠人工逐处定性 NON-TEXT,不是规则自己判出来的)。
+
 | TRACEABILITY_MATRIX.md | 需求-测试-失效模式追踪 | 扫描/审计 = REQ-A282(首扫,该次提交未登记本行);**修补 = REQ-A283**(本文件 §3.1.5) |

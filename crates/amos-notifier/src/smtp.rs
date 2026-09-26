@@ -56,25 +56,82 @@ impl SmtpChannel {
     }
 }
 
-fn read_response_line(stream: &mut TcpStream) -> Result<u16, std::io::Error> {
-    let mut buf = [0u8; 512];
-    let n = stream.read(&mut buf)?;
-    let s = String::from_utf8_lossy(&buf[..n]);
-    // SMTP reply: "NNN rest" or multiline "NNN-...NNN ok".
-    let code: u16 = s
-        .trim()
+/// Read one complete SMTP reply and return its 3-digit code.
+///
+/// A single `read()` is not a reply. TCP hands the receiver whatever prefix
+/// has arrived, so a client that parses its first read turns a healthy
+/// `220 host ESMTP` into code `2` — outside `200..400` — and reports a
+/// channel that is fine as [`SendOutcome::Failed`]. For a *multiline* reply
+/// (`250-…` … `250 …`, which is what `EHLO` usually gets back) a single read
+/// is worse: the reply's tail stays in the socket, so the next command parses
+/// its code out of the previous reply's bytes. This is the same hazard
+/// `webhook::read_status_line` documents for the HTTP status line
+/// (F-NOT-005) — the two transports must not drift.
+///
+/// Lines are read one byte at a time on purpose. A `BufReader` would read
+/// ahead into its own buffer, and because it would be built fresh for each
+/// command (each round trip consumes exactly one reply) that buffered tail
+/// would be dropped between calls — reintroducing the desync it was meant to
+/// fix. One alert per connection and a handful of short replies: the syscall
+/// count does not matter, the correctness does.
+fn read_reply<R: Read>(stream: &mut R) -> Result<u16, std::io::Error> {
+    let first = read_reply_line(stream)?;
+    let code = parse_reply_code(&first)?;
+    let mut line = first;
+    // RFC 5321: a `NNN-` line continues; the final line has a space (or ends)
+    // after the code.
+    while is_continuation(&line) {
+        line = read_reply_line(stream)?;
+    }
+    Ok(code)
+}
+
+/// Read one CRLF-terminated line. `Err` on IO failure, on a peer that closes
+/// before any byte arrives, or on an absurdly long line (a peer that never
+/// sends a newline must not make us grow the buffer without bound).
+fn read_reply_line<R: Read>(stream: &mut R) -> Result<String, std::io::Error> {
+    let mut line: Vec<u8> = Vec::with_capacity(64);
+    let mut byte = [0u8; 1];
+    loop {
+        match stream.read(&mut byte)? {
+            0 => break,
+            _ => {
+                line.push(byte[0]);
+                if byte[0] == b'\n' {
+                    break;
+                }
+                if line.len() > 1024 {
+                    return Err(std::io::Error::other("smtp: reply line too long"));
+                }
+            }
+        }
+    }
+    if line.is_empty() {
+        return Err(std::io::Error::other(
+            "smtp: connection closed before a reply",
+        ));
+    }
+    Ok(String::from_utf8_lossy(&line).into_owned())
+}
+
+fn parse_reply_code(line: &str) -> Result<u16, std::io::Error> {
+    line.trim()
         .chars()
         .take(3)
         .collect::<String>()
         .parse()
-        .map_err(|_| std::io::Error::other("smtp: bad status line"))?;
-    Ok(code)
+        .map_err(|_| std::io::Error::other("smtp: bad status line"))
 }
 
-fn smtp_cmd(stream: &mut TcpStream, cmd: &str) -> Result<u16, std::io::Error> {
+/// `NNN-` continues the reply; `NNN ` (or a bare `NNN`) ends it.
+fn is_continuation(line: &str) -> bool {
+    line.as_bytes().get(3) == Some(&b'-')
+}
+
+fn smtp_cmd<R: Read + Write>(stream: &mut R, cmd: &str) -> Result<u16, std::io::Error> {
     stream.write_all(cmd.as_bytes())?;
     stream.write_all(b"\r\n")?;
-    read_response_line(stream)
+    read_reply(stream)
 }
 
 fn build_message(from: &str, to: &[String], alert: &Alert) -> String {
@@ -107,10 +164,14 @@ impl Channel for SmtpChannel {
         self.id.clone()
     }
     fn send(&self, alert: &Alert) -> SendOutcome {
-        let addr = match self
-            .addr
-            .0
-            .as_str()
+        // Resolve `host:port` as a pair, exactly as the webhook transport
+        // does. `ToSocketAddrs for &str` (which is what `self.addr.0` alone
+        // would select) parses a `"host:port"` *string* and errors on a bare
+        // host — so passing the host by itself made every send return
+        // `Failed` without ever opening a socket. The two transports must
+        // resolve the same way (F-NOT-005).
+        let (host, port) = &self.addr;
+        let addr = match (host.as_str(), *port)
             .to_socket_addrs()
             .ok()
             .and_then(|mut it| it.next())
@@ -141,7 +202,7 @@ impl Channel for SmtpChannel {
             );
         }
         // Server greeting.
-        let greeting = match read_response_line(&mut stream) {
+        let greeting = match read_reply(&mut stream) {
             Ok(c) => c,
             Err(_) => return SendOutcome::Failed,
         };
@@ -190,7 +251,7 @@ impl Channel for SmtpChannel {
         if stream.write_all(b"\r\n.\r\n").is_err() {
             return SendOutcome::Failed;
         }
-        let code = match read_response_line(&mut stream) {
+        let code = match read_reply(&mut stream) {
             Ok(c) => c,
             Err(_) => return SendOutcome::Failed,
         };
@@ -240,5 +301,142 @@ mod tests {
         // This panic is loud-on-startup by design: an operator must see it
         // at daemon startup, not when the first alert drops.
         let _ = SmtpChannel::new("127.0.0.1:25", "a@b", vec![]);
+    }
+
+    /// A `Read` that hands out at most `chunk` bytes per call however large a
+    /// buffer it is given — the way a real socket delivers a reply split
+    /// across segments. A `Cursor` cannot stand in for this: it fills the
+    /// whole caller buffer, which is exactly the assumption the single-read
+    /// reader wrongly makes.
+    struct Dribble {
+        data: Vec<u8>,
+        pos: usize,
+        chunk: usize,
+    }
+
+    impl Dribble {
+        fn new(data: &[u8], chunk: usize) -> Self {
+            Self {
+                data: data.to_vec(),
+                pos: 0,
+                chunk,
+            }
+        }
+    }
+
+    impl Read for Dribble {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = buf.len().min(self.chunk).min(self.data.len() - self.pos);
+            buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    /// The greeting arrives one byte at a time. Classifying the first read
+    /// sees `"2"` — code 2, outside `200..400` — so a healthy server would be
+    /// reported `Failed`.
+    #[test]
+    fn read_reply_assembles_a_status_line_delivered_one_byte_at_a_time() {
+        let mut r = Dribble::new(b"220 host ESMTP\r\n", 1);
+        assert_eq!(read_reply(&mut r).unwrap(), 220);
+    }
+
+    /// An `EHLO` reply is commonly multiline (`250-…` … `250 ok`). Every
+    /// continuation line must be consumed, or the *next* command parses its
+    /// code out of this reply's tail.
+    #[test]
+    fn read_reply_consumes_every_line_of_a_multiline_continuation() {
+        let mut r = Dribble::new(b"250-first\r\n250-second\r\n250 ok\r\n220 next\r\n", 3);
+        assert_eq!(read_reply(&mut r).unwrap(), 250);
+        assert_eq!(
+            read_reply(&mut r).unwrap(),
+            220,
+            "the reply after a multiline continuation was misparsed — the reader left the \
+             previous reply's tail in the stream"
+        );
+    }
+
+    /// A peer that closes without sending anything is an error, not a `0` code.
+    #[test]
+    fn read_reply_errors_when_the_peer_closes_without_a_reply() {
+        let mut r = Dribble::new(b"", 1);
+        assert!(read_reply(&mut r).is_err());
+    }
+
+    /// End-to-end through [`SmtpChannel::send`] against a server that speaks a
+    /// realistic dialogue: the greeting and the *multiline* `EHLO` reply are
+    /// each split across two segments. Before this fix the client classified a
+    /// single read, so the split lines desynced every later reply and a mail
+    /// the server had accepted was reported `Failed` — which the dispatcher
+    /// turns into an operator fallback for an alert that really landed.
+    #[test]
+    fn send_survives_a_greeting_and_multiline_ehlo_split_across_segments() {
+        use std::io::{BufRead, BufReader};
+        use std::net::TcpListener;
+        use std::thread;
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut w = stream.try_clone().unwrap();
+            let mut r = BufReader::new(stream);
+            let mut line = String::new();
+
+            // Greeting, split mid-token.
+            let _ = w.write_all(b"220 fake ");
+            let _ = w.flush();
+            thread::sleep(Duration::from_millis(20));
+            let _ = w.write_all(b"ESMTP\r\n");
+
+            // EHLO → a multiline reply, split between the two lines.
+            r.read_line(&mut line).unwrap();
+            let _ = w.write_all(b"250-fake\r\n");
+            let _ = w.flush();
+            thread::sleep(Duration::from_millis(20));
+            let _ = w.write_all(b"250 OK\r\n");
+
+            // MAIL FROM / RCPT TO / DATA, one reply each.
+            for (expect, reply) in [
+                ("MAIL FROM", "250 OK\r\n"),
+                ("RCPT TO", "250 OK\r\n"),
+                ("DATA", "354 Send it\r\n"),
+            ] {
+                line.clear();
+                r.read_line(&mut line).unwrap();
+                assert!(
+                    line.starts_with(expect),
+                    "server saw {line:?}, expected {expect}"
+                );
+                let _ = w.write_all(reply.as_bytes());
+            }
+
+            // Body, terminated by "." on its own line.
+            loop {
+                line.clear();
+                r.read_line(&mut line).unwrap();
+                if line == ".\r\n" {
+                    break;
+                }
+            }
+            let _ = w.write_all(b"250 OK\r\n");
+
+            line.clear();
+            r.read_line(&mut line).unwrap(); // QUIT
+            let _ = w.write_all(b"221 Bye\r\n");
+        });
+
+        let ch = SmtpChannel::new(
+            format!("127.0.0.1:{port}"),
+            "amos@localhost",
+            vec!["ops@localhost".into()],
+        );
+        assert_eq!(
+            ch.send(&Alert::p0("db.unreachable", "down")),
+            SendOutcome::Sent
+        );
+        server.join().unwrap();
     }
 }

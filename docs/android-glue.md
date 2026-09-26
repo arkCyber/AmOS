@@ -22,15 +22,19 @@
 
 | 位置 | 内容 |
 |---|---|
-| `crates/amos-tauri/android-glue/com/amos/ai/glue/SensorGlue.kt` | 注册 `TYPE_ACCELEROMETER`+`TYPE_GYROSCOPE` `SensorEventListener`；`onSensorChanged` 调 native `recordImu(tsMs, ax..az, gx..gz, tempC)`。 |
+| `crates/amos-tauri/android-glue/com/amos/ai/glue/SensorGlue.kt` | 注册 `TYPE_ACCELEROMETER`+`TYPE_GYROSCOPE` `SensorEventListener`；`onSensorChanged` 调 native `recordImu(tsMs, ax..az, gx..gz, tempC)`。另注册 `TYPE_STEP_COUNTER`+`TYPE_HEART_RATE`，`onSensorChanged` 调 native `recordVitals(tsMs, stepsTotal, hrBpm)`（步数是**自开机累计**；无接触 `SENSOR_STATUS_NO_CONTACT` 传 `NaN`，见 §11 sensors.md）。 |
 | `.../CameraGlue.kt` | `Camera2` `CameraDevice` 预览会话 → NV21 `ImageReader`；`onImageAvailable` 调 native `recordFrame(id,w,h,fmt,fps,bytes)`。 |
 | `.../Nv21.kt` | `YUV_420_888 → NV21` 打包（AmOS `CameraFrame` 负载布局）。 |
 | `.../AmosGlue.kt` | 装配 facade：请求 `CAMERA` 权限、`onStart` attach / `onStop` detach。 |
-| `crates/amos-tauri/src/android_glue.rs`（`#[cfg(feature="android")]`） | **Rust 回调 stub**：`GLUE_BUS` + `arm(bus)`/`is_armed()` + `#[no_mangle]` JNI 上送 `Java_com_amos_ai_glue_SensorGlue_recordImu` / `..._CameraGlue_recordFrame`（解码进 `LiveSensorProvider`）。 |
+| `crates/amos-tauri/src/android_glue.rs`（`#[cfg(feature="android")]`） | **Rust 回调 stub**：`GLUE_BUS` + `arm(bus)`/`is_armed()` + `#[no_mangle]` JNI 上送 `Java_com_amos_ai_glue_SensorGlue_recordImu` / `..._SensorGlue_recordVitals` / `..._CameraGlue_recordFrame`（解码进 `LiveSensorProvider`；`recordVitals` 的非有限值 ⇒ `None`）。 |
 | `SensorHost::producer()` | 把读侧同一 bus 交给 `android_glue::arm`，glue 写、host 读一致。 |
 | `android-glue/AndroidManifest.permissions.xml` | **跟踪**的清单片段（权限 + `uses-feature`）：合并进 `gen/.../AndroidManifest.xml`（§5.1）。 |
-| `android-glue/AndroidManifest.components.xml` | **跟踪**的组件片段：`AmosInCallService`（默认拨号应用的在通话 UI）、`AmosCallScreeningService`（来电筛选/拦截）、`SmsReceiver`（进程不在也收得到短信）。此前这三个注册**只存在于 git-ignored 的生成清单里**。 |
-| `scripts/android-glue-mirror.sh` | 把整棵 `android-glue/` 镜像进 `gen/`（替换而非合并），并**校验**三件事：① 生成清单含全部片段声明的 `android:name`；② **包身份一致**（`tauri.conf.json` 的 identifier ↔ glue 的 Kotlin `package` ↔ Rust 里硬编码的 JNI 类名前缀）；③ 生成 Activity 调用了全部 glue 入口。编译门 / `build-apk.sh` / `make android-app` 共用。 |
+| `android-glue/AndroidManifest.components.xml` | **跟踪**的组件片段：`AmosInCallService`（默认拨号应用的在通话 UI）、`AmosCallScreeningService`（来电筛选/拦截）、`SmsReceiver`（进程不在也收得到短信）、`AlarmReceiver`、`ScreenRecordService`、`AmosImeService`（系统输入法，REQ-A1893）。此前这些注册**只存在于 git-ignored 的生成清单里**。 |
+| `.../AmosImeService.kt` | 系统输入法（`: InputMethodService`，REQ-A1893）。程序化搭键盘 View（不依赖 git-ignored 的 `res/layout`），`onCreate` 里 `nativeAttach(filesDir)` 并**吞 `Throwable` 诚实降级**（引擎不可用 ⇒ 英文键盘 + 禁用中英键，绝不吞掉每个字母）；`onStartInput`/`onFinishInput` 清本条会话缓冲；每次键击经 `ImeRouting.decide` → JNI，再 `InputConnection.commitText/deleteSurroundingText/sendDefaultEditorAction`。 |
+| `.../ImeWire.kt` / `ImeLayout.kt` / `ImeRouting.kt` | 三个**纯**对象（无 Android 类型 ⇒ 宿主 JVM 可测）：线格式解码（`\n` 分记录 / `\t` 分字段 / `\\ \t \n` 转义）、键位与中文标点表 + 8 条/页的候选分页（镜像 `frontend-ts/src/lib/ime.ts`）、§Key behaviours 的**按键路由表**（非字母先提交、空格/回车、退格次序、`1–9` 候选快捷键）。 |
+| `crates/amos-tauri/src/android_ime.rs`（`#[cfg(feature="android")]`） | 系统输入法的 JNI 桥：8 个 `Java_com_amos_ai_glue_AmosImeService_native*` 蹦床，进 `ime::ImeBridge::shared_or_boot()`（未装时按 Kotlin 传来的 `filesDir` 惰性 boot）。`encode_state`/`escape_field` 是**纯函数**（`#[cfg(test)]` 钉住字节）。 |
+| `android-glue/res/xml/method.xml` | **跟踪**的输入法子类型资源（`<input-method><subtype zh_CN>`）；`AmosImeService` 的 `<meta-data android:name="android.view.im">` 指向它。label 用**字面量**而非 `@string/…`（`res/values/strings.xml` 是 git-ignored 生成物）。镜像脚本按名拷贝进 `gen/.../res/xml/`（**不 rm 整目录** —— 那里有 Tauri 的 `file_paths.xml`），并校验每个 `@xml/<n>` 都有跟踪文件。 |
+| `scripts/android-glue-mirror.sh` | 把整棵 `android-glue/` 镜像进 `gen/`（替换而非合并），并按名拷贝 `android-glue/res/**/*.xml`（**不 rm 整目录**），并**校验**四件事：① 生成清单含全部片段声明的 `android:name`，且**没有** `android:name` 只存在于生成清单；② **包身份一致**（`tauri.conf.json` 的 identifier ↔ glue 的 Kotlin `package` ↔ Rust 里硬编码的 JNI 类名前缀）；③ 生成 Activity 调用了全部 glue 入口；④ 片段里每个 `@xml/<n>` 都有跟踪文件（否则 fail loud —— 缺资源是 AAPT 编译错误，而**陈旧**资源是静默错误的子类型）。编译门 / `build-apk.sh` / `make android-app` 共用。 |
 | `scripts/android-activity-wiring-check.sh` | 校验生成的 `MainActivity.kt` 是否真的调用那 15 个 glue 入口（只存在于 git-ignored 生成文件里的"手工拷贝"装配）。 |
 
 ## Rust 侧接线（boot，真机）
@@ -213,8 +217,23 @@ close 释放了在途图像的内存，回调继续读它 → `buffer is inacces
    `row*rowStride + col*pixelStride` **无上界绝对读**，既会误读短窗口、也可能索引越 `limit()`。
    新实现只在 `limit()` 内读（读不到的尾字节留 `0`，绝不抛）、支持 `pixelStride` 1/2 与任意
    `rowStride`、luma 连续行走整行批量拷贝。
-8. **可观测**：`CameraGlue.droppedFrameCount()` 暴露被守卫丢弃的帧数；防御性 `try/catch` 保留为
-   纵深防御，但不再是唯一手段。
+8. **可观测（2026-09-21 更正，REQ-A776 / F-SH-231）**：本条原文写「`CameraGlue.droppedFrameCount()`
+   暴露被守卫丢弃的帧数」——**这句话不成立**：该函数在仓库里**没有任何调用点**（无 JNI 入口、无
+   `amos_*` 命令、无 Kotlin 调用者；`grep -rn droppedFrameCount` 只有定义与两处自增），所以它「暴露」
+   不了任何东西，下节验收步骤第 2 条（「`droppedFrameCount()` 不持续增长」）**从来没有可执行过**。
+   现在改为**日志即账**：每次丢帧都打一行 `frame encode dropped (n=<累计>)`——**包括打包器返回
+   `null`（结构性拒绝几何：非正/奇数尺寸、无平面、未知格式）这条以前「只加计数、一行不打」的静默
+   路径**——于是真机可以从 logcat 直接读出累计丢帧数。`droppedFrameCount()` 保留，但已在 KDoc 里
+   如实标注「仓库内无人调用」。同一轮另加**正向证据**行 `camera attached: id=… WxH`：此前相机只有
+   **负向**日志（`camera attach skipped: …`），于是「相机开着」与「attach 压根没被走到」在日志上
+   **无法区分**——正是本仓库反复登记的「空绿」形态（姊妹 glue 的 `media backend attached (MediaStore)`
+   就是为同一个理由存在的）。防御性 `try/catch` 保留为纵深防御，但不再是唯一手段。
+9. **可见性（REQ-A776 / F-SH-231）**：采集资源字段（`reader`／`generation`／`session`／`camera`／
+   `handler`／`thread`／`cameraNumber`／`manager`）一律 `@Volatile`。第 3、5、6 条的守卫都建立在
+   「`teardown()` 先清字段，回调据此认出陈旧」之上，而写（`attach`/`detach`，前台线程）与读
+   （`onImageAvailable` 与 `CameraDevice`/`CameraCaptureSession` 回调，`amos-camera` 线程）之间
+   **没有 happens-before**：不加 `volatile`，守卫可能把**陈旧**的 `reader` 当成当前，去读一块
+   `close()` 刚释放的 native 内存——即从守卫**内部**把第 3 条修掉的 use-after-free 请回来。
 
 ### 验证
 
@@ -238,11 +257,28 @@ close 释放了在途图像的内存，回调继续读它 → `buffer is inacces
 
 ### 设备验收步骤（真机；未在本环境执行）
 
+**先把第 1–2 条机械化（REQ-A776 / F-SH-231）**：`make android-camera-bringup`
+（= `scripts/android-camera-bringup.sh`；`--dry-run` 是默认，`--apply` 才动设备）——授权 →
+清 logcat → 抓 `AmosGlue:V AndroidRuntime:V` → 反复 `HOME`↔回前台 N 次（默认 5）→ 判读日志。
+判据是下面的第 1 条、第 2 条的**丢帧上界**（`(n=…)` 单次会话累计值的峰值不得超过
+`--max-drops`，默认 10，即本文「个位数偶发可接受」画出的那条线），**外加**「日志里必须出现
+相机路径证据（`camera attached` 或丢帧行）」：**一个前台周期都没跑**、**日志里没有任何相机路径
+证据**、或**守卫在一次会话里丢掉的帧超过上界**（丢帧账本此前只被打印、从不被判定 ⇒ 一个几乎
+丢弃每一帧的相机会以「无 FATAL」通过）的运行，一律判 `FAIL`（`--selftest` 用 10 个合成日志
+证明这些判据有判别力）。同理，崩溃签名只收**签名**不收**症状类名**：曾列入的裸
+`IllegalStateException` 被删除 —— 每一处 REQ-A45 缺陷都已由它自带的报文
+（`buffer is inaccessible` ∕ `ImageReader is not valid`）命中，而**未捕获**的异常一定打印
+`FATAL EXCEPTION`，所以那个裸类名只会命中**胶层捕获并如实上报**的、即守卫正常工作的那一行，
+把一次正确处理的丢帧判成运行失败。它**只**判日志签名，因此**不宣称竞态已消失**——没触发的
+竞态仍然是竞态，且这台设备的 HAL 时序只是一个样本。
+
 1. `adb logcat -s AmosGlue`：授权 `CAMERA` 后不再出现 `frame encode dropped: ... buffer is
-   inaccessible`。
-2. 反复 `HOME` → 回前台（多次触发 `onStart`）：无 FATAL；`droppedFrameCount()` 不持续增长；
-   `dumpsys media.camera | grep -i client` 只有一个 AmOS 客户端连接。
-3. 读侧能取到帧：`LiveSensorProvider` 最新帧 `seq` 递增（`docs/sensors.md` §8 的 `sensor-data`）。
+   inaccessible`（该行现带累计值 `(n=…)`）。
+2. 反复 `HOME` → 回前台（多次触发 `onStart`）：无 FATAL；`frame encode dropped (n=…)` 的 `n`
+   **不持续增长**（≈0；个位数偶发可接受并应记录 —— **此半条已机械化**，见上：峰值 >`--max-drops`
+   即 `FAIL`）；`dumpsys media.camera | grep -i client` 只有一个 AmOS 客户端连接（**仍待机械化**）。
+3. 读侧能取到帧：`LiveSensorProvider` 最新帧 `seq` 递增（`docs/sensors.md` §8 的 `sensor-data`；
+   **仍待机械化** —— 该读数不在 logcat 里，需要应用侧仪器）。
 
 ## 个人热点 glue（`TetheringGlue.kt`，2026-09-13）
 

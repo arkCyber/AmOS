@@ -66,3 +66,79 @@ make dev          # 等价于 scripts/dev.sh
   于是透写静默失效，REQ-A101）；读回确认 `svelte/store.ts` 的 `createStoreValue` 订阅了
   `store-updated`；Rust 侧 `store.rs` 是否广播。
 - 每次改完代码重新跑 `make lint` + `make test`。
+
+---
+
+## 设备读数：真机上的「看得见 / 点得到」（REQ-A486）
+
+上面的清单靠人眼；这一节是它的**仪器版** —— 同一台机器上，用辅助功能树**读**真实 UI、用合成指针**驱动**它。
+工具在仓库里（`scripts/device/amos-device.swift`，包装脚本 `scripts/device.sh`）：
+
+```bash
+make device-tool ARGS='ax Amos 新建窗口'      # 谁在屏幕上：role / 标题 / 位置尺寸 / enabled / 键帽
+make device-tool ARGS='ax Amos 隐藏 --visible' # 只看**真的在窗口里**的节点（其余是排版出来的）
+make device-tool ARGS='activate Amos'         # 把它带到前台（点它窗口之前必须做，见下）
+make device-tool ARGS='rclick 793 868'        # 在 Dock 图标上右键（真实指针事件）
+make device-tool ARGS='click 1212 954'        # 点一个读到的坐标（坐标必须**在窗口内**，见下）
+make device-tool ARGS='scroll 700 500 10'     # 滚轮（把排到窗口外的东西带进来）
+make device-tool ARGS='key cmd+shift+n'        # 真实按键（也认 ⌘⇧N 这种字形写法）
+make device-tool ARGS='press Amos 新建窗口'    # 用 AX 动作激活一个控件（绕过指针路径）
+make device-tool ARGS='drag 300 120 430 250'  # 真实拖拽（AX 只能「设置位置」，不能拖）
+make device-tool ARGS='--selftest'            # 设备无关的那一半（`make lint` 会跑）
+```
+
+**为什么它在仓库里**：这些读数在本项目里找到的缺陷最多（类规则的 x/y 从未到达窗口、去抖存储没有轮询者、
+右键菜单的下半截被窗口裁掉、原生菜单栏广告一个壳已经不认的键），而它们此前每个会话都写在 `/tmp` 里然后丢掉
+—— **无法复跑的读数不算证据**。
+
+### 四条必须记住的读数性质
+
+1. **AX 的 frame 是 DOM 布局，不是「窗口显示出来的东西」。** 实测：一个右键菜单的行被报在 y=913，而窗口下边缘在
+   909 —— frame 是诚实的，行却是看不见的（F-DEV-069）。所以「看得见」要用**像素**判断（`screencapture` + 取色），
+   两者不矛盾时结论才成立。
+2. **滚动过的 web 视图里，AX frame 是「排版坐标」，不是屏幕坐标。** 实测（REQ-A489）：设置窗口 `AXWindow "设置"
+   pos=(236,70) size=(1024x720)` 底边在 **y=790**，而「键盘快捷键」页的 `隐藏应用` 行被报在 **y=945** —— 数字是诚实
+   的，内容却在窗外。**在这种坐标上 `click` 等于点在窗口外面：命令返回成功、什么也没发生**（本轮我在这上面白点了
+   好几次，直到 `--visible` 把「157 个节点排在窗外」直接说出来）。规矩：动手前先 `--visible`，需要它就先让它进窗口
+   （`scroll`，或把页面缩短/窗口放大），再按读到的坐标点。
+3. **键帽不在标题里。** 菜单项广告的快捷键只能从 `AXMenuItemCmdChar` + `AXMenuItemCmdModifiers` 读出来；本工具
+   会把它们翻成 `Cmd+Shift+Alt+Ctrl+<char>` 打印（REQ-A485 的读数就是这样拿到的）。
+4. **点一个非活动窗口的内容，第一下只用来激活它。** macOS 会把这一次点击吞掉（除非视图 `acceptsFirstMouse`），
+   现象与「点空了」一模一样：实测 `click` 返回成功、那一行没变。规矩：先 `activate <process>`，再点。另外
+   ⌘-chord 会送给**聚焦的那个窗口**，不是你以为的那个 —— 本轮我用 `key cmd+w` 关掉的是主窗口而不是设置窗口。
+
+### 一次真实读数长什么样
+
+```
+$ make device-tool ARGS='rclick 793 868'
+rclick at (793,868)
+$ make device-tool ARGS='ax Amos 新建窗口'
+                AXMenuItem title="新建窗口 ⌘N" desc="" value="" pos=(794,682) size=(198x31) enabled
+```
+
+行在 **y=682**（指针在 868）说明菜单**翻转到了指针上方**（REQ-A481 的修复），标题里的 `⌘N` 说明键帽来自
+用户的合并绑定（REQ-A484）。**一次读数同时验证了两件事** —— 这正是把工具留在仓库里的价值。
+
+### 一次「改绑/禁用真的生效了吗」的读数（REQ-A490）
+
+键位设置页（`设置 ▸ 键盘快捷键`）是唯一会写键位的地方，所以「用户把某个键关掉之后，原生菜单栏还广告它吗」只有在
+真机上驱动那一页才答得出来：
+
+```
+$ make device-tool ARGS='activate Amos'
+$ make device-tool ARGS='key cmd+shift+n'          # …或点页面里的 ✕ / 编辑徽章
+$ make device-tool ARGS='ax Amos 隐藏'              # 打开 Apple 菜单后读那一行
+        AXMenuItem title="隐藏 Amos" … enabled                         ← 关掉之后：没有 keyEquivalent
+        AXMenuItem title="隐藏其他" … enabled  keyEquivalent=Cmd+Alt+H   ← 没同步的行原样保留
+```
+
+**修之前**（同一条命令、同一个配置）：`隐藏 Amos … keyEquivalent=Cmd+H` —— 用户关掉的键仍然印在原生菜单上，而且
+macOS 会继续按它执行（F-SH-042：muda 的 `set_key_accelerator(None)` 在 macOS 上根本不碰 `NSMenuItem`，却返回
+`Ok`）。修法见 `menu.rs::BINDING_OVERRIDES`：禁用行**重建**整条菜单栏（不带那个键帽），宿主日志会说
+`re-drew the menu bar so the disabled rows carry no chord`。反向也验过：`重置全部` 之后那一行又拿回 `Cmd+H`。
+
+> **写入前请知道你在动真配置**：这一页写的是**用户的**键位（WebView 的 localStorage），实验做完要还原
+> （页面顶部的「重置全部」；它有一个确认对话框，对话框里的按钮要用 `click` 按坐标点，因为 `press` 取的是**第一个**
+> 同名控件 —— 见下）。`press` 认名字不认序号，遇到 16 个一样的 ✕、或工具栏与对话框各有一个「重置」时，
+> 用 `ax` 读到的 frame 换算中心点 `click`。
+

@@ -7,6 +7,7 @@ import {
   mediaList,
   mediaLoad,
   mediaSave,
+  mediaStreamUrl,
   normalizeDir,
   normalizeGrant,
   normalizeMediaItem,
@@ -192,5 +193,39 @@ describe("bridge presence (hasMediaBridge / error semantics)", () => {
         throw new Error("media read on camera is not authorized");
       }, async () => mediaList("camera")),
     ).rejects.toThrow(/not authorized/);
+  });
+
+  it("mediaStreamUrl returns the host's URL, and null when the host will not serve it", async () => {
+    const item = {
+      id: "content://media/video/1234",
+      kind: "video" as const,
+      collection: "movies" as const,
+      name: "movie.mp4",
+      uri: "content://media/video/1234",
+      mime: "video/mp4",
+      size_bytes: 900 * 1024 * 1024,
+      ts: 1,
+    };
+    // The URL is built by Rust (the platform spelling is its business), so the wrapper
+    // must pass the item through untouched and hand back exactly what the host said.
+    let seenArgs: Record<string, unknown> | undefined;
+    const url = await withBridge(
+      async (cmd, args) => {
+        expect(cmd).toBe("media_stream_url");
+        seenArgs = args;
+        return "amos-media://movies/content%3A%2F%2Fmedia%2Fvideo%2F1234";
+      },
+      async () => mediaStreamUrl(item),
+    );
+    expect(url).toBe("amos-media://movies/content%3A%2F%2Fmedia%2Fvideo%2F1234");
+    expect(seenArgs).toEqual({ item });
+
+    // A host that refuses (no listing entry / no read grant) answers null — the caller
+    // must be able to tell that apart from a URL it should render.
+    expect(
+      await withBridge(async () => null, async () => mediaStreamUrl(item)),
+    ).toBeNull();
+    // No bridge at all: null, not a guess.
+    expect(await mediaStreamUrl(item)).toBeNull();
   });
 });

@@ -1,0 +1,9 @@
+{
+  "entries": [
+    {
+      "file": "scripts/docs-link-scan.mjs",
+      "cited": "docs/X.md",
+      "reason": "A placeholder, not a citation: the header describes a link rewrite by its *shape* (`./docs/X.md` → `docs/X.md`), so `X.md` names no document on purpose. Fixing it by naming a real file would turn an example into a claim."
+    }
+  ]
+}

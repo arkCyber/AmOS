@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { forecast, dayLabel, intlTag, cToF, displayTemp, convertRange, adjustForecast, shiftRange, WEATHER_CITIES, defaultWeatherCities, normalizeWeatherCities, removeWeatherCity, addWeatherCity } from "../lib/weather";
+import { forecast, dayLabel, cToF, displayTemp, convertRange, adjustForecast, shiftRange, WEATHER_CITIES, defaultWeatherCities, normalizeWeatherCities, removeWeatherCity, addWeatherCity } from "../lib/weather";
+// `intlTag` moved to the locale module (it is shared with the browser's date
+// formatting, not weather-specific) — imported from its new home.
+import { intlTag } from "../i18n/types";
 
 describe("weather", () => {
   test("provides a deterministic 5-day forecast starting today", () => {

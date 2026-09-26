@@ -720,7 +720,7 @@ pub mod timesync {
             let clock = self.clock.lock().await;
             TimeSyncStatus {
                 synced: clock.synced(),
-                offset_ms: clock.offset_ns().map(|ns| ns / 1_000_000).unwrap_or(0),
+                offset_ms: clock.offset_ns().map(|ns| ns / 1_000_000),
                 staleness_ms: clock.staleness().map(|d| d.as_millis() as u64),
                 corrected_now_ms: epoch_ms(clock.now()),
             }
@@ -738,9 +738,18 @@ pub mod timesync {
     pub struct TimeSyncStatus {
         /// Whether any calibration offset is known.
         pub synced: bool,
-        /// Signed host→true offset, whole milliseconds.
-        pub offset_ms: i64,
-        /// Age of the calibration, or `None` if never synced.
+        /// Signed host→true offset, whole milliseconds — or `None` when no calibration
+        /// offset is known (the clock has never been synced, see
+        /// [`synced`](Self::synced)).
+        ///
+        /// `0` here is a *measurement* ("the host clock is already correct"); it is not
+        /// what an unsynced clock may answer. Inventing one would be the fold
+        /// [`SyncedClock::staleness`] refuses for the sibling age — turning the least
+        /// knowable state into the most reassuring one (REQ-A539). (REQ-A1703.)
+        pub offset_ms: Option<i64>,
+        /// Age of the calibration in whole milliseconds, or `None` when no age can
+        /// be established — the clock was never synced, or its recorded last-sync
+        /// stamp is ahead of the host clock (see [`SyncedClock::staleness`]).
         pub staleness_ms: Option<u64>,
         /// Corrected wall clock as Unix-epoch milliseconds.
         pub corrected_now_ms: u64,
@@ -748,13 +757,27 @@ pub mod timesync {
 
     impl fmt::Display for TimeSyncStatus {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(
-                f,
-                "corrected now = epoch {}ms (offset {}ms)",
-                self.corrected_now_ms, self.offset_ms
-            )?;
+            // The offset is stated the same way the age is: an absent measurement is
+            // absent, not a reassuring `0`. A never-synced clock reads
+            // "(offset unavailable), never synced" rather than "(offset 0ms), never
+            // synced" — which contradicted itself in one line. (REQ-A1703.)
+            match self.offset_ms {
+                Some(ms) => write!(
+                    f,
+                    "corrected now = epoch {}ms (offset {}ms)",
+                    self.corrected_now_ms, ms
+                )?,
+                None => write!(
+                    f,
+                    "corrected now = epoch {}ms (offset unavailable)",
+                    self.corrected_now_ms
+                )?,
+            }
             match self.staleness_ms {
                 Some(ms) => write!(f, ", last synced {ms}ms ago"),
+                // Synced but no bound on the age: saying "never synced" would
+                // contradict `synced: true`, and "0ms ago" would be a lie. (REQ-A539.)
+                None if self.synced => write!(f, ", sync age unavailable"),
                 None => write!(f, ", never synced"),
             }
         }
@@ -813,6 +836,32 @@ pub mod timesync {
 
             let _ = std::fs::remove_file(&state);
             let _ = std::fs::remove_file(state.with_extension("tmp"));
+        }
+
+        #[test]
+        fn an_unsynced_clock_reports_no_offset_instead_of_a_measured_zero() {
+            // A state file that does not exist ⇒ nothing was ever calibrated here.
+            let state = std::env::temp_dir()
+                .join(format!("amos-sup-ts-unsynced-{}.json", std::process::id()));
+            let _ = std::fs::remove_file(&state);
+            let clock = SyncedClock::load(&state);
+            assert!(!clock.synced());
+
+            let status = TimeSyncStatus {
+                synced: clock.synced(),
+                offset_ms: clock.offset_ns().map(|ns| ns / 1_000_000),
+                staleness_ms: clock.staleness().map(|d| d.as_millis() as u64),
+                corrected_now_ms: epoch_ms(clock.now()),
+            };
+            assert_eq!(status.offset_ms, None, "an unsynced clock knows no offset");
+
+            let text = status.to_string();
+            assert!(
+                !text.contains("(offset 0ms)"),
+                "an unsynced clock must not claim a measured zero offset: {text}"
+            );
+            assert!(text.contains("offset unavailable"), "got: {text}");
+            assert!(text.contains("never synced"), "got: {text}");
         }
 
         #[test]

@@ -105,10 +105,14 @@ impl RagEngine {
     /// Returns the vector dimension after this ingest.
     fn ingest(&mut self, id: String, text: String) -> amos_vector_db::Result<u32> {
         self.store.ingest(id.clone(), &text)?;
-        let dim = self.store.dim().unwrap_or(0);
+        // A successful ingest leaves the index with a dimension; report it rather than
+        // folding a missing one to `0`, which would name a size the index never had.
+        let dim = self.store.dim().map(|d| d as u32).ok_or_else(|| {
+            VectorDbError::Invalid("ingest completed with no vector dimension".into())
+        })?;
         self.passages.insert(id, text);
         self.persist_best_effort();
-        Ok(dim as u32)
+        Ok(dim)
     }
 
     /// Drop an id from retrieval, then persist. `true` if it was present.
@@ -136,8 +140,12 @@ impl RagEngine {
         self.store.len()
     }
 
-    fn dim(&self) -> u32 {
-        self.store.dim().unwrap_or(0) as u32
+    /// The index's vector dimension, `None` until the first ingest
+    /// ([`amos_vector_db::RagStore::dim`]). Not folded to `0`: a dimension of zero is
+    /// not a measurement this engine can hold (`ZeroDimension` is refused on ingest),
+    /// so reporting `0` would state a size the index has never had.
+    fn dim(&self) -> Option<u32> {
+        self.store.dim().map(|d| d as u32)
     }
 
     /// Write the vector snapshot + passages to their sibling files. Best-effort:
@@ -514,7 +522,23 @@ mod tests {
             .expect("status")
             .into_inner();
         assert_eq!(st.indexed, 1);
-        assert_eq!(st.dimension, 8);
+        assert_eq!(st.dimension, Some(8));
+        assert_eq!(st.embedder, "mock");
+    }
+
+    /// An index with nothing in it has **no** dimension — the reply says so by
+    /// leaving the field absent, never by sending a `0` a reader would render as
+    /// 「0 维」. `0` is not a size any embedder can have (`ZeroDimension` is refused).
+    #[tokio::test]
+    async fn empty_index_status_reports_no_dimension_not_zero() {
+        let svc = RagSvc::with_mock(8).expect("mock svc");
+        let st = svc
+            .status(Request::new(RagStatusRequest {}))
+            .await
+            .expect("status")
+            .into_inner();
+        assert_eq!(st.indexed, 0);
+        assert_eq!(st.dimension, None);
         assert_eq!(st.embedder, "mock");
     }
 

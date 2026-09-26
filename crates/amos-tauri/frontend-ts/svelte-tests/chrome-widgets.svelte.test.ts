@@ -33,10 +33,38 @@ import TopbarAppName from "../src/svelte/modules/TopbarAppName.svelte";
 import TopbarMainMenu from "../src/svelte/modules/TopbarMainMenu.svelte";
 import { setLocale } from "../src/svelte/locale.svelte";
 import { CHROME_ICON_BUTTON } from "../src/lib/shellChrome";
+import { SETTINGS_KEY } from "../src/lib/settings";
+import { WIFI_KEY } from "../src/lib/wifi";
 import { zh } from "../src/i18n/locales/zh";
 
 afterEach(cleanup);
 afterEach(() => setLocale("zh"));
+// The radios widget reads persisted stores now (REQ-A1123), so a seeded key must not
+// leak into the next case — the "dimmed when off" case depends on an empty store.
+afterEach(() => window.localStorage.clear());
+// A bridged test must not leak its bridge into the next test (the "—" case relies on
+// being unbridged), so the fake is torn down after every case.
+afterEach(() => {
+  delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+});
+
+/** Install a Tauri bridge whose `system_health` returns the given payload.
+ *  `extra` answers further commands by name — unlisted commands answer `null`, which is
+ *  what a host that does not have the command does. */
+function installBridge(systemHealth: unknown, extra: Record<string, unknown> = {}) {
+  const invoke = async (cmd: string) => {
+    if (cmd === "system_health") return systemHealth;
+    if (cmd in extra) return extra[cmd];
+    return null;
+  };
+  (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
+    invoke,
+    listen: async () => () => {},
+  };
+}
+
+/** Let the async battery poll settle. */
+const settle = () => new Promise((r) => setTimeout(r, 40));
 
 /** The classes the shared chrome button must carry (hit target + focus ring). */
 const REQUIRED_CLASSES = [
@@ -113,6 +141,22 @@ describe("chrome widgets (mounted alone)", () => {
     for (const g of glyphs) expect(g.className).toContain("text-white/30");
   });
 
+  test("the Wi-Fi glyph names the joined network — it reads amos.wifi, not the quick bit (REQ-A1123)", async () => {
+    // The SSID lives in `amos.wifi` (`WifiCfg.current`), and `normalizeQuick` keeps only
+    // booleans — so the old `typeof quick.wifi === "string" ? quick.wifi : null` was
+    // always null and this bar could never name the network the phone's bar names.
+    window.localStorage.setItem(SETTINGS_KEY, JSON.stringify({ wifi: true, airplane: false }));
+    window.localStorage.setItem(
+      WIFI_KEY,
+      JSON.stringify({ current: "Cafe_Free", saved: ["Cafe_Free"], passwords: {} }),
+    );
+    const { container } = render(RadiosWidget);
+    await tick();
+    const root = container.querySelector<HTMLElement>('[data-testid="chrome-radios"]')!;
+    const want = zh["a11y.wifiWithSsid"].replace("{ssid}", "Cafe_Free");
+    expect([...root.querySelectorAll("span")].some((s) => s.getAttribute("title") === want)).toBe(true);
+  });
+
   test("the battery shows — while no sample exists (never an invented level)", async () => {
     const { container } = render(BatteryWidget);
     await tick();
@@ -123,7 +167,22 @@ describe("chrome widgets (mounted alone)", () => {
     expect(root.getAttribute("title")).toBeNull();
   });
 
-  test("the Apple menu opens a real menu, and its impossible rows are greyed + named", async () => {
+  test("the battery shows the REAL daemon level when one is bridged", async () => {
+    // REQ-A517: the desktop top bar used to hardcode an unknown sample and show "—"
+    // forever. It now resolves the reading through the same live subscription as the
+    // phone StatusBar — so with `system_health` reporting a level it must show it.
+    installBridge({ battery_level_pct: 80, battery_charging: false });
+    const { container } = render(BatteryWidget);
+    await settle();
+    const root = container.querySelector<HTMLElement>('[data-testid="chrome-battery"]')!;
+    expect(root.textContent).toContain("80%");
+    expect(root.getAttribute("title")).toBe(zh["a11y.battery"].replace("{pct}", "80%"));
+    // The reading is the NAME too: `aria-label` overrides the content *and* the
+    // `title`, so the old constant label left the level unreadable to AT (REQ-A1016).
+    expect(root.getAttribute("aria-label")).toBe(zh["a11y.battery"].replace("{pct}", "80%"));
+  });
+
+  test("the Apple menu opens a real menu, and every row in it is live", async () => {
     const { container } = render(TopbarAppleMenu);
     await tick();
     // Closed by default: a menu panel that is always mounted is how a bar grows a
@@ -144,23 +203,152 @@ describe("chrome widgets (mounted alone)", () => {
       "apple-menu-lock",
       "apple-menu-restart",
       "apple-menu-shutdown",
+      "apple-menu-sleep",
     ]);
-    // The two the shell can do are live; the three it cannot are greyed **and** say why
-    // (never a row that looks available and does nothing — FMEA F-SH-001).
+    // Every row is live as of REQ-A796: the three power rows run a host command
+    // (REQ-A515), 关于本机 asks the host for the platform About panel, and the other two
+    // are shell-local. No row is greyed here — which is the point, because a greyed row
+    // must name a reason and the one it named ("尚未接入独立面板") was false.
     const live = rows.filter((r) => !(r as HTMLButtonElement).disabled).map((r) => r.getAttribute("data-testid"));
-    expect(live).toEqual(["apple-menu-settings", "apple-menu-lock"]);
-    for (const id of ["apple-menu-about", "apple-menu-restart", "apple-menu-shutdown"]) {
-      const row = container.querySelector<HTMLButtonElement>(`[data-testid="${id}"]`)!;
-      expect(row.disabled).toBe(true);
-      expect(row.getAttribute("aria-disabled")).toBe("true");
-      // …and the name carries the reason, not just the label a Mac user would expect.
-      expect(row.getAttribute("aria-label")).toContain("尚未接入");
+    expect(live).toEqual([
+      "apple-menu-about",
+      "apple-menu-settings",
+      "apple-menu-lock",
+      "apple-menu-restart",
+      "apple-menu-shutdown",
+      "apple-menu-sleep",
+    ]);
+    for (const r of rows) {
+      expect((r as HTMLButtonElement).disabled, `${r.getAttribute("data-testid")} must be live`).toBe(false);
+      // A live row carries no `aria-disabled` at all — the attribute is only for the
+      // greyed-and-named shape, which this menu no longer has.
+      expect(r.getAttribute("aria-disabled")).toBeNull();
+      expect(r.getAttribute("aria-label")).toBeTruthy();
     }
 
     // Escape dismisses it (macOS), and so does a click outside the widget.
     await fireEvent.keyDown(window, { key: "Escape" });
     await tick();
     expect(container.querySelector('[data-testid="apple-menu-panel"]')).toBeNull();
+  });
+
+  /**
+   * REQ-A796 — 关于本机 asks the host, and **reports** what came back.
+   *
+   * The row was greyed before this round with the reason "no standalone panel". That reason
+   * was false: the host already opens the standard panel for the native `menu.about` item, so
+   * what was missing was only a command. Three outcomes are pinned here — the panel came up,
+   * the host has no panel, the host was not reachable — because the defect being guarded
+   * against is a row that *looks* like it worked. Asserting only "a command was invoked" would
+   * pass a version that called the host and then said nothing whatever the answer.
+   */
+  test("关于本机 asks the host for the platform About panel", async () => {
+    installBridge(undefined, { shell_about_panel: "shown" });
+    const { container } = render(TopbarAppleMenu);
+    await tick();
+    await fireEvent.click(container.querySelector('[data-testid="apple-menu-trigger"]')!);
+    await tick();
+    await fireEvent.click(container.querySelector('[data-testid="apple-menu-about"]')!);
+    await tick();
+    await settle();
+    // The panel came up, so the menu is dismissed — the row did what it says.
+    expect(container.querySelector('[data-testid="apple-menu-panel"]')).toBeNull();
+    expect(container.querySelector('[data-testid="apple-about-notice"]')).toBeNull();
+  });
+
+  test("a host with no About panel SAYS so, in the menu, instead of looking like it worked", async () => {
+    // The negative control for the test above: same click, same command, a host that answers
+    // `unsupported_host`. The row must not close quietly — that is exactly the F-SH-001 shape.
+    installBridge(undefined, { shell_about_panel: "unsupported_host" });
+    const { container } = render(TopbarAppleMenu);
+    await tick();
+    await fireEvent.click(container.querySelector('[data-testid="apple-menu-trigger"]')!);
+    await tick();
+    await fireEvent.click(container.querySelector('[data-testid="apple-menu-about"]')!);
+    await tick();
+    await settle();
+    const notice = container.querySelector('[data-testid="apple-about-notice"]')!;
+    expect(notice, "a refusal must be reported, not swallowed").toBeTruthy();
+    expect(notice.getAttribute("role")).toBe("status");
+    expect(notice.textContent).toContain(zh["desktop.apple.aboutUnsupported"]);
+    // The menu stays open, so the row is still there to retry and the user can read the reason
+    // next to the row that produced it.
+    expect(container.querySelector('[data-testid="apple-menu-panel"]')).not.toBeNull();
+    // …and dismissing the menu clears the notice, so it cannot be waiting behind the next open.
+    await fireEvent.keyDown(window, { key: "Escape" });
+    await tick();
+    await fireEvent.click(container.querySelector('[data-testid="apple-menu-trigger"]')!);
+    await tick();
+    expect(container.querySelector('[data-testid="apple-about-notice"]')).toBeNull();
+  });
+
+  test("an unreachable host is reported as unreachable, not as a missing panel", async () => {
+    // Mounted with no bridge at all. `invoke` answers `null`, and `null` is not a spelling the
+    // host can send — collapsing it into "unsupported_host" would blame the platform for the
+    // shell's own missing bridge (the F-SH-236 confusion this signal's enum exists to avoid).
+    const { container } = render(TopbarAppleMenu);
+    await tick();
+    await fireEvent.click(container.querySelector('[data-testid="apple-menu-trigger"]')!);
+    await tick();
+    await fireEvent.click(container.querySelector('[data-testid="apple-menu-about"]')!);
+    await tick();
+    await settle();
+    const notice = container.querySelector('[data-testid="apple-about-notice"]')!;
+    expect(notice.textContent).toContain(zh["desktop.apple.aboutUnreachable"]);
+  });
+
+  /**
+   * REQ-A515: selecting a power row must **not** act.
+   *
+   * Restart / shut down / sleep are irreversible and throw away unsaved work, so the row
+   * opens an inline `alertdialog` and only 「继续」 reaches the host. Mounted alone there is
+   * no bridge at all, so a leaked call would also show up as a `null`... which is why the
+   * assertion is on the confirmation's presence, not on a command list: this test pins
+   * "the row asks", and `desktop-shell…` pins "the confirmed call arrives".
+   */
+  test("a power row asks before it acts, and 取消 leaves without acting", async () => {
+    const { container } = render(TopbarAppleMenu);
+    await tick();
+    await fireEvent.click(container.querySelector('[data-testid="apple-menu-trigger"]')!);
+    await tick();
+    expect(container.querySelector('[data-testid="apple-power-confirm"]')).toBeNull();
+
+    for (const id of ["apple-menu-restart", "apple-menu-shutdown", "apple-menu-sleep"]) {
+      await fireEvent.click(container.querySelector(`[data-testid="${id}"]`)!);
+      await tick();
+      const dialog = container.querySelector('[data-testid="apple-power-confirm"]')!;
+      expect(dialog, `${id} must ask first`).toBeTruthy();
+      expect(dialog.getAttribute("role")).toBe("alertdialog");
+      // The dialog names the action the user picked, in the row's own words.
+      const rowLabel = container
+        .querySelector(`[data-testid="${id}"]`)!
+        .getAttribute("aria-label")!;
+      expect(dialog.textContent).toContain(rowLabel);
+      // The menu stays open behind it.
+      expect(container.querySelector('[data-testid="apple-menu-panel"]')).toBeTruthy();
+      await fireEvent.click(container.querySelector('[data-testid="apple-power-cancel"]')!);
+      await tick();
+      expect(container.querySelector('[data-testid="apple-power-confirm"]')).toBeNull();
+    }
+  });
+
+  test("dismissing the menu drops a pending confirmation (no half-armed power action)", async () => {
+    const { container } = render(TopbarAppleMenu);
+    await tick();
+    const trigger = container.querySelector<HTMLButtonElement>('[data-testid="apple-menu-trigger"]')!;
+    await fireEvent.click(trigger);
+    await tick();
+    await fireEvent.click(container.querySelector('[data-testid="apple-menu-shutdown"]')!);
+    await tick();
+    expect(container.querySelector('[data-testid="apple-power-confirm"]')).toBeTruthy();
+
+    await fireEvent.keyDown(window, { key: "Escape" });
+    await tick();
+    expect(container.querySelector('[data-testid="apple-menu-panel"]')).toBeNull();
+
+    await fireEvent.click(trigger);
+    await tick();
+    expect(container.querySelector('[data-testid="apple-power-confirm"]')).toBeNull();
   });
 
   test("the app name is the product name until the host names a focused app", async () => {
@@ -181,7 +369,11 @@ describe("chrome widgets (mounted alone)", () => {
     }
   });
 
-  test("Help menu is wholly F-SH-001 honest UI (every row disabled and named)", async () => {
+  test("Help menu rows act (REQ-A482): every row is enabled and named", async () => {
+    // Was the F-SH-001 "every row disabled" case — honest while Help had no implementation.
+    // REQ-A482 gave both rows real work (Search → Spotlight, Amos Help → Settings), so the
+    // honest state is now the opposite one: an **enabled** row that is named. A future edit
+    // that greys one again (or leaves it unnamed) is what fails here.
     const { container } = render(TopbarMainMenu);
     await tick();
     const help = container.querySelector<HTMLElement>('[data-testid="menu-help-trigger"]')!;
@@ -192,8 +384,7 @@ describe("chrome widgets (mounted alone)", () => {
     const rows = [...panel!.querySelectorAll<HTMLButtonElement>("[role=menuitem]")];
     expect(rows.length).toBeGreaterThan(0);
     for (const r of rows) {
-      expect(r.disabled).toBe(true);
-      expect(r.getAttribute("aria-disabled")).toBe("true");
+      expect(r.disabled).toBe(false);
       expect((r.textContent ?? "").trim().length).toBeGreaterThan(0);
     }
   });

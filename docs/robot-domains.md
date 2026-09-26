@@ -114,6 +114,7 @@ envelope, arm_on_motion)` —— 同样逐条校验（见 §5 与 §6 边界 11�
 | 未解锁时的运动 | `not armed: send {"action":"arm"} first` | "油门动了但什么都没发生"是最危险的形状；点名**这台机器自己**的解锁键 |
 | 急停锁存中的运动 | `e-stop latched: send {"action":"enable"} to re-arm` | 同上：绝不叫人发一个这台机器没有的动作 |
 | 排不出来的看门狗（0 / 超长） | 构造期拒绝（`Platform::from_parts`） | 一个 0 周期的看门狗只是一个字段 |
+| **不能安全停下的机器声明「停」当失联答案** | `platform drone cannot stop safely, so a lost link must be answered by a manoeuvre: \`stop\` is a torque cut, not a landing` | 曾经：`must_manoeuvre_when_lost()` 与 `is_stop()` 各自都在，却只有**测试对六个内置剖面**的断言把它们对起来读 —— 部署写的 `Drone` + `Failsafe::Stop` 被 `from_parts` 直接收下（REQ-A852 / F-LK-028） |
 
 **停机永远不被这些规则拦住**：`Halt` 不看 speed、不看 targets、不看 params —— 一个拼错了字段的急停
 必须照样停车（这条与参考机一致，且被测试钉住）。

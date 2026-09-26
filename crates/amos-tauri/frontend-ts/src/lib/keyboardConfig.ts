@@ -76,9 +76,9 @@ export function writeKeyboardConfig(config: KeyboardConfig): boolean {
   return writeStoreValueChecked(KEYBOARD_CONFIG_KEY, config);
 }
 
-/** 重置为默认配置。 */
-export function resetKeyboardConfig(): void {
-  writeKeyboardConfig({ ...DEFAULT_CONFIG, updatedAt: Date.now() });
+/** 重置为默认配置。返回**写入是否落地**（与 `writeKeyboardConfig` 同一约定，F-SH-043）。 */
+export function resetKeyboardConfig(): boolean {
+  return writeKeyboardConfig({ ...DEFAULT_CONFIG, updatedAt: Date.now() });
 }
 
 /**
@@ -271,6 +271,51 @@ export function eventToShortcut(e: KeyboardEvent): ShellShortcut {
  */
 export function isValidShortcut(s: ShellShortcut): boolean {
   return Boolean(s.key && (s.meta || s.ctrl || s.shift || s.alt || true));
+}
+
+/**
+ * The touch shell's **own** navigation keys, as *editable defaults* (REQ-A1200).
+ *
+ * Why these live here rather than beside `SYSTEM_DEFAULTS`/`SPACES_DEFAULTS` in
+ * `keyboardConfigHook.svelte.ts`: the touch shell's keyboard admission is a pure function
+ * (`lib/systemKeys.ts::shellKeyIntent`) that must not import `svelte/`, and the hook does
+ * (`SHELL_MODULES`). Before this move the shell matched a **hard-coded** copy of these chords
+ * while the Settings page edited `config.touch` — so the 「触屏导航」 section's three controls
+ * were authorable, saved, re-rendered… and read by nobody: rebinding 返回上一级 to ⌘B left ⌘[
+ * live, and disabling it left ⌘[ live too.
+ *
+ * `settings` is new here and is the mirror half of the same defect: `⌘,` *was* admitted on
+ * touch (in the old hard-coded table) but had **no editor row**, so the one key the panel
+ * taught could never be changed. Same id discipline as the other domains — the label comes from
+ * `settings.keyboard.${id}`.
+ */
+export const TOUCH_DEFAULTS: Record<string, ShellShortcut> = {
+  back: { key: "[", meta: true },
+  dismiss: { key: "Escape" },
+  settings: { key: ",", meta: true },
+};
+
+/**
+ * Merge the touch domains's defaults with a `KeyboardConfig` — the same three-state rule
+ * `mergeOverlayBindings` applies to the overlay registry, so the Settings page, the ⌘-hold
+ * panel and the shell's admission cannot drift:
+ *   • `custom === undefined` → the default chord
+ *   • `custom === null`      → the user disabled this key — no row
+ *   • `custom !== null`      → the user's override
+ * A disabled key is therefore *absent from the map* (`shellKeyIntent` can match only what the
+ * map holds), which is the property the old hard-coded table could not express at all.
+ */
+export function mergeTouchBindings(
+  defaults: Readonly<Record<string, ShellShortcut>>,
+  config: KeyboardConfig,
+): Map<string, ShellShortcut> {
+  const out = new Map<string, ShellShortcut>();
+  for (const [id, def] of Object.entries(defaults)) {
+    const custom = config.touch[id];
+    if (custom === undefined) out.set(id, def);
+    else if (custom !== null) out.set(id, custom);
+  }
+  return out;
 }
 
 /**

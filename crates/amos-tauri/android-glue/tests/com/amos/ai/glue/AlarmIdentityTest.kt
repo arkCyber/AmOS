@@ -47,4 +47,33 @@ class AlarmIdentityTest {
         assertTrue("expected a scheme-prefixed URI, got $uri", uri.startsWith("amos-alarm://"))
         assertTrue("the id must appear in the URI: $uri", uri.contains("2026-09-17T07:30"))
     }
+
+    /**
+     * REQ-A1447 / F-TAU-025 — the SAME collision, one layer over.
+     *
+     * The firing notification's identity is its **(tag, id)** pair, and the previous code used
+     * a constant tag with `requestCode(id)` as the id — the exact `String.hashCode` discriminator
+     * [alarmIdentity] exists to replace. Two hash-colliding alarms therefore posted under one
+     * identity, and the second silently replaced the first's ring. `notifyTag` carries the full
+     * id, so distinctness is structural; this pins it (and re-measures the collision premise).
+     */
+    @Test
+    fun collidingHashCodesStillGetDistinctNotificationTags() {
+        assertEquals(colliding[0].hashCode().toLong(), colliding[1].hashCode().toLong())
+        assertNotEquals(
+            "ids that hash alike must not share a notification identity",
+            AlarmGlue.notifyTag(colliding[0]),
+            AlarmGlue.notifyTag(colliding[1]),
+        )
+    }
+
+    @Test
+    fun theNotificationTagIsStablePerIdAndCarriesTheId() {
+        assertEquals(AlarmGlue.notifyTag("alarm:abc"), AlarmGlue.notifyTag("alarm:abc"))
+        assertNotEquals(AlarmGlue.notifyTag("alarm:abc"), AlarmGlue.notifyTag("alarm:abd"))
+        assertTrue(
+            "the id must appear in the tag: ${AlarmGlue.notifyTag("alarm:abc")}",
+            AlarmGlue.notifyTag("alarm:abc").contains("alarm:abc"),
+        )
+    }
 }

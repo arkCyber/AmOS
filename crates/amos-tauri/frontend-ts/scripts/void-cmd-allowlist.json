@@ -1,0 +1,102 @@
+{
+  "_why": [
+    "Sites where a `void` bridge command is called and the caller does NOT read the",
+    "per-command verdict.",
+    "",
+    "This file was EMPTY until REQ-A845, and the entries below are not a relaxation of the",
+    "gate — they are what the gate found once its window was widened to the shape it always",
+    "claimed to cover (a `void` wrapper declared outside `lib/backend.ts`, a bare `invoke(`,",
+    "a single-quoted literal, and a direct call to a fallible host command). Four of the ten",
+    "sites the widened scan reported were fixed instead (robot.ts, PushSettings.svelte,",
+    "lmk.ts, AirPlayPanel.svelte); the five below have no place to put a verdict, and each",
+    "says why in its own `note`.",
+    "",
+    "REQ-A1003 / F-SH-324 widened it a second time — the third spelling, `Promise<void | null>`",
+    "over `invoke<void>(…)`, was still invisible — and the five `store_set` / `system_set_context`",
+    "sites below are what that widening reported. One site the same widening surfaced was FIXED",
+    "instead: `AiApp.svelte`'s detached-context clear, which drew a refused `system_clear_context`",
+    "as done while the host still held the context. The mirror writes listed here have no surface",
+    "to land a verdict on: each is a best-effort durable copy written *after* the localStorage",
+    "copy the window actually draws, and `sendToAi`'s attach is a request the AI screen re-reads",
+    "",
+    "Every site must carry a `note` arguing ITS case, on top of naming a defined `kind` that",
+    "states the general argument. `node scripts/void-cmd-scan.mjs` fails on an entry naming an",
+    "undefined kind, a kind with no reason, or a site with no note — an allow-list that is not",
+    "forced to argue its case is just a way of turning the gate off one line at a time. An",
+    "entry whose site no longer exists is reported as stale so the file shrinks with the code."
+  ],
+  "kinds": {
+    "self-correcting": {
+      "reason": "The caller re-reads the authoritative state right after the write and draws THAT, so a refused write is never shown as done — only the explanation for the no-op is missing, which is a UX gap, not a lie.",
+      "note": "Declared memberless (REQ-A1492): no entry in this file names this kind. The _why list above records that several sites the widened scan reported were fixed rather than allow-listed, and a site fixed this way is exactly this reason's shape ('re-reads the authoritative state right after the write'), so this is either the kind of a member that was fixed or one that never had a member — the file's own history cannot say which (this file is not in the last commit). Kept, not deleted, so that adding the first member is an explicit act with this argument already on the record. The check is `checkAllowlistShape`: a kind no site references must carry a note or a reason beginning RETIRED ∕ UNUSED ∕ KEPT."
+    },
+    "no-visible-claim": {
+      "reason": "The command's outcome is not drawn anywhere and nothing downstream branches on it, so there is no on-screen claim for it to contradict."
+    },
+    "best-effort-telemetry": {
+      "reason": "A diagnostic-only write. Its failure changes no user-visible state and is already visible in the per-command diagnosis."
+    }
+  },
+  "sites": [
+    {
+      "file": "src/lib/privacyBackend.ts",
+      "command": "perm_grant",
+      "kind": "no-visible-claim",
+      "note": "The daemon mirror of a grant. Both production callers (`osPermissions.ts::grantCapability`) write `void daemonGrant(...)`, so the boolean this returns is discarded before anyone can draw it; the authoritative read is `daemonAuthorize` (surfaced as `daemonVerdict`, which PermissionsApp draws to show drift). Reading the verdict here would produce a value with no consumer — the `true` is a statement about the *submission*, and the doc comment says exactly that."
+    },
+    {
+      "file": "src/lib/privacyBackend.ts",
+      "command": "perm_revoke",
+      "kind": "no-visible-claim",
+      "note": "Same mirror, same discarded boolean: `osPermissions.ts::revokeCapability` calls it as `void daemonRevoke(...)` and returns the local ledger, which is what the UI draws."
+    },
+    {
+      "file": "src/lib/robot.ts",
+      "command": "link_stop_heartbeats",
+      "kind": "no-visible-claim",
+      "note": "The teardown arm of `listenHeartbeats`'s cleanup — it runs when the console is unwinding, and there is no panel left to say 「the host refused to stop the stream」 on. The residue is a host-side task emitting into a closed window, which is real but belongs to the daemon's lifetime, not the shell's: the window that could have reported it is the one being torn down. (The *start* half of the same pair is `startHeartbeats`, which IS bound — `bridgeDiag(\"link_watch_heartbeats\").ok` — and the console draws it, because a live-looking channel with no stream is a claim the caller draws.)"
+    },
+    {
+      "file": "src/svelte/AirPlayPanel.svelte",
+      "command": "airplay_stop_discovery",
+      "kind": "no-visible-claim",
+      "note": "`onDestroy` teardown, issued once the panel is unmounting. REQ-A845 / F-SH-272 fixed the guard that decides whether to send it at all (`discovering` is cleared as soon as the one-shot reply lands, so it was always false at unmount and the host's discovery was never stopped); the reply to the stop itself still has no surface to land on."
+    },
+    {
+      "file": "src/shell-entry.ts",
+      "command": "csp_probe",
+      "kind": "best-effort-telemetry",
+      "note": "The boot CSP probe (REQ-A171). Its channel IS its presence: the host prints each report to stderr, so a probe that could not be delivered is visible as a missing `boot-reached` line — the same signal, read by the same person, as a violation that never arrived. Reading the verdict in the shell would add a second, weaker witness to a fact the first one already answers."
+    },
+    {
+      "file": "src/lib/amosStore.ts",
+      "command": "store_set",
+      "kind": "no-visible-claim",
+      "note": "`writeJson` / `removeStoreValue` write the value through to the Rust `SharedStore` as a **durable copy + cross-window bus**, deliberately fire-and-forget (`void systemStoreSet(...)`) and **after** the localStorage write, which is this window's source of truth and the only thing any reader draws. Nothing branches on the mirror inside the session: it is read back only by `hydrateFromSystemStore` on a later boot, to recover settings whose localStorage was cleared. A refused mirror therefore leaves a stale durable copy but contradicts no on-screen claim — `writeJson`'s own comment says 'a bridge failure must never break a settings write'."
+    },
+    {
+      "file": "src/lib/backend.ts",
+      "command": "store_set",
+      "kind": "no-visible-claim",
+      "note": "`writeStored` — the shell's session pointer, read before the JSON layer exists and mirrored exactly like `lib/themeCore` and the locale: localStorage first (what the shell reads back), then `void systemStoreSet(...)` for the durable copy + cross-window bus. The comment beside the call states this; same argument as `lib/amosStore`."
+    },
+    {
+      "file": "src/lib/themeCore.ts",
+      "command": "store_set",
+      "kind": "no-visible-claim",
+      "note": "`writeStored` — the React-free theme helpers. The value goes to localStorage (the single source `readStored` reads) and is only then mirrored with `void systemStoreSet(...)`; the file header calls this 'one write-through, no second mechanism'. No reader in this window branches on the mirror."
+    },
+    {
+      "file": "src/svelte/locale.svelte.ts",
+      "command": "store_set",
+      "kind": "no-visible-claim",
+      "note": "The locale applies in-session from its own storage and is mirrored to the Rust store with `void systemStoreSet(LOCALE_KEY, l)` for the durable copy — the same write-through as `amosStore`/`themeCore`. A refused mirror is read back only on a later boot."
+    },
+    {
+      "file": "src/svelte/appLinks.ts",
+      "command": "system_set_context",
+      "kind": "no-visible-claim",
+      "note": "`sendToAi` attaches text to the AI window as a *request* and then opens it. The function's own doc says the attach is only a request and that the AI screen 'shows no context attached hint — it never claims a context it does not have': the positive entry is drawn by `AiApp` from `system_peek_context`, i.e. from the host's own answer, never from this call. (The *drop* half of the same surface — `AiApp.svelte`'s clear button — IS bound: REQ-A1003 / F-SH-324.)"
+    }
+  ]
+}

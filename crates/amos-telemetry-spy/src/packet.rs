@@ -35,13 +35,29 @@ pub fn looks_like_ip(buf: &[u8]) -> bool {
 }
 
 /// Decode an Ethernet frame (14-byte header stripped) or a raw-IP frame.
+///
+/// Dispatch is by the **EtherType** when the frame is long enough to be
+/// Ethernet II, and only falls back to the first nibble otherwise (a raw-IP
+/// capture has no EtherType — the nibble is then the only signal it carries).
+/// The order matters: a real Ethernet frame's first byte is the top half of the
+/// **destination MAC**, which is 4 or 6 for ~2/16 of MACs, so a nibble-first
+/// test mistakes such a frame for a raw IPv4/IPv6 header and decodes it at the
+/// wrong offset — silently dropping a frame that may carry a leak. The
+/// EtherType names the network-layer protocol explicitly and is unambiguous.
+/// (REQ-A586 / F-SPY-001.)
 pub fn decode_frame(frame: &[u8]) -> Option<Flow> {
+    // Ethernet II — skip dest MAC (6) + src MAC (6) + ethertype (2).
+    // An IP EtherType names the network-layer protocol explicitly; only if the
+    // bytes after it do not themselves decode do we fall through, so a raw-IP
+    // frame whose 12..14 happen to spell an EtherType is still recovered.
+    // (VLAN tags are not handled; this is a documented limitation.)
+    if frame.len() >= 14 && matches!(u16be(&frame[12..14]), 0x0800 | 0x86dd) {
+        if let Some(flow) = decode_ip(&frame[14..]) {
+            return Some(flow);
+        }
+    }
     if looks_like_ip(frame) {
         decode_ip(frame)
-    } else if frame.len() >= 14 {
-        // Ethernet II — skip dest MAC (6) + src MAC (6) + ethertype (2).
-        // (VLAN tags are not handled; this is a documented limitation.)
-        decode_ip(&frame[14..])
     } else {
         None
     }
@@ -224,6 +240,42 @@ mod tests {
         assert_eq!(flow.dst_ip, "203.0.113.9");
         assert_eq!(flow.src_port, Some(53000));
         assert_eq!(flow.dst_port, Some(53));
+        assert_eq!(flow.payload, marker.to_vec());
+    }
+
+    #[test]
+    fn ethernet_frame_with_a_4_or_6_dst_mac_is_not_mistaken_for_raw_ip() {
+        // A real Ethernet II frame whose destination MAC's top nibble is 4 or 6
+        // (`60:...`) must still decode as Ethernet: the first byte alone is
+        // ambiguous (it is both a plausible IP version nibble and the top half
+        // of a MAC), so the EtherType at bytes 12..14 is what must decide.
+        let marker = b"leak=490154203237518";
+        let ip = ipv4_udp([10, 0, 0, 2], [203, 0, 113, 9], 53000, 53, marker);
+        let mut frame = vec![0x60, 0x1d, 0x22, 0x33, 0x44, 0x55]; // dst MAC, top nibble 6
+        frame.extend_from_slice(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]); // src MAC
+        frame.extend_from_slice(&[0x08, 0x00]); // EtherType = IPv4
+        frame.extend_from_slice(&ip);
+        let flow = decode_frame(&frame).expect("ethernet frame must decode");
+        assert_eq!(flow.src_ip, "10.0.0.2");
+        assert_eq!(flow.dst_ip, "203.0.113.9");
+        assert_eq!(flow.payload, marker.to_vec());
+    }
+
+    #[test]
+    fn raw_ip_whose_source_spells_an_ethertype_is_still_decoded() {
+        // A raw-IP capture (no L2 header) whose source address makes bytes
+        // 12..14 read as the IPv4 EtherType `0x0800` (src `8.0.x.y`) must not
+        // be consumed by the Ethernet branch: that branch only wins if the
+        // bytes after it decode, and here they do not, so it falls through.
+        let marker = b"raw 490154203237518";
+        let ip = ipv4_udp([8, 0, 0, 2], [203, 0, 113, 9], 40000, 53, marker);
+        assert_eq!(
+            &ip[12..14],
+            &[0x08, 0x00],
+            "precondition: bytes 12..14 spell 0x0800"
+        );
+        let flow = decode_frame(&ip).expect("raw ip must still decode");
+        assert_eq!(flow.src_ip, "8.0.0.2");
         assert_eq!(flow.payload, marker.to_vec());
     }
 

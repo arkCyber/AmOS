@@ -7,7 +7,6 @@ import {
   listQuarantined,
   readQuarantine,
   getLayout,
-  saveLayout,
   defaultLayout,
   hideFromHome,
   restoreToHome,
@@ -25,6 +24,7 @@ import {
   DEFAULT_DOCK,
 } from "../lib/amosStore";
 import { writeStored } from "../lib/themeCore";
+import { setStoreTiles } from "../lib/storeApps";
 
 // Bring up a real DOM for this file (globals are per-process in bun).
 try {
@@ -130,7 +130,7 @@ describe("amos home layout & recents (pure logic)", () => {
   });
 
   test("getLayout prunes unknown ids and merges newly registered apps", () => {
-    saveLayout({ page: ["clock", "ghost-app"], dock: ["phone", "maps"], hidden: ["settings"] });
+    writeStoreValue(LAYOUT_KEY, { page: ["clock", "ghost-app"], dock: ["phone", "maps"], hidden: ["settings"] });
     const got = getLayout(available);
     expect(got.dock).toEqual(["phone", "maps"]);
     expect(got.hidden).toEqual(["settings"]);
@@ -139,6 +139,25 @@ describe("amos home layout & recents (pure logic)", () => {
     // every available app is placed exactly once
     const placed = [...got.page, ...got.dock, ...got.hidden].sort();
     expect(placed).toEqual([...available].sort());
+  });
+
+  test("getLayout keeps a store placement that still names an installed app, and drops one that does not", () => {
+    // The repair asks two different questions of the persisted value: "does this id
+    // still name an app?" (a store tile joins the answer) and "which ids get
+    // auto-placed onto a page?" (only the built-in registry does). Passing the
+    // built-in list for both made a store placement read as a ghost.
+    writeStoreValue(LAYOUT_KEY, { page: ["clock"], dock: ["phone", "store:org.amos.demo"], hidden: [] });
+    const installed = { id: "store:org.amos.demo", mid: "org.amos.demo", name: "Demo", icon: "D" };
+
+    setStoreTiles([installed]);
+    const kept = getLayout(available);
+    expect(kept.dock).toEqual(["phone", "store:org.amos.demo"]); // placement survives the repair
+    expect(kept.page).not.toContain("store:org.amos.demo"); // …but it is never auto-placed
+
+    setStoreTiles([]); // uninstalled
+    const pruned = getLayout(available);
+    expect(pruned.dock).toEqual(["phone"]); // a tile with no app behind it is reconciled out
+    expect([...pruned.page, ...pruned.dock, ...pruned.hidden]).not.toContain("store:org.amos.demo");
   });
 
   test("hideFromHome moves a dock icon back to the page and a page icon to hidden", () => {
@@ -178,6 +197,32 @@ describe("amos home layout & recents (pure logic)", () => {
     expect(r.length).toBe(8);
     expect(r[0]).toBe("x11");
     expect(new Set(r).size).toBe(r.length); // no duplicates
+  });
+
+  // REQ-A1438 ∕ FMEA F-SH-696 — `readJson` quarantines only *unparseable* bytes, so a stored
+  // `null` / `{}` / `5` is valid JSON and comes back verbatim; only an *absent* key fires the
+  // fallback. The value here is the durable Rust `SharedStore`'s byte string and both hydration
+  // paths (`store_snapshot` at boot, `store-updated` cross-window) write it into localStorage
+  // verbatim — so a legacy/foreign scalar reaches these readers even though no writer in this
+  // repo mints one. `pushRecent` reads through `getRecents()` on the **first line** of
+  // `shellState.open()`, so a throw here stops every app from opening, not just this list.
+  describe("a non-array `amos.recents` must not throw (REQ-A1438)", () => {
+    for (const corrupt of ['null', '{"a":1}', '5', '"clock"', 'true']) {
+      test(`${corrupt} is read as an empty list, not a value`, () => {
+        writeStoreValue(RECENTS_KEY, JSON.parse(corrupt));
+        expect(getRecents()).toEqual([]);
+        // The whole point: the app-open path may not throw.
+        expect(() => pushRecent("clock")).not.toThrow();
+        expect(getRecents()).toEqual(["clock"]);
+      });
+    }
+
+    test("a list carrying a non-string drops that entry and keeps the ids", () => {
+      writeStoreValue(RECENTS_KEY, ["clock", 5, null, "maps"]);
+      expect(getRecents()).toEqual(["clock", "maps"]);
+      pushRecent("settings");
+      expect(getRecents()).toEqual(["settings", "clock", "maps"]);
+    });
   });
 });
 

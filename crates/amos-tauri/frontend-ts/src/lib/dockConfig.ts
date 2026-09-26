@@ -3,8 +3,13 @@
  *
  * Features:
  * - Bounce animation for notifications (CSS-only, see index.css)
- * - Auto-hide in fullscreen mode
  * - Position switching (bottom/left/right)
+ *
+ * **Not** here any more: "auto-hide in fullscreen mode" and its `isFullscreen()` predicate. The
+ * host owns full screen (`wm_fullscreen`), so `document.fullscreenElement` is never set in this
+ * WebView and the old `autoHideEnabled && isFullscreen()` gate could never fire; `Dock.svelte`
+ * now drives auto-hide from the preference alone (REQ-A1281, and the note at its line 122). The
+ * predicate outlived its only caller as an export nothing called (REQ-A1707).
  *
  * REQ-A414 — the position feature used to be "position the wrapper and nothing else".
  * Every other behaviour of the Dock assumed `bottom`: the wrapper hard-coded
@@ -130,14 +135,6 @@ export function dockCapacityExtent(
   height: number,
 ): number {
   return dockIsVertical(position) ? height : width;
-}
-
-/**
- * Check if fullscreen mode is active.
- * Safe under SSR/tests where `document` may not exist.
- */
-export function isFullscreen(): boolean {
-  return typeof document !== "undefined" && !!document.fullscreenElement;
 }
 
 /**

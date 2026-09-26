@@ -1,14 +1,16 @@
 //! Sparse visual odometry: FAST corner detector, Lucas-Kanade optical flow,
-//! 5-point essential-matrix solver with RANSAC, frame-to-frame pose recovery.
+//! **eight-point** essential-matrix solver with RANSAC, frame-to-frame pose recovery.
 //!
 //! References:
 //!
 //! * Rosten & Drummond, *"Fusing points and lines for high performance tracking"* (FAST).
 //! * Lucas & Kanade, *"An iterative image registration procedure with application to
 //!   stereo vision"* (LK optical flow).
-//! * Nistér, *"An efficient solution to the five-point relative pose problem"* (the
-//!   essential-matrix estimator this module approximates with the Stewénius 5-point
-//!   polynomial solver, kept as the textbook *eight-point* baseline for stability).
+//! * Nistér, *"An efficient solution to the five-point relative pose problem"* — the
+//!   algorithm this module's estimator is *compared against*; the solver actually
+//!   implemented is the textbook **eight-point** baseline (Hartley-normalised, rank-2
+//!   enforced). See [`five_point`] for why the 5-point polynomial solver is deliberately
+//!   absent.
 //! * Hartley & Zisserman, *Multiple View Geometry* (the RANSAC loop and the essential
 //!   matrix's null-space projection).
 //!
@@ -23,8 +25,11 @@
 //!   landmarks are 3-D rays, triangulated later.
 //!
 //! Keeping them in separate modules means a deployment can swap one out (a stereo
-//! camera, a depth sensor) without touching the other. Both produce a
-//! `VisualObservation` whose type signature makes the assumption explicit.
+//! camera, a depth sensor) without touching the other. Their *outputs* are deliberately
+//! different types: this front-end produces a [`VisualObservation`] (a relative
+//! frame-to-frame motion), while the laser front-end produces a
+//! [`crate::slam::Landmark`] cloud in the world frame — a 3-D rigid-motion increment and
+//! a 2-D map point are not the same quantity, and a shared type would hide that.
 //!
 //! ### Honest boundaries
 //!
@@ -33,9 +38,12 @@
 //!    camera abstraction, which is the seam for testing and for swap-in.
 //! 2. **Integer arithmetic in the inner loops.** The detector's threshold and the flow's
 //!    gradient sums are `i32`, not `f32` — pixels are `u8`, gradients are `i32`.
-//! 3. **RANSAC bounded.** [`five_point::MAX_RANSAC_ITERATIONS`] = 256; a real
-//!    RANSAC implementation is correct in expectation over `O(log(1 − p)) / log(1 − w^n)`
-//!    iterations, and 256 is enough for `n = 5`, `w = 0.3`, `p = 0.999`.
+//! 3. **RANSAC bounded.** [`five_point::MAX_RANSAC_ITERATIONS`] = 256. RANSAC needs
+//!    `ln(1 − p) / ln(1 − wⁿ)` iterations; with the eight-point sample (`n = 8`) that is
+//!    ≈ 116 for a healthy `w = 0.7`, `p = 0.999` — a 2.2× margin. At a lower inlier ratio
+//!    the cap is *not* statistically sufficient, and the adaptive early exit is what
+//!    actually terminates the loop; the cap is the hard ceiling on work. Do not read it
+//!    as "256 always finds the model".
 //! 4. **No camera matrix dependency.** The intrinsic calibration is a single
 //!    [`CameraIntrinsics`] value; the essential matrix is in *normalised* image
 //!    coordinates, so a deployment can apply its own intrinsics without rewriting the

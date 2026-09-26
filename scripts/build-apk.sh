@@ -84,7 +84,10 @@ fi
 
 echo
 echo "Install on the S5 (example; adjust to your actual output APK):"
-echo "  adb -s YY000286 install -r crates/amos-tauri/gen/android/app/build/outputs/apk/debug/app-debug.apk"
+echo "  # the debug build keeps its symbols on purpose (~730 MB); re-pack it first —"
+echo "  # scripts/android-app-strip.sh prints the stripped path it wrote."
+echo "  adb -s YY000286 install -r -g \\"
+echo "    crates/amos-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug-stripped.apk"
 echo "  adb -s YY000286 shell am start -n com.amos.ai/.MainActivity"
 echo
 echo "Note: run scripts/build-apk.sh (not this file) to build the APK — it"

@@ -21,8 +21,13 @@ import type { FEntry } from "./files";
 
 /** Magic header for the bundle file.  Must match the Rust side. */
 export const BUNDLE_MAGIC = "AmosFilesBundle/1.0";
-/** Maximum uncompressed bundle size (matches Rust). */
-const MAX_UNCOMPRESSED_BYTES = 10 * 1024 * 1024;
+/**
+ * Maximum uncompressed bundle size (matches Rust `files.rs::MAX_UNCOMPRESSED`).
+ * Both sides are zip-bomb defences on the **decompressed** output, so a drift
+ * here is a security-relevant divergence, not a cosmetic one —
+ * `filesCompression.test.ts` reads the Rust constant and requires equality.
+ */
+export const MAX_UNCOMPRESSED_BYTES = 10 * 1024 * 1024;
 
 /** Whether the Tauri bridge is available — gates which path to take. */
 function hostAvailable(): boolean {

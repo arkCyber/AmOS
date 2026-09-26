@@ -25,8 +25,13 @@ pub trait FlashlightProvider: Send + Sync {
     /// Read the current flashlight snapshot (torch on/off + hardware presence).
     async fn snapshot(&self) -> Result<FlashlightState>;
 
-    /// Set the torch on (`true`) or off (`false`). Returns the boolean the
-    /// backend reported, or an error if the write failed.
+    /// Set the torch on (`true`) or off (`false`). `Ok(())` means the backend
+    /// **accepted** the write without error; a failure is a typed error. It does
+    /// *not* hand back a per-call confirmation boolean (Android's
+    /// `CameraManager#setTorchMode` is void and has no `getTorchMode`): whether
+    /// the light actually changed is derived one level up, by
+    /// [`crate::FlashlightManager::set_on_checked`] comparing the request with
+    /// the resulting authoritative [`snapshot`](Self::snapshot).
     async fn set_on(&self, on: bool) -> Result<()>;
 
     /// Report a torch state the **OS** drove externally (e.g. a

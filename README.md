@@ -308,11 +308,269 @@ and an arrival radius smaller than the machine's turning radius — both recorde
 [`docs/robot-autonomy.md`](docs/robot-autonomy.md). A second pass (REQ-A411) added the scanner-shaped
 `Grid::from_occupancy`/`occupancy()` pair and fixed three numbers that lied: `Path::cost()` priced a
 smoothed waypoint leg as one step (a 5-step route's simplification read *cheaper* than the route),
-and a restarted `ControlLoop` charged the loop for the idle gap between two paced runs — both now
-refuse to answer rather than answer wrongly.
+a restarted `ControlLoop` charged the loop for the idle gap between two paced runs, and `pursuit`
+silently clamped an out-of-range speed limit instead of refusing it — all three now refuse to answer
+rather than answer wrongly. A third pass (REQ-A495) wired the CAN driver's bounded re-transmission
+(it existed as a documented constant with no loop): `apply` re-hands the batch only on a *transient*
+`LinkError::Transport`, never on a refused `LinkError::Robot`, and no `RobotHal` implementation is
+described as a skeleton any more. A fourth pass (REQ-A497) fixed a half-cell geometry defect the
+coverage sweep turned up: `cell_centre` returned the cell's north-west *corner* under the name
+"centre", so `clearance_mm` measured to an obstacle square offset half a cell — a point inside a
+blocked cell read positive clearance (a second bug, `saturating_sub` on `i64` clamping at
+`i64::MIN` instead of `0`, squared the negative gap back into a phantom distance). A fifth pass
+(REQ-A503) fixed a promise the type system never allowed: the UDP drivers documented "wrap a
+`tokio::net::UdpSocket`", but that socket implements neither `AsyncWrite` nor `AsyncRead`, so the
+adapter had to be written by every deployment — it now ships as `UdpSink` (one `write` = one
+datagram, so one frame is one datagram of exactly `FRAME_LEN` bytes), `UdpControlRobotHal` gained
+the `bytes_written()` its serial/CAN siblings already had, and `UdpDiscoveryRobotHal`'s docs stopped
+claiming a state-report path that does not exist (it is a refusal-only guard with a structurally
+zero odometer). A sixth pass (REQ-A506) found the CAN driver stating its COB-ID/PDO mapping three
+times in one file — three mutually incompatible answers, two of them not matching the CiA 301
+document they cite (the real predefined set is `RPDO1 = 0x200 + node_id`, function nibble `4`), and
+a "default" for `function_tx` that exists nowhere in the code. The mapping is now stated once, the
+nibble is documented as the deployment's choice, `MAX_CAN_TX_RETRIES`'s false `// cited:` marker
+became an honest `// chosen:`, and `from_motor_frame`'s never-covered `None` arm is documented as
+unreachable-by-construction instead of faked with a test. A seventh pass (REQ-A509) went back into
+`slam/`: the data-association inner loop took a `sqrt` per landmark per observation only to square
+it straight back in the gate — the module's own docs said the `χ²` threshold is a *squared* form —
+so `Landmark::mahalanobis_squared` is now the gated quantity and `mahalanobis` is defined on top of
+it; and `AssocScratch`, documented as being "read when the gate verdict is recorded", was in fact
+written after the loop from registers and then cleared before returning, so it is now a genuinely
+readable caller-owned workspace (`best_distance`/`best_index`). The "never touches the allocator"
+claim was true of the inner loop and false of the call — `associate` returns one `Vec` per call —
+and now says so. An eighth pass (REQ-A511) went back over `slam/`'s remaining public surface: it
+found the scan-match module citing a paper that does not exist (`Olson et al., "Closed-loop
+performance", IROS 2005` — Olson's paper is the single-author *Real-Time Correlative Scan
+Matching*, ICRA 2009), a one-sample search window that silently placed its only candidate a whole
+`range` away from the pose the caller supplied, a `MAX_SCAN_OPERATIONS` comment whose arithmetic
+called half a control tick "a small fraction" of one, and three `slam/` error enums with no
+`Display` while every error type outside `slam/` has one.
+
+A ninth pass (REQ-A514) moved the audit into `vision/`, which until then was exercised only through
+its integration suite. The LK optical-flow module documents a hard rule against clamping ("never
+invent an edge pixel and bias the flow") and then clamped the *gradient* stencil at the image's far
+edge: `∂I/∂x` is a forward difference to `px + 1`, so where there is no such pixel the code
+duplicated the last column into the gradient matrix. The only observable consequence was that a
+window touching the boundary could come back `Singular` ("constant patch") when its real problem was
+an incomplete window; the boundary guard now refuses one pixel early and the two `.min()` clamps are
+gone. That fix then exposed something worse about the coverage itself: the module's *other*
+documented refusal — a source window that fits but whose fractional target sample leaves the frame —
+had been "covered" only by the very edge features the clamping bug let through, so that coverage was
+evidence of the defect rather than of the branch, and it now has a real fixture (a 1.5-px shift at
+`x = 2`). Two `// measured:` markers turned out to be unfalsifiable — the determinant-floor weight's
+stated flat-vs-textured experiment accepts *any* weight in `(0, 0.1)`, eight orders of magnitude
+wide, so it cannot have selected `1e-3`, and the eigenvalue-ratio floor's "sits between ~0 and
+≫1e-3" is true of every value in that gap — so both became `// chosen:` with the value unchanged.
+And `fast.rs`'s quick-rejection comment said "at least three must agree (the high-speed test)" while
+the code implements the two-of-four *necessary* condition for a 9-arc — with the comment sixteen
+lines below working out why three would wrongly drop real corners. The code was right; only the
+comment was wrong.
+
+A tenth pass (REQ-A516) finished `vision/` — `five_point.rs` (essential matrix + pose recovery) and
+`vo.rs` (frame-to-frame glue). Two findings. First, `sampson_distance` ended in
+`(num * num / denom) as f32` behind `#[allow(clippy::unnecessary_cast)]` whose comment claimed
+"intermediate `f64` work … keeps a meaningful numerator" — but `Essential` is `[f32; 9]` and the two
+correspondences are `(f32, f32)`, so every intermediate is already `f32` and the cast is a genuine
+no-op (removing the `#[allow]` makes clippy report `unnecessary_cast` immediately). Second, and
+worse, `recover_pose_from_essential` initialised its best-candidate slot to `(0, 0)` and replaced it
+only on `in_front > best.1`, so when *no* `(R, t)` candidate put a single correspondence in front of
+both cameras the function still returned `Some` — the untested `candidates[0]`, a fabricated motion
+(a zero essential matrix returned `Some(Pose2D { …, inliers: 0, total: 8 })`). It now returns `None`
+when the best cheirality count is zero, matching the "never a plausible-looking but meaningless
+matrix" contract its sibling already states. The module doc also called Hartley *preconditioning*
+"normalised by the intrinsics" and claimed the eight-point solver is the "equally accurate" one; it
+now cites Hartley 1997 accurately — the eight-point algorithm is comparable to the best estimators
+*once* the points are translated and scaled — and `Pose2D::inliers`'s doc admits the field carries a
+cheirality count from one entry point and a Sampson inlier count from the other.
+
+An eleventh pass (REQ-A520) read `planning.rs`'s dynamic-window (`dwa`) section line by line and
+changed no behaviour at all — it is a documentation round. Its module doc counted "four `DWA_W_*`
+constants" where there are three, linked a `[`score`]` that exists nowhere, told deployments to tune
+the weights "in `DwaLimits`" (they are compile-time `const`s, not fields), gave the velocity pair's
+units as `(m/s, rad/s)` when `DwaVelocity` is `v_mm_s`/`omega_mrad_s`, and claimed a log "still sees
+the real gap" of an unsafe candidate — false, because unsafe candidates are never stored in `best`
+and their clearance never leaves the function; the honest-boundaries list also called the route
+"fixed input" when `dwa` receives no route at all. The three clearance/progress/speed weights had
+been marked as if they came from Fox/Burgard/Thrun 1997, but that paper weights *clearance* by `β`,
+not `α`, and states no numeric values, so they are re-marked `// chosen:` as this crate's own ratio.
+Reading also turned up a check the crate had never run: `RUSTDOCFLAGS="-D warnings" cargo doc` fails
+on six links — two to a `LinkError` not in `can.rs`'s scope and four from public docs to *private*
+items (`MIN_MATCH_RATIO`, `MIN_COST_DROP`, `axis_offset`, `Self::index`) — none of which any of the
+nine gates covers. The links are fixed (path completed or demoted to plain code) and `cargo doc` is
+green; adding it to CI is recorded as a recommendation rather than done unilaterally.
+
+A twelfth pass (REQ-A523) read the flagship `fusion.rs` (Mahony 6-DOF attitude + 9-axis
+magnetometer + an Allan-variance gyro-health monitor), a module the README leads with but no round
+had ever read line by line, and changed no production code. Three provenance markers did not hold:
+a section comment named a `MagReference::Referenced` type that exists nowhere (the variant is
+`YawReference::Magnetic`), `ALLAN_MIN_WINDOW` carried a `// cited:` with no citation (the statement
+is a derivation from the Allan formula in `variance`'s own body), and `ALLAN_DEFAULT_NOMINAL_RAD_S`
+carried a `// measured:` for a "typical MEMS-class gyro noise floor" this crate has no way to have
+measured — `record` is fed whatever the caller supplies. `DEFAULT_KI` attributed "a `Kp:Ki` ratio
+near 20 decouples the bias estimate" to Mahony/Hamel/Pflimlin 2008; that paper gives the bias
+estimator and only the stability condition `Ki > 0`, with no numeric ratio (published
+implementations use ~400), so the `20` — this crate's own `1.0/0.05` — is now `// chosen:`. And the
+honest-boundaries list's `measured: 3.3°` yaw leak from a 25°/15° step reproduces only with
+proportional-only gains: the default `Ki` gives 3.62°, so the figure now names its gains and a test
+pins it. The new test's own metadata is the most useful result: three injected mutations — scaling
+`Kp` by 0.9, zeroing the cross product's body-*z* term, and integrating a world-frame rate instead
+of a body rate — all left it green (the last moved the figure only from 3.3267283° to
+3.3267329°), because the leak is a geometric function of the converged attitude rather than of the
+path. The test is therefore documented as **pinning the outcome, not a branch** — the negative
+mutation result is recorded rather than hidden. One unreachable defensive arm
+(`gravity_reference`'s `!norm.is_finite()`, shadowed by `update`'s finiteness gate) is documented
+as unreachable instead of given a fabricated test.
+
+A thirteenth pass (REQ-A527) read `mrac.rs` (Model-Reference Adaptive Control plus an
+anti-windup PID), which had a dedicated integration suite but no dedicated round, and this one
+**did** change production behaviour. The reference model was integrated as `ẋm = am·(xm − bm·r)`;
+the standard form is `ẋm = am·xm + bm·r`, which is what makes the model *the plant at the matched
+unknown* (`θ̂ = θ` ⇒ `u = r` ⇒ `ẋ = am·x + bm·r`) — the identity the cited Lyapunov argument
+needs. The two forms agree **only at `am = −1`**. At any other pole the old form left a persistent
+`−bm·r·(am+1)` in `ė`, so `V̇ ≤ 0` no longer held and `θ̂` settled at `θ + r·(am+1)/ω` instead of
+the plant's true `θ` (probe: `θ = 0.5` at `am = −2` gave `θ̂ = −0.5`, at `am = −3` gave `−1.5`);
+`e` still reached zero, because the adaptation absorbs the bias — which is why it went unseen.
+Every unit and integration fixture used `am = −1.0`, also the constructor's fallback for an
+invalid pole, so the one default value was the one point where the two forms coincide. The
+integration line is fixed and the model's equilibrium is now documented as `−bm·r/am`; the change
+is numerically identical at `am = −1`, so the 16 existing `mrac` tests did not move (mutation M1 —
+reverting the line — turns exactly one test red, the new one). Three comments contradicted their
+own fixtures: `Pid::new`'s doc claimed "`kp = 1.0`" though `kp` is the argument (another test
+passes `0.0`), the `omega` field claimed to be "needed for the next step" though every `step`
+takes its own `omega` and nothing in the algorithm reads the field, and a test comment said
+"`am = bm = 1`" where the fixture writes `am = -1.0` (`am = +1` is rejected outright as an
+unstable pole). The `p` field's "closed-form" is now named as this crate's `Q = bm²` choice
+rather than a unique solution, and two `measured:` figures describing deleted code were demoted to
+prose — they cannot be reproduced against the shipped implementation.
+
+A fourteenth pass (REQ-A531) read `safety.rs` — the monitor that sits before the bus (a
+heartbeat plus five independent rules `R1`..`R5`) and had a dedicated injection suite but no
+dedicated round. This one changed no behaviour and added no test: every finding is a comment, a
+provenance marker or a doc claim. `FaultCode`'s doc said "the discriminant is part of the wire
+format", but the enum derives no `Serialize`/`Deserialize` and nothing in the workspace reads or
+writes one — there is no wire format; the stable thing an operator greps is the `"R1"`..`"R5"`
+*key*. `MAX_FAULT_LOG`'s doc justified its size with "an `Index` is `u8`", which is wrong twice:
+256 does not fit a `u8`, and the module has no `u8` index at all (`fault_log` is a `VecDeque`,
+its length a `usize`). Its "~2.5 s of cascading faults" holds only at one fault per tick, and
+the module's *own* test records the cascade — `R3` and `R2` fire on the same tick — so 256
+entries cover ~1.3 s. Four `DEFAULT_*` constants wore `// measured:` while this crate has never
+measured a fault rate or a traction model; one of them,
+`DEFAULT_MAX_DIVERGENCE_RAD`, said "chosen as" in the very sentence carrying the `measured:`
+marker. That constant also cited "the SLAM frontend's own gate" — but `slam::data_assoc`'s gate
+is a **squared-Mahalanobis** test on a landmark's *position* against the `χ²(2)` quantile and
+carries no radian threshold, and the only `0.2 rad` in `slam/` is `loop_closure`'s scan-match
+*search* half-extent, not a rejection gate. `MAX_DIVERGENCE_LIMIT_RAD`'s `// cited: an angle's
+range is bounded by 2π (ISO 80000-3)` does not hold either: ISO 80000-3 defines the plane angle
+(table 1, item 3-5, `α = s/r`) and the radian, it states no bound on an angle's range, and an
+angle so defined is not bounded by 2π. `FaultCode::SanityFailed`'s doc listed "a non-finite set
+point" among its triggers though `check_set_point` takes an `i32` — it cannot happen, and the
+module's own rule table correctly omits it — so it is documented as unreachable rather than
+given a fabricated test. And the module's opening line calls itself "the last layer before the
+bus" while nothing in the crate calls the monitor; a new "What is not wired" section reads that
+as intent, not as a description of a running pipeline.
+
+A fifteenth pass (REQ-A534) read `control.rs` — one of the three modules the crate README leads
+with, and the last never-audited one. It changed no production logic and added two tests, both of
+which pin behaviour that already shipped. `CadenceHealth::Unknown`'s variant doc said "fewer than
+two judged ticks", but `health()` tests `judged == 0`: after the second tick `judged == 1`, and an
+on-time one already reads `Held`. The module table's "before the second tick", `health()`'s own
+"`Unknown` until there is evidence" and the crate README's "fewer than two *ticks*" all match the
+code; the variant doc was the lone outlier, and nothing pinned the boundary —
+`the_second_tick_is_already_evidence_not_unknown` now does (mutation: `judged == 0` → `judged < 2`
+turns exactly that test red). `CycleVerdict::late_by`'s field doc measured lateness from "the
+period", though `record` subtracts `period + slack` — the neighbouring `on_time()` doc had it
+right. And the module's opening paragraph presented `"the frequency is the caller's (50–100 Hz in
+a real product)"` as a quotation from `docs/amos-link.md` §6; that section is Chinese, the English
+string appears nowhere in the repository, so it is now labelled a translation with the source
+sentence quoted. A second test, `a_hand_ticked_loop_judges_every_interval`, pins the contrast the
+two entry points exist for — a paced run re-captures its predecessor, a hand tick does not — which
+had been asserted only in prose; it counts `judged` rather than a wall-clock lateness, so the CI
+machine cannot decide the verdict.
+
+A sixteenth pass (REQ-A535) read `slam/ekf.rs` — the EKF-SLAM core, the largest file in `slam/`
+and never audited on its own. Unlike the fifteenth, it did change behaviour: two inputs are now
+refused. The create branch fed `initial_landmark_variance.sqrt()` to `Landmark::new`, which
+computes `σ.max(0.0)²`; `f32::max` returns the non-NaN operand, so a negative variance (`sqrt` →
+`NaN`) and a literal `NaN` both collapsed to `0.0` — a landmark of **zero** covariance, i.e.
+"perfectly known", the opposite of the wide uninformative prior the field documents. The
+`add_landmark` guard could not catch it, because by then the value was already the sanitised
+`0.0`; the three new tests fail before the fix with `Ok(Created { landmark_index: 0 })`. A
+non-finite or negative `gate_squared` is refused in the same block, since `d² ≤ gate` can never
+hold (`d² ≥ 0`) and every observation would become a duplicate while the call still reported
+`Ok`. `0.0` stays legal for both. Four doc defects went with it: `VelocityCommand` cited an
+`amos_link::robot_hal::Gait` / `frame → motion` convention that exists nowhere in the workspace
+(`Gait` is a gait *name* that expands to joint angles), `capacity()` called its row stride a
+total cell count, the module boundary counted only the covariance against ~12 MiB of actual
+`SlamState` (plus two scratch buffers), and `EkfSlam`'s doc claimed it "pins a `SlamControl`"
+though no setter exists — that was left as a doc fix rather than re-adding a zero-caller API.
+
+A seventeenth pass (REQ-A538) read `slam/occupancy.rs`, the log-odds grid mapper and the last
+substantial never-audited `slam/` module. It changed no production logic: one real doc defect,
+two wrong test comments, one garbled test name, four missing provenance markers, and one new
+test. The defect was a self-contradiction — `with_origin`'s doc called the world origin the
+millimetre position of cell `(0, 0)`'s **centre** while claiming, in the same sentence, that it
+was "the same convention as `planning::Grid::with_origin` … so the two agree". The planner's
+`with_origin` and `cell_centre` define that number as the north-west **corner** — "A corner, not
+a centre" — so the two cannot both be true, and a caller who believed the centre reading and
+handed the value to `Grid::with_origin(..)` would shift the whole map by half a cell
+(`resolution / 2`), the same half-cell family as the round-7 `cell_centre`/`clearance_mm` fix.
+Both doc sites now say corner; the mapper stores only the integer and never converts, so no code
+changed. `the_origin_agrees_with_the_planners_corner_convention` reads the origin, passes it to
+`Grid::with_origin`, and asserts `cell_centre((0, 0))` is half a cell in — the check fails if the
+planner ever changes its convention (mutation: dropping the planner's half-cell offset turns it
+red with `left: Some((1000, -2000))`; restored byte-identically). It cannot fail on a doc edit,
+which is recorded honestly. The two comment fixes are threshold arithmetic: one test said its
+cell was "still above the threshold (40/2 = 20)" when `+40` is *exactly* the `Occupied`
+threshold (`OCCUPANCY_DEFAULT_HIT / 2`) and survives only because the comparison is inclusive; the
+other said "two misses" where one already classifies the cell free, while its body called
+`add_miss` three times.
+
+An eighteenth pass (REQ-A540) read `vision/fast.rs`, the FAST-9 corner detector. Unlike the two
+rounds before it this one changed behaviour, in two places. The defect: `Corner::x`/`y` are
+`u16`, and `detect` did `x as u16` with no upper
+bound on the image size, so a 70 000-wide frame would have its suppression scan reach
+`x = 69 998` and truncate that coordinate mod 65 536 to `4 462` — a corner reported at the
+*wrong* column, silently, the same family as the previous round's `ekf::observe` sanitisation.
+The detector now refuses such an image up front (the real bound is `u16::MAX + 2`, since the last
+two columns can never be a corner), and a test builds a 70 000 × 16 frame with a bright square at
+`x ≈ 66 000` so that, absent the guard, a truncated corner would appear — deleting the guard
+turns exactly that test red. Second, when non-maximum suppression was switched off the detector
+still ran the whole 3×3 suppression pass and then threw it away to rebuild a raw list; the raw
+branch now runs first, identical output, no wasted pass. On the documentation side, the default
+threshold was said to come from a Rosten–Drummond "`t = 10 .. 20` working range" — the paper and
+the reference implementation give a *default* of `t = 20`, not a range — so the claim is
+withdrawn for a checkable `// cited:` of the default, and two unverifiable assertions ("every
+aerospace-grade implementation I know of", "a 2-3× speedup") came out; `conservative`'s
+"16-pixel arc" became the 9-of-16 arc it actually is, and `DEFAULT_FAST_MIN_SCORE`'s "one
+threshold-step above" (30 is 1.5 × 20) became a plain statement of policy. Both new tests carry
+measured negative controls (guard → `if false`; `<` → `<=`), each turning exactly one test red and
+restored byte-identically.
+
+A nineteenth pass (REQ-A543) read `vision/vo.rs`, the frame-to-frame VO glue and the last
+never-audited `vision/` module. It changed no production logic. The defect was a promise the
+constant's name made and the code did not keep: `MAX_TRACKED_FEATURES`'s doc called it "the
+largest track set the glue holds between frames", but the cap is applied only to sets the glue
+*generates* — `detect_corners` truncates its own detections and `replenish` stops at the cap,
+while `track_frame_to_frame` takes the caller's `&mut Vec<(u16, u16)>` (and
+`VisualTracker::set_features` takes a `Vec`) and tracks it verbatim. Hand in 300 features, keep
+more than 128 of them tracked, and the glue holds 300 — so the bounded-work guarantee the
+constant exists for (its own test calls it "the bounded-work guarantee for the whole frame
+pipeline") is the caller's to keep, not the glue's. The doc now says exactly that, and the
+round deliberately did *not* add a silent truncation, which would drop features the caller
+explicitly asked to track. Three more docs claimed products that do not exist: `detect_corners`
+advertised a "spatially-distributed" result that a score sort cannot give (spreading the set is
+`replenish`'s spacing filter, and only on the refill path); the module's own honest-boundary
+paragraph said the glue reports "the ratio of flow magnitudes" when no such quantity appears in
+`VisualObservation` or `RansacReport`; and `MIN_TRACKED_FEATURES` said re-detection happens "in
+the current frame" when it runs on the *target* frame. One guard, `VO_MIN_SAMPLES`, turned out
+to be exactly redundant with `ransac_essential`'s own `a.len() < 8` — same `None` either way, so
+no test can tell them apart and none pretends to. The new test — the round's only code change —
+fills a frame with 361 weak corners and puts one saturated corner last in raster order, then
+asserts it survives a 256-cap both through `detect_corners` directly and through the public
+cold-start path; deleting the score sort turns exactly that test red.
 
 ```bash
-cargo test -p amos-robot                     # 51 unit + 2 cross-crate e2e + 10 doc tests, offline
+cargo test -p amos-robot                     # 305 unit + 29 integration + 11 doc tests, offline
 cargo run -p amos-robot --example patrol_loop  # plan → drive → estimate → tick → deadman
 ```
 
@@ -364,13 +622,27 @@ is a node nobody can see (`docs/amos-link.md` §3.14).
 | `StreamHeartbeats` | server-streaming heartbeat, forwarding the beats actually received on `amos/*/telemetry/beat` (the node's own included) — a beat is a *self-description*, so its payload `peer` must equal the frame's (validated) publisher or it is refused and counted: one frame, one identity |
 | `ListActuations` | the return path folded into the control plane: each robot's armed / torque-cut(+reason) / gait / last refusal, attributed by frame publisher — a robot that never reported is **absent, not idle** |
 
-The System UI mirrors this read-only: **Settings →「机器人链路 / Robot Link」**
-(`frontend-ts/src/svelte/settings/LinkPage.svelte` over `crates/amos-tauri/src/link.rs`) shows the
+The System UI reaches this plane over `crates/amos-tauri/src/link.rs`, in **two surfaces**: a
+**read-only** one and a **command console**.
+
+*The read-only one* is **Settings →「机器人链路 / Robot Link」**
+(`frontend-ts/src/svelte/settings/LinkPage.svelte` over that bridge) and shows the
 daemon's verdict, its reasons, cumulative counters, the live peer table (id · how to reach it, when
-the beacon said) and the robots' self-reported modes. It has **no toggle** — the CLI owns
-publishing; the page observes. And the readout is **dated, not just refreshed**: every number is a
+the beacon said) and the robots' self-reported modes. It is the panel with **no toggle** — it
+observes. And the readout is **dated, not just refreshed**: every number is a
 snapshot taken at a printed read time, the page re-reads every 10 s while it is open and visible,
 and a re-read that gets no answer **drops the numbers** instead of leaving frozen ones on screen.
+
+*The command console* is the **「机器人指挥台 / Robot console」** app (`RobotApp.svelte`, the 🦿
+tile), the System UI's **write** side of the same plane: pick a robot, then send `arm` / `estop` /
+a gait (`stand` / `trot` / `walk` / `sit`, with a speed slider) through the bridge's `link_publish`
+to `amos/<robot>/control/action`. `estop` is a short-circuit action and is sent with **no
+confirmation and no pre-check**. The console's one rule is the same everywhere in this file: a
+publish receipt is **not** proof the command took effect (the transport's `matched`/`delivered`
+count is what *this node* could see, and a network transport answers `0` = 「unknown」, never
+「none」) — whether torque moved is read back from the robot's own report, which is exactly the
+return path `ListActuations` folds in above. That is why the CLI is no longer the only publisher;
+it is still the only one that can leave the UI entirely.
 
 Honest boundaries, all of them enforced in code: **not ROS** (no `.msg`/DDS wire — a bridge into that
 ecosystem is a separate deployment component), **not a scheduler** (`RobotBridge::step()` is one
@@ -453,8 +725,10 @@ that has not reported since the daemon started watching is named **absent, never
 that **predates that RPC** says so — one absent section, never a claim about the fleet and never a
 page that looks disconnected (`docs/amos-link.md` §3.17). The numbers
 are **dated** (the page prints when the reading was taken and re-reads every 10 s while open; a read
-that gets no answer drops them rather than freezing them). There is no toggle — the page observes;
-the CLI owns publishing (see [Robot link](#robot-link-amos-link)).
+that gets no answer drops them rather than freezing them). There is no toggle here — this page
+observes. **Commanding is a different app**: the **Robot console** (🦿) publishes arm / estop /
+gait to a chosen robot over the same bridge, and a publish receipt there is a receipt, not a
+verdict (see [Robot link](#robot-link-amos-link)).
 
 The **status bar** (and lock screen / System Monitor / About) shows a **real
 battery** reading, layered daemon `system_health` → desktop-host OS battery
@@ -528,9 +802,11 @@ with a reason, that reason quoted on site, and re-proved *live*), `hover`, `life
 (core-lib line coverage ≥ threshold).
 
 `make verify` is the sequential local equivalent of the CI jobs (REQ-A193: 18 device-free
-targets, all EXIT=0 on 2026-09-13). Targets that need a phone (`make android-app`, `make device-eval`),
-and the generator `make api-docs` (which writes `docs/api-grpc.md`; `make lint` runs its
-read-only `--check`), are deliberately excluded.
+targets, all EXIT=0 on 2026-09-13). Targets that need a phone (`make android-app`, `make device-eval`)
+or a running desktop app plus real pointer events (`make device-tool` — the macOS side of the same
+idea, REQ-A486), and the generator `make api-docs` (which writes `docs/api-grpc.md`; `make lint` runs
+its read-only `--check`), are deliberately excluded — *except* the device-free halves: both device
+tools' `--selftest` runs inside `make lint`, because a gate must not need a device.
 
 - **Rust** (`cargo test --workspace`): daemon unit tests (mock inference,
   session counter, status), socket-path test, and an **end-to-end RPC test**
@@ -671,6 +947,7 @@ We are committed to providing a welcoming and inclusive environment. Please revi
 - [CONTRIBUTING.md](./CONTRIBUTING.md) — How to contribute
 - [CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md) — Community guidelines
 - [SECURITY.md](./SECURITY.md) — Security policy and vulnerability reporting
+- [docs/GATES.md](./docs/GATES.md) — **The gates index**: every instrument the build runs (94 scripts: scanners, generators, smokes, shell entry points), the question each one answers *in its own words*, its failure behaviour and whether it has a `--selftest`; kept in sync by `scripts/gate-index-scan.mjs` (`make lint`), with the rule *read this before writing a new instrument*
 - [docs/FMEA.md](./docs/FMEA.md) — FMEA ledger: failure modes whose mitigations are verified against the code by `scripts/fmea-gen.mjs` (`make lint` runs its `--check`)
 - [docs/TRACEABILITY_MATRIX.md](./docs/TRACEABILITY_MATRIX.md) — Requirements → code → verification ledger (a **partial** index; `scripts/trace-scan.mjs` keeps it readable as an index)
 - [docs/multi-window.md](./docs/multi-window.md) — Multi-window architecture

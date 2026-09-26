@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { flipQuick, flipRadio, flipLocation, locationEnabled, dndActive, removeNotif, addNotif, newestAddedNotif, seedNotifs, countForApp, removeAppNotifs, normalizeQuick, normalizeNotifs, markNotifRead, unreadCount, NOTIF_CAP, flipFlashlight, torchOn, normalizeFlashlight, type Notif, type FlashlightStore } from "../lib/settings";
+import { flipQuick, flipRadio, flipLocation, locationEnabled, dndActive, removeNotif, addNotif, newestAddedNotif, removeAppNotifs, droppedAppNotifs, normalizeQuick, normalizeNotifs, markNotifRead, unreadCount, NOTIF_CAP, flipFlashlight, torchOn, normalizeFlashlight, type Notif, type FlashlightStore } from "../lib/settings";
 import {
   BACKUP_VERSION,
   SETTINGS_KEY,
@@ -113,11 +113,14 @@ describe("settings / NC helpers", () => {
     expect(newestAddedNotif(prev, removed)).toBeNull();
   });
 
-  test("notifications seed and dismiss", () => {
-    const list = seedNotifs(1000);
-    expect(list.length).toBe(3);
-    const after = removeNotif(list, list[0]!.id);
-    expect(after.length).toBe(2);
+  test("dismiss removes exactly the one row asked for", () => {
+    const list: Notif[] = [
+      { id: "a", app: "信息", time: 1 },
+      { id: "b", app: "天气", time: 2 },
+      { id: "c", app: "AI 助手", time: 3 },
+    ];
+    const after = removeNotif(list, "b");
+    expect(after.map((n) => n.id)).toEqual(["a", "c"]);
   });
 
   test("addNotif prepends newest-first and caps at NOTIF_CAP", () => {
@@ -132,12 +135,23 @@ describe("settings / NC helpers", () => {
     expect(many.length).toBe(NOTIF_CAP);
   });
 
-  test("badge counts and clearing per app", () => {
-    const list = seedNotifs(1000); // includes app 信息
-    expect(countForApp(list, "信息")).toBe(1);
+  test("clearing per app by its exact display string", () => {
+    const list: Notif[] = [
+      { id: "a", app: "信息", time: 1 },
+      { id: "b", app: "天气", time: 2 },
+      { id: "c", app: "信息", time: 3 },
+    ];
     const read = removeAppNotifs(list, "信息");
-    expect(read.length).toBe(2);
-    expect(countForApp(read, "信息")).toBe(0);
+    expect(read.map((n) => n.id)).toEqual(["b"]);
+    expect(read.some((n) => n.app === "信息")).toBe(false);
+    // `droppedAppNotifs` names the rows `removeAppNotifs` just dropped — the set a caller
+    // that must also relay the removal to the device has to hand over (REQ-A1260).
+    expect(droppedAppNotifs(list, "信息").map((n) => n.id)).toEqual(["a", "c"]);
+    expect([...droppedAppNotifs(list, "信息"), ...read].map((n) => n.id).sort()).toEqual([
+      "a",
+      "b",
+      "c",
+    ]);
   });
 
   test("cloud prefs read/write round-trip and tolerate garbage", () => {

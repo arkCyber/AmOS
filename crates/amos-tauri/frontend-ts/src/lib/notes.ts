@@ -1,4 +1,5 @@
 import { localId } from "./localId";
+import { inkEqual, normalizeInk, type Ink } from "./ink";
 
 export interface Note {
   id: string;
@@ -13,6 +14,10 @@ export interface Note {
   /** Optional lifecycle bucket: active notes omit this; others are archived or
    * in the trash ("Recently Deleted"). */
   state?: "archived" | "trash";
+  /** Optional freehand-ink layer (REQ-A526). **Absent** on every note written before
+   *  pen support and on every text-only note — the absence is preserved rather than
+   *  materialized as an empty layer, so a text note's persisted shape never drifts. */
+  ink?: Ink;
 }
 
 export const NOTES_KEY = "amos.notes";
@@ -73,6 +78,9 @@ export function duplicateNote(list: Note[], id: string, now: number): Note[] {
   if (!src) return list;
   const copy = makeNote(src.text, now);
   if (src.pinned) copy.pinned = true;
+  // Ink structures are immutable at every entry point (each helper returns a new
+  // layer), so the duplicate can share the reference rather than deep-copy it.
+  if (src.ink) copy.ink = src.ink;
   return [copy, ...list];
 }
 
@@ -152,8 +160,13 @@ export function normalizeNotes(list: unknown): Note[] {
   list.forEach((raw, i) => {
     if (!raw || typeof raw !== "object") return;
     const o = raw as Record<string, unknown>;
-    if (typeof o.text !== "string") return; // drop malformed entries
-    const text = o.text as string;
+    // A note is kept when it has *either* a body or a drawing (REQ-A526): an
+    // ink-only note is legitimate, so `text` is no longer the sole signal. An entry
+    // with neither is still dropped, exactly as before.
+    const hasText = typeof o.text === "string";
+    const ink = normalizeInk(o.ink);
+    if (!hasText && !ink) return; // drop malformed entries
+    const text = hasText ? (o.text as string) : "";
     const ts = typeof o.ts === "number" && Number.isFinite(o.ts) ? o.ts : 0;
     const baseId =
       typeof o.id === "string" && o.id ? o.id : `${ts.toString(36)}-${i}`;
@@ -172,6 +185,9 @@ export function normalizeNotes(list: unknown): Note[] {
         : {}),
       ...(typeof o.pinned === "boolean" ? { pinned: o.pinned } : {}),
       ...(o.state === "archived" || o.state === "trash" ? { state: o.state } : {}),
+      // Spread-conditional, so a text-only note keeps *no* `ink` own-property: the
+      // property's absence is the back-compat invariant, not `ink: undefined`.
+      ...(ink ? { ink } : {}),
     });
   });
   return out;
@@ -188,19 +204,43 @@ export function removeNote(list: Note[], id: string): Note[] {
 }
 
 /**
- * Replace the text of exactly one note (bumping its timestamp). Returns the
- * input unchanged when the id is missing, the new text is blank, or it is the
- * same as the current text (avoids churning timestamps on no-op saves).
+ * Replace the text (and optionally the ink) of exactly one note, bumping its timestamp.
+ * Returns the input unchanged when the id is missing, when there is nothing left to keep
+ * (blank text *and* no ink), or when neither text nor ink actually changed — avoids
+ * churning timestamps on no-op saves.
+ *
+ * `ink` is tri-state (REQ-A526):
+ *  * `undefined` — **leave the layer alone**, so a text-only edit can never disturb a
+ *    drawing it did not touch (this is the behaviour every 4-argument caller gets);
+ *  * `null` or an empty/malformed layer — clear it;
+ *  * a layer — set it.
+ *
+ * Clearing **deletes** the key rather than setting `ink: undefined`. `JSON.stringify`
+ * would drop the latter anyway on the way to the store, but the in-memory object would
+ * still carry an explicit own-property, so a deep-equal against a text-only note would
+ * break and the back-compat invariant would silently rest on the serializer's behaviour.
+ * Deleting keeps it structural.
  */
-export function editNote(list: Note[], id: string, text: string, now: number): Note[] {
+export function editNote(
+  list: Note[],
+  id: string,
+  text: string,
+  now: number,
+  ink?: Ink | null,
+): Note[] {
   const v = text.trim();
-  if (!v) return list;
   const i = list.findIndex((n) => n.id === id);
   if (i < 0) return list; // id missing → true no-op (same ref)
   const target = list[i];
   if (!target) return list; // defensive: index in range by construction
-  if (target.text === v) return list; // unchanged → same ref, no ts churn
-  return list.map((n) => (n.id === id ? { ...n, text: v, ts: now } : n));
+  const nextInk: Ink | undefined =
+    ink === undefined ? target.ink : (normalizeInk(ink) ?? undefined);
+  if (!v && !nextInk) return list; // blank with nothing to draw → true no-op
+  if (target.text === v && inkEqual(target.ink, nextInk)) return list; // unchanged
+  const next: Note = { ...target, text: v, ts: now };
+  if (nextInk) next.ink = nextInk;
+  else delete next.ink;
+  return list.map((n) => (n.id === id ? next : n));
 }
 
 /** First-created timestamp; falls back to `ts` for legacy notes without `created`. */
@@ -272,7 +312,11 @@ export function noteStats(text: string): NoteStats {
   if (!body) return { chars: 0, words: 0, lines: 0 };
   const chars = Array.from(body).length; // counts code points, not UTF-16 units
   const words = body.split(/\s+/).filter((w) => w.length > 0).length;
-  const lines = text.split("\n").length;
+  // All three fields measure the trimmed body: `lines` off the raw `text` would
+  // count a blank line typed above/below the note as a line of it, so "你好"
+  // framed by blank lines read as "2 字 · 6 行" in the compose strip
+  // (`note.stats`). The blank-text early return above already agrees with `body`.
+  const lines = body.split("\n").length;
   return { chars, words, lines };
 }
 

@@ -12,7 +12,7 @@
    * - No DOM manipulation (delegates to shellModule)
    */
   import { onMount, getContext } from "svelte";
-  import { readStoreValue } from "../../lib/amosStore";
+  import { createStoreValue } from "../store";
   import {
     DEFAULT_HOT_CORNERS,
     HOT_CORNER_KEY,
@@ -24,13 +24,17 @@
     type HotCornerConfig,
   } from "../../lib/hotCorners";
   import { SHELL_CHROME_API, type ShellChromeApi } from "../../lib/shellModule";
-  import { wmFocus, wmHide, wmWindows } from "../../lib/wm";
+  import { wmFocusWithDiag, wmHide, wmWindows } from "../../lib/wm";
+  import type { BridgeDiag } from "../../lib/backend";
 
   const api = getContext<ShellChromeApi>(SHELL_CHROME_API);
 
-  let configs = $state<HotCornerConfig[]>(
-    normalizeHotCorners(readStoreValue(HOT_CORNER_KEY, DEFAULT_HOT_CORNERS))
-  );
+  // Subscribed, not read-once: editing the corners in Settings must take effect at once
+  // (the old `readStoreValue` at construction meant a change needed a reload — every other
+  // store-backed surface here subscribes, this one was the odd copy out).
+  const hotCorners = createStoreValue<HotCornerConfig[]>(HOT_CORNER_KEY, DEFAULT_HOT_CORNERS);
+
+  const configs = $derived(normalizeHotCorners($hotCorners));
 
   // Per-corner hover timers (cleared when mouse leaves the zone)
   const timers = new Map<Corner, number>();
@@ -107,13 +111,38 @@
   // remembered — so the restore cannot claim to bring back a window that never left.
   let deskHidden: string[] = [];
 
+  /**
+   * Report a refused `wm_focus` — the same breadcrumb the three sibling surfaces that
+   * bring a window forward already leave (`AppExpose`, `MissionControl`, `DockContextMenu`).
+   * `#diag.ok` means nothing was recorded, so there is nothing to explain.
+   */
+  function noteFocusRefused(label: string, diag: BridgeDiag): void {
+    if (diag.ok) return;
+    const code =
+      diag.kind === "command-failed" && diag.detail && typeof diag.detail === "object"
+        ? (diag.detail as { code?: string }).code
+        : undefined;
+    console.warn(`🛟 [HotCorners] wm_focus(${label}) refused`, code ?? diag.kind);
+  }
+
   async function toggleShowDesktop(): Promise<void> {
     if (deskHidden.length > 0) {
-      const back = deskHidden;
-      deskHidden = [];
       // `wm_focus` is show + focus, so the loop leaves the last window focused — macOS
       // also hands the focus to exactly one window.
-      for (const label of back) await wmFocus(label);
+      //
+      // The restore half is the mirror of the hide half below: only a window the host
+      // **confirmed** it brought back leaves the memory. An emptied-first list (the old
+      // shape) made a refused window *gone*: still hidden, but no longer remembered — and
+      // the next trigger only hides what is visible, so it could never return.
+      const stillDown: string[] = [];
+      for (const label of deskHidden) {
+        const r = await wmFocusWithDiag(label);
+        if (!r.ok) {
+          stillDown.push(label);
+          noteFocusRefused(label, r.diag);
+        }
+      }
+      deskHidden = stillDown;
       return;
     }
     const snap = await wmWindows();
@@ -152,7 +181,11 @@
         api.lockScreen();
         break;
       case "notification-center":
-        api.toggleOverlay("control-center-panel");
+        // The one overlay row for this is `notifications` (`shellModules.ts`), the id the
+        // bar's clock toggles (`modules/ClockWidget.svelte`). This branch sent
+        // `control-center-panel`, so a corner labelled "Notification Center" opened Control
+        // Center — the same wrong-id shape the `mission-control` case above was fixed for.
+        api.toggleOverlay("notifications");
         break;
     }
   }

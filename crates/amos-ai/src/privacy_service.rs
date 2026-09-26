@@ -72,7 +72,7 @@ fn proto_audit(
         principal: principal.to_string(),
         op: op.to_string(),
         resource: resource.to_string(),
-        outcome: outcome.to_string().to_ascii_lowercase(),
+        outcome: outcome.tag().to_string(),
         details: String::new(),
     }
 }
@@ -81,17 +81,16 @@ fn proto_audit(
 ///
 /// An unrecognized outcome is never guessed into the nearest known one — an
 /// audit trail that silently reinterprets a decision is worse than no trail.
+///
+/// The accepted set is **derived from** [`Outcome::ALL`]/[`Outcome::tag`], the
+/// same source the disk writer serializes from, so the wire reader and the trail
+/// cannot drift: a variant added to `Outcome` is immediately readable here.
 fn parse_outcome(key: &str) -> Result<Outcome, Status> {
-    match key.to_ascii_lowercase().as_str() {
-        "success" => Ok(Outcome::Success),
-        "granted" => Ok(Outcome::Granted),
-        "denied" => Ok(Outcome::Denied),
-        "rejected" => Ok(Outcome::Rejected),
-        "error" => Ok(Outcome::Error),
-        _ => Err(Status::invalid_argument(format!(
-            "unknown audit outcome '{key}'"
-        ))),
-    }
+    let k = key.to_ascii_lowercase();
+    Outcome::ALL
+        .into_iter()
+        .find(|o| o.tag() == k)
+        .ok_or_else(|| Status::invalid_argument(format!("unknown audit outcome '{key}'")))
 }
 
 /// Unix seconds now (the daemon's own clock; `0` only if the clock is before the
@@ -268,7 +267,7 @@ impl PrivacyService for PrivacySvc {
                     principal: rec.principal,
                     op: rec.op,
                     resource: rec.resource,
-                    outcome: rec.outcome.to_string().to_ascii_lowercase(),
+                    outcome: rec.outcome.tag().to_string(),
                     details: rec.details,
                 })
                 .collect(),
@@ -732,5 +731,58 @@ mod tests {
             .into_inner();
         assert!(!reply.durable, "no sink ⇒ a trail cannot exist");
         assert!(reply.records.is_empty());
+    }
+
+    /// The declared property (audit.rs `Outcome`: "the on-disk JSON-lines trail
+    /// and the RPC answer the *same* tag for the same record") has exactly one
+    /// establishing path: `Outcome::tag()` is the serde spelling *and* the wire
+    /// spelling, and `parse_outcome` accepts precisely `Outcome::ALL`'s tags.
+    /// This test binds all of them together; before the fix the disk writer's
+    /// serde tags and the RPC reader's hand-written match were independent lists
+    /// nothing tied, so a new variant would serialize to the trail but be
+    /// rejected over the wire.
+    #[test]
+    fn the_outcome_vocabulary_has_one_declaration_for_disk_and_wire() {
+        // The vocabulary is the proto's (`proto/privacy.proto` lists exactly
+        // these five), sorted to compare against the derived set.
+        let mut derived: Vec<&str> = Outcome::ALL.iter().map(|o| o.tag()).collect();
+        derived.sort_unstable();
+        assert_eq!(
+            derived,
+            ["denied", "error", "granted", "rejected", "success"],
+            "Outcome::tag set drifted from the proto vocabulary"
+        );
+
+        for o in Outcome::ALL {
+            // 1. Disk: serde serializes to the canonical lowercase tag.
+            assert_eq!(
+                serde_json::to_string(&o).unwrap(),
+                format!("\"{}\"", o.tag()),
+                "serde tag for {o:?} disagrees with Outcome::tag()"
+            );
+            // 2. The legacy uppercase spelling the Display impl writes lowers to
+            //    the same tag (so an external consumer lowercasing it agrees).
+            assert_eq!(
+                o.to_string().to_ascii_lowercase(),
+                o.tag(),
+                "Display form for {o:?} lowercases to a different tag"
+            );
+            // 3. Wire: parse_outcome accepts the tag, any case. (`tonic::Status`
+            //    is not `PartialEq`, so compare the `Ok` side.)
+            assert_eq!(
+                parse_outcome(o.tag()).ok(),
+                Some(o),
+                "wire rejects its own tag"
+            );
+            assert_eq!(
+                parse_outcome(&o.tag().to_ascii_uppercase()).ok(),
+                Some(o),
+                "wire is case-sensitive for {o:?}"
+            );
+        }
+
+        // Unknown outcomes are rejected, never guessed into a neighbour.
+        assert!(parse_outcome("deferred").is_err());
+        assert!(parse_outcome("").is_err());
     }
 }

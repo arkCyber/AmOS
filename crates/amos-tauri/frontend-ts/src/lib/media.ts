@@ -6,19 +6,6 @@
  * "external storage unavailable" state instead of throwing.
  * Wire shapes: crates/amos-tauri/src/media.rs ↔ crates/amos-media (serde).
  */
-export type StandardDir =
-  | "root"
-  | "camera" // DCIM/Camera
-  | "screenshots" // Pictures/Screenshots
-  | "pictures"
-  | "download"
-  | "recordings"
-  | "movies"
-  | "music";
-
-export type MediaKind = "image" | "video" | "audio" | "file" | "download";
-export type AccessKind = "read" | "write";
-
 export interface MediaItem {
   id: string;
   kind: MediaKind;
@@ -37,19 +24,30 @@ export interface Grant {
   collection: StandardDir;
 }
 
-const DIRS: readonly StandardDir[] = [
+/**
+ * The one declaration of each vocabulary. The union types are derived from these arrays
+ * (`(typeof X)[number]`), so the runtime allowlist that {@link normalizeDir}, {@link
+ * normalizeMediaItem}, and {@link normalizeGrant} consult *is* the type — an entry cannot
+ * exist in one spelling and not the other. (Before: a hand-written union plus this array,
+ * joined only by an `as readonly string[]` cast that hid drift from the checker.)
+ */
+export const DIRS = [
   "root",
-  "camera",
-  "screenshots",
+  "camera", // DCIM/Camera
+  "screenshots", // Pictures/Screenshots
   "pictures",
   "download",
   "recordings",
   "movies",
   "music",
-];
+] as const;
+export type StandardDir = (typeof DIRS)[number];
 
-const KINDS: readonly MediaKind[] = ["image", "video", "audio", "file", "download"];
-const ACCESS: readonly AccessKind[] = ["read", "write"];
+export const KINDS = ["image", "video", "audio", "file", "download"] as const;
+export type MediaKind = (typeof KINDS)[number];
+
+export const ACCESS = ["read", "write"] as const;
+export type AccessKind = (typeof ACCESS)[number];
 
 /** Human-readable relative path under /storage/emulated/0 (display only). */
 export function canonicalPath(dir: StandardDir): string {
@@ -208,6 +206,24 @@ export async function mediaLoad(item: MediaItem): Promise<Uint8Array | null> {
   return arr === null ? null : bytesFromNumbers(arr);
 }
 
+/**
+ * The **stream** URL for one item (null offline, and null when the host will not serve
+ * it).
+ *
+ * A media element can play this URL directly: the host answers with bounded `206` windows
+ * over the `amos-media://` protocol, so an item too large to buffer plays instead of being
+ * refused (docs/media-player.md §8). The URL is built by Rust (`media_stream_url`), never
+ * here — on Windows/Android a custom scheme is spelled `http://amos-media.localhost/…`,
+ * and a literal in this module would be dead exactly on the platform AmOS ships on.
+ *
+ * `null` is therefore a *decision by the host* (an item that is not in the authorized
+ * listing answers `null`, so a revoked read grant revokes the URL with it), and the caller
+ * keeps its own explicit refusal instead of rendering an element whose `src` would fail.
+ */
+export async function mediaStreamUrl(item: MediaItem): Promise<string | null> {
+  return call<string | null>("media_stream_url", { item });
+}
+
 // ---- Paging support (REQ-A316) ------------------------------------------------
 
 /** Opaque cursor for resuming a collection listing. */
@@ -235,12 +251,4 @@ export function cursorOf(items: readonly MediaItem[]): MediaCursor | null {
 export function newestFirst(a: MediaItem, b: MediaItem): number {
   if (a.ts !== b.ts) return b.ts - a.ts;
   return a.id.localeCompare(b.id);
-}
-
-/**
- * Streaming base URL for native media (e.g., "http://localhost:3456/media/stream").
- * Returns null offline; the caller prepends this to a URI to form a thumbnail URL.
- */
-export async function mediaStreamBase(): Promise<string | null> {
-  return call<string>("media_stream_base");
 }

@@ -251,13 +251,6 @@ impl SpaceManager {
         Ok(())
     }
 
-    /// Get the Space that contains the given window
-    pub fn space_for_window(&self, window_label: &str) -> Option<&Space> {
-        self.spaces
-            .iter()
-            .find(|s| s.windows.contains(&window_label.to_string()))
-    }
-
     /// Get windows in the currently active Space
     pub fn active_space_windows(&self) -> &[String] {
         &self.spaces[self.active_index].windows
@@ -268,6 +261,27 @@ impl SpaceManager {
         self.spaces[self.active_index]
             .windows
             .contains(&window_label.to_string())
+    }
+
+    /// The labels a switch **away from** the active Space hides today: the windows filed
+    /// into some *other* Space.
+    ///
+    /// This is [`Self::switch_plan`]'s `hide` half on its own, named because a **second**
+    /// feature has to ask the same question. A space switch hides a window with the very
+    /// same [`crate::wm::WmState::hide`] a user's "park this window" uses, so the window
+    /// model alone cannot tell the two apart — and Stage Manager's rail reads that model.
+    /// Without this list the rail offers a tile for a window that lives on another desktop,
+    /// and "bring it back" would put a window on a Space that does not own it: the two
+    /// managers disagreeing about one window's desktop, in the direction the user can see
+    /// (`stage.rs::views_of`, REQ-A1686).
+    ///
+    /// Deriving it here rather than keeping a mark on each hidden window is deliberate: the
+    /// membership ledger is the source of truth for "which desktop owns this window", and a
+    /// second copy of that fact is how the two come to disagree. Unfiled windows are in no
+    /// Space, so they are never in this list — which is right, because a switch never hides
+    /// them (see [`Self::switch_plan`]).
+    pub fn hidden_by_switch(&self) -> Vec<String> {
+        self.switch_plan().0
     }
 
     /// The window work a switch to the **active** Space implies (REQ-A446): the labels that must
@@ -524,6 +538,28 @@ mod tests {
         let (hide, show) = mgr.switch_plan();
         assert_eq!(hide, vec!["files".to_string()]);
         assert_eq!(show, vec!["notes".to_string()]);
+    }
+
+    /// REQ-A1686 — `hidden_by_switch` is the `hide` half on its own, which is what Stage
+    /// Manager's rail needs to tell a desktop switch's hidden window from one the user parked.
+    ///
+    /// Two negative controls, because both are ways a lazy copy of this list would be wrong:
+    /// the window of the **active** Space is never in it (a switch does not hide what it is
+    /// bringing forward), and an **unfiled** window is never in it (a switch never touches one
+    /// — see `an_unfiled_window_is_never_named_by_a_switch_plan`).
+    #[test]
+    fn hidden_by_switch_names_only_the_other_spaces_windows() {
+        let mut mgr = SpaceManager::new();
+        mgr.create_space("工作".to_string());
+        mgr.move_window_to_space("files", "space-0").unwrap();
+        mgr.move_window_to_space("notes", "space-1").unwrap();
+        // Filed into no Space: belongs to every desktop, so a switch never hides it.
+        assert_eq!(mgr.hidden_by_switch(), vec!["notes".to_string()]);
+
+        mgr.switch_space(1).unwrap();
+        // Asserted as a whole list, not a length: a `main` (the Launcher, which
+        // `switch_plan` refuses to name) slipping into it would fail here.
+        assert_eq!(mgr.hidden_by_switch(), vec!["files".to_string()]);
     }
 
     /// A window nobody filed is in **every** Space. The alternative (hide anything unfiled) would

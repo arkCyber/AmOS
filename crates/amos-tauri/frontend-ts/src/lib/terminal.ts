@@ -23,6 +23,41 @@ export interface TermResult {
 
 export const PROMPT = "amos:~$";
 
+/**
+ * The reply the whole `term_*` family answers, structurally — `term_spawn` /
+ * `term_write` / `term_read` / `term_kill` / `term_resize` all return
+ * `amos-tauri::terminal::TermOut`.
+ *
+ * It is **not** a `Result`, which is the trap this interface exists to name: a refusal is
+ * *inside* a perfectly successful bridge call (`error` carries the reason, `id` is 0,
+ * `running` is false), so `invoke` never folds it to `null` (REQ-A296) and
+ * `bridgeDiag("term_write").ok` is **true** for a write the shell never took. Neither
+ * `void-cmd-scan` (a `void` command's verdict) nor `read-fold-scan` (a refused read folded
+ * into an absence) can see this shape: the failure travels in the *value*, so the only
+ * thing that reads it is this predicate.
+ */
+export interface TermReply {
+  /**
+   * Live session token; `0` when the call failed. **`0` is not the failure test**: a
+   * successful `term_kill` answers `ok(0, None, false)` — id `0`, empty `error` — because
+   * the session it names is gone. Only `error` separates the two.
+   */
+  id: number;
+  /** The reason, non-empty on failure (and the *only* field that is). */
+  error: string;
+  running: boolean;
+}
+
+/** Was this `term_*` reply a failure? `null` = no bridge at all (the same failure). */
+export function termRefused(reply: TermReply | null): boolean {
+  return reply === null || reply.error !== "";
+}
+
+/** The reason to show for a refused `term_*` reply, or `""` when there is none to quote. */
+export function termRefusalReason(reply: TermReply | null): string {
+  return reply === null ? "" : reply.error;
+}
+
 /** Honest banner shown at startup. */
 export function termBanner(demoNote: string): TermLine[] {
   return [

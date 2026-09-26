@@ -60,4 +60,27 @@ describe("AuditLogViewer — export menu keyboard navigation (REQ-A438)", () => 
     expect(trigger.getAttribute("aria-expanded")).toBe("false");
     expect(menu.classList.contains("open")).toBe(false);
   });
+
+  // The closing half of the same contract (REQ-A1057). Collapsing the dropdown sets
+  // `display: none` on the element that holds the focus, and a hidden focused element is
+  // blurred — the browser parks focus on `<body>`, so the keyboard user's place on the audit
+  // page is gone and the next Tab restarts from the top of the document. Escape puts it back on
+  // the trigger, which is where macOS leaves it too.
+  test("Escape leaves the focus on the trigger, not on <body>", async () => {
+    const { container } = render(AuditLogViewer);
+    await tick();
+
+    const trigger = container.querySelector<HTMLButtonElement>('[aria-haspopup="menu"]')!;
+    await fireEvent.click(trigger);
+    await tick();
+    const menu = container.querySelector<HTMLElement>('[role="menu"]')!;
+    const firstRow = [...menu.querySelectorAll<HTMLButtonElement>('[role^="menuitem"]')][0]!;
+    expect(document.activeElement, "the menu took the focus").toBe(firstRow);
+
+    await fireEvent.keyDown(menu, { key: "Escape" });
+    await tick();
+
+    expect(menu.classList.contains("open"), "the menu closed").toBe(false);
+    expect(document.activeElement, "and the focus came back with it").toBe(trigger);
+  });
 });

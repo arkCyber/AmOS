@@ -11,11 +11,13 @@
     parseTranscribe,
     pcmToWavBytes,
     voiceReducer,
+    VOICE_STATUS_LABEL_KEY,
     type VoiceStatus,
   } from "../lib/voice";
   import { loadLedger, capSet, type Capability } from "../lib/permissions";
   import { grantCapability, revokeCapability } from "./osPermissions";
   import { t } from "./locale.svelte";
+  import StoreErrorBar from "./StoreErrorBar.svelte";
 
   const MIC: Capability = "microphone";
   let {
@@ -46,6 +48,8 @@
     micGranted = capSet(loadLedger(), appId, MIC);
   });
   let ask = $state(false);
+  /** The ledger write's refusal, shown inside the still-open prompt (`StoreErrorBar`). */
+  let storeErr = $state("");
 
   // Live-capture plumbing (plain refs).
   let ctxRef: AudioContext | null = null;
@@ -178,15 +182,34 @@
     }
   }
 
+  // `micGranted` is seeded from the persisted ledger (`capSet(loadLedger(), …)`), so it is a
+  // *display of* `amos.permissions` — the ledger every OS capability gate reads back. The
+  // prompt's answer must therefore adopt the write's own verdict, not the intent: on a refused
+  // write `grantCapability`/`revokeCapability` answer the ledger the store still holds. The
+  // adopted value is what decides whether the prompt may close — a still-granted ledger after a
+  // decline, or a still-ungranted one after an allow, is the request *not* satisfied, so the
+  // prompt stays up and states why. (Gating on `landed` alone would be wrong: a decline on a mic
+  // that was never granted needs no write to be true, and a refused no-op write must not trap the
+  // user in the prompt.)
   const allowMic = () => {
-    grantCapability(appId, MIC); // mirrors to daemon for the audit trail
-    micGranted = true;
+    const res = grantCapability(appId, MIC);
+    micGranted = capSet(res.ledger, appId, MIC);
+    if (!micGranted) {
+      storeErr = t("common.storeWriteFailed");
+      return;
+    }
+    storeErr = "";
     ask = false;
     void start();
   };
   const denyMic = () => {
-    revokeCapability(appId, MIC);
-    micGranted = false;
+    const res = revokeCapability(appId, MIC);
+    micGranted = capSet(res.ledger, appId, MIC);
+    if (micGranted) {
+      storeErr = t("common.storeWriteFailed");
+      return;
+    }
+    storeErr = "";
     ask = false;
   };
 </script>
@@ -194,7 +217,7 @@
 <span class="relative inline-flex shrink-0">
   <button
     type="button"
-    aria-label={t("a11y.voiceInput")}
+    aria-label={t(VOICE_STATUS_LABEL_KEY[status])}
     onclick={() => {
       if (transcribing) return;
       if (recording) void stop();
@@ -211,10 +234,13 @@
       (disabled || !online ? " opacity-40" : "")}
   >{recording ? "●" : transcribing ? "…" : "🎤"}</button>
   {#if ask}
-    <span class="absolute bottom-full right-0 z-30 mb-2 flex items-center gap-2 whitespace-nowrap rounded-xl bg-white px-2.5 py-1.5 text-xs shadow ring-1 ring-black/10 dark:bg-neutral-800 dark:ring-white/10">
-      <span class="opacity-80">{t("perm.micAsk")}</span>
-      <button type="button" onclick={allowMic} class="rounded-full bg-accent px-2 py-0.5 text-white">{t("perm.allow")}</button>
-      <button type="button" onclick={denyMic} class="rounded-full bg-neutral-200 px-2 py-0.5 dark:bg-neutral-700">{t("perm.deny")}</button>
+    <span class="absolute bottom-full right-0 z-30 mb-2 flex flex-col gap-1 rounded-xl bg-white px-2.5 py-1.5 text-xs shadow ring-1 ring-black/10 dark:bg-neutral-800 dark:ring-white/10">
+      <span class="flex items-center gap-2 whitespace-nowrap">
+        <span class="opacity-80">{t("perm.micAsk")}</span>
+        <button type="button" onclick={allowMic} class="rounded-full bg-accent px-2 py-0.5 text-white">{t("perm.allow")}</button>
+        <button type="button" onclick={denyMic} class="rounded-full bg-neutral-200 px-2 py-0.5 dark:bg-neutral-700">{t("perm.deny")}</button>
+      </span>
+      <StoreErrorBar message={storeErr} />
     </span>
   {/if}
 </span>

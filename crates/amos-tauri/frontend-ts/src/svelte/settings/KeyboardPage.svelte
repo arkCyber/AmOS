@@ -13,9 +13,9 @@
   //
   // 数据源：
   //   1. 浮层快捷键 —— `shellModules.ts` 注册表（F4 / ⌘Space / F3 / ⌘Tab）
-  //   2. 系统快捷键 —— `DesktopShell.svelte` 硬编码（⌘W / ⌘M / ⌘H / ⌘,）
-  //   3. Spaces 快捷键 —— `DesktopShell.svelte` 硬编码（Ctrl+1-9 / Ctrl+←→↑）
-  //   4. 触屏快捷键 —— `systemKeys.ts` TOUCH_SYSTEM_SHORTCUTS（⌘[ / ⌘, / Esc）
+  //   2. 系统快捷键 —— `keyboardConfigHook.svelte` 的 SYSTEM_DEFAULTS（⌘W / ⌘M / ⌘H / ⌘,）
+  //   3. Spaces 快捷键 —— `keyboardConfigHook.svelte` 的 SPACES_DEFAULTS（Ctrl+1-9 / Ctrl+←→↑）
+  //   4. 触屏快捷键 —— `lib/keyboardConfig.ts` TOUCH_DEFAULTS（⌘[ / Esc / ⌘,）
   //
   // 所有分类与标签都来自 i18n（`settings.keyboard.*`），不内联任何文本。
   import { t } from "../locale.svelte";
@@ -169,11 +169,46 @@
   let importText = $state("");
   let importError = $state<string | null>(null);
   let savedMessage = $state(false);
+  let saveFailed = $state(false);
+  /** The failed-write note stays up longer than the success one: it asks the user to act. */
+  const FAIL_MS = 4000;
+
+  /**
+   * Publish the result of a write instead of assuming it landed (F-SH-043).
+   *
+   * `writeKeyboardConfig` answers whether the value reached the store
+   * (`writeStoreValueChecked` → `writeJson`, which also logs `amosError` when storage is full or
+   * unavailable). This page used to discard that answer and show the green 「已保存」 toast
+   * unconditionally: with a refusing store the user was told their rebind was saved while
+   * `buildSections()` re-read the *old* config — the row kept the old chord and the toast said
+   * otherwise. The repo's `write-scan` gate exempts *config* keys ("they carry no claim about the
+   * user's content"), and that exemption is exactly what this page broke: it does make a claim.
+   */
+  function reportWrite(landed: boolean): boolean {
+    if (landed) {
+      savedMessage = true;
+      setTimeout(() => (savedMessage = false), 2000);
+    } else {
+      saveFailed = true;
+      setTimeout(() => (saveFailed = false), FAIL_MS);
+    }
+    return landed;
+  }
 
   // ─── 注册表用于冲突检测 ──────────────────────────────────────────────────
   const registryMap = new Map<string, ShellShortcut[]>();
   for (const m of modulesFor("overlay", SHELL_MODULES)) {
     if (m.shortcuts) registryMap.set(m.id, [...m.shortcuts]);
+  }
+  // F-SH-045: the conflict check must see **every** table this page renders, not just the overlay
+  // registry. The system / Spaces / touch rows come from their own default tables, and their *labels*
+  // were already registered below while their **bindings** were not — so capturing ⌘W (关闭窗口's own
+  // key, shown two rows further down) produced no warning at all: the page promised 「冲突的绑定将被
+  // 警告」 and stayed silent for every non-overlay chord.
+  for (const defaults of [SYSTEM_DEFAULTS, SPACES_DEFAULTS, TOUCH_DEFAULTS]) {
+    for (const [id, shortcut] of Object.entries(defaults)) {
+      registryMap.set(id, [shortcut]);
+    }
   }
 
   const labelKeysMap = new Map<string, string>();
@@ -295,13 +330,9 @@
       };
     }
 
-    writeKeyboardConfig(config);
+    reportWrite(writeKeyboardConfig(config));
     sections = buildSections();
     cancelEditing();
-
-    // 显示保存成功消息
-    savedMessage = true;
-    setTimeout(() => (savedMessage = false), 2000);
   }
 
   function disableShortcut(id: string, category: "overlay" | "system" | "spaces" | "touch") {
@@ -315,12 +346,12 @@
     } else if (category === "touch") {
       config.touch = { ...config.touch, [id]: null };
     }
-    writeKeyboardConfig(config);
+    reportWrite(writeKeyboardConfig(config));
     sections = buildSections();
   }
 
   function resetAll() {
-    resetKeyboardConfig();
+    reportWrite(resetKeyboardConfig());
     sections = buildSections();
     showResetConfirm = false;
   }
@@ -344,7 +375,13 @@
       importError = result.error;
       return;
     }
-    writeKeyboardConfig(result);
+    // The import path was the third site the rule found (REQ-A492): closing the panel and clearing the
+    // text **before knowing whether the config was stored** told the user the import had been applied.
+    // On a refused write the panel stays open with the reason, so the text can be retried.
+    if (!reportWrite(writeKeyboardConfig(result))) {
+      importError = t("settings.keyboard.saveFailed");
+      return;
+    }
     sections = buildSections();
     showImportPanel = false;
     importText = "";
@@ -354,6 +391,14 @@
 
 <div class="space-y-5">
   <!-- 保存成功消息 -->
+  {#if saveFailed}
+    <div
+      class="fixed top-4 right-4 z-50 rounded-lg bg-red-500 px-4 py-2 text-sm text-white shadow-lg"
+      role="alert"
+    >
+      {t("settings.keyboard.saveFailed")}
+    </div>
+  {/if}
   {#if savedMessage}
     <div class="fixed top-4 right-4 z-50 rounded-lg bg-green-500 px-4 py-2 text-sm text-white shadow-lg">
       {t("settings.keyboard.saved")}
@@ -508,7 +553,19 @@
                       {recordingKey ? formatShortcut(recordingKey) : t("settings.keyboard.pressKey")}
                     </kbd>
                     {#if conflictWarning}
-                      <span class="text-xs text-red-500" title={conflictWarning}>⚠️</span>
+                      <!--
+                        The reason used to live **only** in a `title` tooltip (`<span title=…>⚠️</span>`).
+                        That is the wrong shape here on two counts (F-SH-044): the page's whole audience is
+                        keyboard users — who cannot hover — and a screen reader announces the emoji with no
+                        name at all, so "which binding is this in conflict with?" was unreachable without a
+                        mouse. The message is short (`冲突：已被「关闭窗口」占用`), so it is rendered as text
+                        (and named for assistive tech), which also makes it readable from a device pass.
+                      -->
+                      <span
+                        role="status"
+                        class="text-xs text-red-500"
+                        title={conflictWarning}
+                        aria-label={conflictWarning}>{conflictWarning}</span>
                     {/if}
                     <button
                       onclick={cancelEditing}

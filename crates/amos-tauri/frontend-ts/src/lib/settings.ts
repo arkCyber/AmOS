@@ -1,6 +1,5 @@
+import { readStoreValue, writeStoreValueChecked } from "./amosStore";
 import { localId } from "./localId";
-
-export type QuickKey = "wifi" | "bluetooth" | "airplane" | "hotspot" | "darkmode" | "dnd" | "location";
 
 /** The radios that go through the real `radio_*` backend (wifi / bluetooth / airplane / hotspot). */
 export type RadioKey = "wifi" | "bluetooth" | "airplane" | "hotspot";
@@ -97,27 +96,35 @@ export function flipRadio(s: QuickSettings, key: RadioKey): QuickSettings {
   return { ...s, [key]: !s[key] };
 }
 
-/** Seed a handful of notifications (same spirit as the legacy NC). */
-export function seedNotifs(now: number): Notif[] {
-  return [
-    { id: "n1", app: "信息", icon: "💬", title: "小安", body: "Amos 系统感觉怎么样？", time: now },
-    { id: "n2", app: "天气", icon: "🌤️", title: "今日天气", body: "北京 26° 多云", time: now - 3600e3 },
-    { id: "n3", app: "AI 助手", icon: "🤖", title: "后台任务完成", body: "长文本推理已完成", time: now - 7200e3 },
-  ];
-}
-
 export function removeNotif(list: Notif[], id: string): Notif[] {
   return list.filter((n) => n.id !== id);
 }
 
-/** Count notifications for an app (store uses display names, e.g. Chinese). */
-export function countForApp(list: Notif[], appName: string): number {
-  return list.filter((n) => n.app === appName).length;
-}
-
-/** Remove every notification belonging to an app (open = read). */
+/**
+ * Remove every notification whose `app` is **exactly** `appName` (open = read).
+ *
+ * This is the row's own display string, never a name resolved from an app id: the callers
+ * that use it (the two banners, the desktop notification centre) hold a specific row and
+ * drop its siblings, so an exact-string match is both correct and locale-safe. Dropping rows
+ * by app **id** — where the id must be recovered from a display string in any locale — is
+ * `lib/notifApp.ts::withoutAppNotifs`, which is what the producers use.
+ */
 export function removeAppNotifs(list: Notif[], appName: string): Notif[] {
   return list.filter((n) => n.app !== appName);
+}
+
+/**
+ * Every notification whose `app` is **exactly** `appName` — the rows {@link removeAppNotifs}
+ * drops, named from the same single predicate instead of being re-filtered by each caller.
+ *
+ * The callers that need the dropped set are the ones that must also **relay** the removal to
+ * the device: `amos.notifications` is a projection of the device's push history
+ * (`osPushWatcher` re-reads it every few seconds and writes back anything the store no longer
+ * holds), so a push row removed only locally is resurrected by the next poll — and the
+ * arrival banner then reports the same delivery arriving a second time (REQ-A1260).
+ */
+export function droppedAppNotifs(list: Notif[], appName: string): Notif[] {
+  return list.filter((n) => n.app === appName);
 }
 
 /**
@@ -148,8 +155,11 @@ export function newestAddedNotif(prev: Notif[], curr: Notif[]): Notif | null {
   return added.reduce((a, b) => (b.time >= a.time ? b : a));
 }
 
-/** The known quick-toggle keys, for validating persisted settings. */
-const QUICK_KEYS: readonly QuickKey[] = [
+/**
+ * The known quick-toggle keys, for validating persisted settings. The array is the one
+ * declaration; {@link QuickKey} derives from it, so the validator and the type agree.
+ */
+const QUICK_KEYS = [
   "wifi",
   "bluetooth",
   "airplane",
@@ -157,7 +167,8 @@ const QUICK_KEYS: readonly QuickKey[] = [
   "darkmode",
   "dnd",
   "location",
-];
+] as const;
+export type QuickKey = (typeof QUICK_KEYS)[number];
 
 /** System location-services master switch: ON by default; only an explicit OFF
  * disables location system-wide (regardless of per-app grants). */
@@ -177,7 +188,11 @@ export function flipLocation(s: QuickSettings): QuickSettings {
 }
 
 /** Corruption guard for quick settings: returns an object containing only the
- * known boolean keys, ignoring anything else / non-object input. */
+ * known boolean keys, ignoring anything else / non-object input.
+ *
+ * This is a **read-side** guard. Its result must never be written back to
+ * `amos.settings` — it is a narrowing, and that key is a union blob. Use
+ * {@link saveQuick} for every quick write. */
 export function normalizeQuick(v: unknown): QuickSettings {
   if (!v || typeof v !== "object" || Array.isArray(v)) return {};
   const o = v as Record<string, unknown>;
@@ -186,6 +201,38 @@ export function normalizeQuick(v: unknown): QuickSettings {
     if (typeof o[k] === "boolean") out[k] = o[k] as boolean;
   }
   return out;
+}
+
+/**
+ * Apply a **narrowed** quick-settings update onto the raw `amos.settings` blob.
+ *
+ * `amos.settings` is a union blob: the quick booleans **plus** what other modules
+ * keep there — `aiProvider` / `aiModel` / `aiEndpoint` (`lib/providers.ts`) and
+ * `iCloudSync` / `cloudLast` (`lib/cloud.ts`). Those writers spread the object they
+ * read, so they preserve each other's keys; a caller that writes a `normalizeQuick`
+ * **result** keeps only `QUICK_KEYS` and erases the rest of the user's settings.
+ *
+ * The merge is over the raw blob rather than a normalized one because the point is
+ * to carry the keys this module does not own through untouched; a corrupt blob that
+ * is not an object is treated as empty, exactly as {@link normalizeQuick} does.
+ */
+export function mergeSettings(raw: unknown, quick: QuickSettings): Record<string, unknown> {
+  const base =
+    raw && typeof raw === "object" && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
+  return { ...base, ...quick };
+}
+
+/**
+ * Persist a quick-settings change onto `amos.settings` and hand back the store's verdict.
+ *
+ * Every quick write goes through here: the value handed in is the narrowed flip
+ * (`flipQuick` ∕ `flipRadio` ∕ a single-key literal), and the raw blob underneath it is
+ * preserved. Writing the narrowed value directly is what erased `aiProvider` ∕
+ * `iCloudSync` from the blob for the whole OS (REQ-A1397 ∕ FMEA F-SH-656).
+ */
+export function saveQuick(quick: QuickSettings): boolean {
+  const raw = readStoreValue<unknown>(SETTINGS_KEY, {});
+  return writeStoreValueChecked(SETTINGS_KEY, mergeSettings(raw, quick));
 }
 
 /** Corruption guard for the notifications store: keeps entries with a usable id +

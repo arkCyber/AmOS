@@ -16,31 +16,78 @@
  *
  * Pure + framework-agnostic except for the final `lib/wm` calls (which are the bridge).
  */
-import { wmCloseWithDiag, wmHideWithDiag, wmOpenWithDiag } from "../lib/wm";
+import {
+  wmCloseWithDiag,
+  wmCycleAppWithDiag,
+  wmHideWithDiag,
+  wmMinimizeWithDiag,
+  wmNewWindowWithDiag,
+  wmOpenWithDiag,
+} from "../lib/wm";
+import { appOfWindowLabel } from "../lib/windowRoute";
 
 /** What a bound system key asks the host to do to the **focused** window. */
-export type DesktopSystemIntent = "close-window" | "hide-window" | "open-preferences";
+export type DesktopSystemIntent =
+  | "close-window"
+  | "hide-window"
+  | "minimize-window"
+  | "open-preferences"
+  | "new-window"
+  | "cycle-window";
 
 /**
  * The intent for a binding id, or `null` when this id is not one of the focused-window
  * keys (the keyboard settings page may carry other domains' ids).
  *
- * `minimizeWindow` and `hideApp` both map to *hide*: `crates/amos-tauri/src/wm.rs` models a
- * window as Shown/Hidden with no third "minimized" state, so a menu that promises
- * "minimize" must not invent one (macOS itself treats ⌘H as "hide the app").
+ * `minimizeWindow` (⌘M) and `hideApp` (⌘H) are **different** chords and stay different
+ * here (REQ-A724). They used to collapse into one `hide-window`: the note that justified it
+ * ("wm.rs models a window as Shown/Hidden with no third 'minimized' state") stopped being
+ * true at REQ-A714, which added `wm_minimize` — the platform's own minimize, which leaves
+ * the model alone so the Dock keeps its running dot and Mission Control still lists the
+ * window. The native Window ▸ Minimize item already calls it; this layer did not, so ⌘M
+ * hid while the *same* menu item minimized (and the in-app topbar row, which asked through
+ * here, hid too). macOS keeps them distinct for the same reason: ⌘H hides the app, ⌘M drops
+ * the window into the Dock as a *running* window.
+ *
+ * `newWindow` (⌘N) and `cycleWindows` (⌘`) are **per-app** chords (REQ-A473): they act on
+ * the application the focused window belongs to, which is what macOS does — File ▸ New
+ * Window duplicates *this* app, and ⌘` cycles *this* app's windows.
  */
 export function systemIntentFor(id: string): DesktopSystemIntent | null {
   switch (id) {
     case "closeWindow":
       return "close-window";
     case "minimizeWindow":
+      return "minimize-window";
     case "hideApp":
       return "hide-window";
     case "preferences":
       return "open-preferences";
+    case "newWindow":
+      return "new-window";
+    case "cycleWindows":
+      return "cycle-window";
     default:
       return null;
   }
+}
+
+/**
+ * Which app a per-app chord should act on, given the **focused window's label**.
+ *
+ * REQ-A473. Two rules, in this order:
+ *
+ * 1. A focused window that belongs to an app ⇒ that app. This is macOS's own answer (⌘N
+ *    duplicates what you are looking at), and it is why the identity model had to come
+ *    first: with one window per app there was no app to duplicate, so the File menu item
+ *    had to be renamed to "New Files Window" instead (`menu.rs`, REQ-A434).
+ * 2. Nothing focused (or a window that shows no app — the launcher itself) ⇒ **Files**,
+ *    which is what Finder's own File ▸ New Window does for the shell. Stated as a rule
+ *    rather than a hard-coded command, so the menu row, the ⌘N handler and the native menu
+ *    item cannot describe the same chord three different ways.
+ */
+export function newWindowTarget(focusedLabel: string | null | undefined): string {
+  return appOfWindowLabel(focusedLabel) ?? "files";
 }
 
 /**
@@ -70,7 +117,7 @@ export function actionableLabelOf(label: string | null | undefined): string | nu
  * is what lets a caller report the difference instead of leaving a dead chord silent.
  */
 export interface SystemIntentOutcome {
-  /** The command handed to the host (`wm_close` / `wm_hide` / `wm_open`), or `null`. */
+  /** The command handed to the host (`wm_close` / `wm_hide` / `wm_minimize` / `wm_open`), or `null`. */
   command: string | null;
   /** Why nothing was sent — non-`null` exactly when `command` is `null`. */
   reason: DeadChordReason | null;
@@ -78,6 +125,15 @@ export interface SystemIntentOutcome {
 
 /** The only ways a bound system chord can end up doing nothing. */
 export type DeadChordReason = "no-actionable-window" | "host-refused";
+
+/** Options for an intent whose behaviour is not fully determined by its name. */
+export interface SystemIntentOptions {
+  /**
+   * `cycle-window` only: `true` = ⌘` (next), `false` = ⌘⇧` (previous). Ignored by the
+   * other intents — they have no direction.
+   */
+  forward?: boolean;
+}
 
 /**
  * Run an intent. Returns what was sent (for logs/tests) **and the reason when nothing
@@ -89,10 +145,16 @@ export type DeadChordReason = "no-actionable-window" | "host-refused";
  * indistinguishable from one that worked. That is not hypothetical — a `wm_close` that
  * reported success while closing nothing (the window stayed on screen) is exactly how ⌘W
  * looked dead on this machine; a caller now hears `host-refused` and can say so.
+ *
+ * REQ-A473 adds the two per-app chords. They take the **app** resolved from the focused
+ * label (`newWindowTarget` / [`appOfWindowLabel`]) rather than the label itself: the host
+ * refuses an instance label as an app id on purpose, so a frontend that forwarded the
+ * label would turn ⌘N on the second Files window into an error.
  */
 export async function runSystemIntent(
   intent: DesktopSystemIntent,
   label: string | null,
+  options: SystemIntentOptions = {},
 ): Promise<SystemIntentOutcome> {
   switch (intent) {
     case "close-window": {
@@ -105,10 +167,31 @@ export async function runSystemIntent(
       const r = await wmHideWithDiag(label);
       return { command: "wm_hide", reason: r.ok ? null : "host-refused" };
     }
+    case "minimize-window": {
+      if (!label) return { command: null, reason: "no-actionable-window" };
+      const r = await wmMinimizeWithDiag(label);
+      return { command: "wm_minimize", reason: r.ok ? null : "host-refused" };
+    }
     case "open-preferences": {
       // No window needed: Preferences opens the Settings window.
       const r = await wmOpenWithDiag("settings");
       return { command: "wm_open", reason: r.ok ? null : "host-refused" };
+    }
+    case "new-window": {
+      // `null` is *not* a dead chord here: with nothing focused the target is the shell's
+      // own file manager (`newWindowTarget`), which is what Finder's File ▸ New Window
+      // does. Only a host refusal is a failure.
+      const appId = newWindowTarget(label);
+      const r = await wmNewWindowWithDiag(appId);
+      return { command: "wm_new_window", reason: r.ok ? null : "host-refused" };
+    }
+    case "cycle-window": {
+      const appId = appOfWindowLabel(label);
+      // No focused *app* window ⇒ nothing to cycle within: macOS's ⌘` also has no meaning
+      // when the frontmost thing is the desktop.
+      if (!appId) return { command: null, reason: "no-actionable-window" };
+      const r = await wmCycleAppWithDiag(appId, options.forward ?? true);
+      return { command: "wm_cycle_app", reason: r.ok ? null : "host-refused" };
     }
   }
 }
@@ -123,10 +206,42 @@ export function deadChordMessage(intent: DesktopSystemIntent): string {
     case "close-window":
       return "⌘W did nothing: the host named no focused app window (the launcher itself is never a target — F-SH-008)";
     case "hide-window":
-      return "⌘M/⌘H did nothing: the host named no focused app window (the launcher itself is never a target — F-SH-008)";
+      return "⌘H did nothing: the host named no focused app window (the launcher itself is never a target — F-SH-008)";
+    case "minimize-window":
+      return "⌘M did nothing: the host named no focused app window (the launcher itself is never a target — F-SH-008)";
     case "open-preferences":
       return "⌘, did nothing: the shell could not open the Settings window";
+    case "new-window":
+      return "⌘N did nothing: the shell could not open a new window";
+    case "cycle-window":
+      return "⌘` did nothing: no focused app window, so there is no application whose windows could be cycled";
   }
+}
+
+/**
+ * The sentence for a chord that did nothing because there was **nothing to show** — App
+ * Exposé on an application with fewer than two windows (REQ-A476).
+ *
+ * It lives here, next to [`deadChordMessage`] and [`refusedChordMessage`], because this
+ * module already owns the vocabulary of "a chord did nothing, and why": macOS itself shows
+ * nothing in this case, and a chord that silently does nothing is indistinguishable from a
+ * broken one — which is exactly what those two functions exist to prevent.
+ */
+export function appExposeRefusal(appWindowCount: number): string {
+  return `⌃↓ did nothing: the focused application has ${appWindowCount} window(s) — App Exposé needs at least two (macOS shows nothing here too, and this says so)`;
+}
+
+/**
+ * The same sentence for the **other** member of the window-list family: Mission Control
+ * (`F3` / `⌘Tab`) with fewer than two application windows (F-SH-361).
+ *
+ * It is the same fact as [`appExposeRefusal`] — "there was nothing to switch between" — but it
+ * names its own count, because Mission Control counts *every* application window while App
+ * Exposé counts the focused app's. Both chords are one family, so a reader of the ledger must
+ * not have to guess which one was pressed.
+ */
+export function missionControlRefusal(openWindowCount: number): string {
+  return `F3 / ⌘Tab did nothing: ${openWindowCount} application window(s) are open — Mission Control needs at least two (macOS shows nothing here too, and this says so)`;
 }
 
 /**
@@ -142,6 +257,12 @@ export function refusedChordMessage(intent: DesktopSystemIntent, label: string |
       ? "close"
       : intent === "hide-window"
         ? "hide"
-        : "open Preferences for";
+        : intent === "minimize-window"
+          ? "minimize"
+          : intent === "new-window"
+          ? "open another window of"
+          : intent === "cycle-window"
+            ? "cycle the windows of"
+            : "open Preferences for";
   return `the host refused to ${what}${label ? ` \`${label}\`` : ""}: no bridge, or the command failed (see the diagnostic log)`;
 }

@@ -50,7 +50,12 @@
     type RagUiState,
   } from "../lib/notesRag";
   import { askNotes, liveRagClient, syncNotesIndex } from "../lib/notesRagRun";
-  import { ragStatus, type RagHit, type RagStatus } from "../lib/rag";
+  import {
+    ragQueryRefusedForForeground,
+    ragStatus,
+    type RagHit,
+    type RagStatus,
+  } from "../lib/rag";
   import {
     enterContinuesTask,
     prefixTaskAtLine,
@@ -59,10 +64,15 @@
   } from "../lib/noteEditing";
   import { clipboardHistory, clipboardRead, clipboardClear, copySelection, entryText, previewClipboard } from "../lib/clipboard";
   import { notesChannel, sendToAi } from "./appLinks";
+  import { createStoreValue } from "./store";
+  import { dragGesture } from "./dragGesture";
+  import { openShareSheet } from "./shareSheetState.svelte";
+  import { textShare } from "../lib/shareSheet";
+  import { makeTextPayload } from "../lib/dragDrop";
   import type { ClipboardEntry } from "../lib/clipboard";
   import { iconSvg } from "../lib/sysIcons";
   import { readStoreValue, writeStoreValue, writeStoreValueChecked } from "../lib/amosStore";
-  import { bridged, exportTxtFile, getAiStatus } from "../lib/backend";
+  import { bridgeDiag, bridged, exportTxtFile, getAiStatus } from "../lib/backend";
   import {
     aiIsUnavailable,
     classifyAiAvailability,
@@ -72,12 +82,28 @@
   import NoteEditor from "./NoteEditor.svelte";
   import { markdownTitleOf, parseMarkdownImport, toMarkdownFile } from "../lib/markdown";
   import { loadNotesPrefs, saveNotesPrefs, type NotesPrefs } from "../lib/notePrefs";
+  import { noteHasInk } from "../lib/ink";
   // Display title: prefer a `# heading`, else the first line, else the untitled label.
   const titleOf = (text: string) =>
     stripInlineMarkers(markdownTitleOf(text) || noteTitle(text)) || t("note.untitled");
 
-  const seeded = normalizeNotes(readStoreValue<unknown>(NOTES_KEY, []));
-  let notes = $state<Note[]>(seeded);
+  // （REQ-A1351 ∕ F-SH-615）`amos.notes` 不止这一个写入者：本页自己的动词（`add` ∕ `saveEdit` ∕ 批量 ∕ `importMd`）走
+  // `persist()`，而 Spotlight 的「存为笔记」(`SpotlightPanel.runNewNote`) 是**第二个**写入者 ——
+  // 它在组件之外把新便签写进同一个键，然后把它的 id 经 `notes` 深链频道 (`appLinks.openNote`)
+  // 交回本页，即它**点名要这一页**展示刚写下的东西。
+  //
+  // 所以本页不能只读一次：`openNote` 走的是 `open("notes")`，而屏幕上已经是 notes 时
+  // `_surface` 提交的仍是同一个 id，`AppPane` 按 id 挂载、不会重挂 —— 于是「读一次」的代价是：
+  // 便签**已入库却不显示**（列表停在打开那一刻），而下面深链自己的 `notes.find(...)` 也在这份
+  // 陈旧数组里找不到那个刚生成的 id，于是一本正经地判定这条便签不存在。拥有便签的应用，成了最后
+  // 一个知道这条便签的人。用同一个 `createStoreValue` 原语订阅（与 `amos.settings` 那九个活读者
+  // 同一条原语），让列表**就是**存储本身。
+  const notesStore = createStoreValue<unknown>(NOTES_KEY, []);
+  let notes = $state<Note[]>(normalizeNotes(readStoreValue<unknown>(NOTES_KEY, [])));
+  $effect(() => {
+    const un = notesStore.subscribe((v) => (notes = normalizeNotes(v)));
+    return un;
+  });
   let text = $state("");
   // A rejected store write (full/unavailable storage) must be visible: the list is
   // rendered from this in-memory copy, so applying a change the store never accepted
@@ -88,8 +114,18 @@
   let editEl = $state<HTMLTextAreaElement | null>(null);
   let previewOn = $state(false);
   let editVal = $state("");
+  // The inline editor's own refusal slot for the ⧉ 复制 ∕ 📋 粘贴 buttons. It is *separate*
+  // from `notesErr` (a store-write failure) and from `exportMsg` (the export/share status
+  // line): a refused clipboard op must not be reported through a store banner, nor be
+  // blanked by an unrelated gesture (REQ-A1470).
+  let clipErr = $state("");
   let trayOpen = $state(false);
   let trayItems = $state<ClipboardEntry[]>([]);
+  // `clipboard_history` answers `Ok([])` for **an empty history** and `Err` only on a
+  // refusal (foreground-only), so the tray list alone cannot tell "nothing copied yet"
+  // from "the host would not answer" — both would draw the empty state. This flag keeps
+  // the refusal visible instead of folding it into 「暂无历史」 (REQ-A1600 ∕ F-SH-811).
+  let trayUnread = $state(false);
   let mode = $state<"all" | "archived" | "trash">("all");
   let searchQ = $state("");
   let openId = $state<string | null>(null);
@@ -109,6 +145,12 @@
   let askQ = $state("");
   let askHits = $state<RagHit[] | null>(null);
   let askOffline = $state(false);
+  /**
+   * The retrieval was refused because this window is not the one the user is looking at
+   * (F-AI-019) — a fact about **this window**, not about the index. Kept apart from `askOffline`
+   * (a claim about the daemon) so the panel never reports a refusal as "search offline".
+   */
+  let askRefused = $state(false);
   let ragUi = $state<RagUiState>(initialRagUi);
   const ragBusy = $derived(ragUi.phase !== "idle");
 
@@ -193,8 +235,20 @@
   let linkNonce = 0;
   $effect(() => {
     return notesChannel().subscribe((v) => {
-      if (!v || v.noteId.trim() === "" || v.nonce === linkNonce) return;
+      if (!v || v.nonce === linkNonce) return;
       linkNonce = v.nonce;
+      // A cross-app drop (REQ-A683) prefills the compose box with the dragged text:
+      // a *draft*, never a note — the user still presses add, so an accidental drop
+      // leaves text they can clear rather than a note they did not write.
+      const draft = (v.draftText ?? "").trim();
+      if (draft !== "") {
+        mode = "all";
+        openId = null;
+        text = draft;
+        notesChannel().set({ noteId: "", nonce: linkNonce });
+        return;
+      }
+      if (v.noteId.trim() === "") return;
       const target = notes.find((n) => n.id === v.noteId);
       if (target) {
         if (target.state === "archived") {
@@ -212,6 +266,18 @@
     });
   });
 
+  // Cross-app drag (REQ-A683): hold a note row, then drag — the payload is the note's
+  // text. `dragged()` suppresses the click the release would otherwise fire, so a drag
+  // and an open can never both happen.
+  let dragNoteId = $state<string | null>(null);
+  const noteDrag = dragGesture({
+    payload: () => {
+      const n = notes.find((x) => x.id === dragNoteId);
+      return n ? makeTextPayload(n.text, titleOf(n.text)) : null;
+    },
+    sourceApp: () => "notes",
+  });
+
   const add = () => {
     const v = text.trim();
     if (!v) return;
@@ -226,12 +292,14 @@
   const beginEdit = (n: Note) => {
     editingId = n.id;
     editVal = n.text;
+    clipErr = "";
   };
   const cancelEdit = () => {
     editingId = null;
     editVal = "";
     editEl = null;
     previewOn = false;
+    clipErr = "";
   };
   const saveEdit = () => {
     if (!editingId) return;
@@ -242,11 +310,25 @@
   };
   const copyEditing = async () => {
     if (!editingId) return;
-    await copySelection(editVal);
+    // The claim has to follow the effect (REQ-A352 / REQ-A355): a `false` from
+    // `copySelection` means the text never reached the clipboard, and answering it with
+    // silence is how the ⧉ button becomes a no-op the user has no way to read.
+    clipErr = (await copiedToClipboard(editVal)) ? "" : t("common.copyFailed");
   };
   const pasteEditing = async () => {
     const e = await clipboardRead();
-    const p = e ? entryText(e) : "";
+    if (e === null) {
+      // `clipboard_read` answers `Ok(None)` for **an empty clipboard** as well as `Err(…)`
+      // for a refusal (foreground-only on the Rust side), and `invoke` folds both into
+      // `null`. So the report cannot be keyed on `e === null` — it goes through
+      // `bridgeDiag("clipboard_read")`: an empty clipboard is not a fault, only a real
+      // refusal (or a missing bridge) is. The sibling ⧉ `copyEditing` above already
+      // writes `clipErr`; a refused paste must speak through the same slot (REQ-A1600).
+      clipErr = bridgeDiag("clipboard_read").ok ? "" : t("note.pasteUnavailable");
+      return;
+    }
+    const p = entryText(e);
+    clipErr = "";
     if (!p) return;
     editVal = editVal && editVal.trim() ? `${editVal}\n${p}` : p;
   };
@@ -337,7 +419,14 @@
     selected = [];
   };
   const runBatch = (fn: (sel: string[]) => Note[]) => {
-    persist(fn(selInView));
+    // The same refusal gate the single-item writes already apply (`add`, `saveEdit`, and the
+    // import below, which say so verbatim): `persist(next)` answers whether the write landed,
+    // and `exitSel()` unmounts the batch toolbar (`{#if selecting}`) — the only holder of the
+    // five verbs that call this. Leaving select mode over a write the store refused therefore
+    // throws away a selection the user assembled by hand, to no effect at all: nothing moved
+    // in storage, so the only visible result is 「本机存储写入失败」 plus a dozen rows to re-pick.
+    // REQ-A1266 / F-SH-543.
+    if (!persist(fn(selInView))) return;
     exitSel();
   };
   const bPin = () => runBatch((s) => setPinned(notes, s, true));
@@ -369,16 +458,36 @@
     else if (await copiedToClipboard(text)) exportMsg = t("note.exportCopied");
     else exportMsg = t("note.exportCopyFailed");
   };
+  /**
+   * Hand one note to the system share sheet (REQ-A708's follow-up: the sheet's only
+   * producer was Files). A blank note is refused by `openShareSheet` rather than
+   * opening a sheet that would hand an empty string to every handler; the refusal goes
+   * to the same status line the export paths use. An ink-only note shares the same
+   * refusal (its `text` is empty) but not the same reason — the list row already draws
+   * 「✎ 手写」 for it, so calling it "empty" would contradict the app's own evidence.
+   */
+  const shareNote = (n: Note): void => {
+    const title = noteTitle(n.text) || t("note.untitled");
+    if (!openShareSheet(textShare(n.text, title))) {
+      exportMsg = noteHasInk(n) ? t("note.shareInk") : t("note.shareEmpty");
+    }
+  };
   const composeStats = $derived(noteStats(text));
   const statsOf = (n: Note) => noteStats(n.text);
 
   // "Import Markdown": treat the compose box as a pasted Markdown doc → add a note
   // with the front-matter-stripped, normalized body.
+  //
+  // The refusal gate is the same rule `add` and `saveEdit` above already apply: clearing
+  // the compose box **is** the import's success gesture, and the status line **is** its
+  // success report — neither may happen over a write the store refused (REQ-A1259). The
+  // pasted Markdown is the user's only copy, so a refused write must leave it in the box
+  // and say nothing was imported (`persist` has already set the failure note).
   const importMd = () => {
     const parsed = parseMarkdownImport(text);
     if (!parsed) return;
     const now = Date.now();
-    persist(prependNote(notes, parsed.body, now));
+    if (!persist(prependNote(notes, parsed.body, now))) return;
     text = "";
     exportMsg = t("note.imported", { title: parsed.title || t("note.untitled") });
   };
@@ -408,6 +517,7 @@
     if (!q || ragBusy) return;
     askHits = null;
     askOffline = false;
+    askRefused = false;
     ragUi = ragUiReducer(ragUi, { type: "index_started" });
     try {
       const known = readStoreValue<string[]>(NOTES_RAG_INDEXED_KEY, []);
@@ -421,7 +531,11 @@
     ragUi = ragUiReducer(ragUi, { type: "ask_started" });
     try {
       const res = await askNotes(liveRagClient, q);
-      askOffline = res === null;
+      // Two different `null`s: the index refused *this window* (a fact about focus, which the
+      // host carries in its own code) versus the index being unreachable (a fact about the
+      // daemon). Drawing the first as the second blames the index for a refusal it never made.
+      askRefused = res === null && ragQueryRefusedForForeground();
+      askOffline = res === null && !askRefused;
       askHits = res ? res.hits : null;
       ragUi = ragUiReducer(ragUi, { type: "ask_done" });
     } catch (e) {
@@ -433,6 +547,7 @@
     if (!askOpen) {
       askHits = null;
       askOffline = false;
+      askRefused = false;
       ragUi = ragUiReducer(ragUi, { type: "reset" });
     }
   };
@@ -449,21 +564,44 @@
    * Empty the system clipboard history (foreground-gated on the Rust side). Only
    * clears the on-screen list when the bridge confirms a count — an offline `null`
    * must not look like a successful wipe.
+   *
+   * And a refusal must **speak**: leaving the list up and saying nothing is how the 清空
+   * button becomes a no-op the user has no way to read — the very rule this comment states,
+   * applied to the two sibling clipboard verbs above (📋 `pasteEditing` ∕ ⧉ `copyEditing`,
+   * which report through `clipErr`; 🕘 the history read, through `trayUnread`). `null` is a
+   * refusal here, never "0 removed": an answered wipe says how many it took, so the
+   * sentence goes to the panel's own clipboard-error slot (REQ-A1601).
    */
   const clearTray = async () => {
     const removed = await clipboardClear();
-    if (removed !== null) trayItems = [];
+    if (removed === null) {
+      clipErr = t("clipboard.clearFailed");
+      return;
+    }
+    clipErr = "";
+    trayItems = [];
   };
 
   // Fetch the inline clipboard-history tray only while open.
   $effect(() => {
     if (!trayOpen) {
       trayItems = [];
+      trayUnread = false;
       return;
     }
     let alive = true;
+    // `clipboard_history`'s `null` is refusal-only (`Ok([])` is an empty history), so it
+    // can be keyed on directly: `null` ⇒ the host would not answer, `[]` ⇒ nothing copied
+    // yet. Folding the first into the second is how a refusal reads as 「暂无历史」.
     void clipboardHistory(20).then((v) => {
-      if (alive && v) trayItems = v;
+      if (!alive) return;
+      if (v === null) {
+        trayItems = [];
+        trayUnread = true;
+        return;
+      }
+      trayUnread = false;
+      trayItems = v;
     });
     return () => {
       alive = false;
@@ -513,10 +651,10 @@
     </p>
   {/if}
   {#if editor}
-    <NoteEditor note={editor} onClose={closeEditor} />
+    <NoteEditor note={editor} onClose={closeEditor} palmRejection={prefs.palmRejection} />
   {:else}
   {#if exportMsg}
-    <p role="status" class="mb-2 rounded-lg bg-black/5 px-3 py-1.5 text-xs text-accent dark:bg-white/10">{exportMsg}</p>
+    <p role="status" data-testid="note-status" class="mb-2 rounded-lg bg-black/5 px-3 py-1.5 text-xs text-accent dark:bg-white/10">{exportMsg}</p>
   {/if}
   <textarea
     bind:value={text}
@@ -550,7 +688,9 @@
         <p data-testid="note-rag-status" class="mt-1 text-[11px] opacity-60">
           {t("note.ragStatus", {
             n: String(ragState.indexed),
-            dim: String(ragState.dimension),
+            // An empty index has no vector width — `dimension` is null. Print the
+            // withheld mark rather than "0", which would name a width it never had.
+            dim: ragState.dimension === null ? "—" : String(ragState.dimension),
             embedder: ragState.embedder,
           })}
         </p>
@@ -563,6 +703,8 @@
         <p role="status" class="mt-2 text-[11px] opacity-70">{t("note.askAsking")}</p>
       {:else if ragUi.phase === "error"}
         <p role="status" class="mt-2 text-[11px] text-danger">{ragUi.error}</p>
+      {:else if askRefused}
+        <p role="status" data-testid="note-ask-refused" class="mt-2 text-[11px] opacity-70">{t("note.askRefused")}</p>
       {:else if askOffline}
         <p role="status" class="mt-2 text-[11px] opacity-70">{t("note.askOffline")}</p>
       {:else if askHits && askHits.length === 0}
@@ -590,6 +732,12 @@
       <label class="flex items-center gap-2">
         <input type="checkbox" bind:checked={prefs.sortByModified} onchange={() => saveNotesPrefs(prefs)} data-testid="note-pref-sort-by-modified" />
         {t("note.sortHint")}
+      </label>
+      <!-- REQ-A526. A per-*device* preference, not per-note: the contact ellipse that makes a
+           palm recognisable is a property of the digitizer, not of the drawing. -->
+      <label class="flex items-center gap-2" title={t("note.prefPalmHint")}>
+        <input type="checkbox" bind:checked={prefs.palmRejection} onchange={() => saveNotesPrefs(prefs)} data-testid="note-pref-palm-rejection" />
+        {t("note.prefPalm")}
       </label>
     </div>
   {/if}
@@ -641,7 +789,7 @@
   {#if selecting || view.length > 0}
     <div class="mt-2 flex flex-wrap items-center gap-1.5">
       {#if selecting}
-        <span class="mr-1 text-xs opacity-70">已选 {selInView.length}</span>
+        <span class="mr-1 text-xs opacity-70">{t("note.selectedCount", { n: selInView.length })}</span>
         <button onclick={selectAllInView} class="rounded-full bg-black/5 px-3 py-1 text-xs dark:bg-white/10">{t("note.selectAll")}</button>
         {#if mode === "all"}
           <button onclick={bPin} disabled={selInView.length === 0} class="rounded-full bg-black/5 px-3 py-1 text-xs disabled:opacity-30 dark:bg-white/10">★ {t("note.pin")}</button>
@@ -676,7 +824,13 @@
             </div>
           </button>
         {:else if collapsed(n)}
-          <button onclick={() => rowTap(n)} class="block w-full rounded-2xl bg-white/60 p-3 text-left shadow-sm ring-1 ring-black/5 transition active:bg-white/80 dark:bg-white/[0.06] dark:ring-white/10">
+          <button onclick={() => { if (noteDrag.dragged()) return; rowTap(n); }}
+            onpointerdown={(e) => { dragNoteId = n.id; noteDrag.onpointerdown(e); }}
+            onpointermove={noteDrag.onpointermove}
+            onpointerup={noteDrag.onpointerup}
+            onpointercancel={noteDrag.onpointercancel}
+            data-drag-source="note"
+            class="block w-full rounded-2xl bg-white/60 p-3 text-left shadow-sm ring-1 ring-black/5 transition active:bg-white/80 dark:bg-white/[0.06] dark:ring-white/10">
             <div class="flex items-start justify-between gap-2">
               <span class="truncate text-[15px] font-semibold text-neutral-800 dark:text-neutral-100">
                 {#if mode === "all" && searchQ.trim() && searchHighlight(titleOf(n.text), searchQ)}
@@ -695,6 +849,11 @@
             <div class="mt-1 flex items-center gap-2 text-xs text-neutral-500">
               {#if mode === "all" && n.pinned}
                 <span class="text-amber-500">📌</span>
+              {/if}
+              <!-- An ink-only note has an empty preview, so without this the row would read
+                   as a blank note with nothing to open (REQ-A526). -->
+              {#if noteHasInk(n)}
+                <span data-testid="note-row-ink" title={t("note.inkBadge")}>✎ {t("note.inkBadge")}</span>
               {/if}
               {#if taskSummary(n.text).total > 0}
                 <span class="text-accent">☑ {taskSummary(n.text).done}/{taskSummary(n.text).total}</span>
@@ -785,9 +944,18 @@
                     <button onclick={saveEdit} class="font-semibold text-accent hover:underline">{t("note.save")}</button>
                   </div>
                 </div>
+                {#if clipErr}
+                  <p
+                    role="status"
+                    data-testid="note-clip-error"
+                    class="mt-2 rounded-lg bg-danger/10 px-3 py-1.5 text-[11px] text-danger dark:bg-danger/20"
+                  >{clipErr}</p>
+                {/if}
                 {#if trayOpen}
                   <div class="mt-2 rounded-xl bg-neutral-200/60 p-2 text-xs dark:bg-neutral-800/60">
-                    {#if trayItems.length === 0}
+                    {#if trayUnread}
+                      <p data-testid="clipboard-unread" class="opacity-70">{t("clipboard.unreadable")}</p>
+                    {:else if trayItems.length === 0}
                       <p class="opacity-50">{t("clipboard.empty")}</p>
                     {:else}
                       <div class="mb-1 flex justify-end">
@@ -844,6 +1012,7 @@
                 <div class="flex flex-wrap gap-2">
                   <button onclick={() => void doExportOne(n)} title={t("note.export")} class="hover:underline">↧ {t("note.export")}</button>
                   <button onclick={() => void doExportMd(n)} data-testid="note-export-md" title={t("note.exportMdHint")} class="hover:underline">⇩ .md</button>
+                  <button onclick={() => shareNote(n)} data-testid="note-share" title={t("note.share")} class="hover:underline">⤴ {t("note.share")}</button>
                   {#if mode === "all"}
                     <button onclick={() => persist(togglePin(notes, n.id))} title={t("note.pin")} class={"hover:underline " + (n.pinned ? "text-amber-500" : "opacity-70")}>{n.pinned ? "★" : "☆"}</button>
                     <button onclick={() => setStateOf(n.id, "archived")} class="hover:underline">{t("note.archive")}</button>

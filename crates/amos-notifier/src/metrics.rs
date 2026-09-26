@@ -43,6 +43,15 @@ pub struct ChannelMetrics {
 pub struct DispatchMetrics {
     pub channels: Vec<(String, ChannelMetrics)>,
     pub global: ChannelMetrics,
+    /// How many alerts reached **no** channel and were surfaced only through the
+    /// operator fallback (stderr, or `tracing` when stderr is off) — REQ-A769.
+    ///
+    /// Global, not per-channel: the fallback is what the dispatcher does when
+    /// the channel fan-out delivered nothing, so there is no channel to attribute
+    /// it to. A non-zero value is the operator's signal that a transport is
+    /// configured but not delivering (a dead webhook host, a rejected payload);
+    /// the `crate::channel::SendOutcome` counters on `global` say *why*.
+    pub fallbacks: u64,
 }
 
 #[cfg(test)]

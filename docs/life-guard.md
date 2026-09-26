@@ -11,7 +11,7 @@
 | `LifeGuard::check()` | 无副作用读一次 → `Protection`（`Protected / Unprotected{observed} / Unverifiable / Unsupported`） |
 | `LifeGuard::ensure()` | 需要时**写目标值并回读确认** → `Verdict`（`Protected / Healed{from,to} / NotApplicable`）或 `EnsureError` |
 | `LifeGuard::spawn_periodic()` | 周期自检 + 按状态定日志级别；首 tick 立即触发（启动即验证） |
-| `PlatformProcFs` | 真实现：Linux/Android 读 `/proc/self/oom_score_adj`；其余宿主诚实 `Unsupported` |
+| `PlatformProcFs` | 真实现：Linux/Android 读 `/proc/self/oom_score_adj`；其余宿主诚实 `Unsupported`。平台判定走纯函数 `oom_control_supported(os)`（`linux` \| `android`）——**含 Android 是本模块存在的理由**，详见 §3 与 REQ-A537 |
 
 `LifeGuard` 对同一 [`ProcFs`] 输入**确定性**：同态必得同判，故可安全周期 tick、可穷举测试。
 
@@ -26,11 +26,12 @@
 - 无 oom 控制的宿主（桌面 dev / 零售非 root）→ `Verdict::NotApplicable`，安静 trace，不假报。
 - 失败安全：读不到值 → `Unverifiable`；写完回读对不上 → `RecheckFailed`，绝无静默假设。
 - 桌面（macOS）默认构建下 `PlatformProcFs.supported()==false`，`serve()` 每 tick 只是 trace no-op，不影响开发日志。
+- **平台判定含 Android（REQ-A537，2026-09-20）**：`PlatformProcFs::proc_supported` 原为 `#[cfg(target_os = "linux")]`，而 Android 的 `target_os` 是 `"android"` —— 于是在**唯一**该被保护的 tier（base A）上 `supported()` 恒为 `false`、`ensure()` 恒为 `NotApplicable`、周期守卫恒为 trace no-op：这条安全属性在设备上**从未被验证过一次**，且失败是无声的（还被报成"本宿主无 oom 控制"这个**确定但错误**的结论）。改为等价于 `peercred.rs` 的 `any(target_os = "linux", target_os = "android")`，但抽成纯谓词 `oom_control_supported(os: &str)` 以便**在无 Android 工具链的宿主上单测**该分类。副作用（如实）：Android 上非 root 构建的写会被拒 → 每 tick 一行 `Unprivileged` WARN；这与既有 Linux 桌面路径的行为一致（base A 的 daemon 本就是 `user root`）。
 
 ## 4. 验证
 
-- `cargo test -p amos-ai --lib life_guard` → **12 passed**（保护态/无副作用、异值自愈、零值自愈、无特权诚实报错、写失败、写后回读不符、读失败不 panic、不支持宿主 not-applicable、key 稳定、错误文案、默认路径、Linux 真读形态）。
-- `cargo test -p amos-ai --lib` → **162 passed**。
+- `cargo test -p amos-ai --lib life_guard` → **14 passed**（保护态/无副作用、异值自愈、零值自愈、无特权诚实报错、写失败、写后回读不符、读失败不 panic、不支持宿主 not-applicable、key 稳定、错误文案、默认路径、Linux 真读形态，**＋平台分类含 Android（`oom_control_supported_includes_linux_and_android`）与真实现与谓词一致（`the_platform_impl_agrees_with_the_classifier_on_this_host`）**）。**负控（实测）**：把谓词改回仅 `"linux"` ⇒ 恰好 1 条变红（`oom_control_supported_includes_linux_and_android`），逐字节还原后复绿。
+- `cargo test -p amos-ai --lib` → **330 passed**（实测；本行为旧值 162 的历史记录，随代码增长重测更正）。
 - `cargo clippy -p amos-ai --all-targets -- -D warnings`、`cargo fmt --all -- --check` 干净。
 - 模块 `#![forbid(unsafe_code)]`；生产代码无 `unwrap/expect/panic`（P0-1 gate）。
 

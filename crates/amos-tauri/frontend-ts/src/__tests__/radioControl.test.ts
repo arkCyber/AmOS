@@ -88,6 +88,26 @@ describe("radioRefusalView (REQ-A203)", () => {
     ).toEqual({ noteKey: "radio.refused.device", surface: null });
   });
 
+  test("a refused AP attempt keeps the device sentence and carries the tethering surface", () => {
+    // The AP is the one switch a normal install can *attempt* and be refused (no
+    // TETHER_PRIVILEGED, no upstream, no public tethering API). The sentence must stay
+    // the kind's own — no cause is claimed — but the token that says where the user can
+    // still switch it must survive into the view, or the refusal is a dead end
+    // (REQ-A1456).
+    expect(
+      radioRefusalView(
+        refused("provider_refused", { surface: "wireless_settings", detail: "tethering refused" }),
+        "hotspot",
+      ),
+    ).toEqual({ noteKey: "radio.refused.device", surface: "wireless_settings" });
+  });
+
+  test("a broken surface on a refused attempt is dropped, not turned into a dead button", () => {
+    expect(
+      radioRefusalView(refused("provider_refused", { surface: "" }), "hotspot"),
+    ).toEqual({ noteKey: "radio.refused.device", surface: null });
+  });
+
   test("the airplane guard and an absent backend each speak for themselves", () => {
     expect(radioRefusalView(refused("airplane_active"), "bluetooth")).toEqual({
       noteKey: "radio.refused.airplaneActive",

@@ -1,6 +1,7 @@
 //! MDM 数据模型
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// 设备状态
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -221,7 +222,7 @@ pub struct DeviceConfig {
     pub server_url: String,
     pub api_key: String,
     pub policies: Vec<Policy>,
-    pub restrictions: Restrictions,
+    pub restrictions: RestrictionsDelta,
     pub enforced_shortcuts: Vec<String>,
     pub enforced_templates: Vec<String>,
     pub sync_interval: i64,
@@ -235,47 +236,178 @@ pub struct DeviceConfig {
     pub version: String,
 }
 
-/// 限制配置
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// 下发给设备的限制**增量**（REQ-A1823）。
+///
+/// 为什么是 `Option` 的稀疏表，而不是一整张填满默认值的限制表：`sync_device` 过去发的是
+/// `Restrictions::default()` —— 一份服务器**从未配置过**的"慷慨默认"。而那张表的每个字段
+/// 都参与序列化，于是客户端 `normalizeRestrictions(server, local)` 里那条「键不存在 ⇒ 用
+/// 设备本地值」的规则在生产中**永远走不到**：每一次同步都把整张本地限制表整块换成默认，
+/// 设备本地设过的项静默回落到宽松值（fail-open），紧接着还落盘。写入端同理 ——
+/// 组织策略表里明明存着 `execution_limit` ∕ `sharing_control`，却从没被读出来下发过。
+///
+/// 这一版只携带「组织确有意见的键」（由 `handlers::restrictions_from_policies` 从策略表
+/// 投影），缺席即"没有新意见"，让客户端的增量语义第一次真的成立。
+///
+/// 诚实边界：组织没有用策略表达过的键**不在**这份增量里 —— 设备保留自己那份值，服务器不
+/// 再替它编一个默认。哪些键会被识别，见 [`RestrictionsDelta::apply`]。
+#[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Restrictions {
-    pub disabled_categories: Vec<String>,
-    pub disabled_actions: Vec<String>,
-    pub max_execution_time: i32,
-    pub max_executions_per_day: i32,
-    pub max_actions_per_shortcut: i32,
-    pub max_shortcuts_per_user: i32,
-    pub allow_user_create: bool,
-    pub allow_user_modify: bool,
-    pub allow_user_delete: bool,
-    pub allow_sharing: bool,
-    pub allow_export: bool,
-    pub allow_import: bool,
-    pub require_approval_for_create: bool,
-    pub require_approval_for_modify: bool,
-    pub require_approval_for_sharing: bool,
+pub struct RestrictionsDelta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disabled_categories: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disabled_actions: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_execution_time: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_executions_per_day: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_actions_per_shortcut: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_shortcuts_per_user: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_user_create: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_user_modify: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_user_delete: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_sharing: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_export: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_import: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub require_approval_for_create: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub require_approval_for_modify: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub require_approval_for_sharing: Option<bool>,
 }
 
-impl Default for Restrictions {
-    fn default() -> Self {
-        Self {
-            disabled_categories: vec![],
-            disabled_actions: vec![],
-            max_execution_time: 300,
-            max_executions_per_day: 1000,
-            max_actions_per_shortcut: 100,
-            max_shortcuts_per_user: 100,
-            allow_user_create: true,
-            allow_user_modify: true,
-            allow_user_delete: true,
-            allow_sharing: true,
-            allow_export: true,
-            allow_import: true,
-            require_approval_for_create: false,
-            require_approval_for_modify: false,
-            require_approval_for_sharing: false,
+impl RestrictionsDelta {
+    /// 把一个策略 `config` 里的键值对并入增量表。返回该键是否是**已知**的限制项。
+    ///
+    /// 三条规则，与客户端 `normalizeRestrictions` 的分工一致 —— 那层管「键在不在」，
+    /// 这层管「值能不能解释」：
+    ///
+    /// - **未知键** ⇒ `Ok(false)`，调用方原样忽略：策略 `config` 允许带别的字段
+    ///   （`forced_shortcuts` 的 `shortcuts`、别家的自定义参数），不是错误。
+    /// - **已知键但值解释不了**（类型不对／负数／超出 `i32`）⇒ `Err`，**不**折成默认。
+    ///   一个解释不了的值照样会被下发给设备，那正是"静默沿用一个没人选的限制"。
+    /// - **已知键且值合法** ⇒ 先到先得：`get_policies` 是 `priority DESC`，第一条表达该键的
+    ///   策略就是最高优先级的那条；后来者不改已落定的值。
+    pub fn apply(&mut self, key: &str, value: &Value) -> Result<bool, String> {
+        match key {
+            "disabledCategories" => {
+                set_field(key, &mut self.disabled_categories, value, string_array)?;
+                Ok(true)
+            }
+            "disabledActions" => {
+                set_field(key, &mut self.disabled_actions, value, string_array)?;
+                Ok(true)
+            }
+            "maxExecutionTime" => {
+                set_field(key, &mut self.max_execution_time, value, nonneg_i32)?;
+                Ok(true)
+            }
+            "maxExecutionsPerDay" => {
+                set_field(key, &mut self.max_executions_per_day, value, nonneg_i32)?;
+                Ok(true)
+            }
+            "maxActionsPerShortcut" => {
+                set_field(key, &mut self.max_actions_per_shortcut, value, nonneg_i32)?;
+                Ok(true)
+            }
+            "maxShortcutsPerUser" => {
+                set_field(key, &mut self.max_shortcuts_per_user, value, nonneg_i32)?;
+                Ok(true)
+            }
+            "allowUserCreate" => {
+                set_field(key, &mut self.allow_user_create, value, boolean)?;
+                Ok(true)
+            }
+            "allowUserModify" => {
+                set_field(key, &mut self.allow_user_modify, value, boolean)?;
+                Ok(true)
+            }
+            "allowUserDelete" => {
+                set_field(key, &mut self.allow_user_delete, value, boolean)?;
+                Ok(true)
+            }
+            "allowSharing" => {
+                set_field(key, &mut self.allow_sharing, value, boolean)?;
+                Ok(true)
+            }
+            "allowExport" => {
+                set_field(key, &mut self.allow_export, value, boolean)?;
+                Ok(true)
+            }
+            "allowImport" => {
+                set_field(key, &mut self.allow_import, value, boolean)?;
+                Ok(true)
+            }
+            "requireApprovalForCreate" => {
+                set_field(key, &mut self.require_approval_for_create, value, boolean)?;
+                Ok(true)
+            }
+            "requireApprovalForModify" => {
+                set_field(key, &mut self.require_approval_for_modify, value, boolean)?;
+                Ok(true)
+            }
+            "requireApprovalForSharing" => {
+                set_field(key, &mut self.require_approval_for_sharing, value, boolean)?;
+                Ok(true)
+            }
+            _ => Ok(false),
         }
     }
+}
+
+/// 先到先得地写入一个字段：已落定的值不被后来者改写，但**每个值都要先被解析** —— 否则一条
+/// 高优先级的坏值会借"这个键已经有人管了"溜过去。
+fn set_field<T>(
+    key: &str,
+    slot: &mut Option<T>,
+    value: &Value,
+    parse: fn(&str, &Value) -> Result<T, String>,
+) -> Result<(), String> {
+    let parsed = parse(key, value)?;
+    if slot.is_none() {
+        *slot = Some(parsed);
+    }
+    Ok(())
+}
+
+fn string_array(key: &str, value: &Value) -> Result<Vec<String>, String> {
+    let items = value
+        .as_array()
+        .ok_or_else(|| format!("{key} must be an array of strings"))?;
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        out.push(
+            item.as_str()
+                .ok_or_else(|| format!("{key} must be an array of strings"))?
+                .to_string(),
+        );
+    }
+    Ok(out)
+}
+
+fn nonneg_i32(key: &str, value: &Value) -> Result<i32, String> {
+    let n = value
+        .as_i64()
+        .ok_or_else(|| format!("{key} must be a non-negative integer"))?;
+    if !(0..=i32::MAX as i64).contains(&n) {
+        return Err(format!("{key} must be a non-negative integer"));
+    }
+    Ok(n as i32)
+}
+
+fn boolean(key: &str, value: &Value) -> Result<bool, String> {
+    value
+        .as_bool()
+        .ok_or_else(|| format!("{key} must be a boolean"))
 }
 
 /// 获取命令响应
@@ -298,6 +430,17 @@ pub struct AckCommandRequest {
     #[serde(alias = "deviceId")]
     pub device_id: String,
     pub result: Option<String>,
+    /// 设备报告的执行**结果**（REQ-A410）。
+    ///
+    /// * `None`（字段缺失）= 沿用旧语义「已执行」—— 设备代理不在本仓，缺失该字段的请求必须继续按
+    ///   旧语义工作；
+    /// * `Some(true)` = 执行成功（与旧语义同）；
+    /// * `Some(false)` = 设备**明确报告失败**，该行记成 `failed`，而不是 `acknowledged`。
+    ///
+    /// 没有这个信号时，一台回报「lock 失败」的设备会被记成「已确认」：运维在控制台读到的是成功，
+    /// 而设备其实没有按指令锁屏 —— `db::fail_command` 早就存在，却没有任何调用者（REQ-A410 把它接上）。
+    #[serde(default)]
+    pub ok: Option<bool>,
 }
 
 /// 取消注册请求
@@ -546,28 +689,76 @@ mod tests {
     }
 
     #[test]
-    fn restrictions_default_is_generous_on_purpose() {
-        // REQ-A411, `mdm #22`: a fresh org's restrictions default to
-        // maximally permissive; an admin opts in by creating a policy.
-        // This pins that contract — making it restrictive by default
-        // would silently break every existing org on schema migration.
-        let r = Restrictions::default();
-        assert!(r.allow_user_create);
-        assert!(r.allow_user_modify);
-        assert!(r.allow_user_delete);
-        assert!(r.allow_sharing);
-        assert!(r.allow_export);
-        assert!(r.allow_import);
-        assert!(r.disabled_categories.is_empty());
-        // The numeric ceilings are also part of the public contract.
-        assert_eq!(r.max_execution_time, 300);
-        assert_eq!(r.max_executions_per_day, 1000);
-        assert_eq!(r.max_actions_per_shortcut, 100);
-        assert_eq!(r.max_shortcuts_per_user, 100);
-        // Approval gates off by default — that's the "permissive" choice.
-        assert!(!r.require_approval_for_create);
-        assert!(!r.require_approval_for_modify);
-        assert!(!r.require_approval_for_sharing);
+    fn a_restriction_delta_is_sparse_on_the_wire() {
+        // REQ-A1823. This replaces the old `Restrictions::default()` model. The generous
+        // defaults a fresh org gets are still real, but they now live where they belong —
+        // in the seed policies the org actually owns (`db::create_default_policies`) and in
+        // the device's own `DEFAULT_RESTRICTIONS` — not in a table the server fabricates on
+        // every sync. The contract this test pins is the opposite one: **an empty delta
+        // serialises to `{}`**, so the client's "key absent ⇒ keep the device's value" rule
+        // is reachable. A complete table here is exactly the bug this replaced.
+        let empty = RestrictionsDelta::default();
+        assert_eq!(
+            serde_json::to_value(&empty).unwrap(),
+            serde_json::json!({}),
+            "an org with no restriction-bearing policies must say nothing, not a full table"
+        );
+
+        // Only the keys that were actually set appear — and under their camelCase names,
+        // which is the vocabulary the client's `normalizeRestrictions` reads.
+        let mut delta = RestrictionsDelta::default();
+        assert!(delta
+            .apply("maxExecutionTime", &serde_json::json!(60))
+            .unwrap());
+        assert!(delta
+            .apply("allowSharing", &serde_json::json!(false))
+            .unwrap());
+        assert_eq!(
+            serde_json::to_value(&delta).unwrap(),
+            serde_json::json!({ "maxExecutionTime": 60, "allowSharing": false })
+        );
+    }
+
+    #[test]
+    fn a_restriction_delta_ignores_unknown_keys_and_refuses_unusable_ones() {
+        // Unknown keys are not errors: a policy config carries whatever its type needs.
+        let mut delta = RestrictionsDelta::default();
+        assert!(!delta
+            .apply("shortcuts", &serde_json::json!(["sc-a"]))
+            .unwrap());
+        assert!(!delta.apply("days", &serde_json::json!(30)).unwrap());
+        assert_eq!(serde_json::to_value(&delta).unwrap(), serde_json::json!({}));
+
+        // A recognised key whose value cannot be read is refused, never folded.
+        for (key, value) in [
+            ("maxExecutionTime", serde_json::json!(-1)),
+            ("maxExecutionTime", serde_json::json!("300")),
+            ("allowSharing", serde_json::json!("yes")),
+            ("disabledCategories", serde_json::json!(["a", 2])),
+        ] {
+            let mut d = RestrictionsDelta::default();
+            let err = d.apply(key, &value).expect_err("must refuse");
+            assert!(
+                err.contains(key),
+                "the refusal must name the key, got {err}"
+            );
+            // A refused value leaves nothing behind — not the previous, not a default.
+            assert_eq!(serde_json::to_value(&d).unwrap(), serde_json::json!({}));
+        }
+
+        // First wins: a lower-priority policy must not overwrite a pinned value — but it
+        // still has to be *readable*, or a bad value would slip past on the second policy.
+        let mut d = RestrictionsDelta::default();
+        d.apply("maxExecutionTime", &serde_json::json!(60)).unwrap();
+        d.apply("maxExecutionTime", &serde_json::json!(999))
+            .unwrap();
+        assert_eq!(d.max_execution_time, Some(60));
+        assert!(d.apply("maxExecutionTime", &serde_json::json!(-1)).is_err());
+        assert_eq!(
+            d.max_execution_time,
+            Some(60),
+            "a bad later value changes nothing"
+        );
     }
 
     #[test]

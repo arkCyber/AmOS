@@ -108,6 +108,38 @@ export function dataUrlToBytes(dataUrl: string): Uint8Array | null {
 }
 
 /**
+ * Encode `bytes` as a `data:` URL of `mime` — the inverse of {@link dataUrlToBytes}.
+ *
+ * Used to bring a **device** photo into the editor: `media_load` hands over raw bytes, and the
+ * only thing a canvas can decode is a URL (or a Blob, which cannot be written into
+ * `amos.photos` — that store is text). `null` when there are no bytes, or when the encode
+ * fails: an empty payload is not a photo, and a caller that stored one would be claiming a
+ * picture it does not have.
+ *
+ * The encode is chunked because `String.fromCharCode(...bytes)` spreads one argument per byte;
+ * a 5 MB photo is 5 million arguments, which overflows the engine's argument limit and throws
+ * (`encode_failed` is exactly the four-outcome discipline: no bytes → no claim).
+ */
+export function bytesToDataUrl(
+  bytes: Uint8Array,
+  mime: string | null | undefined,
+): string | null {
+  if (bytes.length === 0) return null;
+  const essence = (mime ?? "").trim().toLowerCase();
+  const type = /^[a-z]+\/[a-z0-9.+-]+$/.test(essence) ? essence : "application/octet-stream";
+  try {
+    let binary = "";
+    const CHUNK = 0x8000;
+    for (let i = 0; i < bytes.length; i += CHUNK) {
+      binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+    }
+    return `data:${type};base64,${btoa(binary)}`;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * The media type a `data:` URL declares, or `null` when it declares none.
  *
  * The camera keeps its stills as data URLs, so a photo's extension has to come from the URL

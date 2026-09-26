@@ -7,9 +7,11 @@ import {
   parseRagStatus,
   ragIndex,
   ragQuery,
+  ragQueryRefusedForForeground,
   ragRemove,
   ragStatus,
   RAG_DEFAULT_TOP_K,
+  RAG_FOREGROUND_REQUIRED,
   RAG_MAX_TOP_K,
   normalizeTopK,
 } from "../lib/rag";
@@ -84,6 +86,24 @@ describe("parseRagStatus", () => {
     expect(parseRagStatus({ indexed: "many", dimension: 384, embedder: "mock" })).toBeNull();
     expect(parseRagStatus({})).toBeNull();
   });
+  test("an unindexed index reports no dimension, not 0", () => {
+    // `RagStatusReply.dimension` is `optional`: absent while nothing has been ingested
+    // (`RagStore::dim() == None`). `0` is not a dimension the daemon can produce — the
+    // vector index refuses `ZeroDimension` — so the documented `0` sentinel of an older
+    // daemon's reply means the same thing as absence: unknown.
+    expect(parseRagStatus({ indexed: 0, embedder: "mock" })).toEqual({
+      indexed: 0,
+      dimension: null,
+      embedder: "mock",
+    });
+    expect(parseRagStatus({ indexed: 0, dimension: 0, embedder: "mock" })).toEqual({
+      indexed: 0,
+      dimension: null,
+      embedder: "mock",
+    });
+    // …and a real dimension is preserved (positive control: an "always null" parser fails).
+    expect(parseRagStatus({ indexed: 3, dimension: 384, embedder: "mock" })!.dimension).toBe(384);
+  });
 });
 
 describe("parseRagIndex / parseRagRemove", () => {
@@ -147,5 +167,55 @@ describe("wire keys (Tauri resolves an argument by its lowerCamelCase name)", ()
     bridge(calls);
     await ragQuery("hello", 1_000_000);
     expect(calls.find((c) => c.cmd === "rag_query")!.args.topK).toBe(RAG_MAX_TOP_K);
+  });
+});
+
+describe("ragQueryRefusedForForeground — which fact a null carries (F-AI-019)", () => {
+  let realWindow: unknown;
+  beforeEach(() => {
+    realWindow = (globalThis as { window?: unknown }).window;
+  });
+  afterEach(() => {
+    (globalThis as { window?: unknown }).window = realWindow;
+  });
+  function bridgeThatRejects(err: unknown) {
+    (globalThis as { window?: unknown }).window = {
+      __TAURI_INTERNALS__: {
+        invoke: async (cmd: string) => {
+          if (cmd === "rag_query") throw err;
+          return null;
+        },
+        listen: async () => async () => {},
+      },
+      localStorage: new Map() as unknown as Storage,
+    };
+  }
+
+  test("true only for the host's own foreground code", async () => {
+    bridgeThatRejects({ code: RAG_FOREGROUND_REQUIRED, message: "refused" });
+    expect(await ragQuery("q")).toBeNull();
+    expect(ragQueryRefusedForForeground()).toBe(true);
+  });
+
+  test("false for any other refusal — an unreachable index is not a refusal of this window", async () => {
+    bridgeThatRejects({ code: "amos.rag.rpc_failed", message: "daemon absent" });
+    expect(await ragQuery("q")).toBeNull();
+    expect(ragQueryRefusedForForeground()).toBe(false);
+  });
+
+  test("false when the read succeeded, and false with no bridge at all", async () => {
+    (globalThis as { window?: unknown }).window = {
+      __TAURI_INTERNALS__: {
+        invoke: async () => ({ hits: [], count: 0 }),
+        listen: async () => async () => {},
+      },
+      localStorage: new Map() as unknown as Storage,
+    };
+    expect(await ragQuery("q")).toEqual({ hits: [], count: 0 });
+    expect(ragQueryRefusedForForeground()).toBe(false);
+
+    (globalThis as { window?: unknown }).window = undefined;
+    expect(await ragQuery("q")).toBeNull();
+    expect(ragQueryRefusedForForeground()).toBe(false);
   });
 });

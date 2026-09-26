@@ -38,9 +38,14 @@
   let exportMenuOpen = $state(false);
   /** 展开的下拉菜单元素，交给 REQ-A436 的共享键盘层（方向键 / Home / End / Escape）。 */
   let exportMenuEl = $state<HTMLDivElement | undefined>();
+  /** 展开这个菜单的那个按钮：Escape 之后焦点要回到它（见 `lib/menuKeys` 的 `restoreFocusTo`）。 */
+  let exportTriggerEl = $state<HTMLButtonElement | undefined>();
   $effect(() => {
     if (!exportMenuEl || !exportMenuOpen) return;
-    return installMenuKeyboard(exportMenuEl, { onClose: () => (exportMenuOpen = false) });
+    return installMenuKeyboard(exportMenuEl, {
+      onClose: () => (exportMenuOpen = false),
+      restoreFocusTo: () => exportTriggerEl ?? null,
+    });
   });
   let loading = $state(false);
   let autoRefresh = $state(false);
@@ -57,9 +62,10 @@
   // 计算属性
   // ============================================================================
 
-  const stats = $derived(
-    auditLogger.getStatistics(query.startTime, query.endTime)
-  );
+  // REQ-A1495 ∕ F-SH-736：统计必须描述**列表正在显示的那个集合**。修前这里只传 `query.startTime` ∕
+  // `query.endTime`，于是把「结果」筛成「失败」之后，统计卡照旧印着时间窗里的成功条数 ——
+  // 列表刚剔除掉的行 —— 而列表标题在数失败。契约：列表 ∕ 导出 ∕ 统计三者传同一个 `query`。
+  const stats = $derived(auditLogger.getStatistics(query));
 
   const uniqueUsers = $derived(
     Array.from(new Set(logs.map(log => log.userId))).sort()
@@ -96,7 +102,12 @@
   function loadLogs() {
     loading = true;
     try {
-      logs = auditLogger.query(query);
+      // REQ-A1514 ∕ F-SH-759：列表画的是**整个匹配集**，不是 `query()` 的默认 100 条那一页。
+      // 修前这里逐字是 `logs = auditLogger.query(query);`，于是匹配集一过 100，统计卡（数整个
+      // 集合）写「总计 105」而列表标题写「日志列表 (100)」，同一个屏幕两个和；更糟的是下面
+      // 两个筛选下拉的候选项也只从那一页取，只出现在第 101 条之后的事件类型再也筛不到。
+      // `Infinity` ⇒ `slice(offset, offset + Infinity)` 取整份；`query()` 自己的分页契约不动。
+      logs = auditLogger.query({ ...query, limit: Number.POSITIVE_INFINITY });
     } finally {
       loading = false;
     }
@@ -205,23 +216,23 @@
 
   function getResultColor(result: AuditResult): string {
     const colors = {
-      success: "#34C759",
-      failure: "#FF3B30",
-      warning: "#FF9500",
-      blocked: "#8E8E93",
+      success: "rgb(var(--success))",
+      failure: "rgb(var(--danger))",
+      warning: "rgb(var(--warning))",
+      blocked: "rgb(var(--label-3))",
     };
     return colors[result];
   }
 
   function getLevelColor(level: AuditLogLevel): string {
     const colors: Record<string, string> = {
-      debug: "#8E8E93",
-      info: "#007AFF",
-      warning: "#FF9500",
-      error: "#FF3B30",
-      critical: "#FF3B30",
+      debug: "rgb(var(--label-3))",
+      info: "rgb(var(--accent))",
+      warning: "rgb(var(--warning))",
+      error: "rgb(var(--danger))",
+      critical: "rgb(var(--danger))",
     };
-    return colors[level] || "#8E8E93";
+    return colors[level] || "rgb(var(--label-3))";
   }
 
   function getEventTypeLabel(eventType: string): string {
@@ -345,6 +356,7 @@
           onclick={() => (exportMenuOpen = !exportMenuOpen)}
           aria-haspopup="menu"
           aria-expanded={exportMenuOpen}
+          bind:this={exportTriggerEl}
         >
           {exporting ? t("audit.exporting") : t("audit.export")}
         </button>
@@ -628,13 +640,13 @@
   .viewer-header h2 {
     font-size: 24px;
     font-weight: 600;
-    color: #000;
+    color: rgb(var(--label));
     margin: 0 0 8px 0;
   }
 
   .subtitle {
     font-size: 14px;
-    color: #8E8E93;
+    color: rgb(var(--label-3));
     margin: 0;
   }
 
@@ -642,7 +654,7 @@
   .filters-card,
   .stats-card,
   .logs-card {
-    background: #fff;
+    background: rgb(var(--surface));
     border-radius: 12px;
     padding: 20px;
     margin-bottom: 16px;
@@ -652,7 +664,7 @@
   .section-title {
     font-size: 17px;
     font-weight: 600;
-    color: #000;
+    color: rgb(var(--label));
     margin: 0 0 16px 0;
   }
 
@@ -673,21 +685,21 @@
   .filter-label {
     font-size: 13px;
     font-weight: 500;
-    color: #3C3C43;
+    color: rgb(var(--label-2));
   }
 
   .filter-select {
     padding: 10px 12px;
-    border: 1px solid #E5E5EA;
+    border: 1px solid rgb(var(--separator));
     border-radius: 8px;
     font-size: 14px;
-    background: #fff;
+    background: rgb(var(--surface));
     cursor: pointer;
   }
 
   .filter-select:focus {
     outline: none;
-    border-color: #007AFF;
+    border-color: rgb(var(--accent));
   }
 
   .filter-actions {
@@ -702,7 +714,7 @@
     align-items: center;
     gap: 8px;
     font-size: 14px;
-    color: #3C3C43;
+    color: rgb(var(--label-2));
     cursor: pointer;
   }
 
@@ -735,7 +747,7 @@
     top: 100%;
     right: 0;
     margin-top: 4px;
-    background: #fff;
+    background: rgb(var(--surface));
     border-radius: 8px;
     box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
     overflow: hidden;
@@ -747,7 +759,7 @@
     width: 100%;
     padding: 12px 16px;
     border: none;
-    background: #fff;
+    background: rgb(var(--surface));
     text-align: left;
     font-size: 14px;
     cursor: pointer;
@@ -756,7 +768,7 @@
   /* 指针契约：只在真能 hover 的设备上生效（REQ-A385） */
   @media (hover: hover) {
     .dropdown-menu button:hover {
-    background: #F2F2F7;
+    background: rgb(var(--surface-2));
   }
   }
 
@@ -771,35 +783,35 @@
     text-align: center;
     padding: 16px;
     border-radius: 8px;
-    background: #F2F2F7;
+    background: rgb(var(--surface-2));
   }
 
   .stat-item.success {
-    background: #E5F7ED;
+    background: rgb(var(--success) / 0.15);
   }
 
   .stat-item.failure {
-    background: #FFE5E5;
+    background: rgb(var(--danger) / 0.15);
   }
 
   .stat-item.warning {
-    background: #FFF4E5;
+    background: rgb(var(--warning) / 0.15);
   }
 
   .stat-item.blocked {
-    background: #F2F2F7;
+    background: rgb(var(--surface-2));
   }
 
   .stat-value {
     font-size: 28px;
     font-weight: 700;
-    color: #000;
+    color: rgb(var(--label));
     margin-bottom: 4px;
   }
 
   .stat-label {
     font-size: 13px;
-    color: #8E8E93;
+    color: rgb(var(--label-3));
   }
 
   /* 日志列表 */
@@ -812,7 +824,7 @@
 
   .loading-indicator {
     font-size: 13px;
-    color: #007AFF;
+    color: rgb(var(--accent));
   }
 
   .logs-list {
@@ -824,7 +836,7 @@
   }
 
   .log-item {
-    background: #F2F2F7;
+    background: rgb(var(--surface-2));
     border-radius: 8px;
     padding: 16px;
     text-align: left;
@@ -835,7 +847,7 @@
   /* 指针契约：只在真能 hover 的设备上生效（REQ-A385） */
   @media (hover: hover) {
     .log-item:hover {
-    background: #E5E5EA;
+    background: rgb(var(--separator));
     transform: translateX(4px);
   }
   }
@@ -854,7 +866,7 @@
   }
 
   .log-timestamp {
-    color: #8E8E93;
+    color: rgb(var(--label-3));
   }
 
   .log-level {
@@ -870,24 +882,24 @@
   }
 
   .log-user {
-    color: #3C3C43;
+    color: rgb(var(--label-2));
   }
 
   .log-event {
-    color: #007AFF;
+    color: rgb(var(--accent));
     font-weight: 500;
   }
 
   .log-description {
     font-size: 14px;
-    color: #000;
+    color: rgb(var(--label));
     margin-bottom: 4px;
   }
 
   .log-error {
     font-size: 13px;
-    color: #FF3B30;
-    background: #FFE5E5;
+    color: rgb(var(--danger));
+    background: rgb(var(--danger) / 0.15);
     padding: 8px;
     border-radius: 4px;
     margin-top: 8px;
@@ -895,7 +907,7 @@
 
   .log-duration {
     font-size: 12px;
-    color: #8E8E93;
+    color: rgb(var(--label-3));
     margin-top: 4px;
   }
 
@@ -913,13 +925,13 @@
   .empty-title {
     font-size: 20px;
     font-weight: 600;
-    color: #000;
+    color: rgb(var(--label));
     margin: 0 0 8px 0;
   }
 
   .empty-text {
     font-size: 15px;
-    color: #8E8E93;
+    color: rgb(var(--label-3));
     margin: 0;
   }
 
@@ -949,7 +961,7 @@
 
   .modal-content {
     position: relative; /* 盖在遮罩之上 */
-    background: #fff;
+    background: rgb(var(--surface));
     border-radius: 16px;
     max-width: 700px;
     width: 100%;
@@ -964,13 +976,13 @@
     align-items: center;
     justify-content: space-between;
     padding: 20px;
-    border-bottom: 1px solid #E5E5EA;
+    border-bottom: 1px solid rgb(var(--separator));
   }
 
   .modal-title {
     font-size: 20px;
     font-weight: 600;
-    color: #000;
+    color: rgb(var(--label));
     margin: 0;
   }
 
@@ -978,8 +990,8 @@
     width: 32px;
     height: 32px;
     border: none;
-    background: #F2F2F7;
-    color: #3C3C43;
+    background: rgb(var(--surface-2));
+    color: rgb(var(--label-2));
     border-radius: 50%;
     font-size: 24px;
     line-height: 1;
@@ -992,7 +1004,7 @@
   /* 指针契约：只在真能 hover 的设备上生效（REQ-A385） */
   @media (hover: hover) {
     .close-btn:hover {
-    background: #E5E5EA;
+    background: rgb(var(--separator));
   }
   }
 
@@ -1013,7 +1025,7 @@
   .detail-title {
     font-size: 15px;
     font-weight: 600;
-    color: #000;
+    color: rgb(var(--label));
     margin: 0 0 12px 0;
   }
 
@@ -1034,25 +1046,25 @@
   }
 
   .detail-item.error {
-    background: #FFE5E5;
+    background: rgb(var(--danger) / 0.15);
     padding: 12px;
     border-radius: 8px;
   }
 
   .detail-label {
     font-size: 12px;
-    color: #8E8E93;
+    color: rgb(var(--label-3));
     font-weight: 500;
   }
 
   .detail-value {
     font-size: 14px;
-    color: #000;
+    color: rgb(var(--label));
     word-break: break-all;
   }
 
   .metadata-pre {
-    background: #F2F2F7;
+    background: rgb(var(--surface-2));
     padding: 12px;
     border-radius: 8px;
     font-size: 12px;
@@ -1063,7 +1075,7 @@
 
   .modal-footer {
     padding: 20px;
-    border-top: 1px solid #E5E5EA;
+    border-top: 1px solid rgb(var(--separator));
   }
 
   .btn-primary,
@@ -1078,7 +1090,7 @@
   }
 
   .btn-primary {
-    background: #007AFF;
+    background: rgb(var(--accent));
     color: white;
     width: 100%;
   }
@@ -1091,14 +1103,14 @@
   }
 
   .btn-secondary {
-    background: #F2F2F7;
-    color: #007AFF;
+    background: rgb(var(--surface-2));
+    color: rgb(var(--accent));
   }
 
   /* 指针契约：只在真能 hover 的设备上生效（REQ-A385） */
   @media (hover: hover) {
     .btn-secondary:hover {
-    background: #E5E5EA;
+    background: rgb(var(--separator));
   }
   }
 

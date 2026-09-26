@@ -5,6 +5,7 @@ import { afterEach, describe, expect, test } from "vitest";
 import { cleanup, fireEvent, render } from "@testing-library/svelte";
 import { tick } from "svelte";
 import TerminalApp from "../src/svelte/TerminalApp.svelte";
+import { recentDiag } from "../src/lib/debugLog";
 
 type AnyWin = Record<string, unknown>;
 const cleanBridge = () => delete (window as AnyWin).__TAURI_INTERNALS__;
@@ -117,6 +118,54 @@ describe("TerminalApp.svelte (offline demo shell)", () => {
     await tick();
     expect(killed).toBeGreaterThan(0);
   });
+
+  test("live mode: a kill the host refused leaves a breadcrumb", async () => {
+    // The ring is bounded, so window on the monotonic `seq` mark, never a length delta.
+    const mark = recentDiag(1)[0]?.seq ?? 0;
+    (window as AnyWin).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string, args?: Record<string, unknown>) => {
+        if (cmd === "term_spawn") return { id: 7, output: null, error: "", running: true };
+        if (cmd === "term_kill") {
+          // A refusal that is not an exception: the reply says the shell is still there.
+          return { id: 7, output: null, error: "terminal: unknown or ended session", running: true };
+        }
+        return { id: (args?.session as number) ?? 0, output: null, error: "", running: true };
+      },
+    };
+    render(TerminalApp);
+    await new Promise<void>((r) => setTimeout(r, 60));
+    cleanup();
+    await tick();
+    await new Promise<void>((r) => setTimeout(r, 0));
+    // There is no window left to draw in, so the ledger is the only place "no orphan" can
+    // be denied — and a kill the host never confirmed must not pass silently.
+    const entry = recentDiag(-1).find((e) => e.seq > mark);
+    expect(entry?.msg).toContain("term_kill did not confirm");
+    expect(entry?.area).toBe("terminal");
+  });
+
+  test("live mode: a refused term_write is not drawn as an entered command", async () => {
+    (window as AnyWin).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string, args?: Record<string, unknown>) => {
+        if (cmd === "term_spawn") return { id: 7, output: null, error: "", running: true };
+        if (cmd === "term_write") {
+          // The host's real refusal shape: `TermOut` with `id: 0` and the reason in
+          // `error` — a successful bridge call, so `invoke` never folds it to `null`.
+          return { id: 0, output: null, error: "terminal: write exceeds 4096 bytes", running: false };
+        }
+        return { id: (args?.session as number) ?? 0, output: null, error: "", running: true };
+      },
+    };
+    const host = render(TerminalApp);
+    await new Promise<void>((r) => setTimeout(r, 60)); // the spawn probe attaches
+    await run(host, "echo hi");
+    await new Promise<void>((r) => setTimeout(r, 0));
+    await tick();
+    // The host's reason is on screen…
+    expect(txt(host)).toContain("terminal: write exceeds 4096 bytes");
+    // …and the command is *not* drawn as entered: the shell never took it.
+    expect(txt(host)).not.toContain("echo hi");
+  });
 });
 
 describe("TerminalApp.svelte — PTY window size", () => {
@@ -189,6 +238,108 @@ describe("TerminalApp.svelte — PTY window size", () => {
     await tick();
     await new Promise<void>((r) => setTimeout(r, 0));
     expect(calls).not.toContain("term_resize");
+  });
+});
+
+describe("TerminalApp.svelte — a refused resize is not remembered as applied", () => {
+  const rect = HTMLElement.prototype.getBoundingClientRect;
+
+  /** happy-dom delivers no ResizeObserver callbacks; capture them so the test can
+   *  re-measure the container at the same size, which is exactly what a real one does. */
+  function stubObserver(): Array<() => void> {
+    const cbs: Array<() => void> = [];
+    (globalThis as AnyWin).ResizeObserver = class {
+      constructor(cb: () => void) {
+        cbs.push(cb);
+      }
+      observe(): void {}
+      disconnect(): void {}
+      unobserve(): void {}
+    };
+    for (const proto of [Element.prototype, HTMLElement.prototype]) {
+      Object.defineProperty(proto, "clientWidth", { get: () => 800, configurable: true });
+      Object.defineProperty(proto, "clientHeight", { get: () => 400, configurable: true });
+    }
+    HTMLElement.prototype.getBoundingClientRect = function (): DOMRect {
+      return { width: 600, height: 15, top: 0, left: 0, right: 600, bottom: 15 } as DOMRect;
+    };
+    return cbs;
+  }
+
+  const settle = () => new Promise<void>((r) => setTimeout(r, 0));
+
+  afterEach(() => {
+    delete (globalThis as AnyWin).ResizeObserver;
+    for (const proto of [Element.prototype, HTMLElement.prototype]) {
+      for (const key of ["clientWidth", "clientHeight"] as const) {
+        delete (proto as unknown as Record<string, unknown>)[key];
+      }
+    }
+    HTMLElement.prototype.getBoundingClientRect = rect;
+  });
+
+  /** `lastSize` is the dedup key, so memoising a size the session never took
+   *  suppressed the next attempt at that same size and left the PTY on its spawn grid
+   *  (120×24) while the box drew the measured one — wrapping and full-screen programs
+   *  wrong, with nothing said.
+   *
+   *  The refusal is **not** a `null` return: `term_resize` answers `TermOut` (not
+   *  `Result`), so a refusal is a perfectly successful bridge call carrying `id: 0` and a
+   *  reason in `error`. A fixture that stubbed `null` tested a shape the host never
+   *  produces, so the guard could stay broken and this test stayed green. */
+  test("a refused term_resize leaves the size unremembered, and the next measure retries", async () => {
+    const cbs = stubObserver();
+    let resizes = 0;
+    (window as AnyWin).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string, args?: Record<string, unknown>) => {
+        if (cmd === "term_spawn") return { id: 7, output: null, error: "", running: true };
+        if (cmd === "term_resize") {
+          resizes += 1;
+          // The host's real refusal shape: a value, not an exception, and not `null`.
+          return { id: 0, output: null, error: "terminal: unknown or ended session", running: false };
+        }
+        // Anything else (term_read / term_write) keeps the session alive, the same
+        // shape the passing resize test uses.
+        return { id: (args?.session as number) ?? 0, output: null, error: "", running: true };
+      },
+    };
+    render(TerminalApp);
+    await tick();
+    await settle();
+    expect(resizes).toBe(1); // the attach measurement went out
+
+    for (const cb of cbs) cb(); // the box is re-measured at the same size
+    await tick();
+    await settle();
+    // Not memoised → asked again. Before the fix this stayed 1: the failed size was
+    // recorded as applied, so the dedup guard swallowed every later attempt.
+    expect(resizes).toBe(2);
+  });
+
+  // The control. Without it, deleting the dedup guard entirely would pass the test above
+  // — and a session that took the resize would be re-told its own size on every frame.
+  test("an accepted term_resize is still deduped", async () => {
+    const cbs = stubObserver();
+    let resizes = 0;
+    (window as AnyWin).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string, args?: Record<string, unknown>) => {
+        if (cmd === "term_spawn") return { id: 7, output: null, error: "", running: true };
+        if (cmd === "term_resize") {
+          resizes += 1;
+          return { id: (args?.session as number) ?? 0, output: null, error: "", running: true };
+        }
+        return null;
+      },
+    };
+    render(TerminalApp);
+    await tick();
+    await settle();
+    expect(resizes).toBe(1);
+
+    for (const cb of cbs) cb();
+    await tick();
+    await settle();
+    expect(resizes).toBe(1);
   });
 });
 

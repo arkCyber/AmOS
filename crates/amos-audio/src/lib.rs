@@ -41,6 +41,10 @@
 //! * [`ring`] — a bounded, host-testable sample buffer that bridges a real-time
 //!   audio producer (the AAudio **data callback** thread) to the pull
 //!   [`AudioCapture`] reader the voice worker drives.
+//! * [`tinyalsa_layout`] — the AOSP `pcm.h` FFI-layout facts (`PcmConfig` field
+//!   order, `pcm_format` / `pcm_flags` values, period sizing) the TinyALSA seam
+//!   authenticates against, kept **host-testable** so the layout contract is
+//!   checked on every `cargo test`, not only on a device.
 //! * [`android`] — **compile-time-gated** direct TinyALSA / AAudio FFI bindings
 //!   (feature `tinyalsa` / `aaudio` + `target_os = "android"`). On a host build
 //!   these modules are empty so the default workspace stays light and green.
@@ -67,6 +71,7 @@ pub mod ring;
 pub mod sink;
 pub mod source;
 pub mod spec;
+pub mod tinyalsa_layout;
 
 // On Android (and only with the matching feature) `android` is a directory of
 // seam modules; on host builds it is intentionally absent so there is nothing to

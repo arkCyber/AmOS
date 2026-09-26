@@ -20,13 +20,14 @@
  * shows the diff and the user chooses.  This avoids silent data divergence.
  */
 
-import type { ExternalFile } from "./externalFiles";
+import { totalExternalBytes, type ExternalFile } from "./externalFiles";
 import {
   readStoreValue,
   removeStoreValue,
   writeStoreValueChecked,
 } from "./amosStore";
 import { filesCloudValidate } from "./backend";
+import { previewBytesLabel } from "./filesPreview";
 
 /** The snapshot shape persisted in localStorage. */
 export interface CloudSnapshot {
@@ -36,8 +37,16 @@ export interface CloudSnapshot {
   savedAt: number;
   /** Collections included. */
   collections: string[];
-  /** Total byte size across all collections. */
-  totalBytes: number;
+  /**
+   * Total byte size across all collections, or `null` when it cannot be measured.
+   *
+   * `ExternalFile.sizeBytes` is `number | null` at the wire: `null` means the platform
+   * did not report that file's size. The snapshot header is the same claim the live
+   * device-files header makes one line below it, so it follows the same rule
+   * ([`totalExternalBytes`]): one unmeasured size withholds the total, and `0` is stored
+   * only when every file really reads 0 (or the list is empty).
+   */
+  totalBytes: number | null;
   /** Total file count. */
   fileCount: number;
   /** The actual entries (minimal shape: id/name/kind/collection/size/ts). */
@@ -70,12 +79,15 @@ export function toCloudFile(f: ExternalFile): CloudFile {
 /** Build a snapshot from a flat list of `ExternalFile` rows and a user label. */
 export function buildSnapshot(label: string, files: ExternalFile[]): CloudSnapshot {
   const collections = [...new Set(files.map((f) => f.collection))].sort();
-  const totalBytes = files.reduce((sum, f) => sum + (f.sizeBytes ?? 0), 0);
   return {
     label,
     savedAt: Date.now(),
     collections,
-    totalBytes,
+    // The **same** rule the live device-files header follows (`totalExternalBytes`): a
+    // partial sum is not "the total". The snapshot stores per-file `sizeBytes`, so a
+    // reader could re-derive this — but only if it is told what the aggregate means, and
+    // the wire field is the one carrier every reader shares.
+    totalBytes: totalExternalBytes(files),
     fileCount: files.length,
     files: files.map(toCloudFile),
   };
@@ -113,25 +125,17 @@ export function deleteSnapshot(): boolean {
   return removeStoreValue(SNAPSHOT_KEY);
 }
 
-/** Human-readable size summary. */
-export function formatSnapshotSize(bytes: number): string {
-  if (!Number.isFinite(bytes) || bytes < 0) return "—";
-  if (bytes === 0) return "0 B";
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  let v = bytes;
-  let u = 0;
-  while (v >= 1024 && u < units.length - 1) {
-    v /= 1024;
-    u += 1;
-  }
-  // Mirrors Rust `size_label` and `previewBytesLabel`: prefer integer for exact
-  // boundaries ("1 KB"), one decimal for fractional values below 100 ("1.5 KB"),
-  // round to integer for large numbers (>= 100).
-  const s =
-    Number.isInteger(v)
-      ? String(v)
-      : v >= 100
-      ? String(Math.round(v))
-      : v.toFixed(1);
-  return `${s} ${units[u]}`;
+/**
+ * Human-readable size summary, or `"—"` when the total could not be measured.
+ *
+ * Delegates to `previewBytesLabel` so the byte→label rule (units, 1024 divisor,
+ * integer/decimal/round thresholds) has a **single** JS implementation, bound to the Rust
+ * `size_label` vectors by `filesPreview.test.ts`. The `null` arm is stated here rather than
+ * left to `previewBytesLabel`, whose contract is about a *number* that is out of range —
+ * the two must not be conflated, or a `null` total would silently ride the same path as a
+ * negative one and a future change to either would move the other.
+ */
+export function formatSnapshotSize(bytes: number | null): string {
+  if (bytes === null) return "—";
+  return previewBytesLabel(bytes);
 }

@@ -27,8 +27,14 @@ import { auditLogger } from "./audit";
 // 类型定义
 // ============================================================================
 
-/** API 认证类型 */
-export type APIAuthType = "api_key" | "bearer_token" | "oauth2" | "basic";
+/**
+ * API 认证类型 —— the **one** declaration. `APIAuthType` is derived from it, so the type the
+ * request path switches on and the list the settings screen renders cannot drift apart
+ * (`vocab-mirror-scan`: a hand-written union next to an array of the same literals is two
+ * spellings of one vocabulary, and the array is the one the code actually consults).
+ */
+export const AUTH_TYPES = ["api_key", "bearer_token", "oauth2", "basic"] as const;
+export type APIAuthType = (typeof AUTH_TYPES)[number];
 
 /** HTTP 方法 */
 export type HTTPMethod = "GET" | "POST" | "PUT" | "DELETE" | "PATCH";
@@ -117,6 +123,76 @@ const DEFAULT_API_CONFIG: APIConfig = {
   debug: false,
 };
 
+/**
+ * One credential input an auth type reads off {@link APIConfig}, named by its own field.
+ *
+ * The name **is** the `APIConfig` key (this is a `keyof`-style union, not a label), so the
+ * screen that renders the inputs and the code that reads them cannot drift apart.
+ */
+export type AuthField = "apiKey" | "bearerToken" | "username" | "password";
+
+/** What one auth type contributes to a request: a `[header, value]` pair, or `null`. */
+type AuthHeader = (config: APIConfig) => [name: string, value: string] | null;
+
+/** Everything the shell knows about one auth type — one declaration, read by the request path
+ *  and by the screen that configures it. */
+export interface AuthTypeInfo {
+  /** Whether this build can authenticate with this type at all. `false` means the vocabulary
+   *  member exists with no flow behind it, and the screen must offer it as an unavailable
+   *  choice **with that reason** rather than as a working one (REQ-A801). */
+  implemented: boolean;
+  /** The credential inputs this type reads, in the order they are shown. */
+  fields: readonly AuthField[];
+  /** The header a configured request carries, or `null` when there is nothing to send. */
+  header: AuthHeader;
+}
+
+/**
+ * **The one declaration of what each auth type means** (REQ-A801) — read by `buildHeaders` on
+ * the request path and by `APISettings.svelte` to build its select and its credential inputs.
+ *
+ * **Why a table and not the `if`/`else if` chain this replaced.** The chain had **three**
+ * branches for a **four**-member vocabulary, so `oauth2` fell off the end and the request went
+ * out with **no authentication header at all** — a 401 the user could not explain from anything
+ * on screen, produced by a config value the type system said was perfectly fine. A chain cannot
+ * be exhaustive; a `Record` over the union can, so a new member now has to be given a header or
+ * an explicit "no flow" instead of silently inheriting "no auth".
+ *
+ * `header`'s `null` carries two different — and both honest — meanings, which is why this holds
+ * *builders* rather than strings:
+ *   • **no credential entered yet** (`api_key` with an empty key, `basic` with a missing half):
+ *     sending nothing is right, because there is nothing to send. Where the user has to be able
+ *     to see that is the screen, and it says so;
+ *   • **this build implements no such flow** (`oauth2`): the `null` is a statement about the
+ *     build, not about the config. `implemented: false` is the flag that keeps the two apart —
+ *     it is asserted to agree with `fields`/`header` by
+ *     `src/lib/__tests__/enterprise-api.test.ts` → `describe("认证方式的词表是全的（REQ-A801）")`.
+ */
+export const AUTH_TYPE_INFO: Record<APIAuthType, AuthTypeInfo> = {
+  api_key: {
+    implemented: true,
+    fields: ["apiKey"],
+    header: (c) => (c.apiKey ? ["X-API-Key", c.apiKey] : null),
+  },
+  bearer_token: {
+    implemented: true,
+    fields: ["bearerToken"],
+    header: (c) => (c.bearerToken ? ["Authorization", `Bearer ${c.bearerToken}`] : null),
+  },
+  basic: {
+    implemented: true,
+    fields: ["username", "password"],
+    header: (c) =>
+      c.username && c.password
+        ? ["Authorization", `Basic ${btoa(`${c.username}:${c.password}`)}`]
+        : null,
+  },
+  // Declared in `APIAuthType`, **not implemented**: no request this build sends carries an
+  // OAuth2 token, and there is no flow to obtain one. Written down here rather than left as
+  // the residue of a missing `else`.
+  oauth2: { implemented: false, fields: [], header: () => null },
+};
+
 // ============================================================================
 // API 客户端
 // ============================================================================
@@ -124,19 +200,57 @@ const DEFAULT_API_CONFIG: APIConfig = {
 export class APIClient {
   private config: APIConfig = DEFAULT_API_CONFIG;
   private requestCounts: Map<string, number[]> = new Map();
+  /** `ensureInitialized()` 是否已经跑过（见那里为什么读写路径要自己把它叫起来）。 */
+  private initialized = false;
+
+  /**
+   * 引导流水线，**幂等**，由使用者自己触发（REQ-A982 / F-SH-309）。
+   *
+   * 为什么不能只依赖 `initialize()`：它只被 `enterprise/index.ts` 的
+   * `initializeEnterprise()` 调用，而后者在生产里**零调用者**（同一事实 `audit.ts` /
+   * `mdm.ts` / `webhooks.ts` 各记过一次，它自己也在 `scripts/unwired-baseline.json` 里）。
+   * 于是 `loadConfig()` 从来没有在设备上跑过，`this.config` 永远是编译期的
+   * `DEFAULT_API_CONFIG`（`enabled: false`、空 `baseUrl`）。
+   *
+   * 后果是**两件**事，第二件比第一件重：①`APISettings.svelte` 挂载时
+   * `getConfig()` 拿到的是默认值 —— 用户上一轮存下的配置在面板上根本不存在；②面板把它
+   * 读到的那一份**原样写回**（`configure(apiConfig)` 传的是整份配置），于是**按一次保存
+   * 就把存储里那份覆盖成默认值**，而且面板还会显示「配置已保存」。
+   *
+   * `initialized` 在任何重入之前置位（与 `audit.ts` 同形）。
+   */
+  private ensureInitialized(): void {
+    if (this.initialized) return;
+    this.initialized = true;
+    this.bootstrap();
+  }
+
+  /**
+   * 「装载」这一份，只有这一处（`initialize()` 与 `ensureInitialized()` 共用；两份字节
+   * 相同的装载正是本模块反复修掉的形状）。
+   */
+  private bootstrap(): void {
+    this.loadConfig();
+    this.loadRateLimits();
+  }
 
   /**
    * 初始化 API 客户端
+   *
+   * 显式初始化 = 「采纳存储里那一份」，每次都重新装载（与从前一致）。
    */
   async initialize(): Promise<void> {
-    this.loadConfig();
-    this.loadRateLimits();
+    this.bootstrap();
+    this.initialized = true;
   }
 
   /**
    * 发送 API 请求
    */
   async request<T = unknown>(options: APIRequestOptions): Promise<APIResponse<T>> {
+    // 判的是 `config.enabled`，所以那份配置必须先真的读过存储 —— 否则这里判的是
+    // 编译期默认的 `false`，用户明明启用了 API 也会拿到「API 未启用」。
+    this.ensureInitialized();
     if (!this.config.enabled) {
       return {
         success: false,
@@ -304,19 +418,15 @@ export class APIClient {
 
   /**
    * 构建请求头
+   *
+   * The auth decision is a table lookup (REQ-A801), not a chain — see {@link AUTH_TYPE_INFO}
+   * for why the chain was a defect rather than a style choice.
    */
   private buildHeaders(customHeaders?: Record<string, string>): Record<string, string> {
     const headers = { ...this.config.defaultHeaders, ...customHeaders };
 
-    // 添加认证
-    if (this.config.authType === "api_key" && this.config.apiKey) {
-      headers["X-API-Key"] = this.config.apiKey;
-    } else if (this.config.authType === "bearer_token" && this.config.bearerToken) {
-      headers["Authorization"] = `Bearer ${this.config.bearerToken}`;
-    } else if (this.config.authType === "basic" && this.config.username && this.config.password) {
-      const credentials = btoa(`${this.config.username}:${this.config.password}`);
-      headers["Authorization"] = `Basic ${credentials}`;
-    }
+    const auth = AUTH_TYPE_INFO[this.config.authType].header(this.config);
+    if (auth) headers[auth[0]] = auth[1];
 
     return headers;
   }
@@ -392,15 +502,37 @@ export class APIClient {
   }
 
   /**
-   * 保存配置
+   * Persist the merged config and **report whether it landed** (REQ-A806).
+   *
+   * The refusal used to stop at `logger.error` — a `console.*` wrapper with **no reader anywhere
+   * in the app** — so the one surface that could have told the user was the one that cannot.
+   * Meanwhile `APISettings.svelte` showed 「配置已保存」 for every write, including the rejected
+   * ones, and the sentence stayed true only until the next launch. Same family as F-SH-043／
+   * F-INK-005: the page draws a conclusion on the store's behalf.
+   *
+   * The refusal now reaches the ledger `settings/AiPage.svelte` renders — because a returned
+   * boolean answers exactly one caller, while the diagnostics ring answers "what has been going
+   * wrong lately", which is the question someone whose config keeps vanishing actually has. It
+   * gets there through {@link logger}, **not** a second channel: REQ-A807 made `logger` itself an
+   * adapter onto that ledger, so this one call is the whole mechanism.
+   *
+   * **REQ-A982 的补充**：上面那句「next launch 会回落默认」在 REQ-A806 写下的当天对
+   * **每一次**成功写入也成立 —— 只是原因在别处（`loadConfig()` 没有生产调用者，
+   * 见 {@link ensureInitialized}），于是这句话把用户指向了存储，而存储是无辜的。
+   * 现在 `false` 真的只意味着「这次写入没落盘」。
+   *
+   * @returns `true` when the config is durably stored, `false` when it lives only in this
+   *   process and will be replaced by {@link DEFAULT_API_CONFIG} on the next launch.
    */
-  saveConfig(config: Partial<APIConfig>): void {
+  saveConfig(config: Partial<APIConfig>): boolean {
+    // **先装载再合并**：`this.config` 是合并的底座，底座若是编译期默认值，这一次写入
+    // 就会用默认值覆盖掉用户此前存下的每一个字段（REQ-A982 / F-SH-309）。
+    this.ensureInitialized();
     this.config = { ...this.config, ...config };
     const serialized = JSON.stringify(this.config);
-    // 写不进去 = 用户的 API 配置重启后消失，必须报（write-scan 判据）。
-    if (!writeStoreValueChecked(STORE_KEYS.API_CONFIG, serialized)) {
-      logger.error("api", "API 配置写入被存储拒绝 —— 重启后会回落到默认配置");
-    }
+    if (writeStoreValueChecked(STORE_KEYS.API_CONFIG, serialized)) return true;
+    logger.error("api", "API 配置写入被存储拒绝 —— 重启后会回落到默认配置");
+    return false;
   }
 
   /**
@@ -437,27 +569,36 @@ export class APIClient {
    * 获取配置
    */
   getConfig(): APIConfig {
+    // 面板挂载时读的就是这一句：不先装载，用户看到的是默认值而不是他存下的那一份。
+    this.ensureInitialized();
     return { ...this.config };
   }
 
   /**
    * 更新配置
+   *
+   * Returns what {@link saveConfig} returns — **not** `void`, so a caller that shows the user a
+   * 「已保存」 claim can only make it when the write landed (REQ-A806).
    */
-  updateConfig(config: Partial<APIConfig>): void {
-    this.saveConfig(config);
+  updateConfig(config: Partial<APIConfig>): boolean {
+    return this.saveConfig(config);
   }
 
   /**
    * 配置 API（updateConfig 的别名，用于向后兼容）
+   *
+   * See {@link updateConfig} for why this reports the write's outcome.
    */
-  configure(config: Partial<APIConfig>): void {
-    this.updateConfig(config);
+  configure(config: Partial<APIConfig>): boolean {
+    return this.updateConfig(config);
   }
 
   /**
    * 测试连接
    */
   async testConnection(): Promise<{ success: boolean; message: string }> {
+    // 同 `request()`：这两条判据读的都是 `this.config`，它必须先真的读过存储。
+    this.ensureInitialized();
     if (!this.config.enabled) {
       return { success: false, message: "API 未启用" };
     }

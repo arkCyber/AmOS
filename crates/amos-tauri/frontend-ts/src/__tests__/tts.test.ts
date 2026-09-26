@@ -48,7 +48,9 @@ describe("tts bridge -> realtime read-aloud", () => {
       calls.push(`${l}:${t}`);
       return PCM;
     };
-    const play = (p: unknown) => played.push(p);
+    const play = (p: unknown) => {
+      played.push(p);
+    };
     expect(await speakText("Hola", "es", { synth, play })).toBe(true);
     expect(calls).toEqual(["es:Hola"]);
     expect(played).toEqual([PCM]);
@@ -60,6 +62,23 @@ describe("tts bridge -> realtime read-aloud", () => {
     expect(await speakText("   ", "zh", { synth, play })).toBe(false);
   });
 
+  test("a synthesis that never reached the speakers is not `true` (REQ-A1444)", async () => {
+    const synth = async () => PCM;
+    const attempted: unknown[] = [];
+    // The shape `playPcm` has when there is no `AudioContext` (or the payload has no samples):
+    // the synthesis *succeeded*, the playback did not happen. Answering `true` off the reply is
+    // how 朗读 becomes a silent no-op with no sentence anywhere.
+    const play = (p: unknown) => (attempted.push(p), false);
+    expect(await speakText("Hola", "es", { synth, play })).toBe(false);
+    expect(attempted).toEqual([PCM]); // it *was* attempted — only the outcome differed
+  });
+
+  test("a backend that answered `null` is still `false` (regression)", async () => {
+    const synth = async () => null;
+    const play = () => true;
+    expect(await speakText("Hola", "es", { synth, play })).toBe(false);
+  });
+
   test("onInterpFinal speaks a final segment but not a partial", async () => {
     const synths: string[] = [];
     const plays: unknown[] = [];
@@ -67,7 +86,9 @@ describe("tts bridge -> realtime read-aloud", () => {
       synths.push(`${l}:${t}`);
       return PCM;
     };
-    const play = (p: unknown) => plays.push(p);
+    const play = (p: unknown) => {
+      plays.push(p);
+    };
 
     expect(await onInterpFinal({ kind: "segment_final", target_text: "Hola", target_lang: "es" }, { synth, play })).toBe(true);
     expect(synths).toEqual(["es:Hola"]);

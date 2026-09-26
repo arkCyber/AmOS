@@ -362,3 +362,65 @@ describe("AndroidApp.svelte (bridged lifecycle tiers)", () => {
   });
 
 });
+
+/**
+ * `bridged()` only says the Tauri internals object exists. The daemon is a **separate
+ * process**, and a command it does not answer resolves `null` — `invoke` catches every
+ * bridge rejection and never rejects (REQ-A296), so a refused `get_android_apps` arrives
+ * at the `.then` as a plain `null`, not as a thrown error the `.catch` could see.
+ *
+ * The main list read folded that `null` together with a genuinely empty list
+ * (`if (!reply || !list.length)`) and rendered `android.empty` — 「暂无安卓应用」 — a
+ * claim about *this device's installed apps* made from a question nobody answered. The
+ * component's two sibling reads already refuse that fold: `refreshTiers` keeps the
+ * previous tiers and says so ("daemon-down (null) is not 'everything stopped'"), and the
+ * `lmk-surface` subscribe returns early on `un === null`. Only the read that feeds the
+ * screen's headline sentence made the claim.
+ */
+describe("AndroidApp.svelte — a refused list read is not an empty device (REQ-A1360 / F-SH-624)", () => {
+  const settle = () => new Promise((r) => setTimeout(r, 40));
+
+  test("a refused get_android_apps reports the daemon, and never claims 'no apps'", async () => {
+    const invoke = async (cmd: string) => {
+      if (cmd === "get_android_apps") return null; // daemon down / command refused
+      if (cmd === "android_lmk_tasks") return [];
+      if (cmd === "get_android_app_icon") return [];
+      return null;
+    };
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
+      invoke,
+      listen: async () => () => {},
+    };
+
+    const host = render(AndroidApp);
+    await settle();
+    await settle();
+
+    const body = txt(host);
+    expect(body).toContain("未连接守护进程");
+    expect(body).not.toContain("暂无安卓应用");
+  });
+
+  test("…while a daemon that answered with nothing still says the list is empty", async () => {
+    // The discriminator: `[]` is an answer and must keep its own sentence. A fix that
+    // simply widened the offline arm would pass the case above and break this one.
+    const invoke = async (cmd: string) => {
+      if (cmd === "get_android_apps") return { apps: [], runtime: "waydroid", demo: false };
+      if (cmd === "android_lmk_tasks") return [];
+      if (cmd === "get_android_app_icon") return [];
+      return null;
+    };
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
+      invoke,
+      listen: async () => () => {},
+    };
+
+    const host = render(AndroidApp);
+    await settle();
+    await settle();
+
+    const body = txt(host);
+    expect(body).toContain("暂无安卓应用");
+    expect(body).not.toContain("未连接守护进程");
+  });
+});

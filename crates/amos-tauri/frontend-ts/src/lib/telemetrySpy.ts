@@ -14,15 +14,42 @@
  * evidence via `confidence` rather than shouting "compromised".
  *
  * Pure helpers are unit-tested; `startTelemetrySpyWatcher` is wired once at the
- * app level (outside Tauri it degrades to a no-op unsubscribe).
+ * app level (outside Tauri it degrades to a no-op unsubscribe) and publishes the
+ * subscription's own verdict to {@link spyWatch}, which is what the audit page
+ * reports — never `bridged()`, which answers a different question.
  */
 
-import { subscribe } from "./backend";
+import { subscribe, bridgeDiag } from "./backend";
+import { writable } from "svelte/store";
 import { readStoreValue, writeStoreValue } from "./amosStore";
-import { NOTIF_KEY, addNotif, type Notif } from "./settings";
+import { NOTIF_KEY, addNotif, normalizeNotifs, type Notif } from "./settings";
 
 /** Tauri event name for one daemon telemetry-spy hit (Rust bridge emits this). */
 export const SPY_HIT_EVENT = "telemetry-spy-hit";
+
+/**
+ * Whether this shell is actually **listening** — the fact 「审计中 · 已接入外发监听」
+ * claims, and the one `bridged()` cannot answer.
+ *
+ * `bridged()` only says the Tauri internals object exists (REQ-A1360); the daemon is a
+ * separate process and the *event registration* can still be refused, which
+ * `backend.listenEvent` reports as `listen-failed` in the ledger. A refused listen means
+ * **no hit will ever arrive** while the shell keeps running — the state the audit page
+ * must never draw as "auditing".
+ *
+ *   • `null`      — the shell has not (yet) established a subscription: no host at all,
+ *                   or the listen is still in flight. Nothing is attached.
+ *   • `"refused"` — the host exists but refused the registration (`listen-failed`).
+ *   • `"attached"`— the subscription is live (hits, if any are produced, will arrive).
+ *
+ * Set by {@link startTelemetrySpyWatcher}, i.e. by the answer the host actually gave —
+ * so the page reads the subscription's verdict rather than re-deriving it from a
+ * capability check that answers a different question.
+ */
+export type SpyWatchState = "attached" | "refused" | null;
+
+/** Live attach state of the audit listener (see {@link SpyWatchState}). */
+export const spyWatch = writable<SpyWatchState>(null);
 
 /** One graded identifier hit, forwarded from the Rust `SpyIdentifierHit`. */
 export interface SpyIdentifierHit {
@@ -183,19 +210,34 @@ export function spyNotif(hit: SpyHitPayload, now = Date.now(), fmt?: SpyTranslat
  * banner can show it (newest-first, capped). Best-effort: never throws.
  */
 export function recordSpyHit(hit: SpyHitPayload, fmt?: SpyTranslate): void {
-  const list = readStoreValue<Notif[]>(NOTIF_KEY, []);
+  const list = normalizeNotifs(readStoreValue<unknown>(NOTIF_KEY, []));
   writeStoreValue(NOTIF_KEY, addNotif(list, spyNotif(hit, Date.now(), fmt)));
 }
 
 /**
  * Subscribe to the `telemetry-spy-hit` feed and invoke `onHit` for every
- * well-shaped high hit. Returns an unsubscribe (no-op outside Tauri).
+ * well-shaped high hit. Returns an unsubscribe, or `null` when the subscription was not
+ * established (REQ-A838) — for an audit surface, "no hits" and "not watching" are the two
+ * most important states to keep apart, and an empty list must not imply the former.
  */
 export async function startTelemetrySpyWatcher(
   onHit: (hit: SpyHitPayload) => void,
-): Promise<() => void> {
-  return subscribe(SPY_HIT_EVENT, (raw) => {
+): Promise<(() => void) | null> {
+  const stop = await subscribe(SPY_HIT_EVENT, (raw) => {
     const hit = toSpyHit(raw);
     if (hit && isHigh(hit)) onHit(hit);
   });
+  // Publish the answer the host gave, for the audit page to *read* rather than guess.
+  // `subscribe` answers `null` for two different facts — "no host" and "the host refused
+  // the registration" — so `bridgeDiag` (REQ-A838's ledger slot) is what tells them apart:
+  // only the second is worth a refusal sentence of its own.
+  const diag = bridgeDiag(SPY_HIT_EVENT);
+  spyWatch.set(
+    stop !== null
+      ? "attached"
+      : !diag.ok && diag.kind === "listen-failed"
+        ? "refused"
+        : null,
+  );
+  return stop;
 }

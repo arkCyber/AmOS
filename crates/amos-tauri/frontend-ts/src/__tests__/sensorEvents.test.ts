@@ -84,15 +84,15 @@ describe("real-time sensor-data events (System UI SensorHost broadcast)", () => 
     expect(toSensorData({ ts_ms: 1, kind: "camera_frame", imu: null, frame: { id: "x" } })).toBeNull();
   });
 
-  test("subscribeSensorData returns a no-op unsubscribe outside Tauri", async () => {
-    // No window.__TAURI_INTERNALS__ bridge in the test env → no-op, never throws.
-    const unsub = await subscribeSensorData(() => {});
-    expect(typeof unsub).toBe("function");
-    expect(() => unsub()).not.toThrow();
+  test("subscribeSensorData answers null outside Tauri, not a no-op (REQ-A838)", async () => {
+    // No `window.__TAURI_INTERNALS__` bridge in the test env. The old contract returned a
+    // no-op unsubscribe here, which is indistinguishable from a live subscription on a quiet
+    // feed — so a sensor card could claim to be listening when nothing was on the wire.
+    expect(await subscribeSensorData(() => {})).toBeNull();
   });
 
   test("isKind narrows correctly", () => {
-    const ev: SensorDataEvent = { ts_ms: 1, kind: "cleared", backend: "live", mode: "balanced", imu: null, frame: null, prev_mode: null };
+    const ev: SensorDataEvent = { ts_ms: 1, kind: "cleared", backend: "live", mode: "balanced", imu: null, frame: null, vitals: null, prev_mode: null };
     expect(isKind(ev, "cleared")).toBe(true);
     expect(isKind(ev, "imu")).toBe(false);
   });

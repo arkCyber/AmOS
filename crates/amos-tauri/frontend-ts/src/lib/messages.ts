@@ -144,6 +144,28 @@ export function findConversation(convs: readonly Conversation[], id: string): Co
 }
 
 /**
+ * The notification row's identity for one incoming message: `<conversation>:<its stamp>`.
+ *
+ * Both halves are the message's own, not a position in a list. The row used to be
+ * `msg:<index>:<ts>`, where the index was a slot in the **activeId-filtered unread list**:
+ * opening any conversation dropped it out of that list and slid every later row down one
+ * slot, so an unrelated message's id changed. The arrival banner compares id **sets**
+ * (`newestAddedNotif`), so a changed id reads as an arrival — switching threads re-announced
+ * a message the user had already seen (banner + tone), naming a thread they were not even
+ * reading. Same rule as `reminderCore::alertKey` / `calendarCore`'s `cal:<id>@<startAt>`
+ * (REQ-A1400 ∕ F-SH-658).
+ *
+ * Being derived rather than minted (`localId`) is what makes it usable as the row's
+ * *reconciliation* key too: re-running the effect must land on the same row. A conversation
+ * whose two unread messages share one millisecond would collapse into a single row here —
+ * `normalizeNotifs` drops repeated ids — which is why the stamp, not the text, is the
+ * discriminator (two identical texts at different times stay two rows).
+ */
+export function messageNotifKey(conversationId: string, ts: number): string {
+  return `msg:${conversationId}:${ts}`;
+}
+
+/**
  * Corruption / back-compat guard for the stored conversation list.
  *
  * REQ-A402: this used to hand out `c:${name}` to every row without an id **and never

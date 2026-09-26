@@ -31,18 +31,63 @@ export interface NativeApp {
   entryPath: string;
 }
 
-/** What the host can actually offer on this machine. */
-export interface NativeAvailability {
-  /** `wine` is on `PATH`. */
-  wine: boolean;
-  /** The host itself is Linux (Linux apps only exist there). */
-  linux: boolean;
-}
+/**
+ * What the host can actually offer on this machine — **per kind**, so a probe the host
+ * did not answer stays `null` instead of becoming a claim about the machine.
+ *
+ * The whole-read `null` (no bridge at all) is not enough: `wine_is_available` and
+ * `linux_is_available` are two commands, and one can be refused while the other answers.
+ * A folded `false` there is not neutral — the screen renders it as 「本机没有安装 Wine」 ∕
+ * 「当前宿主不是 Linux」, a positive statement about the host's PATH and OS (REQ-A1363 /
+ * F-SH-627). Same rule the sibling listing read carries (`NativeAppsRead`), for the same
+ * reason.
+ */
+export type NativeAvailability = Record<NativeAppKind, boolean | null>;
 
 const asRecord = (v: unknown): Record<string, unknown> | null =>
   typeof v === "object" && v !== null ? (v as Record<string, unknown>) : null;
 
 const asString = (v: unknown): string => (typeof v === "string" ? v : "");
+
+/**
+ * One row of the `wine_apps` reply **as it comes off the wire** (`wine::WineApp`).
+ *
+ * Declared for the wire audit rather than for this module's runtime (REQ-A555): the
+ * normalizer below is deliberately `unknown`-in, because a malformed row must degrade to
+ * "no app", but the *reply type* is a fact about the host and `scripts/tauri-reply-scan.mjs`
+ * can only compare it when the `invoke<T>` generic names it. The spellings are the host's:
+ * that struct sets `rename_all = "camelCase"`, so `exe_path`/`desktop_path` arrive as
+ * `exePath`/`desktopPath` — and those two are exactly what the normalizer reads, which is
+ * why a Rust-side rename would now fail a gate instead of silently emptying the list.
+ *
+ * Not exported: nothing outside this module needs it, and an unused export is what
+ * `frontend-ts/scripts/unwired-scan.mjs` reports.
+ */
+interface WineAppWire {
+  id: string;
+  name: string;
+  /** Windows-style `C:\…\app.exe`, or Wine's own `/unix` path, verbatim. */
+  exePath: string;
+  /** The `.desktop` entry it came from; `null` when it came from an exe's parent. */
+  desktopPath: string | null;
+  /** The `WINEPREFIX` it belongs to, when the entry or the scan named one. */
+  prefix: string | null;
+}
+
+/** One row of the `linux_apps` reply as it comes off the wire (`linux_apps::LinuxApp`). */
+interface LinuxAppWire {
+  id: string;
+  name: string;
+  /** `Icon=` — a name or a path, as written; `null` when absent. */
+  icon: string | null;
+  desktopPath: string;
+  /** The program the host would run (`argv[0]` of `Exec=`). */
+  exec: string;
+  /** `Exec=`'s arguments, with `%` field codes removed. */
+  args: string[];
+  /** First `Categories=` token, when the entry has one. */
+  category: string | null;
+}
 
 /** Normalize the `wine_apps` reply. Unknown rows are dropped **and reported**. */
 export function normalizeWineApps(raw: unknown): NativeApp[] {
@@ -103,28 +148,53 @@ export function normalizeLinuxApps(raw: unknown): NativeApp[] {
 }
 
 /**
- * What this host can offer. `null` when the bridge did not answer at all (not
+ * What this host can offer. `null` when the bridge did not answer **either** probe (not
  * running inside AmOS) — the screen then says so instead of claiming "no apps".
+ *
+ * Per kind, a refused probe is `null`, not `false` (REQ-A1363 / F-SH-627): the body used
+ * to fold it with `wine === true`, so an unanswered probe reached the screen as the
+ * sentence 「本机没有安装 Wine」. `false` now means only what it says — the host answered
+ * *no*. A malformed non-boolean answer is still `false`, not `null`: junk is an answer,
+ * and "no answer" is a different thing.
  */
 export async function nativeAvailability(): Promise<NativeAvailability | null> {
-  const wine = await invoke<boolean>("wine_is_available");
-  const linux = await invoke<boolean>("linux_is_available");
+  const [wine, linux] = await Promise.all([
+    invoke<boolean>("wine_is_available"),
+    invoke<boolean>("linux_is_available"),
+  ]);
   if (wine === null && linux === null) return null;
-  return { wine: wine === true, linux: linux === true };
+  return {
+    wine: wine === null ? null : wine === true,
+    linux: linux === null ? null : linux === true,
+  };
 }
 
 /**
- * The host's own listings, merged. `null` when neither command answered (no bridge);
- * `[]` means the host answered and found nothing — two different states the screen
- * must not conflate.
+ * The host's own listings, **per kind** (REQ-A836 / F-SH-266).
+ *
+ * `[]` for a kind means the host answered and found nothing there; `null` means the
+ * host did not answer *that* enumeration. Those are different claims and the screen
+ * words them differently. The merged form this used to return could not carry the
+ * difference — `[...normalizeWineApps(wine), ...normalizeLinuxApps(linux)]` turned a
+ * refused half into an empty half inside the same array, so a partial refusal reached
+ * the screen as 「Wine 已安装，但它的前缀里没有可启动的 Windows 应用」. The doc
+ * directly above already stated the rule that the body broke.
+ *
+ * `null` for the whole read only when **neither** command answered (no bridge at all),
+ * which is what lets the screen keep its separate "not running inside AmOS" state.
  */
-export async function nativeApps(): Promise<NativeApp[] | null> {
+export type NativeAppsRead = Record<NativeAppKind, NativeApp[] | null>;
+
+export async function nativeApps(): Promise<NativeAppsRead | null> {
   const [wine, linux] = await Promise.all([
-    invoke<unknown>("wine_apps"),
-    invoke<unknown>("linux_apps"),
+    invoke<WineAppWire[]>("wine_apps"),
+    invoke<LinuxAppWire[]>("linux_apps"),
   ]);
   if (wine === null && linux === null) return null;
-  return [...normalizeWineApps(wine), ...normalizeLinuxApps(linux)];
+  return {
+    wine: wine === null ? null : normalizeWineApps(wine),
+    linux: linux === null ? null : normalizeLinuxApps(linux),
+  };
 }
 
 /**

@@ -11,6 +11,7 @@
  */
 
 import { describe, it, expect } from "vitest";
+import { fastest, PERF_ATTEMPTS } from "./perfBudget";
 import {
   MEASURE_SETTINGS_KEY,
   MEASURE_HISTORY_KEY,
@@ -574,8 +575,6 @@ describe("MeasureApp - 边界情况", () => {
 
   describe("性能测试", () => {
     it("应该快速处理大量测量", () => {
-      const start = Date.now();
-
       const measurements: Measurement[] = Array.from({ length: 1000 }, (_, i) => ({
         id: `m-${i}`,
         start: { x: 0, y: 0 },
@@ -586,7 +585,10 @@ describe("MeasureApp - 边界情况", () => {
 
       const normalized = normalizeMeasureHistory(measurements);
 
-      const duration = Date.now() - start;
+      // REQ-A850 / F-DEV-106：取 K 次最小值。`normalizeMeasureHistory` 是纯函数，重复安全。
+      const duration = fastest(PERF_ATTEMPTS, () => {
+        normalizeMeasureHistory(measurements);
+      });
 
       expect(normalized.length).toBe(50); // 限制为 50
       expect(duration).toBeLessThan(100); // 应该很快

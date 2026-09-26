@@ -109,8 +109,20 @@ impl Worker {
                 return;
             }
         };
-        r.refresh();
+        // Snapshot every layer **before** `refresh()` overwrites the non-Remote
+        // slots. The file/env diff below compares each layer to its *previous*
+        // tick; capturing after the reload would compare every layer to its own
+        // just-read value, so a change on disk would produce no audit event at
+        // all. The Remote slot is preserved by `refresh`, so this is also the
+        // previous remote the diff above composes against.
+        // Snapshot every layer **before** `refresh()` overwrites the non-Remote
+        // slots. The file/env diff below compares each layer to its *previous*
+        // tick; capturing after the reload would compare every layer to its own
+        // just-read value, so a change on disk would produce no audit event at
+        // all. The Remote slot is preserved by `refresh`, so this is also the
+        // previous remote the diff above composes against.
         let prev_snapshots = r.snapshots().to_vec();
+        r.refresh();
         let mut changes: Vec<(String, serde_json::Value, serde_json::Value, &'static str)> =
             Vec::new();
         if let Some(fetcher) = &self.remote {
@@ -358,6 +370,35 @@ mod tests {
     /// → `from=null, to=null, source=tick`". This test pins that the new
     /// tick produces **no** audit lines when the snapshots haven't actually
     /// changed (i.e. idling the worker does not flood the audit log).
+    /// A change to a file layer **between ticks** must be audited. The
+    /// snapshots used for the diff are captured before `refresh()` re-reads
+    /// disk; captured after, the diff would compare each layer to its own new
+    /// value and every file edit would go unrecorded.
+    #[test]
+    fn a_file_layer_change_between_ticks_is_audited() {
+        let dir = tmpdir("file-change");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config.json");
+        std::fs::write(&cfg, r#"{"amos.ai.port": 9100}"#).unwrap();
+
+        let resolver = ResolverBuilder::new()
+            .layer(crate::layer::Layer::UserFile { path: cfg.clone() })
+            .build();
+        let w = Worker::new(resolver)
+            .with_audit(crate::audit::AuditLogger::open(dir.join("audit.jsonl")));
+        w.tick(); // baseline tick: value on disk is 9100
+
+        std::fs::write(&cfg, r#"{"amos.ai.port": 9200}"#).unwrap();
+        w.tick(); // the change lands
+
+        let text = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap_or_default();
+        assert!(
+            text.contains("amos.ai.port"),
+            "a user-file edit between ticks must produce an audit event; got {text:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn tick_with_no_changes_writes_zero_audit_lines() {
         let dir = tmpdir("idle");

@@ -32,10 +32,10 @@
  */
 import { invoke } from "./backend";
 
-export type DesktopFeature = "shortcuts" | "dock-context-menu";
-
-/** Every capability the host can switch off (keys are pinned on both sides). */
-export const DESKTOP_FEATURES: readonly DesktopFeature[] = ["shortcuts", "dock-context-menu"];
+/** Every capability the host can switch off (keys are pinned on both sides). The array is
+ * the one declaration; {@link DesktopFeature} derives from it. */
+export const DESKTOP_FEATURES = ["shortcuts", "dock-context-menu"] as const;
+export type DesktopFeature = (typeof DESKTOP_FEATURES)[number];
 
 function parseList(raw: string | undefined): Set<string> {
   if (!raw) return new Set();
@@ -72,7 +72,9 @@ let loadInFlight: Promise<void> | null = null;
  */
 export function loadDesktopFeatures(): Promise<void> {
   if (loadInFlight) return loadInFlight;
-  loadInFlight = invoke<unknown>("desktop_features_disabled")
+  // REQ-A555: the generic names the host's reply (`Vec<String>`); the `Array.isArray` guard below
+  // stays because a *declared* type is a claim, not a runtime check.
+  loadInFlight = invoke<string[]>("desktop_features_disabled")
     .then((answer) => {
       // Only an array is a host answer; anything else (including `null`) means "not
       // answered", and the default stands.

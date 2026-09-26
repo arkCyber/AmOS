@@ -11,6 +11,7 @@
  */
 
 import { describe, expect, test } from "vitest";
+import { fastest, PERF_ATTEMPTS } from "../../__tests__/perfBudget";
 import {
   sanitizeUrl,
   validateTitle,
@@ -295,24 +296,21 @@ describe("P2 parseInput 综合测试", () => {
 
 describe("P3 性能与限制", () => {
   test("URL 验证性能", () => {
-    const start = Date.now();
-    
-    for (let i = 0; i < 1000; i++) {
-      sanitizeUrl(`https://example${i}.com`);
-    }
-    
-    const duration = Date.now() - start;
+    // REQ-A850 / F-DEV-106：`Date.now()` 的差值 = 干活 + 被抢占的时间；取 K 次最小值。
+    const duration = fastest(PERF_ATTEMPTS, () => {
+      for (let i = 0; i < 1000; i++) {
+        sanitizeUrl(`https://example${i}.com`);
+      }
+    });
     expect(duration).toBeLessThan(1000); // 应该在 1 秒内完成
   });
 
   test("ID 生成性能", () => {
-    const start = Date.now();
-    
-    for (let i = 0; i < 10000; i++) {
-      generateId();
-    }
-    
-    const duration = Date.now() - start;
+    const duration = fastest(PERF_ATTEMPTS, () => {
+      for (let i = 0; i < 10000; i++) {
+        generateId();
+      }
+    });
     expect(duration).toBeLessThan(1000); // 应该在 1 秒内完成
   });
 });

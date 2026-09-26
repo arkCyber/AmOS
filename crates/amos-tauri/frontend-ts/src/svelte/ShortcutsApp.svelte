@@ -31,7 +31,7 @@
    */
   
   import { onMount, onDestroy } from "svelte";
-  import { t } from "./locale.svelte";
+  import { t, locale } from "./locale.svelte";
   import { attachFocusTrap } from "../lib/focusTrap";
   import { localId } from "../lib/localId";
   import {
@@ -49,7 +49,25 @@
     type ActionCategory,
     type ActionType,
     type ActionInstance,
+    type Trigger,
+    type TriggerType,
   } from "../lib/shortcuts";
+  import { APP_META } from "../lib/appMeta";
+  import { nameForId } from "../lib/appLookup";
+  import { getStoreTiles, subscribeStoreTiles, type StoreTile } from "../lib/storeApps";
+  import { TRIGGER_KINDS, kindOf } from "../lib/shortcutTriggerCatalog";
+  import { isShareTarget, withShareSheet } from "../lib/shareSheet";
+  // MDM 的评判必须由**面板之外**的这一层来问：`updateShortcut()` 被拦下时只返回 `false`，
+  // 理由留在它自己的日志里。要让用户看见"为什么"，就得问同一批判判（REQ-A837）。
+  import { mdmManager, emitWebhookEvent } from "../lib/enterprise";
+  import type { MessageKey } from "../i18n/locales/zh";
+  // 快捷指令库（REQ-A500）：预设模板是**数据**，安装走 `createShortcut`（唯一入口）。
+  import {
+    GALLERY_TEMPLATES,
+    isTemplateInstalled,
+    templateOptions,
+    type GalleryTemplate,
+  } from "../lib/shortcutGallery";
 
   // ============================================================================
   // 状态管理
@@ -61,8 +79,20 @@
   let view = $state<"list" | "editor" | "gallery">("list");
   let showNewModal = $state(false);
   let showActionPicker = $state(false);
+  /** 触发器类型选择面板是否展开（REQ-A702）。 */
+  let showTriggerPicker = $state(false);
   let selectedCategory = $state<ActionCategory | "all">("all");
-  
+
+  /**
+   * 已安装的商店应用（REQ-A1190）。本应用挂在 `AppPane` 里，既不在 `DesktopShell`
+   * 的 context 内、也拿不到壳推下来的 `ext`，所以它读的是 `lib/storeApps` 的模块缓存
+   * —— 那是 `loadStoreTiles()` 唯一的写点，`StoreApp` 在装/卸/升级后 `notifyStoreTilesChanged()`。
+   * 缓存本身**不会**通知响应式，因此这里订阅一份 `$state` 副本：否则编辑器在商店装完
+   * 应用后仍列不出它（`project_long_lived_component_snapshots_store_at_init` 的同一课）。
+   */
+  let ext = $state<StoreTile[]>(getStoreTiles());
+  $effect(() => subscribeStoreTiles(() => { ext = getStoreTiles(); }));
+
   // 新建快捷指令表单
   // 编辑器/新建模态里每一对「可见标签 ↔ 控件」的 id（一次挂载取一次）。
   const nameId = nextFieldId();
@@ -92,7 +122,53 @@
   // 执行状态
   let executing = $state(false);
   let executionResult = $state<string | null>(null);
-  
+
+  /**
+   * 快捷指令库的安装反馈（REQ-A500）。
+   *
+   * 只在**失败**时才有内容可读：成功之后卡片自己的按钮会变成「已添加」（那是从 `shortcuts`
+   * 现算出来的状态，不是第二条账）。失败必须说出来 —— 库里那句「添加失败」正是为了让
+   * 「点了没反应」不再出现（`createShortcut` 会因为名字被拒 / 上限而返回 `null`）。
+   */
+  let galleryNote = $state("");
+
+  /**
+   * 修改 / 删除被拒时的那一句话（REQ-A837）。
+   *
+   * 与 `galleryNote` 同族、同一个判据：**失败了必须说出来**。差别在于这条覆盖的是编辑器里的
+   * 每一处写操作 —— 原先它们全是 `if (updateShortcut(...)) { … }`，**没有 else**：
+   * 管理员勾上「禁止修改」之后，用户改名字、换图标、加触发器、切分享开关，点下去屏幕
+   * 毫无反应，连一句"为什么"都没有。同一个限制面里只有**创建**那条路说了话
+   * （`alert(t("shortcuts.createFailed"))`）—— 三条同类路径，两条不说。
+   */
+  let mutationNote = $state("");
+
+  /**
+   * 失败时的那句话：优先用 `mdmManager` 的**同一批判判**给出的理由
+   * （管理员看到的句子必须与真正拦下它的那句一致），否则退回到一句通用文案
+   * （写盘失败 / 指令已不存在这类非 MDM 的失败）。
+   */
+  function mutationRefusal(id: string, action: "modify" | "delete"): string {
+    const verdict =
+      action === "modify" ? mdmManager.checkCanModify(id) : mdmManager.checkCanDelete(id);
+    if (!verdict.allowed) return verdict.reason ?? t("shortcuts.mutationBlocked");
+    return action === "modify" ? t("shortcuts.updateFailed") : t("shortcuts.deleteFailed");
+  }
+
+  /**
+   * 写快捷指令的唯一 UI 入口：成功就清掉上一次的拒绝，失败就把理由挂上去。
+   *
+   * 返回值与 `updateShortcut` 一致，所以 `if (…) { … }` 的调用点可以原样换过来。
+   */
+  function applyUpdate(id: string, updates: Partial<Shortcut>): boolean {
+    if (updateShortcut(id, updates)) {
+      mutationNote = "";
+      return true;
+    }
+    mutationNote = mutationRefusal(id, "modify");
+    return false;
+  }
+
   // Phase 2: 拖拽状态
   let draggedActionId = $state<string | null>(null);
   let dragOverActionId = $state<string | null>(null);
@@ -149,6 +225,22 @@
   // ============================================================================
   
   onMount(() => {
+    /**
+     * 先把**存下来的 MDM 配置**读回来（REQ-A945）。
+     *
+     * 本应用里每一道 MDM 判据（`checkCanCreate` / `checkCanModify` /
+     * `checkCanDelete` / `checkPermission`）都是**同步**的，它们读的是
+     * `mdmManager` 内存里那份配置；而把那份配置从存储里读回来的
+     * `initialize()` 在生产里**零调用者**（唯一调用点在一个同样零调用者的
+     * `initializeEnterprise()` 里）。于是重启之后：管理员设的限制还在盘上，
+     * 而这台设备**按"完全没有策略"运行** —— 改名字、换图标、加触发器、开分享
+     * 全都放行，且屏幕上一句话都没有。
+     *
+     * 挂在这里而不是每个判据里：这一处是**所有**编辑动作之前的那一次
+     * （`onMount` 在用户能点到任何按钮之前跑完）。加载是幂等的，重复调用无代价。
+     */
+    void mdmManager.ensureInitialized();
+
     // 注册全局快捷键
     window.addEventListener("keydown", handleGlobalKeydown);
     
@@ -201,6 +293,8 @@
         showNewModal = false;
       } else if (showActionPicker) {
         showActionPicker = false;
+      } else if (showTriggerPicker) {
+        showTriggerPicker = false;
       } else if (showPreview) {
         showPreview = false;
       } else if (view === "editor") {
@@ -315,7 +409,7 @@
       actions,
     };
     
-    if (updateShortcut(selectedShortcut.id, updated)) {
+    if (applyUpdate(selectedShortcut.id, updated)) {
       selectedShortcut = updated;
       refreshShortcuts();
     }
@@ -381,17 +475,36 @@
     shortcuts = loadShortcuts();
   }
   
+  /**
+   * 创建被拒时的那个理由（REQ-A842）。
+   *
+   * `createShortcut()` 失败时只返回 `null`，理由留在它自己的日志里 —— 于是三种不同的失败
+   * （管理员禁止创建 / 每用户上限已满 / 名字不合法）在屏幕上是**同一句话**。这里向
+   * **同一批判判**要理由：MDM 说不行就用它的句子（管理员看到的必须与真正拦下它的那句一致），
+   * 否则退回这条路径自己的通用文案。
+   *
+   * 数的是 `shortcuts.length`：`createShortcut()` 判的就是这个数，两边读同一个列表，
+   * 所以不存在"屏幕说没超、引擎说超了"的第三种状态。
+   *
+   * 为什么这里用 `alert` 而不是 `mutationNote`：新建走的是**模态**，它盖住内容区，
+   * 那条读数横幅在模态后面 —— 渲染点必须在用户看得见的那一层（这是上一轮踩过的坑）。
+   */
+  function createRefusal(fallback: string): string {
+    const verdict = mdmManager.checkCanCreate(shortcuts.length);
+    return verdict.allowed ? fallback : (verdict.reason ?? fallback);
+  }
+
   function handleCreate() {
     if (!newName.trim()) {
       alert(t("shortcuts.alerts.enterName"));
       return;
     }
-    
+
     const shortcut = createShortcut(newName.trim(), {
       icon: newIcon,
       color: newColor,
     });
-    
+
     if (shortcut) {
       refreshShortcuts();
       selectedShortcut = shortcut;
@@ -399,26 +512,69 @@
       showNewModal = false;
       newName = "";
     } else {
-      alert(t("shortcuts.createFailed"));
+      alert(createRefusal(t("shortcuts.createFailed")));
     }
   }
   
+  /**
+   * 从预设模板安装一条快捷指令（REQ-A500）。
+   *
+   * 走 `createShortcut` —— 它带着 MDM 权限检查、名字校验与上限，是创建这条路上唯一的入口；
+   * 失败必须**说出来**（`galleryNote`），因为"点了没反应"正是这类界面最容易犯的错。
+   * 装完之后不跳编辑器：用户是来"逛库"的，卡片自己的按钮会变成「已添加」。
+   */
+  function installTemplate(tpl: GalleryTemplate) {
+    const made = createShortcut(
+      t(tpl.nameKey),
+      templateOptions(tpl, t(tpl.descKey), t, () => localId("sa")),
+    );
+    if (!made) {
+      galleryNote = createRefusal(t("shortcuts.galleryAddFailed"));
+      return;
+    }
+    galleryNote = "";
+    refreshShortcuts();
+  }
+
   function handleDelete(id: string) {
     if (!confirm(t("shortcuts.deleteConfirm"))) return;
     
     if (deleteShortcut(id)) {
       refreshShortcuts();
+      mutationNote = "";
       if (selectedShortcut?.id === id) {
         selectedShortcut = null;
         view = "list";
       }
+    } else {
+      // 删除同样会被 MDM 拦下（强制指令不可删 / 管理员禁止删除）。原先这里没有 else：
+      // 用户确认删除之后什么都不发生，指令还在，没有任何解释（REQ-A837）。
+      mutationNote = mutationRefusal(id, "delete");
+      refreshShortcuts();
     }
   }
   
+  /**
+   * 复制一条快捷指令（REQ-A1442）。
+   *
+   * 复制内层走的就是 `createShortcut()`，所以 MDM 的**创建**限制（禁止创建 / 需审批 /
+   * 每用户上限）与应用硬上限都会在那里拦下，`duplicateShortcut()` 只把结果折成 `null`
+   * —— 理由留在日志里。原先这里没有 else：管理员禁止创建、或到达上限之后，用户按列表里的
+   * 📋（或编辑器里按 ⌘D）屏幕毫无反应，列表里也没多出副本，分不清是「没点上」还是
+   * 「不让复制」。同一份列表里的创建（REQ-A842）与修改／删除／分享（REQ-A837）都早已
+   * 说话，复制是唯一读了裁决又把拒绝丢掉的那条。
+   *
+   * 理由向**同一批判判**要（`createRefusal` → `checkCanCreate`），不另写一句；它读的
+   * `shortcuts.length` 正是 `createShortcut()` 判的那个数。`mutationNote` 的渲染点在两个
+   * 视图之外（`role="status"` 的 live region），复制按钮所在的那一层看得见。
+   */
   function handleDuplicate(id: string) {
     const duplicate = duplicateShortcut(id);
     if (duplicate) {
+      mutationNote = "";
       refreshShortcuts();
+    } else {
+      mutationNote = createRefusal(t("shortcuts.duplicateFailed"));
     }
   }
   
@@ -486,7 +642,7 @@
       actions: [...selectedShortcut.actions, action],
     };
     
-    if (updateShortcut(selectedShortcut.id, updated)) {
+    if (applyUpdate(selectedShortcut.id, updated)) {
       selectedShortcut = updated;
       refreshShortcuts();
       showActionPicker = false;
@@ -501,7 +657,7 @@
       actions: selectedShortcut.actions.filter((a) => a.id !== actionId),
     };
     
-    if (updateShortcut(selectedShortcut.id, updated)) {
+    if (applyUpdate(selectedShortcut.id, updated)) {
       selectedShortcut = updated;
       refreshShortcuts();
     }
@@ -533,7 +689,7 @@
       actions,
     };
     
-    if (updateShortcut(selectedShortcut.id, updated)) {
+    if (applyUpdate(selectedShortcut.id, updated)) {
       selectedShortcut = updated;
       refreshShortcuts();
     }
@@ -560,10 +716,192 @@
       actions,
     };
     
-    if (updateShortcut(selectedShortcut.id, updated)) {
+    if (applyUpdate(selectedShortcut.id, updated)) {
       selectedShortcut = updated;
       refreshShortcuts();
     }
+  }
+
+  // ==========================================================================
+  // 自动化触发器 (REQ-A702)
+  //
+  // 运行时两端**早已建成**（Rust 的 `shortcuts_trigger_*` 墙钟账本 + WebView
+  // 心跳，信号源 time/wifi/app/battery），但此前**没有任何 UI 能创建触发器** ——
+  // 用户编不出、自然也就跑不了。本段把那半截界面补上。
+  //
+  // 哪些类型有信号源由目录（`TRIGGER_KINDS`）回答；没有信号源的类型在面板里
+  // **显式禁用**并给出原因，而不是画一个永远不响的开关。
+  // ==========================================================================
+
+  /** 编辑器里的触发器列表（旧数据可能没有 `triggers` 字段）。 */
+  const editorTriggers = $derived(selectedShortcut?.triggers ?? []);
+
+  /** ISO 星期 1..7 的单字标签（周一…周日）。与 ClockApp 的 `DOW` 同一约定。 */
+  const weekdayLabels = $derived(
+    locale() === "zh"
+      ? ["一", "二", "三", "四", "五", "六", "日"]
+      : ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"],
+  );
+
+  /** 落盘一份新的触发器数组；失败不动本地状态（`updateShortcut` 会因 MDM/校验拒）。 */
+  function saveTriggers(triggers: Trigger[]): void {
+    if (!selectedShortcut) return;
+    if (applyUpdate(selectedShortcut.id, { triggers })) {
+      selectedShortcut = { ...selectedShortcut, triggers };
+      refreshShortcuts();
+    }
+  }
+
+  /**
+   * 这条指令是否出现在系统分享面板（REQ-A703）。`quickActions` 曾经是个**只有声明、
+   * 没有兑现**的字段（`shareSheet` 全仓无人读），这里是它唯一的**生产者**，而
+   * `ShareSheet.svelte` 是唯一的**消费者**。
+   */
+  function handleToggleShareSheet(): void {
+    if (!selectedShortcut) return;
+    const on = !isShareTarget(selectedShortcut);
+
+    /**
+     * 「分享」这一层的限制（REQ-A837）。`allowSharing` / `requireApprovalForSharing`
+     * 此前**只**被 `mdmManager.checkPermission("share")` 读，而那个分支**没有任何调用者**
+     * —— 面板上的这两个开关因此是装饰。这里就是它们的生产调用点。
+     *
+     * **只在开启分享时问**：禁止分享之后还拦着"取消分享"，等于把已经分享出去的指令
+     * 永久钉在那里。限制的方向是收紧可见性，而**撤回分享本身就是收紧** —— 拦它是在
+     * 朝危险的一侧失败（同一个开关的两个方向不由它自己决定，由消费者决定）。
+     */
+    if (on) {
+      const share = mdmManager.checkPermission("share");
+      if (!share.allowed) {
+        mutationNote = share.reason ?? t("shortcuts.mutationBlocked");
+        return;
+      }
+    }
+
+    const quickActions = withShareSheet(selectedShortcut.quickActions, on);
+    if (applyUpdate(selectedShortcut.id, { quickActions })) {
+      selectedShortcut = { ...selectedShortcut, quickActions };
+      refreshShortcuts();
+
+      // 企业 webhook（REQ-A980）：**只在开启分享时发**，与上面那道 MDM 判据同一个方向 ——
+      // 面板上的 `shortcut_share` 说的是"这条指令被分享出去了"；撤回分享是收紧可见性，
+      // 把它也发成一次"share"会让订阅者收到一条与事实相反的通知。
+      if (on) {
+        emitWebhookEvent("shortcut_share", {
+          shortcutId: selectedShortcut.id,
+          name: selectedShortcut.name,
+        });
+      }
+    }
+  }
+
+  function handleAddTrigger(type: TriggerType): void {
+    const kind = kindOf(type);
+    if (!kind || kind.unavailableReasonKey !== null) return;
+    const trigger: Trigger = {
+      id: localId("trg"),
+      type,
+      enabled: true,
+      config: { ...kind.defaultConfig },
+    };
+    saveTriggers([...editorTriggers, trigger]);
+    showTriggerPicker = false;
+  }
+
+  function handleRemoveTrigger(triggerId: string): void {
+    saveTriggers(editorTriggers.filter((tr) => tr.id !== triggerId));
+  }
+
+  function handleToggleTrigger(triggerId: string): void {
+    saveTriggers(
+      editorTriggers.map((tr) => (tr.id === triggerId ? { ...tr, enabled: !tr.enabled } : tr)),
+    );
+  }
+
+  function handleUpdateTriggerConfig(triggerId: string, key: string, value: unknown): void {
+    saveTriggers(
+      editorTriggers.map((tr) =>
+        tr.id === triggerId ? { ...tr, config: { ...tr.config, [key]: value } } : tr,
+      ),
+    );
+  }
+
+  /** 切换某个 ISO 星期；空数组 = 每天。 */
+  function handleToggleDay(triggerId: string, day: number): void {
+    const trigger = editorTriggers.find((tr) => tr.id === triggerId);
+    if (!trigger) return;
+    const current = Array.isArray(trigger.config.days) ? trigger.config.days.map(Number) : [];
+    const next = current.includes(day)
+      ? current.filter((d) => d !== day)
+      : [...current, day].sort((a, b) => a - b);
+    handleUpdateTriggerConfig(triggerId, "days", next);
+  }
+
+  /** 一个触发器行的一句话细节（类型名之外的摘要）。 */
+  function triggerDetail(trigger: Trigger): string {
+    const cfg = trigger.config ?? {};
+    switch (trigger.type) {
+      case "time": {
+        const days = Array.isArray(cfg.days) ? cfg.days.map(Number) : [];
+        const time = String(cfg.time ?? "");
+        const text =
+          days.length === 0 || days.length === 7
+            ? t("shortcuts.trigger.everyday")
+            : days.map((d) => weekdayLabels[d - 1] ?? "").join(" ");
+        return `${text} ${time}`.trim();
+      }
+      case "app":
+        return appDisplayName(String(cfg.appId ?? ""));
+      case "wifi": {
+        const phase = wifiEventKey(String(cfg.event ?? "connect"));
+        const ssid = String(cfg.ssid ?? "");
+        return ssid ? `${t(phase)} · ${ssid}` : t(phase);
+      }
+      case "battery": {
+        const parts: string[] = [];
+        if (cfg.levelBelow !== undefined && cfg.levelBelow !== "") {
+          parts.push(`<${Number(cfg.levelBelow)}%`);
+        }
+        if (cfg.levelAbove !== undefined && cfg.levelAbove !== "") {
+          parts.push(`>${Number(cfg.levelAbove)}%`);
+        }
+        if (cfg.charging === true) parts.push(t("shortcuts.trigger.charging.yes"));
+        if (cfg.charging === false) parts.push(t("shortcuts.trigger.charging.no"));
+        return parts.join(" · ");
+      }
+      default: {
+        // 尚无信号源的类型：把原因说出来，而不是给一句空摘要。
+        const kind = kindOf(trigger.type);
+        return kind?.unavailableReasonKey ? t(kind.unavailableReasonKey) : "";
+      }
+    }
+  }
+
+  /** Wi-Fi 时机 → 字典键（字面量映射，不给 i18n 扫描留动态拼接）。 */
+  function wifiEventKey(event: string): MessageKey {
+    if (event === "disconnect") return "shortcuts.trigger.event.disconnect";
+    if (event === "any") return "shortcuts.trigger.event.any";
+    return "shortcuts.trigger.event.connect";
+  }
+
+  /** 应用触发器的显示名：内置注册表或商店瓷砖里认识的用它的名字，否则退回原始 id。
+   * REQ-A1190：此前只查 `APP_META`，一个已安装的商店应用（`store:<manifest.id>`）在
+   * 这里会以 raw wire id 显示 —— 与 REQ-A1185 修掉的同一类「把裸 id 给用户看」。 */
+  function appDisplayName(appId: string): string {
+    if (!appId) return t("shortcuts.trigger.anyApp");
+    return nameForId(appId, ext, t);
+  }
+
+  /** 电池"充电状态"下拉的取值 ↔ 配置值（"any"/"yes"/"no" ↔ undefined/true/false）。 */
+  function chargingToSelect(value: unknown): string {
+    if (value === true) return "yes";
+    if (value === false) return "no";
+    return "any";
+  }
+  function selectToCharging(value: string): boolean | undefined {
+    if (value === "yes") return true;
+    if (value === "no") return false;
+    return undefined;
   }
 </script>
 
@@ -646,6 +984,26 @@
 
   <!-- 内容区域 -->
   <div class="flex-1 overflow-y-auto" bind:this={scrollContainer}>
+    <!-- 写操作被拒时的读数（REQ-A837）。与库视图的 `gallery-note` 同一判据：原先这里
+         有 9 处 `if (updateShortcut(…)) { … }`、**没有一处带 else** —— 管理员禁止修改后，
+         改名字 / 换图标 / 加触发器点下去毫无反应，用户不知道是"没保存上"还是"不让改"。
+
+         **必须渲染在三个视图之外**：删除的按钮在**列表视图**的卡片上（`handleDelete`
+         的唯一调用点就在那里），而改名字那一类写操作在编辑器里。先前它只渲染在编辑器
+         内部，于是"删除被拒"这句理由根本没有渲染点 —— 用户确认删除之后指令还在，
+         屏幕沉默，正是这条要修的那个形状本身。
+
+         必须是 live region：按完按钮焦点还在原处，否则屏幕阅读器不知道那一下成没成。 -->
+    {#if mutationNote}
+      <p
+        class="mx-4 mt-3 rounded-lg border border-danger/40 bg-danger/10 px-3 py-2 text-xs text-danger"
+        role="status"
+        data-testid="shortcut-mutation-note"
+      >
+        {mutationNote}
+      </p>
+    {/if}
+
     {#if view === "list"}
       <!-- 搜索栏 -->
       <div class="sticky top-0 z-10 bg-neutral-50 px-4 py-3 dark:bg-neutral-900">
@@ -770,7 +1128,7 @@
                   id={nameId}
                   type="text"
                   value={selectedShortcut.name}
-                  oninput={(e) => updateShortcut(selectedShortcut!.id, { name: e.currentTarget.value })}
+                  oninput={(e) => applyUpdate(selectedShortcut!.id, { name: e.currentTarget.value })}
                   class="w-full rounded-lg border border-neutral-300 bg-white px-3 py-2 text-sm focus:border-blue-500 focus:outline-none dark:border-neutral-700 dark:bg-neutral-800 dark:text-white"
                 />
               </div>
@@ -779,7 +1137,7 @@
                 <textarea
                   id={descriptionId}
                   value={selectedShortcut.description}
-                  oninput={(e) => updateShortcut(selectedShortcut!.id, { description: e.currentTarget.value })}
+                  oninput={(e) => applyUpdate(selectedShortcut!.id, { description: e.currentTarget.value })}
                   rows="2"
                   class="w-full rounded-lg border border-neutral-300 bg-white px-3 py-2 text-sm focus:border-blue-500 focus:outline-none dark:border-neutral-700 dark:bg-neutral-800 dark:text-white"
                 ></textarea>
@@ -790,7 +1148,7 @@
                   <select
                     id={iconId}
                     value={selectedShortcut.icon}
-                    onchange={(e) => updateShortcut(selectedShortcut!.id, { icon: e.currentTarget.value })}
+                    onchange={(e) => applyUpdate(selectedShortcut!.id, { icon: e.currentTarget.value })}
                     class="w-full rounded-lg border border-neutral-300 bg-white px-3 py-2 text-sm focus:border-blue-500 focus:outline-none dark:border-neutral-700 dark:bg-neutral-800 dark:text-white"
                   >
                     {#each SHORTCUT_ICONS as icon}
@@ -803,7 +1161,7 @@
                   <select
                     id={colorId}
                     value={selectedShortcut.color}
-                    onchange={(e) => updateShortcut(selectedShortcut!.id, { color: e.currentTarget.value })}
+                    onchange={(e) => applyUpdate(selectedShortcut!.id, { color: e.currentTarget.value })}
                     class="w-full rounded-lg border border-neutral-300 bg-white px-3 py-2 text-sm focus:border-blue-500 focus:outline-none dark:border-neutral-700 dark:bg-neutral-800 dark:text-white"
                   >
                     {#each SHORTCUT_COLORS as color}
@@ -936,6 +1294,26 @@
                                         <option value={option.value}>{option.label}</option>
                                       {/each}
                                     </select>
+                                  {:else if param.type === "app"}
+                                    <!-- REQ-A1190：`open_app` 的 `app` 参数是 **required**、类型 `app`，
+                                         而本分支此前不存在 —— 选中「打开 App」后界面上**一个控件都没有**
+                                         （`parameters` 永远是 `{}`），于是该步骤执行时必然抛
+                                         「打开 App 需要应用标识」。缺的不是一个控件，是整条操作的一半。 -->
+                                    <select
+                                      value={String(action.parameters[param.id] ?? "")}
+                                      onchange={(e) => handleUpdateActionParam(action.id, param.id, e.currentTarget.value)}
+                                      id={`shortcut-param-${action.id}-${param.id}`}
+                                      data-testid={`action-param-app-${action.id}`}
+                                      class="w-full rounded border border-neutral-300 bg-white px-2 py-1 text-xs focus:border-blue-500 focus:outline-none dark:border-neutral-600 dark:bg-neutral-800 dark:text-white"
+                                    >
+                                      <option value="">{t("shortcuts.actionAppPlaceholder")}</option>
+                                      {#each APP_META as app (app.id)}
+                                        <option value={app.id}>{app.icon} {t(app.titleKey)}</option>
+                                      {/each}
+                                      {#each ext as tile (tile.id)}
+                                        <option value={tile.id}>{tile.icon} {tile.name}</option>
+                                      {/each}
+                                    </select>
                                   {/if}
                                 </div>
                               {/each}
@@ -948,6 +1326,247 @@
                 {/each}
               </div>
             {/if}
+          </div>
+
+          <!-- 自动化触发器 (REQ-A702)。运行时两端（Rust 墙钟账本 + WebView 心跳）
+               早已建成，此前却没有任何 UI 能创建触发器 —— 用户编不出、自然跑不了。
+               这里把「哪些类型有信号源」交给目录 `TRIGGER_KINDS`：没有信号源的
+               类型**显式禁用**并给出原因，而不是画一个永远不响的开关。 -->
+          <div class="rounded-xl border border-neutral-200 bg-white p-4 dark:border-neutral-800 dark:bg-neutral-950">
+            <div class="mb-1 flex items-center justify-between">
+              <h3 class="text-sm font-semibold text-neutral-700 dark:text-neutral-300">{t("shortcuts.triggersTitle")}</h3>
+              <button
+                type="button"
+                onclick={() => { showTriggerPicker = !showTriggerPicker; }}
+                aria-expanded={showTriggerPicker}
+                data-testid="trigger-add"
+                class="rounded-lg px-3 py-1.5 text-sm font-medium text-blue-600 hover:bg-blue-50 dark:text-blue-400 dark:hover:bg-blue-950"
+              >
+                {t("shortcuts.triggerAdd")}
+              </button>
+            </div>
+            <p class="mb-3 text-xs text-neutral-500 dark:text-neutral-400">{t("shortcuts.triggersHint")}</p>
+
+            {#if showTriggerPicker}
+              <div class="mb-3 rounded-lg border border-neutral-200 p-2 dark:border-neutral-700" data-testid="trigger-picker">
+                <p class="mb-2 text-xs font-medium text-neutral-600 dark:text-neutral-400">{t("shortcuts.triggerPickTitle")}</p>
+                <div class="grid grid-cols-2 gap-2">
+                  {#each TRIGGER_KINDS as kind (kind.type)}
+                    <button
+                      type="button"
+                      onclick={() => handleAddTrigger(kind.type)}
+                      disabled={kind.unavailableReasonKey !== null}
+                      data-testid="trigger-option-{kind.type}"
+                      class="flex items-start gap-2 rounded-lg border border-neutral-200 p-2 text-left transition hover:border-blue-500 disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:border-neutral-200 dark:border-neutral-700 dark:hover:border-blue-500"
+                    >
+                      <span class="text-lg" aria-hidden="true">{kind.icon}</span>
+                      <span class="min-w-0 flex-1">
+                        <span class="block text-sm font-medium text-neutral-900 dark:text-neutral-100">{t(kind.labelKey)}</span>
+                        {#if kind.unavailableReasonKey}
+                          <span class="mt-0.5 block text-xs text-neutral-500 dark:text-neutral-400">{t(kind.unavailableReasonKey)}</span>
+                        {/if}
+                      </span>
+                    </button>
+                  {/each}
+                </div>
+              </div>
+            {/if}
+
+            {#if editorTriggers.length === 0}
+              <p class="py-4 text-center text-xs text-neutral-500 dark:text-neutral-400">{t("shortcuts.triggerEmpty")}</p>
+            {:else}
+              <div class="space-y-2">
+                {#each editorTriggers as trigger (trigger.id)}
+                  {@const kind = kindOf(trigger.type)}
+                  <div
+                    class="rounded-lg border border-neutral-200 bg-neutral-50 p-3 dark:border-neutral-700 dark:bg-neutral-900"
+                    data-testid="trigger-row-{trigger.id}"
+                  >
+                    <div class="flex items-center gap-2">
+                      <span class="text-lg" aria-hidden="true">{kind?.icon ?? "⚡"}</span>
+                      <div class="min-w-0 flex-1">
+                        <div class="text-sm font-medium text-neutral-900 dark:text-neutral-100">
+                          {kind ? t(kind.labelKey) : trigger.type}
+                        </div>
+                        <div class="truncate text-xs text-neutral-600 dark:text-neutral-400">{triggerDetail(trigger)}</div>
+                      </div>
+                      <button
+                        type="button"
+                        role="switch"
+                        aria-checked={trigger.enabled}
+                        aria-label={trigger.enabled ? t("shortcuts.triggerDisable") : t("shortcuts.triggerEnable")}
+                        onclick={() => handleToggleTrigger(trigger.id)}
+                        data-testid="trigger-toggle-{trigger.id}"
+                        class="grid h-11 w-11 shrink-0 place-items-center"
+                      >
+                        <!-- 命中区 44×44，视觉仍是 36×20 的轨道 —— 按钮承担命中区，轨道是里面
+                             那条圆角条（REQ-A387 在 DockPage 上定下的形状）。原来按钮自己只有
+                             20 高，低于 WCAG 2.5.8 的 AA 下限 24（REQ-A953）。 -->
+                        <span class="relative block h-5 w-9 rounded-full transition {trigger.enabled ? 'bg-blue-600' : 'bg-neutral-300 dark:bg-neutral-600'}">
+                          <span class="absolute top-0.5 h-4 w-4 rounded-full bg-white transition-all {trigger.enabled ? 'left-4' : 'left-0.5'}"></span>
+                        </span>
+                      </button>
+                      <button
+                        type="button"
+                        onclick={() => handleRemoveTrigger(trigger.id)}
+                        aria-label={t("shortcuts.triggerRemove")}
+                        title={t("shortcuts.triggerRemove")}
+                        data-testid="trigger-remove-{trigger.id}"
+                        class="rounded p-1 hover:bg-red-100 dark:hover:bg-red-950"
+                      >
+                        <span class="text-xs text-red-600 dark:text-red-400" aria-hidden="true">×</span>
+                      </button>
+                    </div>
+
+                    {#if trigger.type === "time"}
+                      <div class="mt-3 space-y-2">
+                        <label class="block text-xs text-neutral-600 dark:text-neutral-400">
+                          {t("shortcuts.trigger.timeLabel")}
+                          <input
+                            type="time"
+                            value={String(trigger.config.time ?? "08:00")}
+                            oninput={(e) => handleUpdateTriggerConfig(trigger.id, "time", e.currentTarget.value)}
+                            data-testid="trigger-time-{trigger.id}"
+                            class="mt-1 w-full rounded border border-neutral-300 bg-white px-2 py-1 text-xs focus:border-blue-500 focus:outline-none dark:border-neutral-600 dark:bg-neutral-800 dark:text-white"
+                          />
+                        </label>
+                        <div>
+                          <span class="mb-1 block text-xs text-neutral-600 dark:text-neutral-400">{t("shortcuts.trigger.daysLabel")}</span>
+                          <div class="flex flex-wrap gap-1">
+                            {#each weekdayLabels as dayLabel, i}
+                              {@const day = i + 1}
+                              {@const on = (Array.isArray(trigger.config.days) ? trigger.config.days : []).map(Number).includes(day)}
+                              <button
+                                type="button"
+                                onclick={() => handleToggleDay(trigger.id, day)}
+                                aria-pressed={on}
+                                data-testid="trigger-day-{trigger.id}-{day}"
+                                class="h-7 w-7 rounded-full text-xs font-medium {on ? 'bg-blue-600 text-white' : 'bg-neutral-200 text-neutral-700 dark:bg-neutral-700 dark:text-neutral-200'}"
+                              >
+                                {dayLabel}
+                              </button>
+                            {/each}
+                          </div>
+                        </div>
+                      </div>
+                    {:else if trigger.type === "wifi"}
+                      <div class="mt-3 grid grid-cols-2 gap-2">
+                        <label class="block text-xs text-neutral-600 dark:text-neutral-400">
+                          {t("shortcuts.trigger.ssidLabel")}
+                          <input
+                            type="text"
+                            value={String(trigger.config.ssid ?? "")}
+                            placeholder={t("shortcuts.trigger.ssidAnyPlaceholder")}
+                            oninput={(e) => handleUpdateTriggerConfig(trigger.id, "ssid", e.currentTarget.value)}
+                            data-testid="trigger-ssid-{trigger.id}"
+                            class="mt-1 w-full rounded border border-neutral-300 bg-white px-2 py-1 text-xs focus:border-blue-500 focus:outline-none dark:border-neutral-600 dark:bg-neutral-800 dark:text-white"
+                          />
+                        </label>
+                        <label class="block text-xs text-neutral-600 dark:text-neutral-400">
+                          {t("shortcuts.trigger.eventLabel")}
+                          <select
+                            value={String(trigger.config.event ?? "connect")}
+                            onchange={(e) => handleUpdateTriggerConfig(trigger.id, "event", e.currentTarget.value)}
+                            data-testid="trigger-wifi-event-{trigger.id}"
+                            class="mt-1 w-full rounded border border-neutral-300 bg-white px-2 py-1 text-xs focus:border-blue-500 focus:outline-none dark:border-neutral-600 dark:bg-neutral-800 dark:text-white"
+                          >
+                            <option value="connect">{t("shortcuts.trigger.event.connect")}</option>
+                            <option value="disconnect">{t("shortcuts.trigger.event.disconnect")}</option>
+                            <option value="any">{t("shortcuts.trigger.event.any")}</option>
+                          </select>
+                        </label>
+                      </div>
+                    {:else if trigger.type === "app"}
+                      <label class="mt-3 block text-xs text-neutral-600 dark:text-neutral-400">
+                        {t("shortcuts.trigger.appLabel")}
+                        <select
+                          value={String(trigger.config.appId ?? "")}
+                          onchange={(e) => handleUpdateTriggerConfig(trigger.id, "appId", e.currentTarget.value)}
+                          data-testid="trigger-app-{trigger.id}"
+                          class="mt-1 w-full rounded border border-neutral-300 bg-white px-2 py-1 text-xs focus:border-blue-500 focus:outline-none dark:border-neutral-600 dark:bg-neutral-800 dark:text-white"
+                        >
+                          <option value="">{t("shortcuts.trigger.anyApp")}</option>
+                          {#each APP_META as app (app.id)}
+                            <option value={app.id}>{app.icon} {t(app.titleKey)}</option>
+                          {/each}
+                          <!-- REQ-A1190：触发器运行时（`triggerMatches` 的 `app` 分支）按字符串
+                               相等匹配 appId，对 `store:<manifest.id>` 与内置 id 一视同仁；此前这张
+                               列表只有内置应用，于是「当某个已安装应用打开时」这条自动化**编不出来**，
+                               尽管它跑得起来 —— 门比屋窄。 -->
+                          {#each ext as tile (tile.id)}
+                            <option value={tile.id}>{tile.icon} {tile.name}</option>
+                          {/each}
+                        </select>
+                      </label>
+                    {:else if trigger.type === "battery"}
+                      <div class="mt-3 grid grid-cols-2 gap-2">
+                        <label class="block text-xs text-neutral-600 dark:text-neutral-400">
+                          {t("shortcuts.trigger.levelBelowLabel")}
+                          <input
+                            type="number"
+                            min="0"
+                            max="100"
+                            value={trigger.config.levelBelow === undefined || trigger.config.levelBelow === "" ? "" : String(trigger.config.levelBelow)}
+                            oninput={(e) => handleUpdateTriggerConfig(trigger.id, "levelBelow", e.currentTarget.value === "" ? undefined : Number(e.currentTarget.value))}
+                            data-testid="trigger-below-{trigger.id}"
+                            class="mt-1 w-full rounded border border-neutral-300 bg-white px-2 py-1 text-xs focus:border-blue-500 focus:outline-none dark:border-neutral-600 dark:bg-neutral-800 dark:text-white"
+                          />
+                        </label>
+                        <label class="block text-xs text-neutral-600 dark:text-neutral-400">
+                          {t("shortcuts.trigger.levelAboveLabel")}
+                          <input
+                            type="number"
+                            min="0"
+                            max="100"
+                            value={trigger.config.levelAbove === undefined || trigger.config.levelAbove === "" ? "" : String(trigger.config.levelAbove)}
+                            oninput={(e) => handleUpdateTriggerConfig(trigger.id, "levelAbove", e.currentTarget.value === "" ? undefined : Number(e.currentTarget.value))}
+                            data-testid="trigger-above-{trigger.id}"
+                            class="mt-1 w-full rounded border border-neutral-300 bg-white px-2 py-1 text-xs focus:border-blue-500 focus:outline-none dark:border-neutral-600 dark:bg-neutral-800 dark:text-white"
+                          />
+                        </label>
+                        <label class="col-span-2 block text-xs text-neutral-600 dark:text-neutral-400">
+                          {t("shortcuts.trigger.chargingLabel")}
+                          <select
+                            value={chargingToSelect(trigger.config.charging)}
+                            onchange={(e) => handleUpdateTriggerConfig(trigger.id, "charging", selectToCharging(e.currentTarget.value))}
+                            data-testid="trigger-charging-{trigger.id}"
+                            class="mt-1 w-full rounded border border-neutral-300 bg-white px-2 py-1 text-xs focus:border-blue-500 focus:outline-none dark:border-neutral-600 dark:bg-neutral-800 dark:text-white"
+                          >
+                            <option value="any">{t("shortcuts.trigger.charging.any")}</option>
+                            <option value="yes">{t("shortcuts.trigger.charging.yes")}</option>
+                            <option value="no">{t("shortcuts.trigger.charging.no")}</option>
+                          </select>
+                        </label>
+                      </div>
+                    {/if}
+                  </div>
+                {/each}
+              </div>
+            {/if}
+          </div>
+
+          <!-- 系统分享面板 (REQ-A703)：`quickActions` 唯一的编辑器入口。 -->
+          <div class="rounded-xl border border-neutral-200 bg-white p-4 dark:border-neutral-800 dark:bg-neutral-950">
+            <div class="flex items-center gap-3">
+              <div class="min-w-0 flex-1">
+                <div class="text-sm font-medium text-neutral-900 dark:text-neutral-100">{t("shortcuts.shareSheetToggle")}</div>
+                <div class="text-xs text-neutral-500 dark:text-neutral-400">{t("shareSheet.title")}</div>
+              </div>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={isShareTarget(selectedShortcut)}
+                aria-label={t("shortcuts.shareSheetToggle")}
+                onclick={handleToggleShareSheet}
+                data-testid="shortcut-share-sheet-toggle"
+                class="grid h-11 w-11 shrink-0 place-items-center"
+              >
+                <!-- 命中区 44×44，轨道视觉不变（REQ-A953 / REQ-A387 的同一个形状）。 -->
+                <span class="relative block h-5 w-9 rounded-full transition {isShareTarget(selectedShortcut) ? 'bg-blue-600' : 'bg-neutral-300 dark:bg-neutral-600'}">
+                  <span class="absolute top-0.5 h-4 w-4 rounded-full bg-white transition-all {isShareTarget(selectedShortcut) ? 'left-4' : 'left-0.5'}"></span>
+                </span>
+              </button>
+            </div>
           </div>
 
           <!-- 快速运行按钮 -->
@@ -1036,21 +1655,56 @@
         {/if}
       </div>
     {:else if view === "gallery"}
-      <!-- 快捷指令库 -->
+      <!-- 快捷指令库（REQ-A500）：预设模板 → 一键装进「我的快捷指令」。
+           这里此前只有一句 `🚧 快捷指令库即将推出`，而入口、标题与描述都在 —— 承诺与交付不一致。
+           现在渲染的是 `GALLERY_TEMPLATES` 的真实卡片：每张都装得上、跑得动（模板的动作与参数由
+           `shortcutGallery.test.ts` 对着 `BUILTIN_ACTIONS` 逐条校验）。 -->
       <div class="space-y-4 p-4">
         <div class="text-center">
-          <div class="mb-4 text-6xl">📚</div>
-          <h2 class="mb-2 text-xl font-bold text-neutral-900 dark:text-neutral-100">{t("shortcuts.gallery")}</h2>
+          <div class="mb-3 text-5xl">📚</div>
+          <h2 class="mb-1 text-xl font-bold text-neutral-900 dark:text-neutral-100">{t("shortcuts.galleryTitle")}</h2>
           <p class="text-sm text-neutral-600 dark:text-neutral-400">
             {t("shortcuts.galleryDesc")}
           </p>
         </div>
-        
-        <div class="rounded-xl border border-neutral-200 bg-white p-6 text-center dark:border-neutral-800 dark:bg-neutral-950">
-          <p class="text-sm text-neutral-500 dark:text-neutral-400">
-            {t("shortcuts.libraryComing")}
+
+        {#if galleryNote}
+          <!-- 失败读数（成功时按钮自己会变成「已添加」，不维护第二条账）。必须是 live region：
+               用户按完按钮焦点还在原处，否则屏幕阅读器不会知道那一下成没成。 -->
+          <p class="text-center text-xs text-danger" role="status" data-testid="gallery-note">
+            {galleryNote}
           </p>
-        </div>
+        {/if}
+
+        <ul class="space-y-3" data-testid="gallery-grid">
+          {#each GALLERY_TEMPLATES as tpl (tpl.id)}
+            {@const installed = isTemplateInstalled(shortcuts, tpl.id)}
+            <li class="flex items-start gap-3 rounded-xl border border-neutral-200 bg-white p-3 dark:border-neutral-800 dark:bg-neutral-950">
+              <span
+                class="grid h-11 w-11 shrink-0 place-items-center rounded-xl text-xl"
+                style="background-color: {tpl.color}20;"
+                aria-hidden="true"
+              >
+                {tpl.icon}
+              </span>
+              <div class="min-w-0 flex-1">
+                <p class="text-sm font-medium text-neutral-900 dark:text-neutral-100">{t(tpl.nameKey)}</p>
+                <p class="mt-0.5 text-xs text-neutral-600 dark:text-neutral-400">{t(tpl.descKey)}</p>
+                <p class="mt-1 text-xs text-neutral-500">
+                  {t("shortcuts.galleryActionCount", { n: tpl.actions.length })}
+                </p>
+              </div>
+              <button
+                onclick={() => installTemplate(tpl)}
+                disabled={installed}
+                data-testid="gallery-add-{tpl.id}"
+                class="shrink-0 rounded-full bg-blue-600 px-3 py-1.5 text-xs font-medium text-white transition active:scale-95 disabled:bg-black/10 disabled:text-neutral-500 dark:disabled:bg-white/10 dark:disabled:text-neutral-400"
+              >
+                {installed ? t("shortcuts.galleryAdded") : t("shortcuts.galleryAdd")}
+              </button>
+            </li>
+          {/each}
+        </ul>
       </div>
     {/if}
   </div>
@@ -1207,6 +1861,7 @@
   <div
     class="fixed bottom-4 left-1/2 z-50 -translate-x-1/2 animate-[fadeIn_0.3s_ease-in-out]"
     role="status"
+    data-testid="shortcut-execution-result"
   >
     <div class="rounded-full bg-neutral-800 px-6 py-3 text-sm text-white shadow-lg dark:bg-neutral-700">
       {executionResult}

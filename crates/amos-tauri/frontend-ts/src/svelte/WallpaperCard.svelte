@@ -2,7 +2,7 @@
   // WallpaperCard.svelte — Svelte 5 (runes) port of the React WallpaperCard
   // (main/home wallpaper chooser shown in Settings). Persists to amos.settings
   // ({ wallpaper, background }) through pure lib/wallpaper + the shared store.
-  import { readStoreValue, writeStoreValue } from "../lib/amosStore";
+  import { readStoreValue, writeStoreValueChecked } from "../lib/amosStore";
   import {
     BACKGROUND_MODES,
     DEFAULT_BG_MODE,
@@ -12,6 +12,7 @@
     type BgModeId,
   } from "../lib/wallpaper";
   import { t } from "./locale.svelte";
+  import StoreErrorBar from "./StoreErrorBar.svelte";
 
   const GROUP =
     "overflow-hidden rounded-[11px] bg-white/70 ring-1 ring-black/5 dark:bg-white/[0.07] dark:ring-white/10";
@@ -50,25 +51,41 @@
     typeof storedBg === "string" && isBgMode(storedBg) ? storedBg : DEFAULT_BG_MODE;
   let bgSel = $state<BgModeId>(initialBg);
 
-  const writePref = (patch: Record<string, unknown>) => {
-    writeStoreValue("amos.settings", { ...readPrefs(), ...patch });
+  let storeErr = $state("");
+
+  // 写入必须先问判决，再动本地读数（REQ-A1359 ∕ F-SH-623）。`writeStoreValue` 只返回
+  // void —— 配额满 ∕ 存储不可用时它把异常吞掉，于是「盘上收下了」与「盘上拒绝了」在这张
+  // 卡片看来字节相同：药丸照旧点亮，而真正读这枚键的读者（`Backdrop.svelte` 订阅
+  // `amos.settings` 画桌面壁纸）纹丝不动，屏幕上一个字都不解释。`DockPage.svelte:52` 写
+  // 另一枚偏好的同一条规则是这里的先例：拒写要挂横幅、不许把没落盘的选择画在屏幕上。
+  // 本地的读数**只**在落盘成功之后才动 —— 先问判决，再动屏幕。与 `DockPage.svelte:52` 同义，
+  // 只是次序不同：那边先改读数再持久化，所以拒写后要额外回滚一次；这里门挡在 `apply()` 前面，
+  // 屏幕本来就还停在盘上那个值上，没有可回滚的第二份读数。`url` 是用户敲进去的文本，它不上
+  // 盘，也不必在拒写时被抹掉 —— 那是用户还能重试的输入。
+  const commit = (patch: Record<string, unknown>, apply: () => void) => {
+    if (!writeStoreValueChecked("amos.settings", { ...readPrefs(), ...patch })) {
+      storeErr = t("common.storeWriteFailed");
+      return;
+    }
+    storeErr = "";
+    apply();
   };
-  const pick = (id: string) => {
-    writePref({ wallpaper: id });
-    wall = id;
-    url = id;
-  };
+
+  const pick = (id: string) =>
+    commit({ wallpaper: id }, () => {
+      wall = id;
+      url = id;
+    });
   const setCustom = () => {
     const v = url.trim();
-    if (v) {
-      writePref({ wallpaper: v });
-      wall = v;
-    }
+    if (v) commit({ wallpaper: v }, () => (wall = v));
   };
+  const pickBg = (id: BgModeId) => commit({ background: id }, () => (bgSel = id));
   const presetActive = (id: string) => wall === id || (!wall && id === "auto");
 </script>
 
 <section class={"p-4 " + GROUP}>
+  <StoreErrorBar message={storeErr} />
   <h3 class="text-[15px] font-semibold text-neutral-800 dark:text-neutral-100">{t("wp.label")}</h3>
   <div class="mt-2 flex flex-wrap gap-2">
     {#each WALLPAPER_PRESETS as id (id)}
@@ -90,7 +107,7 @@
   <h4 class="mt-4 text-xs opacity-70">{t("bg.label")}</h4>
   <div class="mt-1 flex flex-wrap gap-2">
     {#each BACKGROUND_MODES as m (m.id)}
-      <button onclick={() => { writePref({ background: m.id }); bgSel = m.id; }} class={pillCls(bgSel === m.id)}>
+      <button onclick={() => pickBg(m.id)} class={pillCls(bgSel === m.id)}>
         {t(MODE_LABEL[m.id])}
       </button>
     {/each}

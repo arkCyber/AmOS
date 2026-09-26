@@ -11,6 +11,8 @@
 //! [ split_panes(…) ]   [ enforce_min(…) ]   [ clamp_into(…) ]
 //!        │                    │                    │
 //!        └──────────► Bounds { x, y, w, h } ◄───────┘
+//!                            ▲
+//!                    [ slide_over_pane(…) ]
 //! ```
 
 /// A non-negative size (pixels).
@@ -179,6 +181,67 @@ pub fn split_panes(
         }
     }
 }
+
+/// The floating **Slide Over** pane: a narrow window that floats *over* the working
+/// surface (an app, or an existing two-pane split) instead of sharing the screen
+/// with it.
+///
+/// Unlike [`split_panes`], this pane **overlaps** what is behind it — nothing is
+/// resized to make room, the caller just paints it last. It hugs the trailing long
+/// edge of `screen`: the right edge under [`SplitAxis::Vertical`], the bottom edge
+/// under [`SplitAxis::Horizontal`]. It is inset by `margin` on every side, and takes
+/// `percent` (1..=99) of the screen's extent along `axis`.
+///
+/// Returns `None` when the panel cannot fit `min` once the margin is taken out — the
+/// same honesty as [`split_panes`]: never a sliver, never an inverted inset. A
+/// `percent` that would compute below `min` is **grown to `min`** rather than
+/// refused, because unlike a divider there is no second pane to protect: the panel
+/// only ever covers more of what is behind it.
+pub fn slide_over_pane(
+    screen: Bounds,
+    axis: SplitAxis,
+    percent: u32,
+    min: Size,
+    margin: u32,
+) -> Option<Bounds> {
+    if !(1..=99).contains(&percent) {
+        return None;
+    }
+    let margin = u64::from(margin);
+    let inner_w = u64::from(screen.width).saturating_sub(margin.saturating_mul(2));
+    let inner_h = u64::from(screen.height).saturating_sub(margin.saturating_mul(2));
+    match axis {
+        SplitAxis::Vertical => {
+            let min_w = u64::from(min.width.max(1));
+            let min_h = u64::from(min.height.max(1));
+            let width = (inner_w * u64::from(percent) / 100).max(min_w);
+            if width > inner_w || inner_h < min_h {
+                return None;
+            }
+            Some(Bounds::new(
+                screen.x + (margin + (inner_w - width)) as i32,
+                screen.y + margin as i32,
+                width as u32,
+                inner_h as u32,
+            ))
+        }
+        SplitAxis::Horizontal => {
+            let min_w = u64::from(min.width.max(1));
+            let min_h = u64::from(min.height.max(1));
+            let height = (inner_h * u64::from(percent) / 100).max(min_h);
+            if height > inner_h || inner_w < min_w {
+                return None;
+            }
+            Some(Bounds::new(
+                screen.x + margin as i32,
+                screen.y + (margin + (inner_h - height)) as i32,
+                inner_w as u32,
+                height as u32,
+            ))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,6 +303,73 @@ mod tests {
             Bounds::new(0, 0, 0, 0).enforce_min(Size::new(0, 0)).width,
             1
         );
+    }
+
+    #[test]
+    fn slide_over_hugs_the_trailing_edge_inset_by_the_margin() {
+        let screen = Bounds::new(0, 0, 1000, 600);
+        let min = Size::new(200, 300);
+        let p = slide_over_pane(screen, SplitAxis::Vertical, 33, min, 12).unwrap();
+        // Right edge sits one margin in from the screen edge.
+        assert_eq!(p.right(), 1000 - 12);
+        // Top/bottom inset by the margin on both sides.
+        assert_eq!(p.y, 12);
+        assert_eq!(p.bottom(), 600 - 12);
+        assert_eq!(p.height, 600 - 24);
+        // 33% of the usable width (1000 - 24 = 976) ≈ 322.
+        assert_eq!(p.width, (976 * 33) / 100);
+        assert!(p.width >= min.width);
+    }
+
+    #[test]
+    fn slide_over_horizontal_hugs_the_bottom_edge() {
+        let screen = Bounds::new(0, 0, 800, 1000);
+        let p =
+            slide_over_pane(screen, SplitAxis::Horizontal, 40, Size::new(300, 200), 10).unwrap();
+        assert_eq!(p.bottom(), 1000 - 10);
+        assert_eq!(p.x, 10);
+        assert_eq!(p.width, 800 - 20);
+        assert_eq!(p.y, 10 + (980 - p.height) as i32);
+        assert_eq!(p.height, (980 * 40) / 100);
+    }
+
+    #[test]
+    fn slide_over_grows_a_narrow_percent_up_to_the_minimum() {
+        // 1% of 976 ≈ 9px, far below min.width — the panel grows to min rather than
+        // shrinking below what an app needs to be usable.
+        let p = slide_over_pane(
+            Bounds::new(0, 0, 1000, 600),
+            SplitAxis::Vertical,
+            1,
+            Size::new(240, 300),
+            12,
+        )
+        .unwrap();
+        assert_eq!(p.width, 240);
+    }
+
+    #[test]
+    fn slide_over_refuses_when_the_inset_rect_cannot_hold_the_minimum() {
+        let screen = Bounds::new(0, 0, 100, 100);
+        // margin 60 leaves a 0-px (saturating) inner rect → no pane.
+        assert_eq!(
+            slide_over_pane(screen, SplitAxis::Vertical, 50, Size::new(10, 10), 60),
+            None
+        );
+        // Inner rect fits the width band but not the height minimum.
+        assert_eq!(
+            slide_over_pane(
+                Bounds::new(0, 0, 500, 100),
+                SplitAxis::Vertical,
+                50,
+                Size::new(50, 300),
+                8
+            ),
+            None
+        );
+        // Invalid percent refused, like `split_panes`.
+        assert!(slide_over_pane(screen, SplitAxis::Vertical, 0, Size::new(1, 1), 0).is_none());
+        assert!(slide_over_pane(screen, SplitAxis::Vertical, 100, Size::new(1, 1), 0).is_none());
     }
 
     #[test]

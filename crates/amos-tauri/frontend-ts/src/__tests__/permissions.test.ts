@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import {
+  CAPABILITIES,
   capSet,
   grantCap,
   grantedApps,
@@ -52,7 +54,9 @@ describe("durable permission ledger (pure)", () => {
   });
 
   test("typed helpers compile for all known capabilities", () => {
-    const caps: Capability[] = ["camera", "microphone", "location", "contacts", "storage", "notifications"];
+    // Derived from the one declaration — not re-spelled — so this test cannot
+    // pass while `CAPABILITIES` and its own list silently disagree.
+    const caps: Capability[] = [...CAPABILITIES];
     expect(caps).toHaveLength(6);
   });
 
@@ -78,5 +82,52 @@ describe("durable permission ledger (pure)", () => {
     } finally {
       (globalThis as { window?: unknown }).window = real;
     }
+  });
+});
+
+describe("capability vocabulary (one declaration, frozen, mirrors the daemon Resource)", () => {
+  // The six capabilities the OS knows, in declaration order.
+  const FROZEN: readonly string[] = [
+    "camera",
+    "microphone",
+    "location",
+    "contacts",
+    "storage",
+    "notifications",
+  ];
+  // The five keys the daemon gate-keeps (`amos-ai::privacy::Resource::ALL`).
+  // `notifications` is deliberately absent — it is frontend-local, not an OS asset.
+  const DAEMON_MIRRORED: readonly string[] = [
+    "camera",
+    "microphone",
+    "location",
+    "contacts",
+    "storage",
+  ];
+
+  test("the one declaration is frozen (add/rename/remove == wire break)", () => {
+    // The ledger is persisted to `~/.amos/state.json` and read by Rust, so a
+    // renamed key is a **wire break**, not a refactor — pin every value, not
+    // just the count. Before this test the only vocabulary assertion re-spelled
+    // the six strings locally and checked `length === 6`, so a rename passed.
+    expect([...CAPABILITIES] as string[]).toEqual([...FROZEN]);
+  });
+
+  test("…and the daemon-mirrored five equal `Resource::key()` in Rust, both directions", () => {
+    // Read the daemon's own declaration, so a rename on either side fails here
+    // instead of quietly dropping a real grant (`normalizeLedger` drops unknown
+    // caps) or admitting a cap the daemon will deny.
+    const src = readFileSync(new URL("../../../../amos-ai/src/privacy.rs", import.meta.url), "utf8");
+    const keyIdx = src.indexOf("const fn key(self)");
+    expect(keyIdx).toBeGreaterThan(0);
+    // Slice to the `key()` body: a bare `/Self::\w+ => "…"/g` over the whole file
+    // would also pick up `AccessDecision`'s `Display` arms ("granted"/"denied").
+    const body = src.slice(keyIdx, keyIdx + 400);
+    const rust = [...new Set([...body.matchAll(/Self::\w+ => "([a-z_]+)"/g)].map((m) => m[1] ?? ""))].sort();
+    // A vacuous pass is the failure mode of a source-reading test: assert the
+    // slice+regex actually found the five arms before comparing the two sets.
+    expect(rust).toEqual([...DAEMON_MIRRORED].sort());
+    const mirrored = ([...CAPABILITIES] as string[]).filter((c) => c !== "notifications").sort();
+    expect(mirrored).toEqual(rust);
   });
 });

@@ -5,8 +5,8 @@
 //!
 //! ```bash
 //! cargo run -p amos-tts --example piper_tts --features piper -- \
-//!     "This is a test." models/piper-low/en_US-lessac-low.onnx \
-//!     models/piper-low/en_US-lessac-low.onnx.json /tmp/piper_out.wav
+//!     "This is a test." models/piper-en_US-lessac-medium/en_US-lessac-medium.onnx \
+//!     models/piper-en_US-lessac-medium/en_US-lessac-medium.onnx.json /tmp/piper_out.wav
 //! ```
 
 use std::path::Path;
@@ -47,11 +47,11 @@ async fn main() -> anyhow::Result<()> {
     let model = args
         .get(2)
         .cloned()
-        .unwrap_or_else(|| "models/piper-low/en_US-lessac-low.onnx".into());
+        .unwrap_or_else(|| "models/piper-en_US-lessac-medium/en_US-lessac-medium.onnx".into());
     let voice = args
         .get(3)
         .cloned()
-        .unwrap_or_else(|| "models/piper-low/en_US-lessac-low.onnx.json".into());
+        .unwrap_or_else(|| "models/piper-en_US-lessac-medium/en_US-lessac-medium.onnx.json".into());
     let out = args
         .get(4)
         .cloned()

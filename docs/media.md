@@ -36,6 +36,7 @@
 | `range` | **RFC 7233 单范围**的纯决策：`RangeSpec`/`ResponsePlan` + `parse_range`/`plan_response`/`clamp_window`/`content_range`/`status_for`——"读哪一段、回什么状态码"在碰存储之前就定好（无 IO，可穷举测试） |
 | `read_range` seam | `MediaProvider::read_range`（默认=有界 `load` 后切片；Mock=blob 切片；HostFs=**真 seek+读**）+ 整项 `MAX_LOAD_BYTES`（256 MiB）上限，`MediaManager::read_range` 与 `load` **同一读授权** |
 | `manager` | `MediaManager` + `Grant`：持有 `Arc<dyn MediaProvider>` + 逐 `(access,collection)` 授权；**默认全无授权**；`list`=读门控，`save`=写门控；未授权返回 `Unauthorized`（绝不伪装空列表）；空名单校验先于权限 |
+| `protocol` | **RFC 7233 的服务半**（REQ-A599 起进入构建，REQ-A604 起接到 WebView）：`amos-media://<collection>/<id>` → 经 `list` **授权并查表**（**绝不**把 id 拼进路径；不在列表 ⇒ `404`）→ 规划窗口 → 字节 + 状态/`Content-Range`/`Accept-Ranges`；`serve` 对整个请求返回一个 `MediaReply`，**与传输无关**（无 WebView 也可穷举测试）；后端**不报尺寸**的条目按 §4.2 以 `bytes a-b/*` 流式服务（`UnknownPlan`），只有后缀范围 `bytes=-N` 仍需长度。**发射半**（`media_url`/`dir_key`/`base_url_for`）与解析半是**同一套语法**：宿主用它把 URL 交给屏幕，屏幕从不自己拼（`media_stream_url` 命令），两向由测试钉住。 |
 
 **为何 provider「哑」、策略放 manager**：与 radio/sensor 一致——Mock 与未来真后端共享同一套
 授权/门控规则与测试。真机上"未授权"来自 Android 运行时权限，host 上来自 manager 的 `Grant`，
@@ -90,6 +91,14 @@
 | `media_*` 命令层（boot mock/hostfs、读写往返、load、错误串、hostfs 端到端） | `amos-tauri --lib media::`（6 例） | `crates/amos-tauri/src/media.rs` |
 | 前端 TS 桥：normalize/合并/离线 null/有桥被拒 reject | `media.test.ts` + `photoLibrary.test.ts`（17 例） | `frontend-ts/src/__tests__/` |
 | RFC 7233 单范围解析与规划（开/闭/后缀/越界/畸形/多范围/空资源） | `range::tests::*`（**18 例**） | `src/range.rs` |
+| **未知长度**的范围规划（无头/无单位/畸形/开区间/闭区间/后缀/零界 + 与 `parse_range` 的反漂移） | `range::tests::*`（**+7 例**：`no_usable_range_asks_for_a_probe_one_byte_past_the_bound`、`an_open_range_is_one_bounded_window_without_the_length`、`a_closed_range_is_its_own_length_clamped_to_the_bound`、`a_suffix_range_is_the_one_shape_that_needs_the_length`、`a_zero_bound_still_plans_a_one_byte_window`、`content_range_unknown_spells_the_open_total`、`plan_unknown_agrees_with_parse_range_on_a_huge_resource`） | 同上 |
+| **服务半**（`amos-media://` → 200/206/4xx 的完整决策；URL 解析的两套平台拼法；路径型 id 的转义；未报尺寸的流式与"绝不宣称没有的长度"） | `protocol::tests::*`（**22 例**：19 例服务半 + REQ-A604 的 3 例发射半 —— `media_url_round_trips_every_collection_on_both_platform_forms`、`media_url_escapes_a_media_store_id_into_one_segment`、`media_url_refuses_an_id_that_could_never_be_served`；`dir_from_key_covers_every_collection` 扩为**两向**） | `src/protocol.rs` |
+| **响应装配**（`206`/`200`/`413`/`416` 的头：`Content-Range`、`Accept-Ranges`、拒绝原因、空体） | `amos-tauri --lib media::` 的 `protocol_response_carries_the_headers_a_streaming_player_needs` | `crates/amos-tauri/src/media.rs` |
+| 拒绝原因**非 ASCII** 时仍能进 header（提供者的错误文本不可信输入） | 同上 `header_safe_keeps_a_refusal_reason_that_is_not_ascii` | 同上 |
+| `media_stream_url` 与 `media_load` **同一读授权**（未列出的 id / 说错的集合 / 撤销授权 ⇒ `None`；给出的 URL 能被协议自己的解析器读回） | 同上 `command_core_stream_url_is_gated_by_the_listing_and_the_grant` | 同上 |
+| 前端桥 `mediaStreamUrl`（透传 item / 宿主答 null / 无桥 null） | `media.test.ts` | `frontend-ts/src/__tests__/media.test.ts` |
+| `isObjectUrl`/`isStreamUrl`（只回收自己建的 URL；未解析 ≠ 流式） | `player.test.ts` | `frontend-ts/src/__tests__/player.test.ts` |
+| **播放器采纳**（>`MAX_PLAY_BYTES` 的条目走宿主流式 URL、显示"流式播放"、**不** `revokeObjectURL` 它；无桥 demo 的合成 WAV 仍被回收） | `player.svelte.test.ts` 的 `a >MAX_PLAY_BYTES file plays through the host's stream URL, which is never revoked` | `frontend-ts/svelte-tests/player.svelte.test.ts` |
 | `read_range` 默认实现（有界 load 切片）+ 窗口数学全域 | `provider::tests::the_default_read_range_slices_the_loaded_bytes` / `window_is_total_and_clamped` | `src/provider.rs` |
 | Mock `read_range` 窗口 + 无内容诚实报错 | `provider::tests::mock_read_range_returns_windows_and_stays_honest` | 同上 |
 | 整项 load 上限（有界分配） | `provider::tests::ensure_loadable_enforces_the_ceiling` | 同上 |
@@ -109,6 +118,14 @@
 
 **诚实边界**：真机 Android MediaStore 后端（Kotlin glue + REQ_MEDIA 授权 + `ContentResolver` 实装）
 与 `scan_dir` 在 root 测试机的 10ms 实测属设备验收项，未含在 host 测试矩阵内（见 §5）。
+**传输层已接（REQ-A604，真机验收未做）**：`amos-tauri` 用
+`register_asynchronous_uri_scheme_protocol(amos_media::SCHEME, …)` 注册了 `amos-media://`（与 `amos-app://`
+同一机制，读在 blocking 池上跑），把请求的 `Range` 头交给 `amos_media::serve`，再由 `media::protocol_response`
+装配 `206`/`200`/拒绝的响应（`Content-Range`、`Accept-Ranges`、拒绝原因走 `X-Amos-Media-Refusal`，
+响应头值经 `header_safe` 收敛到可打印 ASCII —— 提供者的错误文本不是我们可以直接塞进 header 的东西）。
+配套的 `media_stream_url` 命令（**与 `media_load` 同一读授权**）把平台正确的 URL 交给屏幕：Windows/Android
+上 wry 把自定义 scheme 重写成 `http://amos-media.localhost/…`，所以前端**从不**自己拼这个 URL。
+仍属设备验收项的是**真实解码播放**与该重写形态的实际行为；未验收前 `MAX_PLAY_BYTES` 与 blob 兜底保留。
 
 > 测试机到手后的逐条执行步骤、命令与验收点见 **`docs/device-bringup-checklist.md`**（路径 A root 扫 DCIM /
 > B 普通 App 走 MediaStore / C Waydroid 直读，三选一）。

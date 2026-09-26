@@ -334,3 +334,69 @@ describe("SpotlightPanel.svelte (controlled via propsBus 'spotlight')", () => {
     off();
   });
 });
+
+/**
+ * The rows the panel draws must be reachable by the keyboard it advertises. Every app row
+ * carries a `⌘↵` keycap, and the panel is the *touch* Spotlight (`Shell.svelte` mounts it;
+ * the desktop's is `SpotlightOverlay`), so the glyph is the panel's own promise that a
+ * hardware keyboard can open the row the user is looking at.
+ */
+describe("SpotlightPanel — the keyboard acts on the rows the panel draws", () => {
+  /** `ma` matches maps / mail / magnifier by app id; with no recents the registry order stands. */
+  async function typeMa(container: HTMLElement) {
+    const input = container.querySelector("input") as HTMLInputElement;
+    await fireEvent.input(input, { target: { value: "ma" } });
+    await tick();
+    return input;
+  }
+
+  test("Return opens the top hit — not the first suggestion above it", async () => {
+    const container = await renderOpen();
+    const events: [string, unknown][] = [];
+    const off = bus().on((e, d) => events.push([e, d]));
+    const input = await typeMa(container);
+
+    // No arrow pressed: the selection starts on the first **hit** (macOS Spotlight opens the
+    // top hit with Return), not on the "save as note" suggestion drawn above it.
+    await fireEvent.keyDown(input, { key: "Enter" });
+    await tick();
+
+    expect(events).toContainEqual(["open", "maps"]);
+    // …and nothing was saved: Return opened the app, it did not run the suggestion above it.
+    expect(readStoreValue<unknown[]>("amos.notes", [])).toEqual([]);
+    off();
+  });
+
+  test("↓ moves the highlight, and Return opens the row it moved onto", async () => {
+    const container = await renderOpen();
+    const events: [string, unknown][] = [];
+    const off = bus().on((e, d) => events.push([e, d]));
+    const input = await typeMa(container);
+
+    await fireEvent.keyDown(input, { key: "ArrowDown" });
+    await tick();
+    // The highlight the user sees has to be the row the key acts on.
+    expect(container.querySelector('[data-testid="spot-app-mail"]')?.getAttribute("data-selected")).toBe("true");
+    expect(container.querySelector('[data-testid="spot-app-maps"]')?.getAttribute("data-selected")).toBe("false");
+
+    await fireEvent.keyDown(input, { key: "Enter" });
+    await tick();
+    expect(events).toContainEqual(["open", "mail"]);
+    off();
+  });
+
+  test("the ⌘↵ glyph names a key that really opens the row", async () => {
+    const container = await renderOpen();
+    const events: [string, unknown][] = [];
+    const off = bus().on((e, d) => events.push([e, d]));
+    const input = container.querySelector("input") as HTMLInputElement;
+    await fireEvent.input(input, { target: { value: "时钟" } });
+    await tick();
+
+    // The glyph drawn on the app row says ⌘↵: pressing exactly that must open the app.
+    await fireEvent.keyDown(input, { key: "Enter", metaKey: true });
+    await tick();
+    expect(events).toContainEqual(["open", "clock"]);
+    off();
+  });
+});

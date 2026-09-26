@@ -26,18 +26,29 @@ use std::sync::Arc;
 
 use serde::Serialize;
 
-use amos_display::{ScreenState, SCREEN_STATE_ENV};
+use amos_display::ScreenState;
 
-/// Wire vocabulary for the display / screen-state module. The UI i18n layer
-/// branches on these; renaming a variant is a wire break. The string form
-/// matches the [`crate::error::ErrorCode`] `as_str()` shape (`amos.<group>.<leaf>`).
+use crate::error::{AmosError, ErrorCode};
+
+/// Wire vocabulary for the display / screen-state module. Each code has a real
+/// producer: `contract_missing` / `write_failed` are the `code` of the
+/// [`AmosError`] a failed [`DisplayPower::set`] returns, and `read_malformed` is
+/// emitted when a present-but-foreign contract file is read. Renaming a variant is
+/// a wire break; the string form matches the [`crate::error::ErrorCode`]
+/// `as_str()` shape (`amos.<group>.<leaf>`) and is pinned equal to it by test.
+///
+/// REQ-A622: before this, all three were declared with *no producer* — the
+/// constants and their `ErrorCode` variants existed only to be listed in a
+/// stability test, while `DisplayPower::set` returned a bare prose `String` and a
+/// malformed contract file was indistinguishable from an absent one.
 pub mod codes {
+    use crate::error::ErrorCode;
     /// `AMOS_SCREEN_STATE_PATH` is unset (no daemon to sync with).
-    pub const CONTRACT_MISSING: &str = "amos.display.contract_missing";
+    pub const CONTRACT_MISSING: &str = ErrorCode::DisplayContractMissing.as_str();
     /// Writing the screen-state file failed (FS error, permission, …).
-    pub const WRITE_FAILED: &str = "amos.display.write_failed";
+    pub const WRITE_FAILED: &str = ErrorCode::DisplayWriteFailed.as_str();
     /// Reading the screen-state file returned malformed content (not `on`/`off`).
-    pub const READ_MALFORMED: &str = "amos.display.read_malformed";
+    pub const READ_MALFORMED: &str = ErrorCode::DisplayReadMalformed.as_str();
 }
 
 /// Largest screen-state file this host will read or write.
@@ -55,12 +66,48 @@ pub struct ScreenPayload {
     pub on: bool,
 }
 
+/// How a read of the screen-state contract file resolved — the three declared
+/// failure modes (`contract_missing` is the *write*-side "no path"; the read side
+/// has "absent" vs "present but foreign"). Split out as a pure function so the
+/// judgement is headless-testable and the wire vocabulary has a real producer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContractRead {
+    /// File present and parseable as `on`.
+    On,
+    /// File present and parseable as `off`.
+    Off,
+    /// No path configured, or the path has no readable file.
+    Missing,
+    /// File present but its content is neither `on` nor `off` (a foreign writer
+    /// filled the shared path with garbage).
+    Malformed,
+}
+
+/// Read + classify the contract file at `path` (or `None` when no path is set).
+/// Pure aside from the single file read; no parsing knowledge is duplicated here
+/// (the `amos_display` host owns the accepted vocabulary).
+pub fn read_contract(path: Option<&Path>) -> ContractRead {
+    let Some(path) = path else {
+        return ContractRead::Missing;
+    };
+    match std::fs::read_to_string(path) {
+        Ok(s) => match amos_display::parse_screen_state(&s) {
+            Some(ScreenState::On) => ContractRead::On,
+            Some(ScreenState::Off) => ContractRead::Off,
+            None => ContractRead::Malformed,
+        },
+        Err(_) => ContractRead::Missing,
+    }
+}
+
 /// **Device seam**: physically blank / wake the panel (and keep the cross-process
 /// state consistent). `set(false)` = go to sleep / blank; `set(true)` = wake /
-/// keep on. Returns `Err` on failure — a host must never report success it didn't
-/// achieve.
+/// keep on. Returns a typed [`AmosError`] carrying the declared wire code
+/// (`contract_missing` when there is no daemon contract, `write_failed` when the
+/// write itself fails) — a host must never report success it didn't achieve, and
+/// the caller must be able to tell *why* without parsing a message.
 pub trait DisplayPower: Send + Sync {
-    fn set(&self, on: bool) -> Result<(), String>;
+    fn set(&self, on: bool) -> Result<(), AmosError>;
     /// Current on/off (conservative: `true` when unknown, so we never throttle a
     /// screen that might be on).
     fn is_on(&self) -> bool;
@@ -92,46 +139,68 @@ impl FileDisplayPower {
 /// Atomically write the screen-state file (`on` | `off`): temp sibling then
 /// rename over the target so a concurrent reader never sees a torn file.
 ///
-/// Returns a typed [`crate::error::AmosError`] on any failure so the caller can
-/// branch on the wire code (e.g. distinguish "no daemon contract" from "FS
-/// error") without parsing the message. The write is bounded by
-/// [`MAX_SCREEN_STATE_BYTES`] — a runaway writer filling the contract path
-/// with garbage is refused before the rename step (which would otherwise
-/// truncate a megabyte file to two bytes and lose the signal).
-pub fn write_screen_state(path: &Path, on: bool) -> io::Result<()> {
+/// Returns a typed [`AmosError`] carrying [`codes::WRITE_FAILED`] on any failure
+/// so the caller can branch on the wire code without parsing the message. The
+/// write is bounded by [`MAX_SCREEN_STATE_BYTES`] — a runaway writer filling the
+/// contract path with garbage is refused before the rename step (which would
+/// otherwise truncate a megabyte file to two bytes and lose the signal).
+pub fn write_screen_state(path: &Path, on: bool) -> Result<(), AmosError> {
+    let write_failed =
+        |e: io::Error| AmosError::with_cause(ErrorCode::DisplayWriteFailed, codes::WRITE_FAILED, e);
     let content = if on { "on" } else { "off" };
     if (content.len() as u64) > MAX_SCREEN_STATE_BYTES {
         // Defensive: `content` is a literal today, but the cap is here so a
         // future change cannot turn this function into a megabyte writer
         // without someone noticing.
-        return Err(io::Error::new(
+        return Err(write_failed(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
                 "screen-state payload is {} bytes (limit {})",
                 content.len(),
                 MAX_SCREEN_STATE_BYTES
             ),
-        ));
+        )));
     }
     let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, content)?;
-    std::fs::rename(&tmp, path)
+    std::fs::write(&tmp, content).map_err(write_failed)?;
+    std::fs::rename(&tmp, path).map_err(write_failed)
 }
 
 impl DisplayPower for FileDisplayPower {
-    fn set(&self, on: bool) -> Result<(), String> {
-        let path = self.path.as_deref().ok_or_else(|| {
-            format!("{SCREEN_STATE_ENV} not set — cannot sync screen state to the daemon")
-        })?;
-        write_screen_state(path, on).map_err(|e| format!("write screen state: {e}"))
+    fn set(&self, on: bool) -> Result<(), AmosError> {
+        let Some(path) = self.path.as_deref() else {
+            // No `AMOS_SCREEN_STATE_PATH` ⇒ no daemon to hear us. The declared
+            // `contract_missing` code names exactly this — emit it rather than a
+            // bare prose string, so the caller can branch (and the vocabulary has
+            // a producer instead of being a dead constant).
+            return Err(AmosError::new(
+                ErrorCode::DisplayContractMissing,
+                codes::CONTRACT_MISSING,
+            ));
+        };
+        write_screen_state(path, on)
     }
 
     fn is_on(&self) -> bool {
-        self.path
-            .as_deref()
-            .and_then(amos_display::read_screen_state_from)
-            .map(|s| s == ScreenState::On)
-            .unwrap_or(true)
+        match read_contract(self.path.as_deref()) {
+            ContractRead::On => true,
+            ContractRead::Off => false,
+            // Conservative: an absent or foreign value means we do not know, so we
+            // must not throttle a screen that might be on. A *malformed* file (a
+            // foreign writer filled the shared path) is the one case worth naming
+            // — it emits the declared `read_malformed` code so the condition is
+            // observable instead of silently indistinguishable from "absent".
+            ContractRead::Missing => true,
+            ContractRead::Malformed => {
+                tracing::warn!(
+                    target: "amos::display",
+                    code = codes::READ_MALFORMED,
+                    "screen-state contract file is present but neither `on` nor `off`; \
+                     reading conservatively as on"
+                );
+                true
+            }
+        }
     }
 }
 
@@ -157,7 +226,7 @@ impl DisplayPowerBridge {
         Self { power }
     }
 
-    fn apply(&self, on: bool) -> Result<(), String> {
+    fn apply(&self, on: bool) -> Result<(), AmosError> {
         self.power.set(on)
     }
 
@@ -167,11 +236,14 @@ impl DisplayPowerBridge {
 }
 
 /// Set the OS screen state on/off and return the authoritative snapshot.
+///
+/// Fails with the declared wire code (`contract_missing` / `write_failed`) so the
+/// UI can tell "there is no daemon to tell" from "the filesystem refused us".
 #[tauri::command]
 pub fn screen_state_set(
     bridge: tauri::State<'_, DisplayPowerBridge>,
     on: bool,
-) -> Result<ScreenPayload, String> {
+) -> Result<ScreenPayload, AmosError> {
     bridge.apply(on)?;
     Ok(ScreenPayload { on })
 }
@@ -180,7 +252,7 @@ pub fn screen_state_set(
 #[tauri::command]
 pub fn screen_state_get(
     bridge: tauri::State<'_, DisplayPowerBridge>,
-) -> Result<ScreenPayload, String> {
+) -> Result<ScreenPayload, AmosError> {
     Ok(ScreenPayload {
         on: bridge.current(),
     })
@@ -188,6 +260,7 @@ pub fn screen_state_get(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use amos_display::SCREEN_STATE_ENV;
 
     fn unique_path(tag: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("amos-tauri-{tag}-{}.state", std::process::id()))
@@ -205,7 +278,7 @@ mod tests {
         }
     }
     impl DisplayPower for MockPower {
-        fn set(&self, on: bool) -> Result<(), String> {
+        fn set(&self, on: bool) -> Result<(), AmosError> {
             *self.last.lock().unwrap_or_else(|p| p.into_inner()) = Some(on);
             Ok(())
         }
@@ -314,6 +387,85 @@ mod tests {
         assert_eq!(codes::CONTRACT_MISSING, "amos.display.contract_missing");
         assert_eq!(codes::WRITE_FAILED, "amos.display.write_failed");
         assert_eq!(codes::READ_MALFORMED, "amos.display.read_malformed");
+        // ...and it is *single-sourced* with the shared `ErrorCode` vocabulary:
+        // the constant and the enum must never drift into two spellings of one
+        // wire code (the defect this module's codes previously invited by being
+        // declared with no producer at all).
+        assert_eq!(
+            ErrorCode::DisplayContractMissing.as_str(),
+            codes::CONTRACT_MISSING
+        );
+        assert_eq!(ErrorCode::DisplayWriteFailed.as_str(), codes::WRITE_FAILED);
+        assert_eq!(
+            ErrorCode::DisplayReadMalformed.as_str(),
+            codes::READ_MALFORMED
+        );
+    }
+
+    #[test]
+    fn set_without_a_contract_carries_the_contract_missing_code() {
+        // No `AMOS_SCREEN_STATE_PATH` ⇒ the declared `contract_missing` code, not a
+        // bare prose string (the exact defect: the vocabulary was declared but no
+        // code path ever produced it).
+        let power = FileDisplayPower::at(None);
+        let err = power.set(false).expect_err("no contract ⇒ error");
+        assert_eq!(err.code(), codes::CONTRACT_MISSING);
+        assert_eq!(err.code(), ErrorCode::DisplayContractMissing.as_str());
+    }
+
+    #[test]
+    fn a_write_failure_carries_the_write_failed_code() {
+        // A path whose parent does not exist makes `fs::write` fail — that must
+        // surface as the declared `write_failed` code, distinct from
+        // `contract_missing`.
+        let p = std::env::temp_dir()
+            .join(format!("amos-tauri-missing-dir-{}", std::process::id()))
+            .join("nope.state");
+        let power = FileDisplayPower::at(Some(p));
+        let err = power.set(true).expect_err("unwritable path ⇒ error");
+        assert_eq!(err.code(), codes::WRITE_FAILED);
+        assert_ne!(err.code(), codes::CONTRACT_MISSING);
+    }
+
+    #[test]
+    fn read_contract_classifies_each_outcome() {
+        // Pure classifier: the judgement that decides "conservative on, but tell
+        // the logs it was malformed" must be reachable without a live seam.
+        assert_eq!(read_contract(None), ContractRead::Missing);
+        let absent = unique_path("read-absent");
+        let _ = std::fs::remove_file(&absent);
+        assert_eq!(read_contract(Some(&absent)), ContractRead::Missing);
+
+        let p = unique_path("read-classify");
+        write_screen_state(&p, true).expect("write on");
+        assert_eq!(read_contract(Some(&p)), ContractRead::On);
+        write_screen_state(&p, false).expect("write off");
+        assert_eq!(read_contract(Some(&p)), ContractRead::Off);
+
+        std::fs::write(&p, "lit\n").expect("write garbage");
+        assert_eq!(read_contract(Some(&p)), ContractRead::Malformed);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_malformed_contract_file_still_reads_conservatively_on() {
+        // Behaviour is unchanged on purpose (never throttle a screen that might be
+        // on); what is new is that the read is *observably* malformed, not silently
+        // indistinguishable from "absent".
+        let p = unique_path("malformed-on");
+        std::fs::write(&p, "lit").expect("write garbage");
+        let power = FileDisplayPower::at(Some(p.clone()));
+        assert!(power.is_on());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn bridge_apply_surfaces_the_declared_code_from_the_seam() {
+        // The bridge (what the command calls) must forward the seam's typed code,
+        // so `screen_state_set` can hand it to the UI.
+        let bridge = DisplayPowerBridge::with(Arc::new(FileDisplayPower::at(None)));
+        let err = bridge.apply(true).expect_err("no contract ⇒ error");
+        assert_eq!(err.code(), codes::CONTRACT_MISSING);
     }
 
     #[test]

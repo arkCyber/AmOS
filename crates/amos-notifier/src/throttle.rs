@@ -1,10 +1,16 @@
-//! Token-bucket rate limiter + suppression-window state machine.
+//! Suppression-window state machine + token-bucket rate limiter.
 //!
-//! Each `(channel, severity)` pair owns one of these. The dispatcher
-//! consults [`Throttle::allow`] before forwarding; a return of `false`
-//! means "drop or merge this alert", and the throttle then tracks whether
-//! it was a rate-limit drop or a suppression-window merge so the metrics
-//! are honest.
+//! Each `(channel, fingerprint)` pair owns one bucket. The dispatcher
+//! consults [`Throttle::allow`] before forwarding; the returned
+//! [`ThrottleDecision`] says whether to send, merge (suppression window) or
+//! drop (rate limit) so the metrics stay honest.
+//!
+//! **The rate limiter does not bite today.** The bucket is keyed per
+//! fingerprint, and the suppression window alone already swallows every
+//! repeat of a fingerprint, so the bucket can never be empty at the moment
+//! the window lets an alert through — see [`ThrottleDecision::RateLimit`]
+//! for the arithmetic and `rate_limit_is_unreachable_for_every_severity`
+//! for the measurement.
 //!
 //! No external `tokio::time` — we use [`std::time::Instant`] and a single
 //! mutex per bucket. The dispatcher calls this from the firing thread;
@@ -26,13 +32,27 @@ pub enum ThrottleDecision {
     Suppress,
     /// Rate limit (token bucket empty) — drop without merging. The
     /// operator sees a "dropped" counter.
+    ///
+    /// **Unreachable under the current [`Severity`] table.** The bucket
+    /// starts full and loses a token only on an `Allow`, which at the same
+    /// instant opens the suppression window. While the window is open every
+    /// call still refills the bucket, so an `Allow` leaves `capacity - 1`
+    /// tokens and the bucket has to climb back to just **one** token before
+    /// it could ever refuse — at most `1 / rate_per_sec` seconds (P0 ≈ 0 s,
+    /// P1 = 1 s, P2 = 10 s). Every severity's suppression window is far
+    /// longer than that (30 s ∕ 300 s ∕ 3600 s), so any alert the window lets
+    /// through arrives with a full bucket and is `Allow`ed. The arm is kept
+    /// because the dispatcher matches on it; a severity table that made it
+    /// live would also mean the `dropped` channel counter — whose only
+    /// *other* producer is `SendOutcome::Dropped` in `channel.rs` — no
+    /// longer means one thing.
     RateLimit,
 }
 
 #[derive(Debug)]
 struct Bucket {
-    /// Token-bucket capacity. For P0 this is a huge number so the bucket
-    /// never empties; for everything else it's the ceil of `rate_per_sec`.
+    /// Token-bucket capacity — `rate_per_sec.max(1.0)`, except P0
+    /// (`rate_per_sec == 0.0`), which gets `1e9` so the bucket never empties.
     capacity: f64,
     /// Tokens/sec refill rate. P0 is `1e9` (effectively unlimited).
     refill: f64,
@@ -207,31 +227,100 @@ mod tests {
         );
     }
 
+    /// The suppression window is checked before the token bucket, so a
+    /// repeat of the same fingerprint inside the window is merged even when
+    /// the bucket has plenty of tokens. (This test was named
+    /// `rate_limit_kicks_in_when_window_has_expired`, which its own body
+    /// contradicted — see `rate_limit_is_unreachable_for_every_severity` for
+    /// why the third arm never appears at all.)
     #[test]
-    fn rate_limit_kicks_in_when_window_has_expired() {
-        // After the suppression window closes, if the bucket is empty the
-        // second call should be RateLimit (not Suppress). We construct a
-        // scenario where:
-        // - First call: Allow (bucket full).
-        // - Past the window AND bucket empty (rate is slow + we wait
-        //   exactly the window length so no refill has happened yet).
+    fn suppression_window_beats_the_token_bucket() {
         let t = Throttle::new();
         let now = Instant::now();
         let f = "P2|x";
         assert_eq!(t.allow("ch", f, Severity::P2, now), ThrottleDecision::Allow);
-        // 1 ns after the 1 h window opens, the bucket has refilled by
-        // `0.1 tokens/sec * 1 h = 360 tokens` — so the second call here is
-        // also Allow. To exercise RateLimit we need many calls inside the
-        // window without time passing. But Suppression wins while the
-        // window is open. So this test is documenting the **current**
-        // behaviour: window wins, RateLimit is reached only if the window
-        // is shorter than the bucket refill time. We assert that the
-        // public behaviour matches that contract: a call inside the window
-        // is Suppress, even if the bucket is full.
+        // 10 s in, the bucket has refilled by `0.1 tokens/s * 10 s = 1`
+        // token — full — but the 1 h window still swallows the repeat.
         let now2 = now + Duration::from_secs(10);
         assert_eq!(
             t.allow("ch", f, Severity::P2, now2),
             ThrottleDecision::Suppress
         );
+    }
+
+    /// The invariant behind the previous two tests: an `Allow` leaves
+    /// `capacity - 1` tokens and `RateLimit` needs the bucket to still be
+    /// short of **one** token when the suppression window closes — so the
+    /// window must be shorter than the `max(0, 2 - capacity) / rate` seconds
+    /// it takes to refill to one token. Pin it, so that widening a severity's
+    /// rate or shortening its window fails *here* with the consequence
+    /// spelled out — instead of quietly switching a nominal dispatch path on.
+    #[test]
+    fn the_rate_limit_stays_unreachable_only_while_the_window_outlasts_the_refill() {
+        for severity in [Severity::P0, Severity::P1, Severity::P2] {
+            let rate = severity.rate_per_sec();
+            if rate <= 0.0 {
+                continue; // no token bucket to drain
+            }
+            let capacity = rate.max(1.0);
+            // Tokens left after an `Allow` is `capacity - 1`; a refusal needs
+            // fewer than one, so this is how long the bucket stays refilling.
+            let refill_secs = (1.0 - (capacity - 1.0)).max(0.0) / rate;
+            let window = severity.suppression_window_secs() as f64;
+            assert!(
+                window > refill_secs,
+                "{severity:?}: the suppression window ({window}s) no longer outlasts the \
+                 bucket refill ({refill_secs}s) — ThrottleDecision::RateLimit becomes \
+                 reachable, so the dispatcher's `dropped` counter needs a test that \
+                 actually produces it"
+            );
+        }
+    }
+
+    /// Characterisation, written before this file's docs were touched: no
+    /// input reaches [`ThrottleDecision::RateLimit`]. The bucket starts full
+    /// and the only thing that ever removes a token is an `Allow` — which at
+    /// the same instant opens the suppression window. Everything the window
+    /// swallows still refills the bucket, so the token count has to climb
+    /// from `capacity - 1` back to `capacity` before the window can close,
+    /// and every severity's window is far longer than that climb. Drive the
+    /// densest stream the API allows — one call per second, which keeps
+    /// `last_refill` current so even the boundary call sees almost no
+    /// elapsed time — and the third arm still never appears.
+    #[test]
+    fn rate_limit_is_unreachable_for_every_severity() {
+        for severity in [Severity::P0, Severity::P1, Severity::P2] {
+            let t = Throttle::new();
+            let start = Instant::now();
+            let window = severity.suppression_window_secs();
+            let mut decisions = Vec::new();
+            for secs in 0..=window {
+                decisions.push((
+                    secs,
+                    t.allow("ch", "fp", severity, start + Duration::from_secs(secs)),
+                ));
+            }
+            for secs in [window + 1, window + 2, window * 2] {
+                decisions.push((
+                    secs,
+                    t.allow("ch", "fp", severity, start + Duration::from_secs(secs)),
+                ));
+            }
+            for (secs, d) in &decisions {
+                assert_ne!(
+                    *d,
+                    ThrottleDecision::RateLimit,
+                    "{severity:?} produced RateLimit at t={secs}s — the arm just became \
+                     reachable; the dispatcher's `dropped` accounting and this file's docs \
+                     must be revisited"
+                );
+            }
+            // The stream really did exercise the other two arms, so the
+            // assertion above is not vacuous.
+            assert!(decisions.iter().any(|(_, d)| *d == ThrottleDecision::Allow));
+            assert!(decisions
+                .iter()
+                .any(|(_, d)| *d == ThrottleDecision::Suppress));
+        }
     }
 }

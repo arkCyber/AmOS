@@ -252,6 +252,22 @@ export function folderPath(list: FEntry[], id: string): string {
 export const FILES_FAV_KEY = "amos.files.favorites";
 
 /**
+ * Corruption guard for the favorites id-list — the same rule `normalizePhotos` /
+ * `normalizeNotes` / `normalizeTrash` apply to their keys: anything that is not an
+ * array reads as "no favorites" rather than throwing at the reader.
+ *
+ * `amos.files.favorites` is one of `lib/cloud.ts`'s `SYNC_STORES`, and `restoreBackup`
+ * writes a backup's value into the key **verbatim** (no shape check), so a valid-JSON
+ * non-array (`{}` / `5` / `null` / `"x"` — returned verbatim by `readJson`, whose
+ * `fallback` fires only when the bytes are *absent*) can land here by restoring a
+ * backup. The entry ids are opaque strings, so a non-string member is dropped too.
+ */
+export function normalizeFavs(list: unknown): string[] {
+  if (!Array.isArray(list)) return [];
+  return list.filter((x): x is string => typeof x === "string");
+}
+
+/**
  * The **cross-window** reveal intent (REQ-A458): `{ id, nonce }`, written by whoever wants the
  * Files screen to show one entry, cleared by the Files screen once it has.
  *
@@ -283,6 +299,63 @@ export function normalizeReveal(raw: unknown): FilesReveal | null {
   if (typeof o.id !== "string" || o.id.trim() === "") return null;
   const nonce = typeof o.nonce === "number" && Number.isFinite(o.nonce) ? o.nonce : 0;
   return { id: o.id, nonce };
+}
+
+/**
+ * The Files screen's four top-level views, as one declaration.
+ *
+ * This is not a new concept — it is that screen's `mode` state (`FilesApp.svelte`), promoted to a
+ * named, exported vocabulary so the *asking* side and the *answering* side share it instead of
+ * each spelling out the same four literal strings.
+ *
+ * The **array is the declaration and the type is derived from it**, deliberately: the reader below
+ * has to check a *stored* value against this set at runtime, which a type alone cannot do, and two
+ * spellings (a union and a list) are two edits for one rename. `vocab-mirror-scan` fails the build
+ * on exactly that duplication, which is how this shape was arrived at.
+ */
+export const FILES_VIEWS = ["all", "fav", "recent", "trash"] as const;
+
+/** One of the views above. `FilesApp.svelte`'s `mode` state is typed with this. */
+export type FilesView = (typeof FILES_VIEWS)[number];
+
+/**
+ * The **cross-window view intent** (REQ-A783): `{ view, nonce }`, written by anyone who wants the
+ * Files screen to *land on* one of its views, cleared by the Files screen once it has.
+ *
+ * A sibling of `FILES_REVEAL_KEY`, for the same reason and with the same rules (store key rather
+ * than `propsBus`, because the desktop app that asks — the Dock's trash tile — lives in the shell
+ * window while Files lives in its own `WebviewWindow`; command-not-state, because a later Files
+ * window must find nothing pending).
+ *
+ * Why it exists: the trash tile was greyed out on the argument that "`wm_open(label)` carries a
+ * label and nothing else, so a Dock tile cannot open *the trash pane*". That argument is about the
+ * **window route**, and it is true of `wm_open` — but it was read as a limit on what the shell can
+ * ask for, and the reveal intent (REQ-A458) already showed the label was never the whole channel.
+ * The window is opened by label; the *destination inside it* travels here.
+ */
+export const FILES_VIEW_KEY = "amos.files.view";
+
+/** One view request: the view to show, and a nonce so asking for the same view twice still fires. */
+export interface FilesViewIntent {
+  view: FilesView;
+  nonce: number;
+}
+
+/**
+ * Coerce a stored view value — `null` for "nothing pending". A non-object, a missing `view`, or a
+ * view name this build does not have (an older reader meeting a newer writer) are all *not*
+ * requests: the screen keeps the view it is on rather than switching to a state no branch of its
+ * template renders.
+ */
+export function normalizeViewIntent(raw: unknown): FilesViewIntent | null {
+  if (!raw || typeof raw !== "object") return null;
+  const o = raw as Record<string, unknown>;
+  if (typeof o.view !== "string") return null;
+  // Widened for the lookup: `FILES_VIEWS` is a tuple of literals, so `includes` would otherwise
+  // only accept a literal — and this string came off a store, i.e. from anywhere.
+  if (!(FILES_VIEWS as readonly string[]).includes(o.view)) return null;
+  const nonce = typeof o.nonce === "number" && Number.isFinite(o.nonce) ? o.nonce : 0;
+  return { view: o.view as FilesView, nonce };
 }
 
 /** Toggle an entry id in a favorites id-list (returns a new array). */

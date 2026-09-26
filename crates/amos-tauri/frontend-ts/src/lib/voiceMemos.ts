@@ -372,7 +372,9 @@ export function trimMemo(
 export type AsrState =
   | { kind: "idle" }
   | { kind: "transcribing" }
-  | { kind: "done"; transcript: MemoTranscript }
+  /** `unsaved` ⇒ the daemon transcribed, but the store refused to attach it to the memo. The
+   *  text is real and worth showing; it must not be drawn as an *attached* transcript. */
+  | { kind: "done"; transcript: MemoTranscript; unsaved?: boolean }
   | { kind: "empty" }
   | { kind: "error"; message: string };
 

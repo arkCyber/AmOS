@@ -18,6 +18,7 @@ import {
   addConversation,
   removeConversation,
   findConversation,
+  messageNotifKey,
 } from "../lib/messages";
 
 const day = (y: number, mo: number, d: number, h = 12) =>
@@ -170,5 +171,18 @@ describe("messages", () => {
     const gone = removeConversation(withLi, id);
     expect(gone.length).toBe(1);
     expect(removeConversation(withLi, "nope").length).toBe(2);
+  });
+});
+
+describe("messageNotifKey (a notice's identity is the message's own, REQ-A1441)", () => {
+  test("is derived from the conversation and the stamp — never a position", () => {
+    // The same message keeps its id no matter where it sits in any list the screen
+    // builds (the arrival banner diffs id **sets**, `newestAddedNotif`).
+    expect(messageNotifKey("c:b", 1700)).toBe(messageNotifKey("c:b", 1700));
+    expect(messageNotifKey("c:b", 1700)).toBe("msg:c:b:1700");
+    // Two conversations' rows never collide, even at the same millisecond.
+    expect(messageNotifKey("c:b", 1700)).not.toBe(messageNotifKey("c:a", 1700));
+    // Two messages in one thread stay two rows (the stamp is the discriminator).
+    expect(messageNotifKey("c:b", 1700)).not.toBe(messageNotifKey("c:b", 1701));
   });
 });

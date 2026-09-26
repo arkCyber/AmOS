@@ -71,6 +71,31 @@ fn is_off(raw: &str) -> bool {
     )
 }
 
+/// The **one** place the on-disk log directory policy lives.
+///
+/// `dir` set to an "off" spelling (`""` / `off` / `none` / `0`, trimmed and
+/// case-insensitive) ⇒ `None`; set to anything else ⇒ that trimmed path; unset
+/// ⇒ `$HOME/.amos/logs`, or `None` when `home` is missing/empty. `None` means
+/// "this sink is disabled".
+///
+/// Both log sinks resolve through here — the human [`LogFileConfig::from_vars`]
+/// and `jsonlog::JsonLogConfig` — so the two can never disagree on the directory
+/// (the property the JSON module's docs promise). It is `pub(crate)` on purpose:
+/// a second copy of this match is exactly the drift F-SH-200 warns about.
+pub(crate) fn resolve_log_dir(dir: Option<String>, home: Option<String>) -> Option<PathBuf> {
+    match dir {
+        Some(d) if is_off(&d) => None,
+        Some(d) => Some(PathBuf::from(d.trim())),
+        None => {
+            let h = home?;
+            if h.trim().is_empty() {
+                return None;
+            }
+            Some(PathBuf::from(h.trim()).join(".amos").join("logs"))
+        }
+    }
+}
+
 impl LogFileConfig {
     /// Resolve the config from the process env (see the module docs).
     pub fn from_env() -> Option<Self> {
@@ -84,24 +109,15 @@ impl LogFileConfig {
 
     /// Pure policy (env is process-global, so this split keeps it unit-testable):
     /// `dir` unset ⇒ `home/.amos/logs`; an explicit "off" spelling or a missing home
-    /// ⇒ `None` (stdout only).
+    /// ⇒ `None` (stdout only). The directory half is [`resolve_log_dir`], the one
+    /// implementation the JSON sink shares too.
     pub fn from_vars(
         dir: Option<String>,
         home: Option<String>,
         max_bytes: Option<String>,
         keep: Option<String>,
     ) -> Option<Self> {
-        let chosen: PathBuf = match dir {
-            Some(d) if is_off(&d) => return None,
-            Some(d) => PathBuf::from(d.trim()),
-            None => {
-                let h = home?;
-                if h.trim().is_empty() {
-                    return None;
-                }
-                PathBuf::from(h.trim()).join(".amos").join("logs")
-            }
-        };
+        let chosen = resolve_log_dir(dir, home)?;
         Some(Self {
             dir: chosen,
             max_bytes: max_bytes

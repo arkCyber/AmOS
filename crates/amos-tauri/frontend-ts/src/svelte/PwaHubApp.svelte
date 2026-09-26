@@ -13,15 +13,17 @@
   // (and it answers with its reason as text, which we show verbatim).
   import {
     fetchPwaIndex,
+    openRemotePwa,
     pwaAllTools,
     pwaEntryGlyph,
     pwaEntryIconUrl,
     type PwaEntry,
     type PwaIndexDoc,
     type PwaIndexFailure,
+    type PwaRemoteFailure,
   } from "../lib/pwaIndex";
   import { t } from "./locale.svelte";
-  import { currentFormFactor } from "../lib/desktopApps";
+  import { currentFormFactor } from "../lib/formAuthority.svelte";
   import { pwaHubCols } from "../lib/formLayout";
 
   type Load =
@@ -69,6 +71,40 @@
     base === null ? null : pwaEntryIconUrl(base, entry);
 
   const failureKey = (reason: PwaIndexFailure): string => `pwa.failed.${reason}`;
+
+  // ── 「从 URL 添加」 (REQ-A560) ──────────────────────────────────────────────
+  //
+  // `pwa_open_remote` (Gap 6) had no caller at all: implemented and tested in the
+  // `amos-appstore` domain, registered by name in the unwired ledger — so the only way to
+  // put a *remote* manifest into this index was to edit the index directory by hand.
+  // This is the missing screen. It shows the host's own refusal verbatim (which host was
+  // not allow-listed / which env var is unset / which feature the build lacks) instead of a
+  // generic failure, and on success it **reloads the index** — the new tile is the proof.
+  type RemoteState =
+    | { kind: "idle" }
+    | { kind: "failed"; reason: PwaRemoteFailure; detail: string }
+    | { kind: "added"; name: string };
+
+  let remoteUrl = $state("");
+  let remote = $state<RemoteState>({ kind: "idle" });
+  let remoteBusy = $state(false);
+
+  const addRemote = async () => {
+    if (remoteBusy) return;
+    remoteBusy = true;
+    remote = { kind: "idle" };
+    const result = await openRemotePwa(remoteUrl);
+    if (result.kind === "ok") {
+      remote = { kind: "added", name: result.app.name };
+      remoteUrl = "";
+      // Re-read the index: the manifest was persisted by the host, and a tile that has not
+      // appeared yet is not something we may claim.
+      await run();
+    } else {
+      remote = { kind: "failed", reason: result.reason, detail: result.detail };
+    }
+    remoteBusy = false;
+  };
 </script>
 
 <div
@@ -83,6 +119,51 @@
       >
     {/if}
   </header>
+
+  <!-- Add-from-URL (REQ-A560): the one route a *remote* manifest has into this index.
+       Placed outside the load-state branches on purpose — an empty index is exactly when a
+       user needs it, and hiding it behind "there are already apps" would only serve the demo
+       case. The refusal text below is the host's own sentence, shown verbatim. -->
+  <form
+    class="flex flex-col gap-1.5"
+    onsubmit={(e) => {
+      e.preventDefault();
+      void addRemote();
+    }}
+  >
+    <div class="flex gap-2">
+      <input
+        type="url"
+        bind:value={remoteUrl}
+        placeholder={t("pwa.remotePlaceholder")}
+        aria-label={t("pwa.remoteTitle")}
+        autocomplete="off"
+        spellcheck="false"
+        class="min-w-0 flex-1 rounded-xl border border-black/10 bg-white/60 px-3 py-1.5 font-mono text-[11px] outline-none placeholder:opacity-50 focus:border-black/30 dark:border-white/10 dark:bg-black/20 dark:focus:border-white/30"
+        data-testid="pwa-remote-url"
+      />
+      <button
+        type="submit"
+        disabled={remoteBusy}
+        class="cursor-pointer rounded-xl bg-black/5 px-3 py-1.5 text-xs font-medium transition active:scale-95 disabled:opacity-50 dark:bg-white/10"
+        data-testid="pwa-remote-add">{t(remoteBusy ? "pwa.remoteBusy" : "pwa.remoteAdd")}</button
+      >
+    </div>
+    {#if remote.kind === "added"}
+      <p class="text-[11px] text-emerald-600 dark:text-emerald-400" data-testid="pwa-remote-added">
+        {t("pwa.remoteAdded", { name: remote.name })}
+      </p>
+    {:else if remote.kind === "failed"}
+      <p class="text-[11px] text-amber-600 dark:text-amber-400" data-testid="pwa-remote-error">
+        {t(`pwa.failed.${remote.reason}`)}
+      </p>
+      <!-- Which host was not allow-listed, which env var is unset, which feature this build
+           lacks — the operator can act on the host's sentence and not on a generic "failed". -->
+      <p class="break-words font-mono text-[10px] opacity-60" data-testid="pwa-remote-detail">
+        {remote.detail}
+      </p>
+    {/if}
+  </form>
 
   {#if load.kind === "loading"}
     <p class="py-8 text-center text-sm opacity-60" data-testid="pwa-loading">{t("pwa.loading")}</p>

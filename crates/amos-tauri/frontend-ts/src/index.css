@@ -17,10 +17,53 @@
 :root {
   --accent: 0 102 204; /* AA-blue (light)              #0066CC */
   --danger: 215 0 21;  /* AA-red  (light)              #D70015 */
+  /* A **theme-independent** solid red for small white-on-red chips (notification
+     badges: DockTileButton / HomeDock / Launchpad). `--danger` above is deliberately
+     overridden in `.dark` to the HIG-faithful #FF453A, which only meets AA-Large for
+     white text — fine for a bold ≥14pt button label, but a badge number is small text
+     that needs AA (4.5:1). White on this red is 5.38:1 in *both* themes, so it is left
+     out of `.dark` on purpose. Not for large filled buttons — those keep `bg-danger`. */
+  --danger-solid: 215 0 21;
+
+  /* ─── Semantic surface/label tokens (enterprise admin panels) ──────────────
+   * `AuditLogViewer` / `APISettings` / `MDMPanel` / `TemplateLibrary` are the four
+   * panels `SettingsApp` mounts under 企业. They are the only surfaces in the app
+   * whose look comes from a scoped `<style>` block, and those blocks carried bare
+   * HIG literals (`#fff` cards, `color:#000` headings, `#8E8E93` captions) with no
+   * dark pair — so under the dark theme a heading was #000 on the `#1e1e1e` shell
+   * (`lib/wallpaper.ts::wallpaperFallbackColor`, 1.28:1 — unreadable) and the
+   * cards stayed white. The literals now resolve through these tokens, so the four
+   * panels follow the same theme as every Tailwind surface around them.
+   *
+   * Values are RGB channels (like `--accent` / `--danger` above) so `rgb(var(--x))`
+   * and `rgb(var(--x) / a)` tints both work. Light greys are the HIG values; the
+   * light success/warning are deepened from HIG (#34C759 / #FF9500, ~1.9:1 and
+   * ~2.1:1 on white) to reach AA SC 1.4.3 as *text*, mirroring `--accent`'s
+   * documented deepening. Dark greys are the HIG system values.
+   *
+   * Every one of these MUST be overridden in `.dark` — a token declared only here
+   * renders dark-on-dark. `src/__tests__/theme-tokens.test.ts` parses both blocks
+   * and pins the pair. */
+  --surface: 255 255 255;   /* card / field fill        #FFFFFF */
+  --surface-2: 242 242 247; /* secondary fill (gray6)   #F2F2F7 */
+  --separator: 229 229 234; /* hairline (gray5)         #E5E5EA */
+  --label: 0 0 0;           /* primary text             #000000 */
+  --label-2: 60 60 67;      /* secondary text (gray3)   #3C3C43 */
+  --label-3: 142 142 147;   /* tertiary text (gray)     #8E8E93 */
+  --success: 31 127 54;     /* AA green on light        #1F7F36 */
+  --warning: 165 95 0;      /* AA amber on light        #A55F00 */
 }
 .dark {
   --accent: 10 132 255; /* iOS system blue (dark)        #0A84FF */
   --danger: 255 69 58;  /* iOS system red  (dark)        #FF453A */
+  --surface: 28 28 30;      /* elevated card on dark    #1C1C1E */
+  --surface-2: 44 44 46;    /* secondary fill (dark)    #2C2C2E */
+  --separator: 56 56 58;    /* hairline (dark)          #38383A */
+  --label: 255 255 255;
+  --label-2: 209 209 214;
+  --label-3: 152 152 157;
+  --success: 48 209 88;     /* iOS green (dark)         #30D158 */
+  --warning: 255 159 10;    /* iOS orange (dark)        #FF9F0A */
 }
 
 /* base scrollbar + tap feel, iOS-ish */
@@ -284,10 +327,8 @@ html.theme-transitioning * {
   html.theme-transitioning * {
     transition-duration: 0s !important;
   }
-  
+
   .theme-switching {
     animation: none;
   }
 }
-
-

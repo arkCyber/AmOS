@@ -85,6 +85,47 @@ fn sub_second_timeout_never_sleeps_instantly() {
 }
 
 #[test]
+fn zero_timeout_disables_auto_off_never_sleeps_on_the_first_probe() {
+    // The shipped contract defines timeout `0` as 「关闭」/disabled (Settings →
+    // Auto screen-off, durable key `amos.displayAutoOffSec`, fresh-install default
+    // 0). The kernel must read `0` the same way the live shell rule does
+    // (`lib/display.ts::autoOffDue`: `<= 0` ⇒ never due) — *not* as "sleep after
+    // 1 s", which is what the sub-second floor would do to `Duration::ZERO`.
+    let policy = IdlePolicy {
+        on_battery_timeout: Duration::ZERO,
+        on_charger_timeout: Duration::ZERO,
+    };
+    let mut c = ScreenController::new(policy, 0);
+    // Even a long idle on either power source must never auto-off.
+    for now in [1u64, 60, 3_600, 86_400] {
+        assert_eq!(c.probe(now, false, false), ScreenChange::None);
+        assert_eq!(c.probe(now, true, false), ScreenChange::None);
+    }
+    assert_eq!(c.state(), ScreenState::On);
+    // The other paths still work: an explicit sleep, then a user wake.
+    assert_eq!(c.sleep(), ScreenChange::Off);
+    assert_eq!(c.touch(90_000), ScreenChange::On);
+}
+
+#[test]
+fn one_source_may_be_disabled_while_the_other_is_not() {
+    // Disabled is *per power source*: on the battery the screen stays on forever,
+    // on the charger the normal timeout still applies.
+    let policy = IdlePolicy {
+        on_battery_timeout: Duration::ZERO,
+        on_charger_timeout: Duration::from_secs(120),
+    };
+    let mut c = ScreenController::new(policy, 0);
+    assert_eq!(c.probe(600, false, false), ScreenChange::None); // battery: never
+    assert_eq!(c.state(), ScreenState::On);
+    // The charger half is still live: 119 s of idle is under the 120 s timeout…
+    assert_eq!(c.probe(119, true, false), ScreenChange::None);
+    assert_eq!(c.state(), ScreenState::On);
+    // …and the battery's `0` did *not* leak into the charger's timeout.
+    assert_eq!(c.probe(120, true, false), ScreenChange::Off);
+}
+
+#[test]
 fn persistent_hold_keeps_the_screen_on_until_cleared() {
     let mut c = ScreenController::new(battery_policy(), 0);
     // Assert a call hold → 10 minutes of no touch must not sleep.

@@ -6,7 +6,7 @@
  * removed; the group card previews up to the first few member apps (falling back
  * to a 📁 icon when empty).
  */
-import { readStoreValue, writeStoreValue } from "./amosStore";
+import { readStoreValue, writeStoreValueChecked } from "./amosStore";
 import { localId } from "./localId";
 
 export interface CustomGroup {
@@ -17,6 +17,20 @@ export interface CustomGroup {
   apps: string[];
   /** Optional user-chosen emoji icon (defaults to a folder when absent). */
   icon?: string;
+}
+
+/**
+ * What a mutator hands back: the new list **and the store's own verdict**.
+ *
+ * A custom group is authored by the user (its name, its emoji, its members and their
+ * order) and its only reader is `getCustomGroups()` — i.e. the next mount. So a caller
+ * must not move its `customGroups` state to a list the store refused: the folder would be
+ * drawn, and gone after a relaunch. `ok === false` means the write did not land and the
+ * list must be discarded (a no-op — an empty rename, an unknown id — is `ok: true`).
+ */
+export interface GroupsWrite {
+  groups: CustomGroup[];
+  ok: boolean;
 }
 
 export const CUSTOM_GROUPS_KEY = "amos.appLibrary.groups";
@@ -43,15 +57,15 @@ export function getCustomGroups(): CustomGroup[] {
   }));
 }
 
-function persist(list: CustomGroup[]): void {
-  writeStoreValue(CUSTOM_GROUPS_KEY, list);
+function persist(list: CustomGroup[]): boolean {
+  return writeStoreValueChecked(CUSTOM_GROUPS_KEY, list);
 }
 
-/** Append a new (empty) group, persisting it; returns the created group + new list. */
+/** Append a new (empty) group, persisting it; returns the created group + new list + verdict. */
 export function addCustomGroup(
   current: CustomGroup[],
   name: string,
-): { groups: CustomGroup[]; created: CustomGroup } {
+): GroupsWrite & { created: CustomGroup } {
   const trimmed = name.trim();
   const created: CustomGroup = {
     // A group id is identity: `renameCustomGroup` / `setGroupApps` / `removeCustomGroup`
@@ -63,34 +77,32 @@ export function addCustomGroup(
     apps: [],
   };
   const groups = [...current, created];
-  persist(groups);
-  return { groups, created };
+  return { groups, created, ok: persist(groups) };
 }
 
-/** Replace one group's member apps (persist + return the new list). */
+/** Replace one group's member apps (persist + return the new list + verdict). */
 export function setGroupApps(
   current: CustomGroup[],
   id: string,
   apps: string[],
-): CustomGroup[] {
+): GroupsWrite {
   const groups = current.map((g) =>
     g.id === id ? { ...g, apps: [...apps] } : g,
   );
-  persist(groups);
-  return groups;
+  return { groups, ok: persist(groups) };
 }
 
-/** Rename a group (trimmed, non-empty; persist + return the new list). */
+/** Rename a group (trimmed, non-empty; persist + return the new list + verdict). */
 export function renameCustomGroup(
   current: CustomGroup[],
   id: string,
   name: string,
-): CustomGroup[] {
+): GroupsWrite {
   const trimmed = name.trim();
-  if (!trimmed) return current;
+  // An empty name is a no-op, not a refusal: nothing was attempted, so `ok` is true.
+  if (!trimmed) return { groups: current, ok: true };
   const groups = current.map((g) => (g.id === id ? { ...g, name: trimmed } : g));
-  persist(groups);
-  return groups;
+  return { groups, ok: persist(groups) };
 }
 
 /** Set (or clear, with `undefined`) a group's custom emoji icon (persisted). */
@@ -98,19 +110,17 @@ export function setGroupIcon(
   current: CustomGroup[],
   id: string,
   icon: string | undefined,
-): CustomGroup[] {
+): GroupsWrite {
   const groups = current.map((g) =>
     g.id === id ? { ...g, icon: icon ? icon : undefined } : g,
   );
-  persist(groups);
-  return groups;
+  return { groups, ok: persist(groups) };
 }
 
 /** Remove one custom group by id, persisting the result. */
-export function removeCustomGroup(current: CustomGroup[], id: string): CustomGroup[] {
+export function removeCustomGroup(current: CustomGroup[], id: string): GroupsWrite {
   const groups = current.filter((g) => g.id !== id);
-  persist(groups);
-  return groups;
+  return { groups, ok: persist(groups) };
 }
 
 /**

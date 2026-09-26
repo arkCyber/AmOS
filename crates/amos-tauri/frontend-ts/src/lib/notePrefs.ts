@@ -18,9 +18,18 @@ export interface NotesPrefs {
   /** When on, the active list is ordered by last-modified (desc), pinned on top.
    *  Default off (preserves insertion/newest-first order). */
   sortByModified: boolean;
+  /** When on, a touch contact that looks like a resting palm is ignored while writing
+   *  (REQ-A526). Default **on**: a palm that draws is the failure the user cannot undo
+   *  with a single gesture. A legacy stored blob without the field degrades to this safe
+   *  default, so no migration is needed. */
+  palmRejection: boolean;
 }
 
-export const defaultNotesPrefs: NotesPrefs = { openInEditor: false, sortByModified: false };
+export const defaultNotesPrefs: NotesPrefs = {
+  openInEditor: false,
+  sortByModified: false,
+  palmRejection: true,
+};
 
 /** Pure: coerce unknown stored bytes into a sane [`NotesPrefs`]. */
 export function normalizeNotesPrefs(raw: unknown): NotesPrefs {
@@ -29,6 +38,7 @@ export function normalizeNotesPrefs(raw: unknown): NotesPrefs {
   return {
     openInEditor: typeof o.openInEditor === "boolean" ? o.openInEditor : false,
     sortByModified: typeof o.sortByModified === "boolean" ? o.sortByModified : false,
+    palmRejection: typeof o.palmRejection === "boolean" ? o.palmRejection : true,
   };
 }
 

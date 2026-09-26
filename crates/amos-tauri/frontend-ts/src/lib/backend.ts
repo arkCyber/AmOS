@@ -9,7 +9,8 @@ import { localId } from "./localId";
 
 interface TauriBridge {
   invoke(command: string, args?: Record<string, unknown>): Promise<unknown>;
-  listen(channel: string, handler: (e: { payload: unknown }) => void): Promise<() => void>;
+  /** `null` when the host did **not** establish the subscription (REQ-A838). */
+  listen(channel: string, handler: (e: { payload: unknown }) => void): Promise<(() => void) | null>;
 }
 
 /**
@@ -53,20 +54,28 @@ function bridge(): TauriBridge | null {
  * Uses a host-provided `listen` when present; otherwise registers through the
  * event plugin exactly like `@tauri-apps/api` does
  * (`plugin:event|listen` + a `transformCallback` id), because the internal
- * `listen` helper does not exist. Returns an unsubscribe function; a no-op when
- * the host cannot subscribe at all (offline / test double).
+ * `listen` helper does not exist.
+ *
+ * Returns an unsubscribe function, or **`null` when the subscription was not
+ * established** (REQ-A838). This function used to answer `() => {}` for every failure —
+ * a plugin path that is unavailable, a registration the host rejected — which is the same
+ * value it answers for success, so no caller could tell a live channel from a dead one.
+ * `null` is the honest answer, and it is the convention every other wrapper in this module
+ * already follows ([`invoke`] answers `null` for the same reason); [`subscribe`] records
+ * *why* in the diagnostic ledger so `bridgeDiag(channel)` can still distinguish
+ * "not bridged" from "the host refused".
  */
 async function listenEvent(
   internals: TauriInternals,
   invoke: (command: string, args?: Record<string, unknown>) => Promise<unknown>,
   channel: string,
   handler: (e: { payload: unknown }) => void,
-): Promise<() => void> {
+): Promise<(() => void) | null> {
   if (typeof internals.listen === "function") {
     return internals.listen(channel, handler);
   }
   const transform = internals.transformCallback?.bind(internals);
-  if (typeof transform !== "function") return () => {};
+  if (typeof transform !== "function") return null;
   const handlerId = transform((raw: unknown) => {
     handler({ payload: (raw as { payload?: unknown } | null)?.payload });
   });
@@ -82,8 +91,10 @@ async function listenEvent(
       void invoke("plugin:event|unlisten", { event: channel, eventId, target }).catch(() => {});
     };
   } catch {
+    // The host refused the registration. Unregister the callback we minted so the id is
+    // not leaked, then report the failure honestly rather than as a no-op unsubscribe.
     internals.unregisterCallback?.(handlerId);
-    return () => {};
+    return null;
   }
 }
 
@@ -100,7 +111,27 @@ export function bridged(): boolean {
 export type BridgeDiag =
   | { ok: true }
   | { ok: false; kind: "not-bridged"; command: string }
-  | { ok: false; kind: "command-failed"; command: string; detail?: unknown };
+  // `command-failed` carries the raw shape Tauri throws when a `Result<T, AmosError>`
+  // comes back `Err`: `{ code, message, cause? }`. The `code` field is the wire-stable
+  // name (e.g. `amos.interpret.no_active`) the UI branches on; `message` is the
+  // developer-facing diagnostic the Rust side wrote, **never** shown to users as-is
+  // — the i18n mirror is the contract, the message is the debug trail. The shape is
+  // typed as optional `string` so a non-AmosError throw (a thrown JS value, a Tauri
+  // bug that bypassed `Result::Err`) still fits and the ledger stays total.
+  | {
+      ok: false;
+      kind: "command-failed";
+      command: string;
+      detail?: unknown;
+      code?: string;
+    }
+  /**
+   * A subscription that was **not established** (REQ-A838). Its own kind because the
+   * consequence differs from a failed command: a refused `invoke` means one answer is
+   * missing, while a refused `listen` means **no event will ever arrive** — the surface
+   * stays up and simply never updates, which is indistinguishable from a quiet channel.
+   */
+  | { ok: false; kind: "listen-failed"; command: string; detail?: unknown };
 
 let lastDiag: BridgeDiag = { ok: true };
 
@@ -156,7 +187,18 @@ export async function invoke<T = unknown>(command: string, args?: Record<string,
     noteDiag(command, { ok: true });
     return result;
   } catch (err) {
-    noteDiag(command, { ok: false, kind: "command-failed", command, detail: err });
+    // Tauri throws the Rust `AmosError` envelope as a plain object:
+    //   `{ code: "amos.<group>.<kind>", message: "<debug>", cause?: ["…"] }`
+    // We surface the `code` on the diagnostic ledger (REQ-A461) so a caller can
+    // branch on the typed reason — "no active session" vs. "session id mismatch"
+    // vs. "text too long" — rather than parsing the (English-only, possibly
+    // renamable) message string. The full envelope still rides along in
+    // `detail` for any caller that wants the developer-facing diagnostic.
+    const code =
+      err && typeof err === "object" && typeof (err as { code?: unknown }).code === "string"
+        ? ((err as { code: string }).code)
+        : undefined;
+    noteDiag(command, { ok: false, kind: "command-failed", command, detail: err, code });
     // Routed through the diagnostic ledger (P1-3) so a failed bridge call is
     // retrievable from the UI, not just visible in logcat while it scrolls away.
     amosWarn("backend", `${command} failed`, err);
@@ -164,12 +206,44 @@ export async function invoke<T = unknown>(command: string, args?: Record<string,
   }
 }
 
-/** Subscribe to a backend event channel; returns an unsubscribe (noop outside Tauri). */
-export async function subscribe(channel: string, onEvent: (payload: unknown) => void): Promise<() => void> {
+/**
+ * Subscribe to a backend event channel.
+ *
+ * Returns an unsubscribe function, or **`null` when the channel was not subscribed** —
+ * which is the failure value, and the same convention [`invoke`] uses (REQ-A838). The
+ * `bridgeDiag(channel)` entry says which failure it was:
+ *
+ * * `{ ok: false, kind: "not-bridged" }` — no host at all (a browser, a test double).
+ * * `{ ok: false, kind: "listen-failed" }` — a host **is** there and refused the
+ *   registration. This is the case that used to be invisible: it is a real fault, and the
+ *   surface it feeds will never update.
+ *
+ * It used to answer `() => {}` in every case, including success, so a screen driven by a
+ * dead channel looked exactly like one on a quiet channel — no error, no gap, nothing to
+ * notice. Reading the verdict is what separates them, and a caller that does not care can
+ * still collapse deliberately (`?? undefined`) and say so.
+ */
+export async function subscribe(
+  channel: string,
+  onEvent: (payload: unknown) => void,
+): Promise<(() => void) | null> {
   const b = bridge();
-  if (!b) return () => {};
+  if (!b) {
+    noteDiag(channel, { ok: false, kind: "not-bridged", command: channel });
+    return null;
+  }
   try {
     const un = await b.listen(channel, (e) => onEvent(e.payload));
+    if (typeof un !== "function") {
+      // `listenEvent` answers `null` for the failures it handles internally (no
+      // `transformCallback`, a rejected `plugin:event|listen`). Warn on this path too —
+      // the `catch` below warns, and a ledger entry nobody writes a breadcrumb for is the
+      // half-visible failure this round is about.
+      noteDiag(channel, { ok: false, kind: "listen-failed", command: channel });
+      amosWarn("backend", `listen(${channel}) was refused by the host`);
+      return null;
+    }
+    noteDiag(channel, { ok: true });
     return () => {
       try {
         un();
@@ -177,8 +251,10 @@ export async function subscribe(channel: string, onEvent: (payload: unknown) => 
         /* ignore */
       }
     };
-  } catch {
-    return () => {};
+  } catch (err) {
+    noteDiag(channel, { ok: false, kind: "listen-failed", command: channel, detail: err });
+    amosWarn("backend", `listen(${channel}) failed`, err);
+    return null;
   }
 }
 
@@ -440,23 +516,95 @@ export async function deviceMicStatus(): Promise<DeviceMicStatus | null> {
  * `native` is true only inside the Android System UI where the Kotlin
  * `MicPermissionGlue` is bound; `granted` is true only when the permission is held.
  */
+/**
+ * Which of four things a *failed* `granted:false` means (REQ-A787 / F-AND-010).
+ *
+ * Mirrors `crates/amos-tauri/src/mic_permission.rs`'s `MicGrantState` variant for variant
+ * (`#[serde(rename_all = "kebab-case")]`), and `declaredMirrors.test.ts` fails when the two
+ * drift: `"granted"`, `"denied"`, `"unreadable"`, `"timed-out"`, `"host"`. `"unreadable"` is
+ * the one a UI must never word as a fact about the user — the read failed, so the grant
+ * question was never answered.
+ */
+export type MicGrantStateWire = "granted" | "denied" | "unreadable" | "timed-out" | "host";
+
 export interface MicPermissionState {
+  /** True only when the OS-grant concept exists here (Android System UI, glue bound). */
   native: boolean;
+  /** True **only** when the OS itself answered "yes" — i.e. `state === "granted"`. */
   granted: boolean;
+  /** *Why* `granted` is false, when it is — never inferred from `granted` alone. */
+  state: MicGrantStateWire;
+  /** The host's own words when `state === "unreadable"`; absent otherwise. */
+  detail?: string;
 }
 
-/** Dialog-free snapshot of the OS `RECORD_AUDIO` grant. Host → `native:false`. */
+/** Dialog-free snapshot of the OS `RECORD_AUDIO` grant. Host → `state: "host"`. */
 export async function micPermissionState(): Promise<MicPermissionState | null> {
   return invoke<MicPermissionState>("mic_permission_state");
 }
 
 /**
  * JS-awaitable: ensure `RECORD_AUDIO` for the native AAudio mic, posting the OS
- * dialog only when it is not already held. Host → `{ native:false, granted:false }`
- * (no dialog, no fabricated grant).
+ * dialog only when it is not already held. Host → `state: "host"` (no dialog, no
+ * fabricated grant).
  */
 export async function micPermissionRequest(): Promise<MicPermissionState | null> {
   return invoke<MicPermissionState>("mic_permission_request");
+}
+
+/* ---- OS SMS grant (READ_SMS / SEND_SMS / RECEIVE_SMS — the whole set is one grant) ---- */
+
+/** Wire spellings of the SMS grant read; the same five states as the mic grant. */
+export type SmsGrantStateWire = "granted" | "denied" | "unreadable" | "timed-out" | "host";
+
+export interface SmsPermissionState {
+  /** True only when the OS-grant concept exists here (Android System UI, glue bound). */
+  native: boolean;
+  /** True **only** when the OS answered that the whole set is held. */
+  granted: boolean;
+  /** *Why* `granted` is false, when it is — never inferred from `granted` alone. */
+  state: SmsGrantStateWire;
+  /** The host's own words when `state === "unreadable"`; absent otherwise. */
+  detail?: string;
+}
+
+/**
+ * JS-awaitable: ask the OS for READ_SMS / SEND_SMS / RECEIVE_SMS, posting the dialog
+ * only when the set is not already held. Host → `state: "host"` (no dialog, no
+ * fabricated grant).
+ */
+export async function smsPermissionRequest(): Promise<SmsPermissionState | null> {
+  return invoke<SmsPermissionState>("sms_permission_request");
+}
+
+/* ---- OS location grant (the native `LocationManager` read needs it; not the WebView path) ---- */
+
+/**
+ * State of the OS location grant for the native GNSS read behind the sensor snapshot's
+ * `gnss` block. `native` is true only inside the Android System UI where the Kotlin
+ * `LocationPermissionGlue` is bound.
+ *
+ * Three levels, not a boolean: Android 12+ lets the user answer **approximate**, and a
+ * boolean would report that as the precise grant — the UI would then promise an accuracy
+ * the receiver was never allowed to give (REQ-A772 / F-SH-228).
+ */
+export interface LocationPermissionState {
+  native: boolean;
+  grant: "none" | "coarse" | "fine";
+}
+
+/** Dialog-free snapshot of the OS location grant. Host → `native:false`. */
+export async function locationPermissionState(): Promise<LocationPermissionState | null> {
+  return invoke<LocationPermissionState>("location_permission_state");
+}
+
+/**
+ * JS-awaitable: ensure the location grant for the native `LocationManager` read, posting the
+ * OS dialog only when none is held. Host → `{ native:false, grant:"none" }` (no dialog, no
+ * fabricated grant).
+ */
+export async function locationPermissionRequest(): Promise<LocationPermissionState | null> {
+  return invoke<LocationPermissionState>("location_permission_request");
 }
 
 /* ---- 同传 / interpret RPC (degrade to null outside Tauri) ----
@@ -493,6 +641,16 @@ export async function interpretText(sessionId: number, text: string): Promise<un
 
 export async function interpretStop(sessionId: number): Promise<unknown> {
   return invoke("interpret_stop", { sessionId });
+}
+
+/**
+ * Force the in-flight utterance to translate now, without waiting for the VAD's silence.
+ * The command answers `Result<(), String>`, and `()` serializes to `null` — the same value
+ * `invoke` returns on failure — so success is read from the diagnostic ledger
+ * (`bridgeDiag("interpret_end_of_speech").ok`), the pattern `PhoneApp` uses for its
+ * `()`-returning commands, not from the return value. */
+export async function interpretEndOfSpeech(sessionId: number): Promise<unknown> {
+  return invoke("interpret_end_of_speech", { sessionId });
 }
 
 export async function interpretPause(sessionId: number): Promise<unknown> {
@@ -635,8 +793,33 @@ export type TelephonyCall = {
   /** "Outgoing" / "Incoming" — who initiated the call. */
   direction: string;
   emergency: boolean;
-  /** "Off" / "On" / "Failed" — whether the call is being recorded. */
-  recording: string;
+  /**
+   * "Off" / "On" / "Failed" — whether the call is being recorded.
+   *
+   * `undefined` is "no claim", exactly like `muted`: a real in-call bridge reply answers
+   * about *one* toggle, so a mute / speaker / hold reply carries no recording. A caller
+   * applying this payload field-by-field must keep the recording state it already has.
+   * Every daemon snapshot and every `Watch` event carries the field.
+   */
+  recording?: string;
+  /**
+   * Whether the daemon's call state says this call's outbound audio is muted.
+   *
+   * `undefined` means the host made **no claim** (the real in-call recording bridge
+   * answers about recording only), so a caller must leave its current mute state
+   * alone rather than reading `undefined` as `false`.
+   */
+  muted?: boolean;
+  /**
+   * Whether this call's audio is routed to the loudspeaker.
+   *
+   * Only the **real in-call bridge** answers this: the daemon's transport has no audio
+   * route, so every daemon snapshot and every `Watch` event leaves it `undefined`. The
+   * same "no claim" rule as `muted` — a caller keeps the speaker state it has.
+   */
+  speaker?: boolean;
+  /** Whether this call is on hold. Real in-call bridge only — see `speaker`. */
+  hold?: boolean;
 };
 export type TelephonyDialResult = { id: string };
 
@@ -654,15 +837,66 @@ export async function telephonyDial(
 }
 
 /**
- * Place a **real** outbound call through Android Telecom (`ACTION_CALL`), bypassing
- * the daemon's mock. Returns `true` when the call was handed to the OS; `false` when
- * real dialing is unavailable (desktop host, or on-device build without the bound
- * context / `CALL_PHONE` grant) so the caller can fall back to `telephonyDial`.
- * Emergency numbers intentionally go through the privileged mock path (see dialer).
+ * Place a **real** outbound call through Android Telecom (`ACTION_CALL`). Returns
+ * `true` when the platform took the call; `false` when real dialing is unavailable
+ * (desktop host, or an on-device build without the bound context / `CALL_PHONE`
+ * grant) — never a fabricated success.
+ *
+ * The dialer reaches this as the **first** transport of `placeOutgoingCall`
+ * (`lib/phone.ts`): a real platform call is preferred over a simulated one, and this
+ * is the only path that reaches the platform. A daemon that can genuinely own a call
+ * (backend kind `android`) is preferred ahead of it so the in-call UI stays bound;
+ * otherwise a failed real dial is reported honestly rather than downgraded to a mock.
  */
 export async function realDial(number: string): Promise<boolean> {
   const status = await invoke<string>("real_dial", { number });
   return typeof status === "string";
+}
+
+/** Whether this host can place a **real** call, and if not, why not. */
+export type RealDialStatus = {
+  /** This build is an on-device (Android) System UI build that could dial. */
+  on_device: boolean;
+  /**
+   * A real call can be fired right now: on-device, the dial context bound **and** the
+   * `CALL_PHONE` grant held. `false` also covers "the grant could not be read" — the
+   * safe direction, so a caller never routes a dial into a rejected `ACTION_CALL`
+   * (REQ-A1626).
+   */
+  available: boolean;
+  /** Why `available` is false, in the host's own words ("" when available). */
+  reason: string;
+};
+
+/**
+ * Ask whether a real call can be placed right now.
+ *
+ * `null` means the host never answered — which must **not** be read as either
+ * "yes" or "no": a caller that cannot classify the host treats it as "cannot place a
+ * real call" and reports failure rather than trusting a simulation.
+ */
+export async function realDialStatus(): Promise<RealDialStatus | null> {
+  return invoke<RealDialStatus>("telephony_real_dial_status");
+}
+
+/** Which provider backs the daemon's telephony service. */
+export type TelephonyBackend = {
+  /** `mock` | `android` | `unconfigured` | `unspecified`. */
+  kind: string;
+  /** The backend's own words about itself. */
+  detail: string;
+  /** Does `Dial` reach the platform telephony stack? True only for `android`. */
+  real: boolean;
+};
+
+/**
+ * Ask which provider backs the daemon's telephony `Dial`.
+ *
+ * `null` (the daemon did not answer) is **not** "mock" and **not** "real": it is
+ * "unknown", and an unknown backend is never trusted as a real call path.
+ */
+export async function telephonyBackendKind(): Promise<TelephonyBackend | null> {
+  return invoke<TelephonyBackend>("telephony_backend_kind");
 }
 
 /** End a live call by id. */
@@ -720,8 +954,15 @@ export async function telephonyStatus(): Promise<TelephonyCall[] | null> {
 
 /**
  * Subscribe to live call-state events pushed from the daemon `Watch` stream via the
- * Rust bridge. Outside Tauri this is a no-op (returns an unsubscribe). Each call to
- * `onEvent` receives a `TelephonyCall`.
+ * Rust bridge. Each call to `onEvent` receives a `TelephonyCall`.
+ *
+ * The returned value is the **cleanup**, and it is the same function whether or not the
+ * subscription was established: releasing a subscription that does not exist is a no-op, so a
+ * caller that only calls it in `onMount`'s teardown needs nothing more. Whether events will
+ * actually arrive is answered by `bridgeDiag(TELEPHONY_EVENT)` (REQ-A838) — a refused listen
+ * records `listen-failed` there and warns through the debug ledger, rather than looking like a
+ * call stream that happens to be quiet. Outside Tauri there is no bridge at all, so the answer
+ * is `not-bridged` and no event will ever be delivered.
  */
 export function onTelephonyEvent(
   onEvent: (call: TelephonyCall) => void,
@@ -732,6 +973,7 @@ export function onTelephonyEvent(
     const call = payload as TelephonyCall;
     if (call && typeof call.id === "string") onEvent(call);
   }).then((u) => {
+    if (u === null) return; // never established — nothing to release
     if (cancelled) u();
     else unsub = u;
   });
@@ -754,6 +996,12 @@ export function onTelephonyEvent(
  * the host emits had **no consumer at all**. Both halves of that sentence are now fixed: the
  * subscriber exists here (same shape as `onTelephonyEvent`: a synchronously returned unsubscribe,
  * a no-op outside Tauri), and the emit has a reader again.
+ *
+ * REQ-A838: the menu bar has no polling fallback — if the listen is refused, no item activation
+ * will ever reach the shell and the menu will simply do nothing. That is exactly the shape this
+ * round is about, so the refusal is recorded where the shell already looks: `subscribe` writes
+ * `listen-failed` to the diagnosis ledger under `MENU_EVENT`, which `DesktopShell.svelte` reads
+ * back with `bridgeDiag`. A dead menu is then a verdict, not an absence of evidence.
  */
 export function onMenuEvent(onEvent: (id: string) => void): () => void {
   let cancelled = false;
@@ -761,6 +1009,7 @@ export function onMenuEvent(onEvent: (id: string) => void): () => void {
   void subscribe(MENU_EVENT, (payload) => {
     if (typeof payload === "string" && payload) onEvent(payload);
   }).then((u) => {
+    if (u === null) return; // never established — nothing to release
     if (cancelled) u();
     else unsub = u;
   });
@@ -782,6 +1031,107 @@ export async function telephonyStopRecording(
   callId: string,
 ): Promise<TelephonyCall | null> {
   return invoke<TelephonyCall>("telephony_stop_recording", { callId });
+}
+
+/**
+ * Set the mute flag on a live call; returns the daemon's authoritative snapshot.
+ *
+ * `muted` is the **desired state**, not a toggle, so a retried call is safe. The
+ * daemon owns this flag — it is the same call state `Watch` subscribers receive — so
+ * muting here is visible to the lock screen and the AI assistant too. Physically
+ * cutting the microphone is the audio pipeline's job; this records the decision.
+ */
+export async function telephonySetMuted(
+  callId: string,
+  muted: boolean,
+): Promise<TelephonyCall | null> {
+  return invoke<TelephonyCall>("telephony_set_muted", { callId, muted });
+}
+
+/**
+ * Send one **DTMF** tone to a live call, so a caller navigating an IVR reaches it.
+ *
+ * The answer is `true` **only** when a bound in-call service handed the tone to Telecom;
+ * `false` is the host's honest "the tone did not reach the call" (no in-call service is
+ * bound, or Telecom refused). It is deliberately not an error — a keypad keystroke is
+ * best-effort, and the pad already says so. A malformed tone is a typed `AmosError`
+ * (`invoke` folds it to `null`; the reason is in `bridgeDiag("telephony_play_dtmf")`).
+ *
+ * The three-valued answer is the whole point: the pad's note must not promise the far end
+ * hears the digits when it does not, and must not keep disclaiming them when it does.
+ * (REQ-A1146 / F-SH-453)
+ */
+export async function telephonyPlayDtmf(
+  callId: string,
+  tone: string,
+): Promise<boolean | null> {
+  return invoke<boolean>("telephony_play_dtmf", { callId, tone });
+}
+
+/**
+ * Route a live call's audio to the **loudspeaker** (`true`) or the earpiece (`false`).
+ *
+ * `speaker` is the desired state, not a toggle, so a retried call cannot flip a route the
+ * user did not touch. Device-only: without a bound in-call service there is no audio route
+ * to change, and the host refuses in typed words (a fabricated `Ok` would light the button
+ * over a call still on the earpiece).
+ */
+export async function telephonySetSpeaker(
+  callId: string,
+  speaker: boolean,
+): Promise<TelephonyCall | null> {
+  return invoke<TelephonyCall>("telephony_set_speaker", { callId, speaker });
+}
+
+/**
+ * Put a live call on hold (`true`) or take it off hold (`false`). Device-only, like
+ * [`telephonySetSpeaker`]; a call that cannot be held is a typed refusal rather than a
+ * silent no-op that leaves a "held" button lit over a live call.
+ */
+export async function telephonySetHold(
+  callId: string,
+  hold: boolean,
+): Promise<TelephonyCall | null> {
+  return invoke<TelephonyCall>("telephony_set_hold", { callId, hold });
+}
+
+/**
+ * Whether AmOS is the device's **default phone app** (`ROLE_DIALER`) — the precondition
+ * for every real in-call control (`telephony_answer` / `telephony_end` /
+ * `telephony_set_muted` / `telephony_set_speaker` / `telephony_set_hold` /
+ * `telephony_play_dtmf` / the recording pair), each of which refuses with "AmOS is not the
+ * default phone app" until the role is held.
+ *
+ * The three fields are the same triple `BlocklistStatusOut` uses for the sibling
+ * ROLE_CALL_SCREENING role, and carry the same meanings:
+ * * `role_supported` — this device can hold the role at all (Android + telephony).
+ * * `role_held` — the **platform's** verdict (`RoleManager#isRoleHeld`), not "an in-call
+ *   service happens to be bound": that question (`incall.rs::is_default_dialer_bound`)
+ *   answers `false` between calls on a correctly configured phone.
+ * * `role_requestable` — a request can actually be delivered (the native glue is bound).
+ *   `false` means "we could not ask", never a verdict.
+ *
+ * `null` when the bridge is unavailable. (REQ-A1180)
+ */
+export interface DialerRoleStatusOut {
+  role_supported: boolean;
+  role_held: boolean;
+  role_requestable: boolean;
+}
+
+/** Is AmOS the default phone app, and can it ask to become one? `null` = no bridge. */
+export async function telephonyDefaultDialerStatus(): Promise<DialerRoleStatusOut | null> {
+  return invoke<DialerRoleStatusOut>("telephony_default_dialer_status");
+}
+
+/**
+ * Post the system dialog that grants the default-phone-app role (foreground, user-initiated).
+ *
+ * Resolves `true` when the dialog was posted **or** the role is already held — never "the
+ * user accepted", which only a later [`telephonyDefaultDialerStatus`] read can answer.
+ */
+export async function telephonyRequestDefaultDialer(): Promise<boolean> {
+  return (await invoke<boolean>("telephony_request_default_dialer")) === true;
 }
 
 /* ---- Radio / connectivity (radio_*: wifi / bluetooth / airplane / hotspot). Real
@@ -808,7 +1158,11 @@ export type RadioRefusal = {
   kind: string;
   /** The radio the refusal names (a cascade names the refused member), if known. */
   radio?: string | null;
-  /** For `platform_managed`: the system surface that owns the switch. */
+  /**
+   * The system surface where the switch can still be worked by hand: the owning screen
+   * for `platform_managed`, and the tethering settings for a refused AP attempt
+   * (`provider_refused` on `hotspot`). `null` when the device offered none.
+   */
   surface?: string | null;
   /** For `platform_managed`: why (`switch_removed` / `privileged_only`). */
   reason?: string | null;
@@ -983,6 +1337,52 @@ export async function flashlightSet(enabled: boolean): Promise<FlashlightPayload
   return invoke<FlashlightPayload>("flashlight_set", { enabled });
 }
 
+/* ---- Rotation lock / forced orientation (rotation_*). The Android
+ *       Activity#setRequestedOrientation is reachable only from the System UI, so
+ *       like the torch it does NOT round-trip through the headless daemon. ---- */
+
+export type RotationModeKey = "auto" | "locked" | "portrait" | "landscape";
+export type RotationSnapshotPayload = { mode: string; available: boolean };
+export type RotationAppliedPayload = {
+  mode: string;
+  available: boolean;
+  outcome: { state: string; detail?: string };
+};
+
+/** Read the committed rotation intent + whether this platform can apply it. */
+export async function rotationGet(): Promise<RotationSnapshotPayload | null> {
+  return invoke<RotationSnapshotPayload>("rotation_get");
+}
+
+/** Commit a rotation mode and apply it to the device. The reply says what the
+ *  platform actually did (`outcome.state`), never rounded up to "applied". */
+export async function rotationSet(
+  mode: RotationModeKey,
+): Promise<RotationAppliedPayload | null> {
+  return invoke<RotationAppliedPayload>("rotation_set", { mode });
+}
+
+/* ---- Cellular signal (`cellular_signal`). Needs a real `TelephonyManager`, so
+ *       like the torch and rotation it does NOT round-trip through the headless
+ *       daemon. ---- */
+
+/**
+ * The device's cellular facts — `supported` (is this a phone), `present` (a SIM is
+ * ready) and the real `signal` level (`1..=4`, or `null` when none is readable).
+ * Mirrors `RadioSignal` plus `supported`, so `readCellularSignal` can spread it.
+ */
+export type CellularSignalPayload = {
+  supported: boolean;
+  present: boolean;
+  signal: number | null;
+};
+
+/** Ask the host for the real cellular presence + signal level. `null` when the
+ *  call itself failed (desktop, or no host) — an absent answer, not "no modem". */
+export async function cellularSignal(): Promise<CellularSignalPayload | null> {
+  return invoke<CellularSignalPayload>("cellular_signal");
+}
+
 /* ---- Mail (amos-mail bridge: mail_mailboxes / mail_list / mail_inbox /
  *       mail_read / mail_send). Shapes mirror the Rust amos_mail models. ---- */
 export type MailAddr = { name: string; email: string };
@@ -1004,11 +1404,29 @@ export interface MailMessage {
   body_html: string | null;
   attachments: MailAttachment[];
 }
-export type MailReceipt = { id: string; date: number };
+/**
+ * The engine's acknowledgment. `delivered` is `false` when the backend had no
+ * wire — the message was filed in `Sent` but transmitted nowhere, so the UI must
+ * not call that 「已发送」(F-SH-824).
+ */
+export type MailReceipt = { id: string; date: number; delivered: boolean };
+
+/** What the mail surface can actually deliver (`provider` + whether it has a wire). */
+export type MailStatus = { provider: string; delivers: boolean };
 
 /** List selectable mailbox names. */
 export async function mailMailboxes(): Promise<string[] | null> {
   return invoke<string[]>("mail_mailboxes");
+}
+
+/**
+ * The backend's capability: `{ provider, delivers }`. `delivers: false` is the
+ * offline mock — a send stores a copy in `Sent` and leaves the device never.
+ * Read **before** composing so the composer can say so up front rather than
+ * after a silent non-delivery.
+ */
+export async function mailStatus(): Promise<MailStatus | null> {
+  return invoke<MailStatus>("mail_status");
 }
 
 /** Summaries in a mailbox, newest first. */
@@ -1045,7 +1463,12 @@ export async function mailSend(o: {
   });
 }
 
-/** Star / unstar a message. Resolves (null) on success, else the command throws. */
+/**
+ * Star / unstar a message. **It never rejects** — a `void` command resolves `null`
+ * on success and `invoke` also answers `null` for a call that failed (the reason
+ * goes to the per-command diagnosis). Read `bridgeDiag("mail_set_flagged").ok` for
+ * the verdict; the return value cannot carry it (REQ-A830 / F-SH-263).
+ */
 export async function mailSetFlagged(
   mailbox: string,
   id: string,
@@ -1054,7 +1477,16 @@ export async function mailSetFlagged(
   return invoke<null>("mail_set_flagged", { mailbox, id, flagged });
 }
 
-/** Mark a message read / unread. */
+/** Mark a message replied / un-replied. `void` — the verdict is `bridgeDiag("mail_set_answered").ok`, not the null return. */
+export async function mailSetAnswered(
+  mailbox: string,
+  id: string,
+  answered: boolean,
+): Promise<null> {
+  return invoke<null>("mail_set_answered", { mailbox, id, answered });
+}
+
+/** Mark a message read / unread. `void` — the verdict is `bridgeDiag("mail_set_seen").ok`, not the null return. */
 export async function mailSetSeen(mailbox: string, id: string, seen: boolean): Promise<null> {
   return invoke<null>("mail_set_seen", { mailbox, id, seen });
 }
@@ -1077,17 +1509,25 @@ export async function mailMove(
  *       appstore_find / appstore_installed / appstore_updatable /
  *       appstore_status / appstore_install / appstore_upgrade /
  *       appstore_uninstall). Shapes mirror the Rust amos_appstore models. ---- */
-export type AppVersion = { major: number; minor: number; patch: number; pre: string | null };
+/** `pre` is **absent** (not `null`) on a full release: the Rust side carries
+ *  `#[serde(skip_serializing_if = "Option::is_none")]`, so `pre` is `undefined`
+ *  on the wire whenever there is no pre-release tag — measured, not assumed. */
+export type AppVersion = { major: number; minor: number; patch: number; pre?: string | null };
 export type AppCategory =
   | "other" | "tools" | "media" | "communication"
   | "games" | "productivity" | "education" | "system";
-export type PackageFormat = "tar_gz" | "zip";
+/** The serde wire tokens of `amos_appstore::PackageFormat` — note `tar_gz`, which
+ *  is **not** the same spelling as the Rust `as_str()` (`tar.gz`); the wire is the
+ *  serde one. `"apk"` is the third variant and is produced by the F-Droid ingest. */
+export type PackageFormat = "tar_gz" | "zip" | "apk";
 export type AppChecksum = { algorithm: "sha256"; value: string };
 export interface PackageRef {
   format: PackageFormat;
   url: string;
-  sha256: AppChecksum | null;
-  size_bytes: number | null;
+  /** Absent (not `null`) when the source publishes no digest — `skip_serializing_if`. */
+  sha256?: AppChecksum | null;
+  /** Absent (not `null`) when the source announces no size — `skip_serializing_if`. */
+  size_bytes?: number | null;
 }
 export interface AppManifest {
   id: string;
@@ -1263,7 +1703,8 @@ export interface FilesCloudSnapshot {
   label: string;
   savedAt: number;
   collections: string[];
-  totalBytes: number;
+  /** `null` when any entry's size was not reported — see `filesCloud.ts::buildSnapshot`. */
+  totalBytes: number | null;
   fileCount: number;
   files: Array<{
     id: string;
@@ -1406,6 +1847,13 @@ export type BlockReasonOut =
  */
 export interface BlocklistStatusOut {
   has_call_rules: boolean;
+  /**
+   * The call path can reject a call *at all* — a rule covers calls **or** the
+   * unknown-number switch is on. This, not `has_call_rules`, is what the
+   * enforcement banner gates on: with the switch on and no call rules a
+   * withheld caller is still rejected, so the role is still worth requesting.
+   */
+  filters_calls: boolean;
   has_sms_rules: boolean;
   /** The platform supports the role (Android 10+). */
   role_supported: boolean;
@@ -1466,10 +1914,10 @@ export async function blocklistRequestRole(): Promise<boolean> {
   return (await invoke<boolean>("blocklist_request_role")) === true;
 }
 
-export type SmsFolder = "inbox" | "sent" | "draft";
-
-/** Every folder, in the order the UI shows them. */
-export const SMS_FOLDERS: readonly SmsFolder[] = ["inbox", "sent", "draft"];
+/** Every folder, in the order the UI shows them. The one declaration; {@link SmsFolder}
+ * derives from it, so the allowlist that validates a folder is the type. */
+export const SMS_FOLDERS = ["inbox", "sent", "draft"] as const;
+export type SmsFolder = (typeof SMS_FOLDERS)[number];
 
 /** Per-folder distinct-thread counts (`amos-tauri::sms::SmsFolderCountsOut`). */
 export interface SmsFolderCounts {
@@ -1506,6 +1954,33 @@ export type SmsFolderSnapshotResult =
   | { ok: true; threads: SmsThreadOut[] }
   | { ok: false; error: string; denied: boolean; notBridged: boolean };
 
+/**
+ * The words a failed command's diagnostic carries, as one searchable string.
+ *
+ * `invoke` records **what Tauri threw**. When a `Result<T, AmosError>` comes back `Err`
+ * that is the envelope *object* `{ code, message, cause? }` — so `String(detail)` is
+ * `"[object Object]"` and **not one word of the host's answer survives the fold**
+ * (only a JS-level throw — a test fixture, a Tauri bug — is string-shaped). Read the
+ * envelope's own fields instead, exactly as `hostFs.ts::extractEnvelope` does for its
+ * typed `code` (REQ-A542); the envelope's `cause[0]` is where `AmosError::with_cause`
+ * puts the provider's own words (`error.rs`'s `SmsProviderRejected` doc).
+ */
+export function commandFailureText(detail: unknown): string {
+  if (typeof detail === "string") return detail;
+  if (detail === null || detail === undefined) return "";
+  if (typeof detail === "object") {
+    const e = detail as { code?: unknown; message?: unknown; cause?: unknown };
+    const parts = [
+      typeof e.code === "string" ? e.code : "",
+      typeof e.message === "string" ? e.message : "",
+      ...(Array.isArray(e.cause) ? e.cause.filter((c): c is string => typeof c === "string") : []),
+    ];
+    const joined = parts.filter((s) => s.length > 0).join(" ");
+    if (joined.length > 0) return joined;
+  }
+  return String(detail);
+}
+
 /** Read one folder's threads, distinguishing success (possibly empty) from failure. */
 export async function smsFolderSnapshot(folder: SmsFolder): Promise<SmsFolderSnapshotResult> {
   const threads = await invoke<SmsThreadOut[]>("sms_snapshot", { folder });
@@ -1518,10 +1993,13 @@ export async function smsFolderSnapshot(folder: SmsFolder): Promise<SmsFolderSna
   if (!diag.ok && diag.kind === "not-bridged") {
     return { ok: false, error: "not bridged", denied: false, notBridged: true };
   }
-  const error = diag.ok ? "no result" : String(diag.detail ?? "failed");
+  const error = diag.ok ? "no result" : commandFailureText(diag.detail) || "failed";
   return {
     ok: false,
     error,
+    // REQ-A1756: the host's refusal arrives as the envelope object, whose `cause[0]` is
+    // the `SmsError` words (`SMS permission denied: …`). Folding in the envelope's own
+    // fields is what lets this regex see them.
     denied: /permission|denied|not granted/i.test(error),
     notBridged: false,
   };
@@ -1547,10 +2025,21 @@ export async function smsMessages(
   });
 }
 
-/** Send a real SMS. `true` only on the command's explicit success marker. */
-export async function smsSend(address: string, text: string): Promise<boolean> {
+/** A send's verdict as the platform reported it. `failed` covers a refusal *and* an
+ *  unavailable bridge; `unconfirmed` means the platform gave no verdict within its
+ *  window — the message may still go out, so the caller must not claim it was sent. */
+export type SmsSendVerdict = "sent" | "unconfirmed" | "failed";
+
+/** Send a real SMS. Resolves to `sent` **only** when the radio confirmed it took the
+ *  message; "the command did not throw" is deliberately not the question. */
+export async function smsSend(
+  address: string,
+  text: string,
+): Promise<SmsSendVerdict> {
   const r = await invoke<string>("sms_send", { address, text });
-  return r === "sent";
+  if (r === "sent") return "sent";
+  if (r === "unconfirmed") return "unconfirmed";
+  return "failed";
 }
 
 // ---- View-layer trash (REQ-A42) ------------------------------------------------
@@ -1602,9 +2091,18 @@ export async function smsTrashList(): Promise<SmsTrashEntryOut[] | null> {
 /** Put a trashed message back (undo). `true` only when an entry was removed.
  *  The command answers a **boolean** (serde `true`/`false`); an earlier revision of
  *  this wrapper compared it to the string `"restored"`, so a successful restore was
- *  reported as a failure and the list never refreshed. */
-export async function smsTrashRestore(threadId: string, messageId: string): Promise<boolean> {
-  return (await invoke<boolean>("sms_trash_restore", { threadId, messageId })) === true;
+ *  reported as a failure and the list never refreshed.
+ *
+ *  `null` = the bridge never answered (no bridge, or the command `Err`ed — since the
+ *  handler persists on the blocking pool, a worker timeout/panic is now reachable).
+ *  That is *not* the same as `false`, which means "no trash entry matched": the two
+ *  demand different sentences, so they must not be folded together here. */
+export async function smsTrashRestore(
+  threadId: string,
+  messageId: string,
+): Promise<boolean | null> {
+  const r = await invoke<boolean>("sms_trash_restore", { threadId, messageId });
+  return typeof r === "boolean" ? r : null;
 }
 
 /** Empty the trash: every hidden message becomes visible again (an honest
@@ -1614,5 +2112,51 @@ export async function smsTrashRestore(threadId: string, messageId: string): Prom
 export async function smsTrashPurge(): Promise<boolean> {
   const purged = await invoke<number>("sms_trash_purge");
   return typeof purged === "number";
+}
+
+/**
+ * What the host did with a request for the platform's About panel (REQ-A796).
+ *
+ * Mirrors `menu::AboutPanelOutcome` — the Rust enum is `#[serde(rename_all = "snake_case")]`,
+ * so these three spellings **are** the wire and this union is the only place the frontend
+ * spells them.
+ *
+ * Why an enum and not a `Result`/`()`: `invoke` answers `null` both for a command that
+ * failed and for a successful command that returns nothing (Tauri serializes `()` to
+ * `null`), so a `void` command makes "the panel came up" and "the host refused" the same
+ * value — F-SH-236, the defect this signal exists to avoid. Three words cost one string and
+ * are distinguishable.
+ */
+export type AboutPanelOutcome = "shown" | "unsupported_host" | "wrong_thread";
+
+/**
+ * Why no About panel appeared. `shown` is excluded by construction (a success is never a
+ * failure reason); `unreachable` cannot come from the host at all — it is what a `null`
+ * reply means here, i.e. no bridge or no such command, and `null` is not a spelling the
+ * host can send.
+ */
+export type AboutPanelFailure = Exclude<AboutPanelOutcome, "shown"> | "unreachable";
+
+/** Whether the shell's Apple menu got the platform About panel on screen, and if not, why.
+ *  The reason is a value rather than a log line because the row that asks for the panel has
+ *  to *say* what happened: a menu item that appears to work and silently does nothing is
+ *  F-SH-001, and this repository has shipped it more than once. */
+export type AboutPanelResult =
+  | { shown: true }
+  | { shown: false; reason: AboutPanelFailure; diag: BridgeDiag };
+
+/**
+ * Ask the host for the platform's About panel — the same panel the native
+ * `menu.about` item opens (`menu::show_about_dialog`), reached from the WebView.
+ *
+ * Honest boundary: on a host whose platform has no such panel (Linux/Windows) the host
+ * answers `unsupported_host` rather than pretending; on macOS, if the call arrives off the
+ * main thread it answers `wrong_thread` rather than doing nothing. Neither is treated as a
+ * crash — both are answered, and the caller is expected to report them.
+ */
+export async function shellAboutPanel(): Promise<AboutPanelResult> {
+  const r = await invoke<AboutPanelOutcome>("shell_about_panel");
+  if (r === "shown") return { shown: true };
+  return { shown: false, reason: r ?? "unreachable", diag: bridgeDiag("shell_about_panel") };
 }
 

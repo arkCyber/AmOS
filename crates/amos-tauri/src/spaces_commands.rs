@@ -11,6 +11,32 @@ use crate::spaces::{SpaceInfo, SpaceManagerState};
 use crate::store::SharedStore;
 use crate::wm::WmState;
 
+/// 一次空间切换的**结果读数**（REQ-A513）。
+///
+/// 为什么要有返回值：这个命令以前返回 `()` —— 于是 wire 上是 `null`，而前端的桥约定是
+/// "**失败**也返回 `null`"（`lib/backend.invoke` 把错误吞进诊断台账）。两者撞在一起，
+/// 前端那 5 个 mutation 包装器判 `result !== null` 就**永远为 false**：切换明明成功，
+/// `MissionControl` 不关闭浮层、`SpacesPanel` 直接写一行"切换失败"。
+///
+/// 同一次改动把另一半也带回来：`apply_switch_plan` 早就把"账本动了、屏幕没动"的窗口
+/// 作为 `(label, why)` **返回**给调用方（它的文档写着"由调用方决定多大声"），而这个调用方
+/// 以前只把它们写进 `tracing::warn!`。一个用户看得见、别的模块看不见的状态不该只留在日志里。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SpaceSwitchReport {
+    /// 切换后的活动桌面索引（与请求一致；成功即生效）。
+    pub index: usize,
+    /// 账本要求隐藏、但平台没能隐藏的窗口（`(label, 原因)`）。
+    pub hide_failed: Vec<SwitchFailure>,
+    /// 账本要求带到前台、但平台没能聚焦的窗口（`(label, 原因)`）。
+    pub show_failed: Vec<SwitchFailure>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SwitchFailure {
+    pub label: String,
+    pub reason: String,
+}
+
 // One shape used at every Mutex::lock() site — keeps the `code` consistent
 // across all 7 commands and lets a future `clippy::else_if_without_else` rule
 // stay quiet. The `with_cause` form would be richer, but the inner MutexGuard
@@ -54,7 +80,7 @@ pub fn spaces_switch(
     wm: State<WmState>,
     spaces: State<SpaceManagerState>,
     store: State<SharedStore>,
-) -> AmosResult<()> {
+) -> AmosResult<SpaceSwitchReport> {
     // The manager lock is released before any platform call: a window operation can block on the
     // OS, and holding the ledger while it does would stall every other Spaces command.
     let (hide, show) = {
@@ -72,7 +98,7 @@ pub fn spaces_switch(
         |label| wm.hide(&app, label).map(|_| ()),
         |label| wm.focus(&app, label).map(|_| ()),
     );
-    for (label, reason) in failures {
+    for (_, label, reason) in &failures {
         tracing::warn!(
             space = index,
             window = %label,
@@ -80,11 +106,41 @@ pub fn spaces_switch(
             "the space switch moved the ledger but not the screen for this window"
         );
     }
-    Ok(())
+    // 台账动了、屏幕没动的那些窗口，**返回**给前端（不只留在日志里）：用户看得见它们，
+    // 而壳需要拿到 label 才能说出"哪几个窗口没跟过来"。
+    Ok(switch_report(index, failures))
+}
+
+/// 失败发生在切换的哪一半（隐藏 / 带到前台）。带着阶段返回，报告才能分栏 ——
+/// 从前 `apply_switch_plan` 只回 `(label, reason)`，调用方**无法**知道那一项属于哪一步。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SwitchPhase {
+    Hide,
+    Show,
+}
+
+/// 把 `apply_switch_plan` 的失败列表变成**命令的读数**（纯函数）。
+///
+/// 顺序即尝试顺序；两栏各自保序（`Vec` 不是集合 —— 同一个窗口在同一栏里只可能出现一次）。
+fn switch_report(index: usize, failures: Vec<(SwitchPhase, String, String)>) -> SpaceSwitchReport {
+    let mut hide_failed = Vec::new();
+    let mut show_failed = Vec::new();
+    for (phase, label, reason) in failures {
+        let entry = SwitchFailure { label, reason };
+        match phase {
+            SwitchPhase::Hide => hide_failed.push(entry),
+            SwitchPhase::Show => show_failed.push(entry),
+        }
+    }
+    SpaceSwitchReport {
+        index,
+        hide_failed,
+        show_failed,
+    }
 }
 
 /// Make a switch plan visible on the platform and report every label it could not act on as
-/// `(label, why)`.
+/// `(phase, label, why)`.
 ///
 /// The two window operations are passed in rather than taken from a `&WmState` on purpose: the
 /// command supplies `WmState::hide` / `WmState::focus` (which need the concrete `AppHandle`), while
@@ -96,7 +152,7 @@ fn apply_switch_plan<H, S>(
     show: &[String],
     mut do_hide: H,
     mut do_focus: S,
-) -> Vec<(String, String)>
+) -> Vec<(SwitchPhase, String, String)>
 where
     H: FnMut(&str) -> Result<(), String>,
     S: FnMut(&str) -> Result<(), String>,
@@ -104,12 +160,12 @@ where
     let mut failures = Vec::new();
     for label in hide {
         if let Err(e) = do_hide(label) {
-            failures.push((label.clone(), e));
+            failures.push((SwitchPhase::Hide, label.clone(), e));
         }
     }
     for label in show {
         if let Err(e) = do_focus(label) {
-            failures.push((label.clone(), e));
+            failures.push((SwitchPhase::Show, label.clone(), e));
         }
     }
     failures
@@ -257,16 +313,57 @@ mod tests {
             failures,
             vec![
                 (
+                    SwitchPhase::Hide,
                     "ghost".to_string(),
                     "window 'ghost' is not registered".to_string()
                 ),
                 (
+                    SwitchPhase::Show,
                     "also-gone".to_string(),
                     "window 'also-gone' is not registered".to_string()
                 ),
             ],
-            "both failures are reported, in the order they were attempted"
+            "both failures are reported **with their phase**, in the order they were attempted"
         );
+    }
+
+    /// REQ-A513 — the report splits the failures by half and carries the index. This is the value
+    /// the frontend now reads: before it existed the command returned `()`, the wire value was
+    /// `null` (the *same* value the bridge uses for a failure), and every mutation wrapper in
+    /// `lib/spaces.ts` answered `false` even on success.
+    #[test]
+    fn the_report_splits_failures_by_half_and_carries_the_index() {
+        let report = switch_report(
+            2,
+            vec![
+                (SwitchPhase::Hide, "notes".to_string(), "gone".to_string()),
+                (SwitchPhase::Show, "files".to_string(), "gone".to_string()),
+                (SwitchPhase::Hide, "mail".to_string(), "gone".to_string()),
+            ],
+        );
+        assert_eq!(report.index, 2);
+        assert_eq!(
+            report
+                .hide_failed
+                .iter()
+                .map(|f| f.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["notes", "mail"],
+            "hide failures keep their order and their half"
+        );
+        assert_eq!(report.show_failed.len(), 1);
+        assert_eq!(report.show_failed[0].label, "files");
+        assert_eq!(report.show_failed[0].reason, "gone");
+    }
+
+    /// The honest shape of a switch that worked: an index and two **empty** lists — not `()`,
+    /// which the bridge cannot tell apart from a failure.
+    #[test]
+    fn a_clean_switch_reports_an_index_and_no_failures() {
+        let report = switch_report(0, Vec::new());
+        assert_eq!(report.index, 0);
+        assert!(report.hide_failed.is_empty());
+        assert!(report.show_failed.is_empty());
     }
 
     /// An empty plan is not an error and touches nothing — the honest result of switching to a

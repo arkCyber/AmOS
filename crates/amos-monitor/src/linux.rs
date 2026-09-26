@@ -24,19 +24,37 @@ pub fn default_proc_root() -> PathBuf {
 ///
 /// Format (all cores summed): `cpu user nice system idle iowait irq softirq
 /// steal guest guest_nice`. `idle` includes `iowait`; busy = `total - idle`.
-/// Returns `None` on a malformed / missing line (honest, never fabricates).
+/// `total` sums only the first eight (elapsed jiffies) — `guest`/`guest_nice`
+/// are a subset of `user`/`nice`, not extra time. Returns `None` on a malformed
+/// / missing line (honest, never fabricates).
+///
+/// **Every** field must parse as an integer, because the fields are read by
+/// *position* (`nums[3]` = idle, `nums[4]` = iowait): silently skipping a field
+/// we cannot read would shift every later field by one and hand back a
+/// definite-but-wrong `(idle, total)` — a fabricated busy% from a line nobody
+/// actually read. A field that is not a number is therefore a malformed *line*,
+/// not a field to drop. (REQ-A536.)
 pub fn parse_cpu_line(line: &str) -> Option<(u64, u64)> {
     let mut fields = line.split_whitespace();
     if fields.next()? != "cpu" {
         return None;
     }
-    let nums: Vec<u64> = fields.filter_map(|f| f.parse::<u64>().ok()).collect();
+    // Strict: the first field that is not an integer fails the whole line
+    // (collecting into `Option` short-circuits at the first `None`).
+    let nums: Vec<u64> = fields
+        .map(|f| f.parse::<u64>().ok())
+        .collect::<Option<Vec<u64>>>()?;
     // user nice system idle iowait irq softirq steal = 7 core fields.
     if nums.len() < 7 {
         return None;
     }
+    // Elapsed jiffies are the first eight fields (`user`…`steal`). `guest` and
+    // `guest_nice` are a *subset* annotation — the kernel adds them to `user` /
+    // `nice` as well (`account_guest_time` bumps `CPUTIME_USER` **and**
+    // `CPUTIME_GUEST`) — so folding the whole line counts guest time twice,
+    // inflating `total` and with it the busy%. (REQ-A1266.)
     let idle = nums[3].saturating_add(nums[4]); // idle + iowait
-    let total: u64 = nums.iter().fold(0, |a, b| a.saturating_add(*b));
+    let total: u64 = nums.iter().take(8).fold(0, |a, b| a.saturating_add(*b));
     Some((idle, total))
 }
 
@@ -149,8 +167,12 @@ mod tests {
         std::fs::write(root.join(rel), content).unwrap();
     }
 
-    fn fixture() -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!("amos-monitor-test-{}", std::process::id()));
+    /// A private procfs root per test: `tag` must differ between tests, since
+    /// cargo runs them in parallel in one process (a shared path would let two
+    /// tests clobber each other's `stat`).
+    fn fixture(tag: &str) -> std::path::PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("amos-monitor-test-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         root
@@ -171,6 +193,86 @@ mod tests {
     }
 
     #[test]
+    fn a_field_that_is_not_a_number_is_a_malformed_line() {
+        // A non-numeric field used to be *dropped* and the rest read by
+        // position, so this line returned `Some((11, 196))` — idle/iowait taken
+        // from whichever fields happened to land at index 3/4. That is a
+        // fabricated reading from an unreadable line; it must be `None`.
+        // (REQ-A536.)
+        assert_eq!(parse_cpu_line("cpu 100 x 30 40 5 6 7 8"), None);
+        assert_eq!(parse_cpu_line("cpu 100 20 30 40 5 6 7 x"), None);
+        // Out of `u64` range is the same case: it cannot be a real field.
+        assert_eq!(
+            parse_cpu_line("cpu 99999999999999999999 20 30 40 5 6 7 8"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_malformed_stat_read_is_unknown_and_keeps_the_baseline() {
+        let root = fixture("malformed");
+        write(&root, "stat", "cpu  0 0 0 100 0 0 0 0 0 0\n"); // baseline: idle=total=100
+        write(
+            &root,
+            "meminfo",
+            "MemTotal: 8000 kB\nMemAvailable: 2000 kB\n",
+        );
+        let s = LinuxSystemSampler::new_with_root(root.clone());
+        s.snapshot();
+
+        // A corrupted field: honest "unknown", never a shifted percentage.
+        write(&root, "stat", "cpu  50 x 0 100 0 0 0 0 0 0\n");
+        let bad = s.snapshot();
+        assert_eq!(bad.cpu.busy_pct, None, "a malformed line is honest unknown");
+
+        // The unreadable line did not advance the baseline, so the next good
+        // read still deltas from the last *readable* one: +50 busy over the
+        // 50-jiffy window = 100%.
+        write(&root, "stat", "cpu  50 0 0 100 0 0 0 0 0 0\n");
+        let good = s.snapshot();
+        assert_eq!(good.cpu.busy_pct, Some(100.0));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn guest_time_is_not_counted_twice_in_total() {
+        // `guest`/`guest_nice` are a *subset* annotation: the kernel already added
+        // them to `user`/`nice` (`account_guest_time` bumps `CPUTIME_USER` **and**
+        // `CPUTIME_GUEST`). Summing the whole line therefore counts guest time
+        // twice, inflating `total` — and with it the busy%. Elapsed jiffies are
+        // the first eight fields; `total` must be their sum. (REQ-A1266.)
+        // user=100 nice=20 system=30 idle=40 iowait=5 irq=6 softirq=7 steal=8
+        // guest=1000 guest_nice=500 → idle = 40+5 = 45, total = 216 (not 1716).
+        assert_eq!(
+            parse_cpu_line("cpu 100 20 30 40 5 6 7 8 1000 500"),
+            Some((45, 216))
+        );
+    }
+
+    #[test]
+    fn guest_time_does_not_inflate_the_reported_busy_percent() {
+        // Half the window idle, half in a guest (which is also counted in `user`).
+        // True: busy 50 / total 100 = 50%. Counting guest twice gave 100/150 =
+        // 66.7% — a host under a hypervisor reported as far busier than it is.
+        let root = fixture("guest");
+        write(&root, "stat", "cpu  0 0 0 0 0 0 0 0 0 0\n");
+        write(
+            &root,
+            "meminfo",
+            "MemTotal: 8000 kB\nMemAvailable: 4000 kB\n",
+        );
+        let s = LinuxSystemSampler::new_with_root(root.clone());
+        s.snapshot(); // baseline
+
+        write(&root, "stat", "cpu  50 0 0 50 0 0 0 0 50 0\n");
+        let load = s.snapshot();
+        assert_eq!(load.cpu.busy_pct, Some(50.0));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn parses_meminfo() {
         let c = "MemTotal:        8000000 kB\nMemFree:         1000000 kB\nMemAvailable:    3000000 kB\n";
         assert_eq!(parse_meminfo(c), (Some(8_000_000), Some(3_000_000)));
@@ -183,7 +285,7 @@ mod tests {
 
     #[test]
     fn reads_and_deltas_over_a_fixture_proc_root() {
-        let root = fixture();
+        let root = fixture("delta");
         write(&root, "stat", "cpu  0 0 0 100 0 0 0 0 0 0\n"); // t0: all idle, total=100
         write(
             &root,

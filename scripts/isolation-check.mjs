@@ -16,6 +16,21 @@
  * `build`) because the class is name-resolution/type-level — an unresolved import fails the
  * check — and it is several times cheaper (no codegen, no linking).
  *
+ * Rule 2, same root cause seen from the other side (REQ-A465): a **workspace build is not N
+ * independent builds**. Cargo also merges the members' *output paths*: a `bin` named `foo` in
+ * two packages both want `target/<profile>/foo`, and an `example` named `foo` in two packages
+ * both want `target/<profile>/examples/foo`. Cargo prints `warning: output filename collision
+ * … this may become a hard error in the future` and links whichever runs last, so the by-path
+ * artefact is ambiguous (measured on this tree: `status_once` in `amos-ai` *and*
+ * `amos-translate`, `embed_commands` in `amos-appstore-cli` *and* `amos-link-cli` — and a
+ * script that executes `target/debug/examples/status_once` by path is relying on an accident).
+ * Read from `cargo metadata` (cargo's own model — no manifest parsing) for the kinds whose
+ * output path is *not* hashed: `bin` and `example`. Tests and benchmarks land in
+ * `deps/<name>-<hash>`, where the hash makes a repeated name harmless.
+ *
+ * Even a clean warning is worth failing on here: `-D warnings` is clippy's, not cargo's, and
+ * `cargo build -q` (what `scripts/examples-smoke.mjs` runs) hides this one entirely.
+ *
  * The member list is parsed from the workspace `Cargo.toml` **skipping comments**: the ad-hoc
  * harness that produced this gate's first measurement did not, and reported a failure for
  * `amos-link-py` — a member that is commented out on purpose (PyO3, built with maturin) and
@@ -82,6 +97,41 @@ export function tailOf(s, n = 6) {
     .join("\n");
 }
 
+/**
+ * Target kinds whose output path is **not** hashed, so two packages cannot both use the name:
+ * a `bin` lands at `target/<profile>/<name>` and an `example` at
+ * `target/<profile>/examples/<name>`. Everything else (lib kinds, tests, benches) lands under
+ * `deps/<name>-<metadata-hash>`, where the hash keeps same-named targets apart.
+ */
+export const UNSHARED_KINDS = ["bin", "example"];
+
+/**
+ * `[{ kind, name, packages }]` for every `(kind, name)` that more than one package declares in
+ * an unhashed output kind — i.e. exactly the set cargo warns about as an "output filename
+ * collision". `metadata` is `cargo metadata --no-deps`'s parsed JSON (cargo's own model of the
+ * workspace, so this needs no manifest parsing and cannot disagree with cargo).
+ */
+export function outputCollisions(metadata) {
+  const seen = new Map();
+  for (const pkg of metadata?.packages ?? []) {
+    for (const target of pkg.targets ?? []) {
+      for (const kind of target.kind ?? []) {
+        if (!UNSHARED_KINDS.includes(kind)) continue;
+        const key = `${kind}\u241f${target.name}`;
+        if (!seen.has(key)) seen.set(key, []);
+        seen.get(key).push(pkg.name);
+      }
+    }
+  }
+  const out = [];
+  for (const [key, packages] of seen) {
+    if (packages.length < 2) continue;
+    const [kind, name] = key.split("\u241f");
+    out.push({ kind, name, packages: [...packages].sort() });
+  }
+  return out.sort((a, b) => `${a.kind}\u241f${a.name}`.localeCompare(`${b.kind}\u241f${b.name}`));
+}
+
 function checkPackage(name, timeoutMs) {
   const r = spawnSync("cargo", ["check", "-p", name, "--all-targets", "-q"], {
     cwd: root,
@@ -98,6 +148,22 @@ function checkPackage(name, timeoutMs) {
     }),
     output: `${r.stdout ?? ""}${r.stderr ?? ""}`,
   };
+}
+
+/** Parsed `cargo metadata --no-deps`, or `null` when cargo could not answer (rule 2 needs it). */
+function loadMetadata() {
+  const r = spawnSync("cargo", ["metadata", "--no-deps", "--format-version", "1"], {
+    cwd: root,
+    encoding: "utf8",
+    timeout: 120_000,
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  if (r.status !== 0 || typeof r.stdout !== "string") return null;
+  try {
+    return JSON.parse(r.stdout);
+  } catch {
+    return null;
+  }
 }
 
 // --- main --------------------------------------------------------------------
@@ -168,6 +234,70 @@ if (flags.includes("--selftest")) {
 
   ok("tailOf keeps the last non-empty lines", tailOf("a\n\nb\nc\n", 2) === "b\nc");
 
+  // Rule 2: output-path collisions, read from `cargo metadata`'s target list.
+  const pkg = (name, targets) => ({ name, targets });
+  const tgt = (name, kind) => ({ name, kind });
+  ok(
+    "collisions: two packages' examples with one name collide",
+    outputCollisions({
+      packages: [
+        pkg("a", [tgt("status_once", ["example"])]),
+        pkg("b", [tgt("status_once", ["example"])]),
+      ],
+    }).length === 1,
+  );
+  ok(
+    "collisions: the entry names the kind, the name and both packages, sorted",
+    (() => {
+      const [c] = outputCollisions({
+        packages: [
+          pkg("b", [tgt("status_once", ["example"])]),
+          pkg("a", [tgt("status_once", ["example"])]),
+        ],
+      });
+      return c.kind === "example" && c.name === "status_once" && c.packages.join() === "a,b";
+    })(),
+  );
+  ok(
+    "collisions: one name in two different kinds is not a collision",
+    outputCollisions({
+      packages: [pkg("a", [tgt("embed", ["bin"])]), pkg("b", [tgt("embed", ["example"])])],
+    }).length === 0,
+  );
+  ok(
+    "collisions: a repeated test/bench name is harmless (hashed under deps/)",
+    outputCollisions({
+      packages: [
+        pkg("a", [tgt("e2e", ["test"]), tgt("bench_x", ["bench"])]),
+        pkg("b", [tgt("e2e", ["test"]), tgt("bench_x", ["bench"])]),
+      ],
+    }).length === 0,
+  );
+  ok(
+    "collisions: a repeated library name is harmless",
+    outputCollisions({
+      packages: [pkg("a", [tgt("amos-lib", ["lib"])]), pkg("b", [tgt("amos-lib", ["lib"])])],
+    }).length === 0,
+  );
+  ok(
+    "collisions: three packages yield one entry naming all three",
+    (() => {
+      const c = outputCollisions({
+        packages: [
+          pkg("a", [tgt("dup", ["bin"])]),
+          pkg("b", [tgt("dup", ["bin"])]),
+          pkg("c", [tgt("dup", ["bin"])]),
+        ],
+      });
+      return c.length === 1 && c[0].packages.length === 3;
+    })(),
+  );
+  ok(
+    "collisions: a unique name is not reported",
+    outputCollisions({ packages: [pkg("a", [tgt("only_here", ["example"])])] }).length === 0,
+  );
+  ok("collisions: absent metadata is empty, not a throw", outputCollisions(undefined).length === 0);
+
   const failed = cases.filter(([, cond]) => !cond);
   if (failed.length > 0) {
     console.log(`[isolation-check] selftest FAILED — ${failed.length} case(s):`);
@@ -191,15 +321,36 @@ for (const m of members) {
   }
 }
 
+// Rule 1: every active member must `check --all-targets` **on its own**.
 const results = members.map((m) => checkPackage(m, timeoutMs));
 const failures = results.filter((r) => r.outcome !== "ok");
 
+// Rule 2: no two members may write a `bin`/`example` to the same (unhashed) output path.
+const metadata = loadMetadata();
+if (metadata === null) {
+  console.error(
+    "[isolation-check] `cargo metadata --no-deps` failed, so the output-path rule cannot be\n" +
+      "      evaluated — refusing to print OK rather than report a check that did not run.",
+  );
+  process.exit(2);
+}
+const collisions = outputCollisions(metadata);
+
 if (flags.includes("--json")) {
-  console.log(JSON.stringify({ members: members.length, results, failures: failures.length }, null, 2));
-  process.exit(failures.length === 0 ? 0 : 1);
+  console.log(
+    JSON.stringify(
+      { members: members.length, results, failures: failures.length, collisions },
+      null,
+      2,
+    ),
+  );
+  process.exit(failures.length === 0 && collisions.length === 0 ? 0 : 1);
 }
 
+let failed = false;
+
 if (failures.length > 0) {
+  failed = true;
   console.log(
     `[isolation-check] FAIL — ${failures.length} of ${members.length} package(s) do not build on their own:`,
   );
@@ -212,6 +363,26 @@ if (failures.length > 0) {
       "       that fails alone (a target using a feature-gated item without `required-features`\n" +
       "       is the usual cause). Declare the requirement, or enable the feature explicitly.",
   );
-  process.exit(1);
 }
-console.log(`[isolation-check] OK — all ${members.length} workspace member(s) check --all-targets on their own.`);
+
+if (collisions.length > 0) {
+  failed = true;
+  console.log(
+    `[isolation-check] FAIL — ${collisions.length} target name(s) are declared by more than one package:`,
+  );
+  for (const c of collisions) {
+    console.log(`  ${c.kind}: ${c.name}  ← ${c.packages.join(", ")}`);
+  }
+  console.log(
+    "  Fix: cargo writes both to one path (`target/<profile>/<name>` for a bin,\n" +
+      "       `target/<profile>/examples/<name>` for an example), warns about it today and\n" +
+      "       promises a hard error tomorrow; the by-path artefact is ambiguous in the meantime.\n" +
+      "       Rename one target (or its file), or give it an explicit `[[example]] name = \"…\"`.",
+  );
+}
+
+if (failed) process.exit(1);
+console.log(
+  `[isolation-check] OK — all ${members.length} workspace member(s) check --all-targets on their\n` +
+    "  own, and no two members share a `bin`/`example` output path.",
+);

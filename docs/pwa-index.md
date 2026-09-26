@@ -148,9 +148,30 @@ cp <上面的示例> /tmp/amos-index/apps/org.amos.demo.odds.toml
 
   **强制（2026-09-13 起）**：同一份文法现在有两个被执行的落点，见 [`appstore.md`](./appstore.md) §4.10 —— **已安装的 bundle** 在自己的 `amos-app.json` 里声明域名，宿主把它折进该 bundle **每个响应的 `Content-Security-Policy`**（`connect-src` / `form-action`），由 WebView 逐文档强制。**但索引里的预装声明（本页格式）仍未被强制**：那些条目今天根本不能启动（没有外部站点能力），所以它们的 `allowed_domains` 只是声明。逐 uid 的 `amos-network-guard` 规则**不能**用于隔离一个 web bundle —— 它与壳**同进程同 uid**，包过滤器无法区分（这条已写进代码注释，避免有人再承诺一个不可能的东西）。
 
-* **「Web 应用」屏幕只呈现声明，不启动应用。** `[display].url` 是一个**远程站点**，而 AmOS 今天没有任何「打开 URL」的能力（全仓无 `window.open`、无 opener 插件、无远程 URL webview）。屏幕因此如实写出这一点，而不是放一个按下去没反应的按钮——那和 `Shell.svelte` 在 `isExtId` 分支上写「运行时宿主未建成」是同一条规矩。要让那一格真的能打开，需要的是**新能力**（外部浏览器 intent 或远程 webview + 出口放行），那是一个安全决策，不是画面的事。
+* **「Web 应用」屏幕只呈现声明，不启动应用。** `[display].url` 是一个**远程站点**，而 AmOS 今天没有「打开远程 URL 的 webview」（全仓无 `window.open`、无 opener 插件、无远程 URL webview）——注意：**远程 manifest** 现在可以受控地取回并安装（见下「远程 opener」），但那**不等于**能打开远程 origin。屏幕因此如实写出这一点，而不是放一个按下去没反应的按钮——那和 `Shell.svelte` 在 `isExtId` 分支上写「运行时宿主未建成」是同一条规矩。要让那一格真的能打开，需要的是**新能力**（外部浏览器 intent 或远程 webview + 出口放行），那是一个安全决策，不是画面的事。
 
 要让上面任何一行变成"接受"，需要的不是一个字段，而是**那个 Rust 收口点**（enforce 的地方）。加字段而没加收口点，正是本仓审计反复抓的"死字段"。
+
+### 远程 opener（`open_remote_pwa`，Gap 6）
+
+v0.1 的索引只能来自 `AMOS_PWA_INDEX_DIR` 的本地 `*.toml`。本轮新增一条**刻意做窄的**远程入口：Tauri 命令 `pwa_open_remote(url)` → Rust `open_remote_pwa`，从一个远程 URL 取回 manifest 并折进当前索引（`PwaInstallSource::RemoteHttps`；本地路径仍是 `LocalIndex`）。它只放开下面这几个口子，其余一律在缝上拒：
+
+| 约束 | 规则 |
+|---|---|
+| scheme | **只接受 `https://`**；`http://` 在缝上即拒（不做 TLS 降级）——`require_https_host` |
+| host | 必须命中**运维允许清单** `AMOS_PWA_REMOTE_ALLOW`（逗号分隔、**全限定小写主机名**）；**无通配符**形式，裸域名匹配该主机**及其子域**（点边界安全）——`parse_remote_allow_list` / `host_allowed` |
+| 未设变量 | `AMOS_PWA_REMOTE_ALLOW` 未设 = **空允许清单**（什么都不允许），**不是**"允许所有"——`remote_allow_list_from_env` |
+| 抓取 | 超时 **10 s**、body ≤ **256 KiB**（`MAX_MANIFEST_BYTES`）、URL ≤ 2048 字节；超限在**读取端**失败关闭——`REMOTE_FETCH_TIMEOUT_SECS` / `MAX_MANIFEST_BYTES` |
+| 内容 | 取回后走**与本地索引同一份** `PwaManifest::parse` + `validate`：`deny_unknown_fields`、`allowed_domains` ≤ 64、**`eval_js` 拒绝**、URL 模版校验（见上表） |
+| 身份 | id 与 tool name 必须与现有索引**唯一不冲突** |
+| 构建 | 需要 appstore 的 `live` feature（HTTPS client）；没有它时如实报"rebuild with the `live` feature"，不静默降级 |
+
+**它不做什么**（避免被读成"能打开任意远程站点"）：
+
+* 它**只取回并安装 manifest**，**不打开**那个远程 origin——没有远程 URL webview、没有外部浏览器 intent。打开远程站点仍是 §5 路线图里"需要新能力 + 安全决策"的未完成项。
+* 服务 manifest 的那个 host **不会**因此进入该应用的 `allowed_domains`/CSP（见 `open_remote_pwa` 的 Egress 注释）；应用自己的出口仍由它声明的 `allowed_domains` → `connect-src` 决定。
+* 这条路径今天**未**串 `amos-network-guard` 的出口清单——它只依赖上面的 operator allow-list（进度表里仍有一条待办）。
+* 前端没有「+ 添加远程 PWA」按钮；`pwa_open_remote` 只能由命令面直接调用，多装 UX 推迟到 v0.2 之后。
 
 ---
 

@@ -7,8 +7,15 @@
  * HMAC-SHA256 签名覆盖的**正是发出去的那个 body**、统计计数。没有一条断言依赖真机。
  */
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach, mock } from "bun:test";
-import { webhookManager, type WebhookConfig } from "../enterprise/webhooks";
+import { webhookManager, WebhookManager, type WebhookConfig } from "../enterprise/webhooks";
 import { readStoreValue, writeStoreValue } from "../amosStore";
+import {
+  createShortcut,
+  updateShortcut,
+  deleteShortcut,
+  duplicateShortcut,
+  executeShortcut,
+} from "../shortcuts";
 
 /**
  * 这个文件**故意不注册 happy-dom**：`scripts/bun-iso-test.mjs` 把导入 happy-dom 的文件
@@ -167,8 +174,17 @@ describe("webhookManager 生命周期与存储", () => {
 
 describe("webhookManager 事件队列", () => {
   test("trigger 只入队、不立刻发送，且没有订阅者时不崩", async () => {
-    await webhookManager.trigger("audit.log", { a: 1 });
-    expect(webhookManager.getWebhooks()).toHaveLength(0); // 发送交给事件处理器
+    // **用自己的实例**（REQ-A980）：向单例的共享队列里放一条 `audit.log`，它会在**后面**
+    // 某个刚好订阅了 audit.log 的用例（本文件的 `重试` 那条用的就是默认 events）被那个
+    // 1 秒一拍的处理器投递出去，于是那条用例的 fetch 次数多一 —— 实测就是这么红的。
+    // 这条用例本来就不需要单例：它要证的是"入队 ≠ 立刻发送"。
+    const own = new WebhookManager();
+    try {
+      await own.trigger("audit.log", { a: 1 });
+      expect(own.getWebhooks()).toHaveLength(0); // 发送交给事件处理器
+    } finally {
+      own.shutdown();
+    }
   });
 
   test("队列超过上限时丢掉最旧的（不无限增长）", async () => {
@@ -180,9 +196,53 @@ describe("webhookManager 事件队列", () => {
     // 事件名**故意不与任何 webhook 的 events 匹配**：队列是单例的、每个用例都会往同一个
     // 处理器里放事件，若这里塞 "audit.log"，后面注册了 audit.log 订阅的用例就会被这个
     // 间隔处理器多发几次 fetch（第一版的重试用例正是因此多算了一次尝试）。
-    for (let i = 0; i < 1005; i++) await webhookManager.trigger("queue-overflow-test", { i });
-    expect(called).toBe(0); // 队列私有：能验的是“这条路径被走过”
+    //
+    // **用自己的实例，不用单例**（REQ-A980）：这个用例会往队尾压满 1000 条，而处理器
+    // 一秒只走一条 —— 那些事件在单例队列里要 1000 秒才排空，于是**后面任何"入队后等它
+    // 被投递"的用例都永远等不到自己的事件**（本文件的 `自举` 那两条就是这么被卡红的）。
+    // 一个用例的残留不该决定另一个用例能测什么：这就是"泄漏的单元是文件"那条纪律的
+    // 又一个实例。`finally` 里停掉自己的处理器，队列随实例一起被丢掉。
+    const own = new WebhookManager();
+    try {
+      for (let i = 0; i < 1005; i++) await own.trigger("queue-overflow-test", { i });
+      expect(called).toBe(0); // 队列私有：能验的是“这条路径被走过”
+    } finally {
+      own.shutdown();
+    }
   });
+
+  test("一拍清空**当前排队的所有**事件，而不是一拍一条（REQ-A980）", async () => {
+    /**
+     * 这条钉的是排空速率。发射侧接上之后，这条流水线第一次真的跑起来了：
+     * 「1 秒一拍、一拍一条」会变成用户看得见的**延迟**，而延迟等于队列深度。
+     *
+     * 窗口 2.5s 是**判别 1 拍与 3 拍**用的（1 拍 ≈ 1s，3 拍 ≈ 3s），不是量机器快慢：
+     * 退回「一拍一条」时，这条与 `enterprise.test.ts::应该能够触发 Webhook` 会同时红。
+     */
+    const cold = new WebhookManager();
+    const sent: number[] = [];
+    globalThis.fetch = (async (_url: string, init: RequestInit) => {
+      const body = JSON.parse(String(init.body)) as { data: { i: number } };
+      sent.push(body.data.i);
+      return new Response("", { status: 200 });
+    }) as unknown as typeof fetch;
+
+    try {
+      const id = cold.addWebhook(config({ events: ["shortcut_run"] }));
+      for (const i of [1, 2, 3]) await cold.trigger("shortcut_run", { i });
+
+      const deadline = Date.now() + 2_500;
+      while (Date.now() < deadline && (cold.getWebhook(id)?.triggerCount ?? 0) < 3) {
+        await new Promise((r) => setTimeout(r, 50));
+      }
+
+      expect(cold.getWebhook(id)!.triggerCount).toBe(3);
+      expect(cold.getWebhook(id)!.successCount).toBe(3);
+      expect(sent.sort()).toEqual([1, 2, 3]);
+    } finally {
+      cold.shutdown();
+    }
+  }, 10_000);
 });
 
 describe("webhookManager 发送（fetch 打桩）", () => {
@@ -321,5 +381,135 @@ describe("webhookManager 签名", () => {
     expect(res.success).toBe(false);
     expect(res.error).toContain("aborted");
     expect(webhookManager.getWebhook(id)!.failureCount).toBe(1);
+  });
+});
+
+describe("webhookManager 自举（REQ-A980）", () => {
+  /**
+   * 这一组测的是**没人调用 `initialize()`** 时的行为，因为那正是生产里的形状：
+   * `initialize()` 唯一的调用者 `enterprise/index.ts::initializeEnterprise()` 在生产里
+   * 零调用者（`audit.ts`（REQ-A897）与 `mdm.ts` 各记过一次）。
+   *
+   * `shutdown()` 现在会清掉「已自举」标记，所以它就是那个冷状态：处理器不在、配置没读回，
+   * 与设备上启动后的管理器一模一样。
+   */
+  const planted: WebhookConfig = {
+    ...config({ name: "from-last-session" }),
+    id: "webhook-planted",
+    createdAt: 1,
+    updatedAt: 1,
+    lastTriggeredAt: 0,
+    triggerCount: 0,
+    successCount: 0,
+    failureCount: 0,
+  };
+
+  test("没人调用 initialize() 时，getWebhooks() 也会把落盘的配置读回来", () => {
+    // 落一份「上一次会话」的配置，写法与 `save()` 一致（`writeJson` 收的是字符串）。
+    writeStoreValue(STORE_KEY, JSON.stringify([planted]));
+
+    // 一个**从没被 initialize() 的管理器**：内存表是空的，所以下面读到的只能来自存储。
+    const cold = new WebhookManager();
+    const read = cold.getWebhooks();
+    expect(read).toHaveLength(1);
+    expect(read[0]!.id).toBe("webhook-planted");
+    expect(read[0]!.name).toBe("from-last-session");
+  });
+
+  test("没人调用 initialize() 时，入队的事件也会被投递（处理器自举）", async () => {
+    const cold = new WebhookManager();
+    const sent: string[] = [];
+    globalThis.fetch = (async (_url: string, init: RequestInit) => {
+      sent.push(String((init.headers as Record<string, string>)["X-Webhook-Event"]));
+      return new Response("", { status: 200 });
+    }) as unknown as typeof fetch;
+
+    try {
+      const id = cold.addWebhook(config({ events: ["shortcut_create"] }));
+
+      await cold.trigger("shortcut_create", { shortcutId: "s-1" });
+
+      // 处理器每 1s 走一条；这个队列是这条用例自己的，所以只需等它自举起来的那一拍。
+      const deadline = Date.now() + 4_000;
+      while (Date.now() < deadline && (cold.getWebhook(id)?.triggerCount ?? 0) === 0) {
+        await new Promise((r) => setTimeout(r, 50));
+      }
+
+      expect(sent).toEqual(["shortcut_create"]);
+      expect(cold.getWebhook(id)!.triggerCount).toBe(1);
+    } finally {
+      cold.shutdown(); // 不留 interval
+    }
+  }, 10_000);
+});
+
+describe("生产发射点（REQ-A980）", () => {
+  /**
+   * 这一组钉的是**发射侧**。面板（`APISettings.svelte::availableEvents`）让用户为七个事件
+   * 各配一个 URL，而修复前 `trigger` 在生产里**零调用者** —— 于是 `triggerCount` 恒为 0、
+   * 成功率恒显示 0，用户会以为自己的 webhook 坏了。
+   *
+   * 每个事件都由**生产函数自己**发出去（不是测试替身直接调 `trigger`），断言的落点是
+   * 「生产函数 → `emitWebhookEvent` → 单例的入队口」，也就是**发射侧那个缝**本身：
+   * 单例的 `trigger` 被换成一个记录器（`finally` 里 `delete` 掉，恢复原型方法）。
+   *
+   * 为什么不看**线上收到**的那几条（第一版就是那么写的，在 200+ 文件的整批里红了）：
+   * 单例的队列是**跨用例、跨文件共享**的，而处理器**一秒只走一条**、队列里排在我前面的
+   * 每一条都要吃掉一拍。本文件早先的溢出用例曾往队尾压 1000 条，其它文件的快捷指令用例
+   * 现在也会经这些发射点入队。整批实测：15 秒的等待窗口在 `[15042.26ms]` 到点，`received`
+   * 停在第 3 条 —— 一个用例的通过与否由**别的文件往共享队列里放了多少东西**决定。
+   *
+   * 投递本身（入队 → 1 秒一拍 → `sendWebhook` → fetch）由上面 `自举` 那条钉住，用的是
+   * **自己的管理器**（队列空 ⇒ 只需等一拍，确定性的）。两条合起来覆盖整条链，而各自都不
+   * 依赖别的用例留下的状态。
+   */
+  test("建/改/跑/删四条生产路径各自发出面板上的那个事件", async () => {
+    const seen: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const spy = {
+      trigger: async (event: string, data: unknown) => {
+        seen.push({ event, data: data as Record<string, unknown> });
+      },
+    };
+    // 只看入队口：事件不再真的进队列，也就不会给后面的用例留下残留。
+    const real = webhookManager.trigger;
+    (webhookManager as unknown as { trigger: typeof real }).trigger = spy.trigger;
+
+    try {
+      // 四条都走**导出给生产用的**那些函数。
+      const created = createShortcut("seam-probe");
+      expect(created).not.toBeNull();
+      expect(updateShortcut(created!.id, { name: "seam-probe-renamed" })).toBe(true);
+      const copied = duplicateShortcut(created!.id);
+      expect(copied).not.toBeNull();
+      await executeShortcut(created!.id);
+      expect(deleteShortcut(created!.id)).toBe(true);
+
+      // 复制**不**另发一条：它内部就是一次 `createShortcut`，所以这里是 5 条、其中两条
+      // 同名 `shortcut_create`（原指令与副本），而不是 5 条各不相同的名字。
+      expect(seen.map((r) => r.event)).toEqual([
+        "shortcut_create",
+        "shortcut_update",
+        "shortcut_create",
+        "shortcut_run",
+        "shortcut_delete",
+      ]);
+
+      // 跑一次会让 `executeShortcut()` 自己把 `runCount` +1（又一次 `updateShortcut` 调用），
+      // 但那**不是**"指令被修改"：运行时已经由 `shortcut_run` 报过了。上面那个数组钉住了
+      // 没有第二条 `shortcut_update`，这里再直接钉一次判据本身（去掉过滤就会在这里红）。
+      expect(
+        seen.flatMap((r) => (Array.isArray(r.data.changed) ? (r.data.changed as string[]) : [])),
+      ).not.toContain("runCount");
+
+      expect(seen[0]!.data.shortcutId).toBe(created!.id);
+      expect(seen[1]!.data).toMatchObject({ shortcutId: created!.id, changed: ["name"] });
+      expect(seen[2]!.data.shortcutId).toBe(copied!.id);
+      expect(seen[3]!.data).toMatchObject({ shortcutId: created!.id, success: true });
+      expect(seen[4]!.data).toMatchObject({ shortcutId: created!.id, name: "seam-probe-renamed" });
+    } finally {
+      // 删掉自己的属性，恢复 `WebhookManager.prototype.trigger`（赋值回一个包一层的不算恢复）。
+      delete (webhookManager as unknown as { trigger?: unknown }).trigger;
+      expect(webhookManager.trigger).toBe(real);
+    }
   });
 });

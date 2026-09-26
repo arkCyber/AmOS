@@ -5,8 +5,9 @@
 //! Why these live here and not in `src/`: every one of them needs `amos-link` (a node, a
 //! broker, a bridge, a profile), and the point of the test is the *join* between the two
 //! crates — a unit test on either side cannot fail when the join breaks. There is no device,
-//! no network and no wall clock anywhere in this file: the one loop uses `tokio::time` only
-//! for its ticks, and the vehicle model below is an explicit fixture, not a simulator claim.
+//! no network and no wall clock anywhere in this file: the one loop is a plain `for`
+//! advanced by an explicit `dt_s`, and the vehicle model below is an explicit fixture, not a
+//! simulator claim.
 
 use std::sync::Arc;
 
@@ -17,7 +18,10 @@ use amos_link::platform::Platform;
 use amos_link::qos::Qos;
 use amos_link::robot_hal::{AgentAction, BridgeEvent, MockRobotHal, RobotBridge, RobotHal};
 use amos_robot::fusion::{AttitudeEstimator, GravityCorrection, ImuSample, STANDARD_GRAVITY_M_S2};
-use amos_robot::planning::{plan, Cell, Connectivity, Grid, Path, Pose, PursuitLimits};
+use amos_robot::planning::{
+    plan, pursuit, Cell, Connectivity, DwaLimits, DwaVelocity, Grid, LocalPlanner, Path, Pose,
+    PursuitLimits, VehicleGeometry,
+};
 
 /// The `ground-vehicle` profile, in a `static` because `RobotBridge::for_platform` wants a
 /// `&'static Platform` — the same requirement a real deployment satisfies by naming its
@@ -108,6 +112,257 @@ async fn wheeled_robot() -> (
     let bridge = RobotBridge::for_platform(subscriber, MockRobotHal::new(), &VEHICLE)
         .expect("the profile's envelope is valid");
     (bridge, publisher, node)
+}
+
+/// A straight corridor, 24 m east by 9 m north, all free.
+///
+/// The route runs along the middle row. What makes it an *avoidance* fixture is the order of
+/// operations in the test: the route is planned on this map, and only then is a cell of it
+/// blocked. A planner cannot anticipate an obstacle that appears after it planned, which is
+/// exactly the situation a reactive layer exists for.
+const CORRIDOR: [&str; 9] = ["........................"; 9];
+
+/// The cell of [`CORRIDOR`] that is set down on top of the route *after* it was planned.
+const POP_UP: Cell = Cell::new(12, 4);
+
+/// The machine the avoidance test drives: a small steered vehicle, deliberately nimbler than
+/// the [`BikeModel`] default (a 1 m wheelbase turns in `1/tan 40° ≈ 1.19 m`), because the
+/// point of the test is the *join* between the window and the profile's columns, not how tight
+/// a particular car can turn.
+const AVOID_GEOMETRY: VehicleGeometry = VehicleGeometry {
+    wheelbase_mm: 1_000,
+    top_speed_mm_s: 2_000,
+};
+
+/// The route-tracking limits the avoidance test uses.
+///
+/// The **lookahead is the local goal's distance**, and it is not free: DWA's progress term
+/// measures the distance from a rollout's end to the goal, so a goal closer than one rollout
+/// (i.e. `max_v · DWA_HORIZON_STEPS · dt_s` = 4.5 m here) makes "end exactly on the goal"
+/// optimal, and the window caps the machine's speed at `lookahead / horizon` — measured, a
+/// 1.5 m lookahead with a 3 s horizon held the vehicle at 380–500 mm/s for the whole corridor.
+/// The goal has to be as far ahead as the planner can see, or the planner is asked to solve a
+/// problem it cannot express.
+///
+/// The arrival radius must exceed the fixture's turn radius (`1/tan 40°` of a 1 m wheelbase
+/// ≈ 1.19 m), or the pursuer orbits the goal instead of reaching it — the constraint
+/// [`PursuitLimits::arrive_radius_mm`] names.
+fn avoid_pursuit_limits() -> PursuitLimits {
+    PursuitLimits {
+        lookahead_mm: 4_500,
+        arrive_radius_mm: 1_500,
+        slow_radius_mm: 3_000,
+        max_steer_milli_deg: 40_000,
+        cruise_milli_percent: 30_000,
+    }
+}
+
+/// The dynamic window the avoidance test scores with.
+///
+/// Two numbers are sized rather than picked, and both are what make the fixture an avoidance
+/// test instead of a stall:
+///
+/// * **The rollout sub-step.** The lookahead is `DWA_HORIZON_STEPS · dt_s`, and an arc that
+///   rounds a 1 m obstacle with a 1.19 m turn radius is a metre and a half of lateral travel —
+///   so a 20-step horizon needs about 3 s of rollout to *see* a swerve that clears. At the
+///   50 ms sub-step the control loop ticks at, the window sees 1 s (≈ 1.5 m at cruise), every
+///   forward arc ends inside the obstacle, and DWA picks its degenerate zero-velocity
+///   candidate (which is collision-free precisely because it goes nowhere) and stalls. This
+///   0.2 s sub-step is the *predictor's* granularity, not the control cadence: the machine is
+///   still commanded every 50 ms.
+/// * **`max_omega_mrad_s`.** The bicycle relation `ω = v·tan δ / L` makes the machine's real
+///   yaw-rate ceiling speed-dependent, and [`DriveCommand::from_velocity`] saturates a demand
+///   past the steering travel. The test asserts below that the *selected* candidate was never
+///   one the machine could not realise, which is what makes the window's score transfer to the
+///   machine rather than staying a fiction.
+fn avoid_dwa_limits() -> DwaLimits {
+    DwaLimits {
+        max_v_mm_s: 1_500,
+        max_v_reverse_mm_s: 100,
+        max_omega_mrad_s: 900,
+        max_accel_mm_s2: 3_000,
+        max_alpha_mrad_s2: 4_000,
+        dt_s: 0.2,
+        cell_mm: 1_000,
+    }
+}
+
+/// What one run of the corridor did.
+struct CorridorRun {
+    /// The route's goal was reported reached.
+    reached: bool,
+    /// The vehicle occupied [`POP_UP`] at some tick.
+    entered: bool,
+    /// The velocity→set-point conversion had to move the steering demand by more than a
+    /// milli-degree of rounding to fit the column. On the avoidance run this must stay `false`:
+    /// a saturated steer means the arc DWA scored is not the arc the machine drove.
+    saturated: bool,
+    /// Steps taken, for the "it actually drove" assertion.
+    steps: usize,
+}
+
+/// Drive the corridor once, with the command built from the same pieces a caller would use:
+/// [`pursuit`] for the goal, [`dwa`] for the command, [`DriveCommand::from_velocity`] for the
+/// set points.
+///
+/// The join is written out here rather than hidden behind [`LocalPlanner`] so the test can see
+/// the window's own choice — which is the only way to assert that the arc that was *scored* is
+/// the arc that was *driven*.
+///
+/// `avoid` picks the command source and nothing else, so the two runs differ in exactly the
+/// claim under test:
+///
+/// * `false` — [`pursuit`] on the map the route was planned on, i.e. a tracker that cannot see
+///   the pop-up. This is the negative control: it must drive into the cell.
+/// * `true` — the route's aim point scored by the window against the *live* map.
+fn drive_corridor(avoid: bool) -> CorridorRun {
+    let plan_grid = Grid::from_rows(&CORRIDOR, 1_000).expect("the corridor parses");
+    let start = Cell::new(0, 4);
+    let goal = Cell::new(23, 4);
+    let route = plan(&plan_grid, start, goal, Connectivity::Four)
+        .expect("the corridor is open")
+        .simplified(&plan_grid);
+    // The pop-up goes in *after* the plan, in a copy of the map the planner never saw.
+    let mut world = plan_grid.clone();
+    world
+        .set_blocked(POP_UP, true)
+        .expect("the pop-up is in bounds");
+
+    let limits = avoid_pursuit_limits();
+    let dwa_limits = avoid_dwa_limits();
+    let planner = LocalPlanner {
+        pursuit: limits,
+        dwa: dwa_limits,
+        geometry: AVOID_GEOMETRY,
+    };
+
+    let (start_north, start_east) = plan_grid.cell_centre(start).expect("start centre");
+    let mut vehicle = BikeModel::new(Pose {
+        north_mm: start_north,
+        east_mm: start_east,
+        // North is 0 and clockwise is positive, so east is a quarter turn.
+        heading_mrad: 1_571,
+    });
+    vehicle.wheelbase_mm = f64::from(AVOID_GEOMETRY.wheelbase_mm);
+    vehicle.top_speed_mm_s = f64::from(AVOID_GEOMETRY.top_speed_mm_s);
+
+    let dt_s = 0.05;
+    let mut run = CorridorRun {
+        reached: false,
+        entered: false,
+        saturated: false,
+        steps: 0,
+    };
+    let mut velocity = DwaVelocity {
+        v_mm_s: 0,
+        omega_mrad_s: 0,
+    };
+    for _ in 0..4_000 {
+        let nominal = pursuit(&plan_grid, &route, vehicle.pose, &limits).expect("a command");
+        let command = if nominal.reached_goal {
+            run.reached = true;
+            break;
+        } else if avoid {
+            // The diagnostic first: the window's own choice, so the test can assert that the
+            // arc that was *scored* is an arc the conversion could *realise*. (It is the same
+            // call `LocalPlanner::command` makes below — deterministic, and worth the second
+            // evaluation to keep the assertion about the geometry rather than about the
+            // wrapper agreeing with itself.)
+            let score = amos_robot::planning::dwa(
+                &world,
+                vehicle.pose,
+                nominal.target,
+                velocity,
+                &dwa_limits,
+            )
+            .expect("the window is well-formed");
+            if !score.safe {
+                panic!(
+                    "no safe trajectory at step {}: stopping instead of driving",
+                    run.steps
+                );
+            }
+            // The demand before the column's saturation, in milli-degrees.
+            let v = f64::from(score.velocity.v_mm_s);
+            let demand = (f64::from(score.velocity.omega_mrad_s) / 1_000.0
+                * f64::from(AVOID_GEOMETRY.wheelbase_mm)
+                / v)
+                .atan()
+                .to_degrees();
+            if demand.abs() > 40.0 {
+                run.saturated = true;
+            }
+            // And the production path: the same window, through the wrapper a deployment calls.
+            planner
+                .command(&VEHICLE, &plan_grid, &world, &route, vehicle.pose, velocity)
+                .expect("the wrapper must produce a command for every tick it is driven")
+        } else {
+            // The blind tracker: the route's own map, which does not contain the pop-up.
+            nominal
+        };
+        let before = vehicle.pose;
+        let pose = vehicle.advance(
+            command.steer_milli_deg,
+            command.throttle_milli_percent,
+            dt_s,
+        );
+        run.steps += 1;
+        // The window is hot-started from what the machine *actually did*, not from what it was
+        // asked: a conversion bug shows up here as a growing mismatch, not as silence.
+        let v_mm_s = (f64::from(command.throttle_milli_percent) / 100_000.0
+            * vehicle.top_speed_mm_s)
+            .round() as i32;
+        let omega_mrad_s = ((pose.heading_mrad - before.heading_mrad) as f64 / dt_s).round() as i32;
+        velocity = DwaVelocity {
+            v_mm_s,
+            omega_mrad_s,
+        };
+        let cell = world
+            .world_to_cell(pose.north_mm, pose.east_mm)
+            .expect("the vehicle stays on the map");
+        if cell == POP_UP {
+            run.entered = true;
+        }
+    }
+    run
+}
+
+/// The join the audit found missing (REQ-A672): `dwa` was implemented and unit-tested, and no code
+/// outside its own tests ever called it — there was no `(v, ω)` → set-point conversion at all.
+/// This drives it in a loop — and, in the same fixture, drives the blind tracker that shows the
+/// loop is not passing for free.
+#[test]
+fn the_local_planner_steers_around_an_obstacle_the_route_does_not_know() {
+    let run = drive_corridor(true);
+    assert!(
+        !run.entered,
+        "the local planner drove into the pop-up at ({}, {})",
+        POP_UP.col, POP_UP.row
+    );
+    assert!(run.reached, "the local planner must still arrive");
+    assert!(
+        !run.saturated,
+        "a saturating steer means the arc DWA scored is not the arc that was driven"
+    );
+    assert!(
+        run.steps > 50,
+        "{} step(s) is not a driven route, it is a lucky straight line",
+        run.steps
+    );
+}
+
+/// The negative control for the test above: with the *same* fixture, the route's own map and
+/// the same pursuer, and only the reactive layer removed, the machine drives into the pop-up.
+///
+/// Without this, "it reached the goal without hitting anything" could be a property of the
+/// corridor (wide, straight, obstacle nowhere near the line) rather than of the planner.
+#[test]
+fn the_negative_control_drives_into_the_obstacle_the_route_does_not_know() {
+    let run = drive_corridor(false);
+    assert!(
+        run.entered,
+        "the blind pursuer must hit the pop-up — otherwise the avoidance test proves nothing"
+    );
 }
 
 #[tokio::test]
@@ -256,7 +511,11 @@ async fn the_route_is_actually_driven_and_the_goal_is_reached() {
     let attitude = estimator.estimate();
     assert_eq!(attitude.correction, GravityCorrection::Applied);
     let heading_deg = (f64::from(vehicle.pose.heading_mrad) / 1_000.0).to_degrees();
-    let drift = (f64::from(attitude.yaw_rad.to_degrees()) - heading_deg).abs();
+    // Both are angles, and they use different domains: the model's heading accumulates
+    // without bound while `yaw_rad` is wrapped to `(-180, 180]`. Wrap the difference so a
+    // net turn past ±180° over the route cannot masquerade as a huge "drift".
+    let raw = f64::from(attitude.yaw_rad.to_degrees()) - heading_deg;
+    let drift = ((raw + 180.0).rem_euclid(360.0) - 180.0).abs();
     assert!(
         drift < 3.0,
         "the estimator must track the heading it was fed: drift {drift} deg, heading {} mrad, \

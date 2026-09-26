@@ -8,6 +8,7 @@
 import { describe, expect, it } from "bun:test";
 import {
   blobBytes,
+  bytesToDataUrl,
   CAMERA_EXPORT_DIR,
   dataUrlMime,
   RECORDING_EXPORT_DIR,
@@ -44,6 +45,34 @@ describe("dataUrlMime", () => {
     expect(dataUrlMime("data:base64,AAAA")).toBeNull();
     expect(dataUrlMime("blob:http://localhost/xyz")).toBeNull();
     expect(dataUrlMime("")).toBeNull();
+  });
+});
+
+describe("bytesToDataUrl", () => {
+  it("round-trips through dataUrlToBytes with the declared MIME", () => {
+    const url = bytesToDataUrl(new Uint8Array([1, 2, 3, 250]), "image/jpeg");
+    expect(url).toBe(`data:image/jpeg;base64,${btoa("\x01\x02\x03\xfa")}`);
+    expect(dataUrlMime(url!)).toBe("image/jpeg");
+    expect([...dataUrlToBytes(url!)!]).toEqual([1, 2, 3, 250]);
+  });
+
+  it("no bytes means no data URL — an empty photo is not a photo", () => {
+    expect(bytesToDataUrl(new Uint8Array([]), "image/png")).toBeNull();
+  });
+
+  it("an unknown/absent MIME is octet-stream, not a guessed image type", () => {
+    expect(bytesToDataUrl(new Uint8Array([1]), null)).toBe(`data:application/octet-stream;base64,${btoa("\x01")}`);
+    expect(bytesToDataUrl(new Uint8Array([1]), "not a mime")).toBe(
+      `data:application/octet-stream;base64,${btoa("\x01")}`,
+    );
+  });
+
+  it("encodes a payload past the argument-spread limit", () => {
+    // `String.fromCharCode(...bytes)` would spread one argument per byte; the chunked encoder
+    // must survive a payload far beyond the engine's argument ceiling (a real photo is MBs).
+    const big = new Uint8Array(300_000).fill(65);
+    const url = bytesToDataUrl(big, "image/jpeg");
+    expect(dataUrlToBytes(url!)!.length).toBe(300_000);
   });
 });
 

@@ -86,6 +86,9 @@ mod tests {
             AirPlayResult::Failed {
                 reason: "Connection timeout".to_string(),
             },
+            AirPlayResult::NotImplemented {
+                reason: "No platform implementation".to_string(),
+            },
         ];
 
         for result in results {
@@ -101,8 +104,59 @@ mod tests {
                 ) => (),
                 (AirPlayResult::DeviceNotFound, AirPlayResult::DeviceNotFound) => (),
                 (AirPlayResult::Failed { .. }, AirPlayResult::Failed { .. }) => (),
+                (AirPlayResult::NotImplemented { .. }, AirPlayResult::NotImplemented { .. }) => (),
                 _ => panic!("Mismatched AirPlayResult variants"),
             }
+        }
+    }
+
+    /// REQ-A467: the `kind` strings are the frontend contract (`lib/airplay.ts`). Two of them used
+    /// to be *unreachable lies*: `rename_all = "lowercase"` emitted `"permissiondenied"` /
+    /// `"devicenotfound"` while the declared union said `permission_denied` / `device_not_found`.
+    /// Nothing compared them, so nothing noticed — and any per-kind handling (like the panel's
+    /// refusal message) would have silently fallen through. This pins the wire form itself.
+    #[test]
+    fn test_airplay_result_wire_form() {
+        let cases: [(AirPlayResult, &str); 6] = [
+            (AirPlayResult::Ok, r#"{"kind":"ok"}"#),
+            (
+                AirPlayResult::Unavailable {
+                    reason: "r".to_string(),
+                },
+                r#"{"kind":"unavailable","reason":"r"}"#,
+            ),
+            (
+                AirPlayResult::PermissionDenied {
+                    reason: "r".to_string(),
+                },
+                r#"{"kind":"permission_denied","reason":"r"}"#,
+            ),
+            (
+                AirPlayResult::DeviceNotFound,
+                r#"{"kind":"device_not_found"}"#,
+            ),
+            (
+                AirPlayResult::Failed {
+                    reason: "r".to_string(),
+                },
+                r#"{"kind":"failed","reason":"r"}"#,
+            ),
+            (
+                AirPlayResult::NotImplemented {
+                    reason: "r".to_string(),
+                },
+                r#"{"kind":"not_implemented","reason":"r"}"#,
+            ),
+        ];
+
+        for (value, expected) in cases {
+            assert_eq!(serde_json::to_string(&value).unwrap(), expected);
+            let back: AirPlayResult = serde_json::from_str(expected).unwrap();
+            assert_eq!(
+                serde_json::to_string(&back).unwrap(),
+                expected,
+                "the wire form must survive a round trip"
+            );
         }
     }
 
@@ -196,42 +250,28 @@ mod tests {
         }
     }
 
+    /// REQ-A467: `set_volume` used to clamp into `status.volume` and answer `Ok` with a
+    /// `TODO: Send volume command to device` under it. It now refuses with a reason and leaves the
+    /// status alone — the clamp lost its meaning once that write went away.
     #[test]
-    fn test_manager_volume_bounds() {
+    fn test_manager_volume_refuses_without_moving_the_status() {
         let mut manager = AirPlayManager::new();
+        let before = manager.get_status().volume;
 
-        // Test valid volumes
-        assert!(matches!(
-            manager.set_volume(0.0),
-            AirPlayResult::Ok | AirPlayResult::Unavailable { .. }
-        ));
-        assert!(matches!(
-            manager.set_volume(0.5),
-            AirPlayResult::Ok | AirPlayResult::Unavailable { .. }
-        ));
-        assert!(matches!(
-            manager.set_volume(1.0),
-            AirPlayResult::Ok | AirPlayResult::Unavailable { .. }
-        ));
-
-        // Test out-of-range volumes (should be clamped, not fail)
-        let result = manager.set_volume(-0.1);
-        assert!(matches!(
-            result,
-            AirPlayResult::Ok | AirPlayResult::Unavailable { .. }
-        ));
-        if manager.is_available() {
-            assert_eq!(manager.get_status().volume, 0.0); // Should be clamped to 0.0
+        for requested in [0.0_f32, 0.5, 1.0, -0.1, 1.5] {
+            match manager.set_volume(requested) {
+                AirPlayResult::NotImplemented { reason } => {
+                    assert!(!reason.is_empty(), "a refusal must explain itself");
+                }
+                other => panic!("set_volume must refuse, got {other:?}"),
+            }
         }
 
-        let result = manager.set_volume(1.5);
-        assert!(matches!(
-            result,
-            AirPlayResult::Ok | AirPlayResult::Unavailable { .. }
-        ));
-        if manager.is_available() {
-            assert_eq!(manager.get_status().volume, 1.0); // Should be clamped to 1.0
-        }
+        assert_eq!(
+            manager.get_status().volume,
+            before,
+            "a refused volume change must not edit the status"
+        );
     }
 
     #[test]

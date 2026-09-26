@@ -81,6 +81,11 @@ Four pieces, in the order data flows:
   `amos/<robot>/state/actuation` (armed / e-stopped + why / which gait / the last refusal),
   published **only when the mode changes** — so a commander can tell an applied command from
   a refused one, and a watchdog torque cut is visible to the very peer whose link died.
+- **A bus that dies mid-batch latches and says so**: when a HAL's `apply` fails partway
+  through a batch, the bridge writes the profile's halt batch, latches `EstopReason::BusFault`
+  and **reports before returning the error** — so the next motion is refused rather than
+  written into a bus that just proved it is not honouring frames. A torque cut that could not
+  be written either is reported as `0` frames accepted, never as a claim that torque went away.
 - **The wire is not trusted, on either side of the loop**: a motor frame and an actuation
   report are both *decoded from a peer*, so both validate on decode (`try_from` on the wire
   form). A report whose frame count, deadman period or refusal reason is outside its bound is

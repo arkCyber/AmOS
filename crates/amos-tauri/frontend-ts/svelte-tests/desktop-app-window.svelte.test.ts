@@ -12,6 +12,8 @@ import { cleanup, render } from "@testing-library/svelte";
 import { tick } from "svelte";
 import DesktopAppWindow from "../src/svelte/DesktopAppWindow.svelte";
 import { resetDesktopFeaturesForTest } from "../src/lib/desktopFeatures";
+import { writeStoreValue } from "../src/lib/amosStore";
+import { KEYBOARD_CONFIG_KEY } from "../src/lib/keyboardConfigHook.svelte";
 
 type Call = { cmd: string; args?: Record<string, unknown> };
 let calls: Call[] = [];
@@ -98,6 +100,26 @@ describe("DesktopAppWindow — the window owns its own system keys", () => {
     await tick();
     expect(ev.defaultPrevented).toBe(false);
     expect(calls.filter((c) => c.cmd === "wm_close")).toEqual([]);
+    // Same switch, same family: a ⌃⌥ snapping chord is a desktop shortcut too, so the
+    // window must not consume it either.
+    const snapEv = press("ArrowLeft", { ctrlKey: true, altKey: true });
+    await tick();
+    expect(snapEv.defaultPrevented).toBe(false);
+    expect(calls.filter((c) => c.cmd === "wm_snap")).toEqual([]);
+  });
+
+  test("a ⌃⌥ chord snaps THIS window (its own label, no focus poll)", async () => {
+    // Snapping is the desktop window gesture a person reaches for, and like ⌘W it belongs
+    // to the window the user is in: `DesktopWindowKeys` passes its own id, so the chord
+    // cannot snap a neighbour and never waits on a poll (`lib/snapZones.ts` is the table).
+    render(DesktopAppWindow, { props: { id: "notes" } });
+    await tick();
+    const ev = press("ArrowRight", { ctrlKey: true, altKey: true });
+    await tick();
+    expect(calls.filter((c) => c.cmd === "wm_snap")).toEqual([
+      { cmd: "wm_snap", args: { label: "notes", zone: "right" } },
+    ]);
+    expect(ev.defaultPrevented).toBe(true);
   });
 
   /**
@@ -211,5 +233,72 @@ describe("DesktopAppWindow — the host's capability answer reaches an app windo
     expect(calls.filter((c) => c.cmd === "wm_close")).toEqual([
       { cmd: "wm_close", args: { label: "settings" } },
     ]);
+  });
+});
+
+/**
+ * REQ-A1312 — the window that **writes** the keyboard config follows its own write.
+ *
+ * 「设置 ▸ 键盘」(`KeyboardPage.svelte`) and this window's `DesktopWindowKeys` live in the
+ * **same** `WebviewWindow` (`settingsPages.ts`: the Settings screen runs in its own window, and
+ * that window's app surface renders `DesktopAppWindow`). `writeKeyboardConfig` →
+ * `writeStoreValueChecked` → `writeJson` announces a same-window write with
+ * `amos-store-changed` — and the hook only listened to `storage`, which the browser **never
+ * dispatches inside the writing document**. So the window that just changed a chord went on
+ * honouring the old one: rebind 关闭窗口 from ⌘W to ⌥⌘W (or disable it) in Settings, press ⌘W in
+ * the Settings window, and it still closed. The symptom is invisible from another window, which
+ * is why the cross-window probe (`dock-prefs-cross-window`) could not see it.
+ */
+describe("DesktopAppWindow — a rebind written in THIS window takes effect here (REQ-A1312)", () => {
+  const configWith = (system: Record<string, unknown>): Record<string, unknown> => ({
+    version: 1,
+    overlays: {},
+    system,
+    spaces: {},
+    touch: {},
+    updatedAt: 0,
+  });
+
+  /** What `KeyboardPage` does when the user saves: a write **in this window**. */
+  const saveInThisWindow = (system: Record<string, unknown>): void => {
+    writeStoreValue(KEYBOARD_CONFIG_KEY, configWith(system));
+  };
+
+  test("⌘W stops closing once it is rebound away in this window; the new chord closes instead", async () => {
+    render(DesktopAppWindow, { props: { id: "settings" } });
+    await tick();
+    press("w", { metaKey: true });
+    await tick();
+    expect(calls.filter((c) => c.cmd === "wm_close")).toEqual([
+      { cmd: "wm_close", args: { label: "settings" } },
+    ]);
+
+    // 用户在设置窗把「关闭窗口」从 ⌘W 改到 ⌥⌘W。
+    saveInThisWindow({ closeWindow: { key: "W", meta: true, alt: true } });
+    await tick();
+
+    // 旧弦当场失效（而不是"等下次开窗"）……
+    const stale = press("w", { metaKey: true });
+    await tick();
+    expect(stale.defaultPrevented).toBe(false);
+    expect(calls.filter((c) => c.cmd === "wm_close").length).toBe(1);
+
+    // ……新弦当场生效。
+    press("w", { metaKey: true, altKey: true });
+    await tick();
+    expect(calls.filter((c) => c.cmd === "wm_close").length).toBe(2);
+  });
+
+  test("disabling 关闭窗口 in this window leaves ⌘W alone (no dead chord kept alive)", async () => {
+    render(DesktopAppWindow, { props: { id: "notes" } });
+    await tick();
+
+    saveInThisWindow({ closeWindow: null });
+    await tick();
+
+    const ev = press("w", { metaKey: true });
+    await tick();
+    expect(ev.defaultPrevented).toBe(false);
+    expect(calls.filter((c) => c.cmd === "wm_close")).toEqual([]);
   });
 });

@@ -8,37 +8,72 @@
  * (its in-app timer already shows it). Fully React-free so it can live on the
  * Svelte import graph.
  */
-import { readStoreValue, writeStoreValue, STORE_CHANGED_EVENT } from "../lib/amosStore";
-import { NOTIF_KEY, NOTIF_CAP, type Notif } from "../lib/settings";
-import { pollTimer, TIMER_KEY } from "../lib/timerStore";
-import { zh } from "../i18n/locales/zh";
+import { readStoreValue, writeStoreValueChecked, STORE_CHANGED_EVENT } from "../lib/amosStore";
+import { NOTIF_KEY, NOTIF_CAP, normalizeNotifs, removeNotif, type Notif } from "../lib/settings";
+import { pollTimer, timerDue, TIMER_KEY } from "../lib/timerStore";
+import { bgT } from "./bgText";
 
 /** Internal Clock app id (suppressed there). */
 export const CLOCK_APP_ID = "clock";
 /** Poll cadence. */
 export const TIMER_WATCH_MS = 1_000;
 
-function pushTimerDoneNotif(nowMs: number): void {
-  const existing = readStoreValue<Notif[]>(NOTIF_KEY, []);
+/**
+ * Push this timer's "time's up" row. Returns the store's verdict.
+ *
+ * Idempotent by id: the retry below (and a second timer later in the session) writes the
+ * same `timer:done` row rather than stacking duplicates — `normalizeNotifs` collapses them
+ * on read, but the **stored** array would carry two, and a raw reader would draw both.
+ *
+ * Normalize the existing list (REQ-A1404): a corrupt value must not wedge the alert
+ * pipeline. `readJson` quarantines only *unparseable* bytes — a stored `null`, `{}` or `5`
+ * parses fine and comes back as-is — and `removeNotif` is a `filter`, so a raw read threw
+ * here before the alert was ever written. Both call sites below swallow that throw in a bare
+ * `catch {}`, so the failure was silent **every second, forever**: the countdown reached
+ * zero, `pollTimer` was never reached (`running` stayed true, `fired` stayed false) and the
+ * notification never landed. The three sibling producers of the same key (`alarmCore`,
+ * `calendarCore`, `reminderCore`) all normalize this read; two of them state the rule
+ * verbatim in a comment.
+ */
+function pushTimerDoneNotif(nowMs: number): boolean {
+  const existing = normalizeNotifs(readStoreValue<unknown>(NOTIF_KEY, []));
   const n: Notif = {
     id: "timer:done",
-    app: zh["app.clock"],
+    app: bgT("app.clock"),
     icon: "⏱️",
-    title: zh["clock.timerDone"],
+    title: bgT("clock.timerDone"),
     time: nowMs,
   };
-  writeStoreValue(NOTIF_KEY, [n, ...existing].slice(0, NOTIF_CAP));
+  return writeStoreValueChecked(NOTIF_KEY, [n, ...removeNotif(existing, n.id)].slice(0, NOTIF_CAP));
 }
 
-/** One poll decision: fire (and notify) only when due and Clock app not focused. */
+/**
+ * One poll decision: fire (and notify) only when due and Clock app not focused.
+ *
+ * The alert goes **first** and the one-shot is consumed only once it has a home
+ * (REQ-A1394 ∕ FMEA F-SH-653). `pollTimer` writes `fired: true, running: false`, and that
+ * is the only thing that stops later ticks from re-notifying — so consuming before the
+ * alert landed meant a store that refused the (larger) notifications write while accepting
+ * the (small) timer write, which quota pressure makes routine, dropped the alert forever
+ * and said nothing. A refused alert leaves the timer due, and the next tick retries: there
+ * is no surface to speak on from a `setInterval`, so the honest fix is "don't consume until
+ * it lands", not "say so" (the Clock app still owns the on-screen state either way).
+ *
+ * The consume's verdict is returned rather than dropped (REQ-A1431): the mirror-image store
+ * state — the alert landing while `amos.timer` is refused — used to read as `true` here, so
+ * "the deadline was consumed" was asserted off the attempt and not off the store. It is the
+ * *store* that decides whether a later tick announces this deadline again, and the timer
+ * write can be the refused one for the same reason the notification write can (`writeJson`
+ * refuses per `setItem`, and availability can change between the two).
+ */
 export function timerWatcherTick(
   activeAppId: string | null | undefined,
   nowMs = Date.now(),
 ): boolean {
   if (activeAppId === CLOCK_APP_ID) return false;
-  if (!pollTimer(nowMs)) return false;
-  pushTimerDoneNotif(nowMs);
-  return true;
+  if (!timerDue(nowMs)) return false;
+  if (!pushTimerDoneNotif(nowMs)) return false;
+  return pollTimer(nowMs);
 }
 
 /** Start a background watcher. Returns a stop function (call on unmount). */

@@ -48,7 +48,12 @@ export const APP_META: AppMeta[] = [
   { id: "webman", titleKey: "app.webman", icon: "🌐" },
   { id: "compass", titleKey: "app.compass", icon: "🧭" },
   { id: "measure", titleKey: "app.measure", icon: "📏" },
+  { id: "health", titleKey: "app.health", icon: "❤️" },
+  { id: "podcast", titleKey: "app.podcast", icon: "🎧" },
   { id: "shortcuts", titleKey: "app.shortcuts", icon: "⚡" },
+  { id: "nfc", titleKey: "app.nfc", icon: "🏷️" },
+  { id: "ble", titleKey: "app.ble", icon: "📶" },
+  { id: "robot", titleKey: "app.robot", icon: "🦿" },
 ];
 
 export function appMetaById(id: string): AppMeta | undefined {
@@ -66,6 +71,43 @@ export function appIcon(id: string): string {
 
 export function isKnownApp(id: string): boolean {
   return appMetaById(id) !== undefined;
+}
+
+/**
+ * The **reverse** of `appMetaById`: which built-in app *displays itself* as `name`?
+ *
+ * A stored notification names its sender as a display string, never as an app id — every
+ * `addNotif` call site writes one (`zh["app.mail"]`, `bgT("app.clock")`, or a push
+ * payload's free text). So "which app is this row from?" can only be answered backwards,
+ * and one rule has to answer it for both consumers: the notification centre's
+ * tap-to-open, and the Dock's unread badge.
+ *
+ * `dictionaries` is a **list** on purpose, and every locale is meant to be passed:
+ * the timer / reminder / calendar producers resolve the name at push time via
+ * `bgText.ts::bgT`, so a row written while the UI was Chinese keeps a Chinese name after
+ * a switch to English. Resolving against the active locale alone would silently stop
+ * finding it — and, worse, would make "open = read" (`removeAppNotifs`) miss its own rows.
+ *
+ * `null` means **no built-in app names itself that way** — a push payload's free-text
+ * `app`, the telemetry spy's own label, a third-party id. That is the honest answer, and
+ * the caller must render no affordance rather than invent one; there is no fuzzy match and
+ * no fallback to the id, because either would open the wrong window.
+ *
+ * The name is trimmed first: a push payload is external input (the device-side bridge test
+ * feeds `"  Mail  "`), and whitespace around a sender name is not a different sender.
+ */
+export function appIdForDisplayName(
+  name: string | undefined,
+  dictionaries: readonly Record<string, string>[],
+): string | null {
+  const trimmed = (name ?? "").trim();
+  if (trimmed === "") return null;
+  for (const meta of APP_META) {
+    for (const dict of dictionaries) {
+      if (dict[meta.titleKey] === trimmed) return meta.id;
+    }
+  }
+  return null;
 }
 
 export function appIds(): string[] {

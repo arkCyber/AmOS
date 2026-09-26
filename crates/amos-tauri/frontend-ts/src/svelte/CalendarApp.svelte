@@ -542,7 +542,7 @@
     <button
       onclick={goToday}
       data-testid="cal-today"
-      class="rounded-full bg-accent/15 px-3 py-1 text-xs text-accent"
+      class="rounded-full bg-accent/10 px-3 py-1 text-xs text-accent"
     >{t("calendar.today")}</button>
     <button
       onclick={() => {
@@ -824,11 +824,16 @@
                     draft.endDateStr = draft.dateStr;
                   }
                 }}
-                class={"h-5 w-9 shrink-0 rounded-full transition " +
-                  (draft.allDay ? "bg-accent" : "bg-neutral-300 dark:bg-neutral-600")}
+                class="grid h-11 w-11 shrink-0 place-items-center"
               >
-                <span class={"block h-4 w-4 rounded-full bg-white transition " +
-                  (draft.allDay ? "translate-x-[18px]" : "translate-x-0.5")}></span>
+                <!-- 命中区 44×44，视觉仍是 36×20 的轨道（REQ-A953：按钮自己只有 20 高，
+                     低于 WCAG 2.5.8 的 AA 下限 24；形状同 REQ-A387 的 DockPage）。 -->
+                <span class={"relative block h-5 w-9 rounded-full transition " +
+                  (draft.allDay ? "bg-accent" : "bg-neutral-300 dark:bg-neutral-600")}
+                >
+                  <span class={"block h-4 w-4 rounded-full bg-white transition " +
+                    (draft.allDay ? "translate-x-[18px]" : "translate-x-0.5")}></span>
+                </span>
               </button>
             </div>
             <div class="flex items-center gap-2">

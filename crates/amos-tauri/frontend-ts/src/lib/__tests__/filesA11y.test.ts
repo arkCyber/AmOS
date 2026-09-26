@@ -90,6 +90,7 @@ describe("filesA11y.ts", () => {
         onDelete: () => calls.push("delete"),
         onToggle: () => calls.push("toggle"),
         onSelectAll: () => calls.push("selectAll"),
+        onQuickLook: () => {},
       });
 
       handler(mockKeyEvent("ArrowUp"));
@@ -108,6 +109,7 @@ describe("filesA11y.ts", () => {
         onDelete: () => {},
         onToggle: () => {},
         onSelectAll: () => {},
+        onQuickLook: () => {},
       });
 
       handler(mockKeyEvent("Enter"));
@@ -122,6 +124,7 @@ describe("filesA11y.ts", () => {
         onDelete: () => calls.push("delete"),
         onToggle: () => {},
         onSelectAll: () => {},
+        onQuickLook: () => {},
       });
 
       handler(mockKeyEvent("Delete"));
@@ -137,6 +140,7 @@ describe("filesA11y.ts", () => {
         onDelete: () => {},
         onToggle: () => calls.push("toggle"),
         onSelectAll: () => {},
+        onQuickLook: () => {},
       });
 
       handler(mockKeyEvent(" "));
@@ -151,11 +155,49 @@ describe("filesA11y.ts", () => {
         onDelete: () => {},
         onToggle: () => {},
         onSelectAll: () => calls.push("selectAll"),
+        onQuickLook: () => {},
       });
 
       handler(mockKeyEvent("a", { metaKey: true }));
       handler(mockKeyEvent("A", { ctrlKey: true }));
       expect(calls).toEqual(["selectAll", "selectAll"]);
+    });
+
+    test("Cmd/Ctrl+Y calls onQuickLook — Quick Look has a keyboard route (REQ-A787)", () => {
+      const calls: string[] = [];
+      const handler = createKeyboardHandler({
+        onNav: () => {},
+        onOpen: () => {},
+        onDelete: () => {},
+        onToggle: () => {},
+        onSelectAll: () => {},
+        onQuickLook: () => calls.push("quickLook"),
+      });
+
+      handler(mockKeyEvent("y", { metaKey: true }));
+      handler(mockKeyEvent("Y", { ctrlKey: true }));
+      expect(calls).toEqual(["quickLook", "quickLook"]);
+    });
+
+    /**
+     * The negative half, and the reason ⌘Y is the binding: Space must keep meaning **toggle
+     * selection**. If someone "fixes" Quick Look onto Space later (because that is the macOS
+     * key everyone remembers), these two assertions fail together and say why.
+     */
+    test("a bare `y` is not Quick Look, and Space stays the selection toggle", () => {
+      const calls: string[] = [];
+      const handler = createKeyboardHandler({
+        onNav: () => {},
+        onOpen: () => {},
+        onDelete: () => {},
+        onToggle: () => calls.push("toggle"),
+        onSelectAll: () => {},
+        onQuickLook: () => calls.push("quickLook"),
+      });
+
+      handler(mockKeyEvent("y")); // no modifier → nobody's key
+      handler(mockKeyEvent(" ")); // still the ARIA listbox selection toggle
+      expect(calls).toEqual(["toggle"]);
     });
 
     test("ignores keys when typing in input/textarea", () => {
@@ -166,6 +208,7 @@ describe("filesA11y.ts", () => {
         onDelete: () => calls.push("delete"),
         onToggle: () => calls.push("toggle"),
         onSelectAll: () => calls.push("selectAll"),
+        onQuickLook: () => {},
       });
 
       // Mock events with input/textarea as target

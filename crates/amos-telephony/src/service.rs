@@ -11,9 +11,10 @@ use std::sync::Arc;
 
 use amos_proto::amos_telephony::{
     telephony_server::{Telephony, TelephonyServer},
-    AnswerRequest, CallDirection as ProtoDirection, CallIdMsg, CallList, CallSnapshot,
-    CallState as ProtoState, CallStateEvent, DialRequest, EndReason as ProtoEndReason, EndRequest,
-    RecordingState as ProtoRecording, SimulateIncomingRequest, StatusRequest, WatchRequest,
+    AnswerRequest, BackendStatus as ProtoBackendStatus, CallDirection as ProtoDirection, CallIdMsg,
+    CallList, CallSnapshot, CallState as ProtoState, CallStateEvent, DialRequest,
+    EndReason as ProtoEndReason, EndRequest, MuteRequest, RecordingState as ProtoRecording,
+    SimulateIncomingRequest, StatusRequest, WatchRequest,
 };
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_stream::{Stream, StreamExt};
@@ -52,6 +53,11 @@ pub struct TelephonyService {
     /// network answering), so a desktop demo can actually reach `Active` — and
     /// therefore recording — without a real carrier. Off for deterministic tests.
     demo_connect_delay: Option<tokio::time::Duration>,
+    /// Which provider is actually behind the two seams above (see
+    /// [`crate::backend::BackendKind`]). Carried so `GetBackend` can answer honestly:
+    /// `Dial` returns a `CallIdMsg` either way, and only this field says whether a
+    /// real call exists behind it.
+    backend: crate::backend::BackendKind,
 }
 
 impl TelephonyService {
@@ -76,9 +82,34 @@ impl TelephonyService {
             emergency_map,
             audit: Arc::new(AuditLog::new()),
             dial_limiter: None,
+            // The injector IS the mock seam: it is `Some` exactly when the backend is
+            // the in-process mock and `None` for every other provider. Deriving the
+            // backend kind from it keeps the two from drifting — a future real backend
+            // that left `injector` set would advertise itself as real while simulating.
+            backend: if injector.is_some() {
+                crate::backend::BackendKind::Mock
+            } else {
+                crate::backend::BackendKind::Unconfigured
+            },
             injector,
             demo_connect_delay: None,
         }
+    }
+
+    /// Declare which provider is behind the seams, overriding the derived default.
+    ///
+    /// The derived value in [`Self::with_injector`] is exact for the mock and for
+    /// "nothing wired"; a real provider (feature `android`) is `Arc<dyn ...>` with no
+    /// mock injector, which the derive cannot distinguish from a bare stub — so its
+    /// constructor must say so explicitly rather than inherit `Unconfigured`.
+    pub fn with_backend(mut self, backend: crate::backend::BackendKind) -> Self {
+        self.backend = backend;
+        self
+    }
+
+    /// Which provider actually backs this service. See [`crate::backend::BackendKind`].
+    pub fn backend_kind(&self) -> crate::backend::BackendKind {
+        self.backend
     }
 
     /// Access the bounded call audit trail (for tests / future ops surfaces).
@@ -203,6 +234,7 @@ fn snapshot_of(c: &ModelCall) -> CallSnapshot {
             DomainRecording::Failed => ProtoRecording::RecordingFailed,
         } as i32,
         emergency: c.emergency,
+        muted: c.muted,
     }
 }
 
@@ -214,48 +246,87 @@ fn call_id_from(opt: Option<CallIdMsg>) -> Result<CallId, Status> {
 }
 
 /// Convert a provider signalling event into a wire `CallStateEvent`. The event
-/// carries enough (id + peer) to build the snapshot without a state round-trip.
+/// carries enough (id + peer + the call's mutable flags) to build the snapshot
+/// without a state round-trip.
+///
+/// `emergency` comes off the event, not a constant: the provider holds the call
+/// and stamps the flag, so a streamed snapshot can no longer claim an emergency
+/// call is ordinary while `status()` (which reads the model) says otherwise.
 fn event_to_state_event(evt: ProviderEvent) -> CallStateEvent {
-    let (id, peer, state, direction, reason, recording) = match evt {
-        ProviderEvent::Incoming { id, peer } => (
+    let (id, peer, state, direction, reason, recording, muted, emergency) = match evt {
+        ProviderEvent::Incoming {
+            id,
+            peer,
+            emergency,
+        } => (
             id,
             peer.as_str().to_string(),
             ProtoState::Ringing,
             ProtoDirection::Incoming,
             ProtoEndReason::Local,
             ProtoRecording::RecordingOff,
+            false,
+            emergency,
         ),
-        ProviderEvent::Connected { id, peer } => (
+        ProviderEvent::Connected {
+            id,
+            peer,
+            direction,
+            emergency,
+        } => (
             id,
             peer.as_str().to_string(),
             ProtoState::Active,
-            ProtoDirection::Outgoing,
+            proto_direction(direction),
             ProtoEndReason::Local,
             ProtoRecording::RecordingOff,
+            false,
+            emergency,
         ),
-        ProviderEvent::RemoteEnded(id) => (
+        ProviderEvent::RemoteEnded {
             id,
-            String::new(),
+            peer,
+            direction,
+            emergency,
+        } => (
+            id,
+            peer.as_str().to_string(),
             ProtoState::Ended,
-            ProtoDirection::Outgoing,
+            proto_direction(direction),
             ProtoEndReason::Remote,
             ProtoRecording::RecordingOff,
+            false,
+            emergency,
         ),
-        ProviderEvent::LocalEnded(id) => (
+        ProviderEvent::LocalEnded {
             id,
-            String::new(),
+            peer,
+            direction,
+            emergency,
+        } => (
+            id,
+            peer.as_str().to_string(),
             ProtoState::Ended,
-            ProtoDirection::Outgoing,
+            proto_direction(direction),
             ProtoEndReason::Local,
             ProtoRecording::RecordingOff,
+            false,
+            emergency,
         ),
-        ProviderEvent::Failed(id) => (
+        ProviderEvent::Failed {
             id,
-            String::new(),
+            peer,
+            direction,
+            emergency,
+        } => (
+            id,
+            peer.as_str().to_string(),
             ProtoState::Ended,
-            ProtoDirection::Outgoing,
+            proto_direction(direction),
             ProtoEndReason::Failed,
             ProtoRecording::RecordingOff,
+            false,
+            emergency,
         ),
         ProviderEvent::RecordingChanged {
             id,
@@ -263,6 +334,8 @@ fn event_to_state_event(evt: ProviderEvent) -> CallStateEvent {
             state,
             direction,
             recording,
+            muted,
+            emergency,
         } => (
             id,
             peer.as_str().to_string(),
@@ -270,6 +343,26 @@ fn event_to_state_event(evt: ProviderEvent) -> CallStateEvent {
             proto_direction(direction),
             ProtoEndReason::Local,
             proto_recording(recording),
+            muted,
+            emergency,
+        ),
+        ProviderEvent::MutedChanged {
+            id,
+            peer,
+            state,
+            direction,
+            muted,
+            recording,
+            emergency,
+        } => (
+            id,
+            peer.as_str().to_string(),
+            proto_state(state),
+            proto_direction(direction),
+            ProtoEndReason::Local,
+            proto_recording(recording),
+            muted,
+            emergency,
         ),
     };
     CallStateEvent {
@@ -280,7 +373,8 @@ fn event_to_state_event(evt: ProviderEvent) -> CallStateEvent {
             state: state as i32,
             end_reason: reason as i32,
             recording: recording as i32,
-            emergency: false,
+            emergency,
+            muted,
         }),
     }
 }
@@ -458,6 +552,24 @@ impl Telephony for TelephonyService {
         Ok(Response::new(self.snapshot_for(&id).await?))
     }
 
+    /// Set whether the call's outbound audio is muted; returns its authoritative
+    /// snapshot so the UI reflects the daemon's answer rather than its own guess.
+    ///
+    /// `muted` is the desired state (not a toggle), so a retried request is safe.
+    /// Legal on any live call, emergency included (see [`crate::session::CallSession::set_muted`]).
+    async fn set_muted(
+        &self,
+        request: Request<MuteRequest>,
+    ) -> Result<Response<CallSnapshot>, Status> {
+        let req = request.into_inner();
+        let id = call_id_from(req.call)?;
+        self.regular
+            .set_muted(&id, req.muted)
+            .await
+            .map_err(into_status)?;
+        Ok(Response::new(self.snapshot_for(&id).await?))
+    }
+
     /// Dev/demo hook: make the mock "network" deliver a ringing incoming call from
     /// `number`. Only available on the in-process mock backend (used by the desktop
     /// demo to exercise the incoming-call surface); a real provider has no such
@@ -480,6 +592,21 @@ impl Telephony for TelephonyService {
         let calls = self.live_calls().await?;
         Ok(Response::new(CallList {
             calls: calls.iter().map(snapshot_of).collect(),
+        }))
+    }
+
+    /// Answer which provider backs `Dial`. Always available: this is a property of the
+    /// service, not of a call, so it is answered even with no calls live and even when
+    /// the backend is a mock (`Status` would just return an empty list there, which
+    /// reads as "no calls" rather than "no real telephony").
+    async fn get_backend(
+        &self,
+        _request: Request<StatusRequest>,
+    ) -> Result<Response<ProtoBackendStatus>, Status> {
+        let kind = self.backend_kind();
+        Ok(Response::new(ProtoBackendStatus {
+            kind: kind.to_proto() as i32,
+            detail: kind.detail().to_string(),
         }))
     }
 
@@ -508,11 +635,74 @@ impl Telephony for TelephonyService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use amos_proto::amos_telephony::BackendKind as ProtoBackendKind;
     use std::time::Duration;
     use tokio_stream::StreamExt;
 
     fn svc() -> TelephonyService {
         TelephonyService::with_mock()
+    }
+
+    /// The next `Watch` snapshot, failing loudly on a timeout / stream error.
+    async fn next_snap(
+        s: &mut Pin<Box<dyn Stream<Item = Result<CallStateEvent, Status>> + Send + 'static>>,
+    ) -> CallSnapshot {
+        tokio::time::timeout(Duration::from_secs(2), s.next())
+            .await
+            .expect("a watch event arrives within 2s")
+            .expect("the stream yields an item")
+            .expect("the item is not an error")
+            .call
+            .expect("the event carries a call snapshot")
+    }
+
+    #[tokio::test]
+    async fn get_backend_reports_the_mock_as_not_real() {
+        // The production daemon mounts a mock (see `demo_server_limited`). A caller
+        // asking "will this dial reach the platform?" must be told no, even though
+        // `Dial` answers happily.
+        let s = svc();
+        let reply = s
+            .get_backend(Request::new(StatusRequest {}))
+            .await
+            .expect("get_backend is infallible")
+            .into_inner();
+        assert_eq!(reply.kind, ProtoBackendKind::BackendMock as i32);
+        assert!(reply.detail.contains("mock"), "detail: {}", reply.detail);
+        assert!(!s.backend_kind().is_real());
+    }
+
+    #[tokio::test]
+    async fn get_backend_distinguishes_unconfigured_from_mock() {
+        // A service built around bare stubs (no mock injector) must not claim to be a
+        // mock — `Unconfigured` is the honest answer, and neither is `is_real`.
+        let s = TelephonyService::new(
+            Arc::new(MockTelephonyProvider::with_common_emergency()),
+            Arc::new(MockTelephonyProvider::with_common_emergency()),
+            EmergencyMap::common_global(),
+        );
+        assert_eq!(s.backend_kind(), crate::backend::BackendKind::Unconfigured);
+        let reply = s
+            .get_backend(Request::new(StatusRequest {}))
+            .await
+            .expect("get_backend is infallible")
+            .into_inner();
+        assert_eq!(reply.kind, ProtoBackendKind::BackendUnconfigured as i32);
+    }
+
+    #[tokio::test]
+    async fn an_explicit_backend_kind_overrides_the_derived_default() {
+        // The future Android provider is `Arc<dyn TelephonyProvider>` with no mock
+        // injector, so the derive cannot tell it apart from a stub; its constructor
+        // declares the kind and that must win.
+        let s = svc().with_backend(crate::backend::BackendKind::Android);
+        assert!(s.backend_kind().is_real());
+        let reply = s
+            .get_backend(Request::new(StatusRequest {}))
+            .await
+            .expect("get_backend is infallible")
+            .into_inner();
+        assert_eq!(reply.kind, ProtoBackendKind::BackendAndroid as i32);
     }
 
     #[tokio::test]
@@ -577,6 +767,46 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].call.as_ref().unwrap().id, id);
         assert!(calls[0].emergency, "112 routed to emergency provider");
+    }
+
+    /// A streamed snapshot must report the call's real emergency flag. `status()`
+    /// always did (it reads the model); the *event* path built every
+    /// `CallStateEvent` with a hardcoded `emergency: false`, so a subscriber
+    /// watching an emergency call was told it was ordinary (P1-T3, REQ-A1776).
+    #[tokio::test]
+    async fn watch_events_keep_an_emergency_call_marked_emergency() {
+        let svc = svc();
+        let id = svc
+            .dial(Request::new(DialRequest {
+                number: "112".into(),
+                emergency: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .id;
+        let mut stream = svc
+            .watch(Request::new(WatchRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        // The opening live-call snapshot already carried the flag.
+        assert!(next_snap(&mut stream).await.emergency);
+
+        // A *signalling event* (MutedChanged is one — and mute is legal on an
+        // emergency call) must keep saying so rather than reverting to the constant.
+        svc.set_muted(Request::new(MuteRequest {
+            call: Some(CallIdMsg { id: id.to_string() }),
+            muted: true,
+        }))
+        .await
+        .unwrap();
+        let evt = next_snap(&mut stream).await;
+        assert!(
+            evt.emergency,
+            "the MutedChanged event for 112 must report emergency=true, not a constant false"
+        );
+        assert!(evt.muted, "the same event still carries the new mute flag");
     }
 
     #[tokio::test]
@@ -762,6 +992,97 @@ mod tests {
         assert_eq!(snap.direction, ProtoDirection::Incoming as i32);
     }
 
+    /// A call has two independent mutable flags, and `Watch` events are applied as
+    /// **snapshots** — so each change event must carry *both* flags or the subscriber
+    /// silently clears the other one. This walks a real stream through both changes and
+    /// asserts the surviving flag on each event (the cross-talk direction the wire
+    /// contract cannot leave implicit).
+    #[tokio::test]
+    async fn every_change_event_carries_both_mutable_flags() {
+        let svc = svc();
+        let mut stream = svc
+            .watch(Request::new(WatchRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        async fn next_snap(
+            s: &mut Pin<Box<dyn Stream<Item = Result<CallStateEvent, Status>> + Send + 'static>>,
+        ) -> CallSnapshot {
+            tokio::time::timeout(Duration::from_secs(2), s.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .call
+                .unwrap()
+        }
+        let id = svc.inject_incoming("02112345678").await.unwrap();
+        let ringing = next_snap(&mut stream).await;
+        assert_eq!(ringing.state, ProtoState::Ringing as i32);
+        assert!(!ringing.muted);
+
+        svc.answer(Request::new(AnswerRequest {
+            call: Some(CallIdMsg { id: id.to_string() }),
+        }))
+        .await
+        .unwrap();
+        let connected = next_snap(&mut stream).await;
+        assert_eq!(connected.state, ProtoState::Active as i32);
+        assert_eq!(
+            connected.direction,
+            ProtoDirection::Incoming as i32,
+            "answering an incoming call does not make it an outgoing call"
+        );
+
+        // Mute first: the mute event says nothing new about recording (Off at this
+        // point, and it must *say* Off rather than leave it to the subscriber).
+        svc.set_muted(Request::new(MuteRequest {
+            call: Some(CallIdMsg { id: id.to_string() }),
+            muted: true,
+        }))
+        .await
+        .unwrap();
+        let muted_evt = next_snap(&mut stream).await;
+        assert!(muted_evt.muted, "the mute event carries the new flag");
+        assert_eq!(
+            muted_evt.recording,
+            ProtoRecording::RecordingOff as i32,
+            "…and the current recording flag, so applying it cannot invent one"
+        );
+
+        // Now start recording. The recording event must carry the *live* mute flag —
+        // this is the assertion that fails if `RecordingChanged` only knows about
+        // recording, which would un-mute the user in every subscriber.
+        svc.start_recording(Request::new(CallIdMsg { id: id.to_string() }))
+            .await
+            .unwrap();
+        let rec_evt = next_snap(&mut stream).await;
+        assert_eq!(rec_evt.recording, ProtoRecording::RecordingOn as i32);
+        assert!(
+            rec_evt.muted,
+            "a recording change must not clear the call's mute flag"
+        );
+
+        // And the mirror: stopping the recording keeps the mute flag, too.
+        svc.stop_recording(Request::new(CallIdMsg { id: id.to_string() }))
+            .await
+            .unwrap();
+        let stop_evt = next_snap(&mut stream).await;
+        assert_eq!(stop_evt.recording, ProtoRecording::RecordingOff as i32);
+        assert!(stop_evt.muted, "stopping a recording keeps the mute flag");
+
+        // Unmuting reports the still-Off recording honestly.
+        svc.set_muted(Request::new(MuteRequest {
+            call: Some(CallIdMsg { id: id.to_string() }),
+            muted: false,
+        }))
+        .await
+        .unwrap();
+        let unmuted_evt = next_snap(&mut stream).await;
+        assert!(!unmuted_evt.muted);
+        assert_eq!(unmuted_evt.recording, ProtoRecording::RecordingOff as i32);
+    }
+
     #[tokio::test]
     async fn start_recording_on_dialing_call_is_failed_precondition() {
         let svc = svc();
@@ -819,6 +1140,105 @@ mod tests {
             calls[0].recording,
             amos_proto::amos_telephony::RecordingState::RecordingOff as i32
         );
+    }
+
+    #[tokio::test]
+    async fn set_muted_returns_the_authoritative_snapshot() {
+        let svc = svc();
+        let id = svc
+            .dial(Request::new(DialRequest {
+                number: "13800138000".into(),
+                emergency: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .id;
+
+        // A freshly dialled call is unmuted; the request asks for a state, not a toggle.
+        let snap = svc
+            .set_muted(Request::new(MuteRequest {
+                call: Some(CallIdMsg { id: id.clone() }),
+                muted: true,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(snap.muted, "the reply is the daemon's own snapshot");
+
+        // Idempotent: asking again for the same state is not an error.
+        let again = svc
+            .set_muted(Request::new(MuteRequest {
+                call: Some(CallIdMsg { id: id.clone() }),
+                muted: true,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(again.muted);
+
+        // And Status carries it, so a re-adopting UI sees the true state.
+        let calls = svc
+            .status(Request::new(StatusRequest {}))
+            .await
+            .unwrap()
+            .into_inner()
+            .calls;
+        assert!(calls[0].muted, "Status reports the muted flag");
+
+        let off = svc
+            .set_muted(Request::new(MuteRequest {
+                call: Some(CallIdMsg { id }),
+                muted: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!off.muted);
+    }
+
+    #[tokio::test]
+    async fn set_muted_on_unknown_call_is_not_found() {
+        let svc = svc();
+        let err = svc
+            .set_muted(Request::new(MuteRequest {
+                call: Some(CallIdMsg { id: "ghost".into() }),
+                muted: true,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn set_muted_without_a_call_id_is_invalid() {
+        let svc = svc();
+        let err = svc
+            .set_muted(Request::new(MuteRequest {
+                call: None,
+                muted: true,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn status_snapshots_carry_muted_false_by_default() {
+        let svc = svc();
+        svc.dial(Request::new(DialRequest {
+            number: "13800138000".into(),
+            emergency: false,
+        }))
+        .await
+        .unwrap();
+        let calls = svc
+            .status(Request::new(StatusRequest {}))
+            .await
+            .unwrap()
+            .into_inner()
+            .calls;
+        assert!(!calls[0].muted, "a new call is not muted");
     }
 
     #[tokio::test]
@@ -882,5 +1302,63 @@ mod tests {
         assert_eq!(snap.peer, "02112345678");
         assert_eq!(snap.state, ProtoState::Ringing as i32);
         assert_eq!(snap.direction, ProtoDirection::Incoming as i32);
+    }
+
+    /// An incoming call's **whole** lifecycle must reach the `Watch` stream with its
+    /// true direction and peer — not only its ringing edge.
+    ///
+    /// `IncomingCall.svelte` drops every event whose `direction !== "Incoming"`
+    /// (outgoing calls are the Phone screen's own UI) and writes the call-log row from
+    /// the *Ended* event's `peer`. When this mapper invented `Outgoing` and an empty
+    /// peer for `Connected`/`RemoteEnded`/`LocalEnded`, both later edges were dropped
+    /// by that guard: no incoming call ever reached `amos.calllog` — this was the log's
+    /// only production writer — and a caller hanging up left the overlay on screen for
+    /// good (REQ-A1095/F-SH-409).
+    #[tokio::test]
+    async fn incoming_call_keeps_direction_and_peer_through_to_the_end() {
+        let svc = svc();
+        let mut stream = svc
+            .watch(Request::new(WatchRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        let id = svc.inject_incoming("02112345678").await.unwrap();
+
+        let ringing = next_snap(&mut stream).await;
+        assert_eq!(ringing.peer, "02112345678");
+        assert_eq!(ringing.state, ProtoState::Ringing as i32);
+        assert_eq!(ringing.direction, ProtoDirection::Incoming as i32);
+
+        // Answering must not re-tag the call as Outgoing — the incoming overlay reads
+        // its own Ringing → Active edge from this event.
+        svc.answer(Request::new(AnswerRequest {
+            call: Some(CallIdMsg { id: id.to_string() }),
+        }))
+        .await
+        .unwrap();
+        let active = next_snap(&mut stream).await;
+        assert_eq!(active.state, ProtoState::Active as i32);
+        assert_eq!(
+            active.peer, "02112345678",
+            "the answered edge still names the caller"
+        );
+        assert_eq!(active.direction, ProtoDirection::Incoming as i32);
+
+        // The Ended edge is the only writer of an incoming/missed call-log row, so it
+        // must carry the peer the row is keyed on and the direction that gets it past
+        // the overlay's `direction !== "Incoming"` guard.
+        svc.end(Request::new(EndRequest {
+            call: Some(CallIdMsg { id: id.to_string() }),
+        }))
+        .await
+        .unwrap();
+        let ended = next_snap(&mut stream).await;
+        assert_eq!(ended.state, ProtoState::Ended as i32);
+        assert_eq!(
+            ended.peer, "02112345678",
+            "the ended edge still names the caller"
+        );
+        assert_eq!(ended.direction, ProtoDirection::Incoming as i32);
+        assert_eq!(ended.end_reason, ProtoEndReason::Local as i32);
     }
 }

@@ -17,8 +17,8 @@
  */
 export const FOCUS_KEY = "amos.focus";
 
-export type FocusId = "work" | "sleep";
-export const FOCUS_SCENARIOS: readonly FocusId[] = ["work", "sleep"];
+export const FOCUS_SCENARIOS = ["work", "sleep"] as const;
+export type FocusId = (typeof FOCUS_SCENARIOS)[number];
 
 export type FocusPrefs = Record<FocusId, boolean>;
 
@@ -38,4 +38,10 @@ export function normalizeFocus(raw: unknown): FocusPrefs {
 /** Pure: flip one scenario preference (immutable). */
 export function toggleFocus(s: FocusPrefs, id: FocusId): FocusPrefs {
   return { ...s, [id]: !s[id] };
+}
+
+/** The i18n key naming a scenario. One declaration, shared by the 专注模式 page and its
+ * schedule editor, so the two cannot label the same scenario differently. */
+export function focusLabelKey(id: FocusId): string {
+  return id === "work" ? "settings.focusWork" : "settings.focusSleep";
 }

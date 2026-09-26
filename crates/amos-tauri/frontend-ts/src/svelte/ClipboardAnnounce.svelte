@@ -37,6 +37,11 @@
         timer = null;
       }, SHOW_MS);
     }).then((u) => {
+      // REQ-A838: `null` = the listen was refused (and, in `lib/clipboard`, the per-window
+      // opt-in was therefore *not* sent — the host stays on the global broadcast that still
+      // reaches us, so notices may yet arrive). Either way there is no handle to store or
+      // release; the verdict is on `bridgeDiag("clipboard-changed")`.
+      if (u === null) return;
       if (alive) unsub = u;
       else u();
     });

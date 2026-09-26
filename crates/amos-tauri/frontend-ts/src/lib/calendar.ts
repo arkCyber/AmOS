@@ -37,8 +37,8 @@ export const CALENDAR_COLORS = [
 ] as const;
 export type CalendarColor = (typeof CALENDAR_COLORS)[number];
 
-export type Repeat = "none" | "daily" | "weekly" | "monthly" | "yearly";
-export const REPEATS: readonly Repeat[] = ["none", "daily", "weekly", "monthly", "yearly"];
+export const REPEATS = ["none", "daily", "weekly", "monthly", "yearly"] as const;
+export type Repeat = (typeof REPEATS)[number];
 
 /** Alert offsets the editor offers (minutes before start; null = no alert). */
 export const ALERT_OPTIONS: readonly (number | null)[] = [null, 0, 5, 15, 30, 60, 120, 1440];
@@ -413,6 +413,35 @@ export function occurrencesInRange(
   const out: Occurrence[] = [];
   for (const e of events) out.push(...expandOccurrences(e, from, to));
   return sortOccurrences(out);
+}
+
+/** How far ahead [`nextEvent`] looks for something to show. A calendar with nothing in
+ *  the next month reads as "nothing coming up"; scanning further would let an event a year
+ *  out claim the home screen's single line. */
+export const NEXT_EVENT_WINDOW_MS = 30 * DAY_MS;
+
+/**
+ * The soonest occurrence still relevant at `now` — an event that has already started but
+ * has not ended counts (it is what is happening), which is the half-open `[now, now+30d)`
+ * window `expandOccurrences` already implements. Repeating events are expanded, so a daily
+ * stand-up shows its *next* occurrence rather than the series' original start.
+ *
+ * `null` when nothing overlaps the window. `EVENT_CAP`/`MAX_OCCURRENCES_PER_EVENT` bound the
+ * work, so a corrupt store cannot make this scan unboundedly.
+ */
+export function nextEvent(
+  events: readonly CalendarEvent[],
+  now: number,
+): Occurrence | null {
+  const to = now + NEXT_EVENT_WINDOW_MS;
+  let best: Occurrence | null = null;
+  for (const e of events) {
+    // `expandOccurrences` returns ascending by start, so the first entry of an event is
+    // its earliest candidate — later ones cannot beat it within this event.
+    const first = expandOccurrences(e, now, to)[0];
+    if (first && (best === null || first.startAt < best.startAt)) best = first;
+  }
+  return best;
 }
 
 /** Occurrences on one local calendar day (date-based window, DST-safe). */

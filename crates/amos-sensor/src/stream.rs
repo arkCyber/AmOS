@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::error::{Result, SensorError};
 use crate::provider::SensorProvider;
-use crate::spec::{CameraConfig, CameraFrame, CameraId, ImuSample};
+use crate::spec::{CameraConfig, CameraFrame, CameraId, ImuSample, VitalsSample};
 
 /// The newest [`ImuSample`] delivered by a producer (any thread).
 #[derive(Debug, Default)]
@@ -160,6 +160,80 @@ impl FrameLatest {
             .clear();
     }
 }
+/// The newest [`VitalsSample`] delivered by a producer (any thread).
+///
+/// Unlike [`ImuLatest`], a push here is announced only when the payload actually
+/// **changed** — steps and heart rate are low-rate, so a producer re-pushing an
+/// unchanged value must not spam the real-time bus. A change is also the only way
+/// to *retract* a reading: when a heart-rate sensor loses contact it reports
+/// `None`, which differs from the previous `Some(bpm)` and so is stored and
+/// announced (the UI then prints `—` instead of a stale number).
+#[derive(Debug, Default)]
+pub struct VitalsLatest {
+    latest: Mutex<Option<VitalsSample>>,
+    recorded: AtomicU64,
+}
+
+impl VitalsLatest {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Store `sample`. A push older than the current one is dropped as stale.
+    /// Returns `true` when the push was **accepted and materially changed** the
+    /// stored value (so the caller can announce it), `false` when it was stale,
+    /// identical to what is already stored, or carries no reading at all.
+    ///
+    /// A sample whose two fields are both `None` is not a measurement, and storing
+    /// it would make the host snapshot carry an empty `vitals` block where the
+    /// contract says the block stays absent until a producer pushes a reading (see
+    /// [`VitalsSample::has_reading`]). The single exception is **retraction**: when
+    /// we are holding a reading, a reading-less sample is how a lost contact is
+    /// told apart from silence, so it *is* stored and announced — otherwise the UI
+    /// would keep drawing the last bpm forever.
+    pub fn record(&self, sample: VitalsSample) -> bool {
+        let mut guard = self.latest.lock().unwrap_or_else(|p| p.into_inner());
+        let prev = *guard;
+        let is_newer = prev
+            .map(|p| sample.timestamp_ms >= p.timestamp_ms)
+            .unwrap_or(true);
+        if !is_newer {
+            return false;
+        }
+        let retracts = prev.is_some_and(|p| p.has_reading());
+        if !sample.has_reading() && !retracts {
+            return false;
+        }
+        // Compare the *readings*, not the timestamp: a fresh push carrying the same
+        // steps/bpm is not a change worth announcing.
+        let changed = prev.map(|p| {
+            p.steps_total != sample.steps_total || p.heart_rate_bpm != sample.heart_rate_bpm
+        }) != Some(false);
+        *guard = Some(sample);
+        if changed {
+            self.recorded.fetch_add(1, Ordering::Relaxed);
+        }
+        changed
+    }
+
+    /// The most recent sample, or `None` before the first accepted push.
+    pub fn latest(&self) -> Option<VitalsSample> {
+        *self.latest.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Number of accepted *changes* so far.
+    pub fn recorded(&self) -> u64 {
+        self.recorded.load(Ordering::Relaxed)
+    }
+
+    /// Drop the stored sample and reset the counter (glue detach), so a later
+    /// re-attach never serves a stale pre-detach reading as current.
+    pub fn clear(&self) {
+        *self.latest.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        self.recorded.store(0, Ordering::Relaxed);
+    }
+}
+
 /// A `Send + Sync` [`SensorProvider`] backed by the latest-sample stores — the
 /// read-side that a device HAL (or host/dev simulator) pushes into.
 ///
@@ -176,6 +250,8 @@ pub enum StreamChange {
     Imu(ImuSample),
     /// A producer accepted a validated [`CameraFrame`].
     Frame(CameraFrame),
+    /// A producer changed the latest [`VitalsSample`] (steps and/or heart rate).
+    Vitals(VitalsSample),
     /// A producer cleared every stored sample (glue detach).
     Cleared,
 }
@@ -190,6 +266,7 @@ pub struct LiveSensorProvider {
     imu_rate_hz: AtomicU64,
     imu: ImuLatest,
     frames: FrameLatest,
+    vitals: VitalsLatest,
     /// Subscribers announced (outside any lock) on each accepted change.
     listeners: Mutex<Vec<StreamListener>>,
 }
@@ -202,6 +279,7 @@ impl std::fmt::Debug for LiveSensorProvider {
             .field("imu_rate_hz", &self.imu_rate_hz)
             .field("imu", &self.imu)
             .field("frames", &self.frames)
+            .field("vitals", &self.vitals)
             .finish_non_exhaustive()
     }
 }
@@ -220,6 +298,7 @@ impl LiveSensorProvider {
             imu_rate_hz: AtomicU64::new(u64::from(imu_rate_hz)),
             imu: ImuLatest::new(),
             frames: FrameLatest::new(),
+            vitals: VitalsLatest::new(),
             listeners: Mutex::new(Vec::new()),
         }
     }
@@ -251,6 +330,15 @@ impl LiveSensorProvider {
             self.notify(&StreamChange::Frame(frame));
         }
         Ok(())
+    }
+
+    /// Producer entry point: store the newest wellness sample (steps / heart
+    /// rate) from an Android `SensorEventListener` or a host feeder. Announces
+    /// only a material change, so an unchanged re-push is silent.
+    pub fn record_vitals(&self, sample: VitalsSample) {
+        if self.vitals.record(sample) {
+            self.notify(&StreamChange::Vitals(sample));
+        }
     }
 
     /// Register `listener`, announced (after any store lock is released) whenever
@@ -291,12 +379,18 @@ impl LiveSensorProvider {
         &self.frames
     }
 
-    /// Clear every stored sample (IMU + all camera frames); the advertised camera
-    /// list is kept. Producers (glue) call this on detach so a later re-attach
-    /// never serves stale pre-detach data as current.
+    /// Share the vitals store (see [`Self::imu_store`]).
+    pub fn vitals_store(&self) -> &VitalsLatest {
+        &self.vitals
+    }
+
+    /// Clear every stored sample (IMU + all camera frames + vitals); the advertised
+    /// camera list is kept. Producers (glue) call this on detach so a later
+    /// re-attach never serves stale pre-detach data as current.
     pub fn clear_samples(&self) {
         self.imu.clear();
         self.frames.clear_all();
+        self.vitals.clear();
         self.notify(&StreamChange::Cleared);
     }
 }
@@ -373,9 +467,13 @@ mod tests {
         ImuSample::new(
             ts,
             Vec3::new(0.0, -9.8, 0.0),
-            Vec3::new(0.0, 0.0, 0.0),
-            36.5,
+            Some(Vec3::new(0.0, 0.0, 0.0)),
+            Some(36.5),
         )
+    }
+
+    fn vitals(ts: u64, steps: Option<f64>, hr: Option<f64>) -> VitalsSample {
+        VitalsSample::new(ts, steps, hr)
     }
 
     #[test]
@@ -599,5 +697,75 @@ mod tests {
         p.clear_samples();
         let got = seen.lock().unwrap_or_else(|g| g.into_inner());
         assert!(matches!(got.last(), Some(StreamChange::Cleared)));
+    }
+
+    #[test]
+    fn vitals_latest_returns_none_before_first_push() {
+        let s = VitalsLatest::new();
+        assert_eq!(s.latest(), None);
+        assert_eq!(s.recorded(), 0);
+    }
+
+    #[test]
+    fn vitals_latest_announces_only_material_changes() {
+        let s = VitalsLatest::new();
+        assert!(s.record(vitals(10, Some(100.0), Some(70.0))));
+        // Same payload (newer timestamp) is stored but not a change.
+        assert!(!s.record(vitals(11, Some(100.0), Some(70.0))));
+        assert_eq!(s.recorded(), 1, "identical re-push is not announced");
+        // A real change announces.
+        assert!(s.record(vitals(12, Some(140.0), Some(70.0))));
+        assert_eq!(s.latest().unwrap().steps_total, Some(140.0));
+        assert_eq!(s.recorded(), 2);
+        // Stale timestamp is dropped outright.
+        assert!(!s.record(vitals(5, Some(999.0), None)));
+        assert_eq!(s.latest().unwrap().steps_total, Some(140.0));
+    }
+
+    #[test]
+    fn vitals_latest_ignores_a_reading_less_sample_with_nothing_to_retract() {
+        let s = VitalsLatest::new();
+        // Nothing is held, so a sample with no reading is not a measurement: it is
+        // not stored (which would draw an empty vitals block in the host snapshot)
+        // and not announced.
+        assert!(!s.record(vitals(10, None, None)));
+        assert_eq!(s.latest(), None);
+        assert_eq!(s.recorded(), 0);
+    }
+
+    #[test]
+    fn vitals_latest_retracts_a_lost_heart_rate_reading() {
+        let s = VitalsLatest::new();
+        s.record(vitals(10, None, Some(72.0)));
+        // Sensor loses contact: the next sample carries no heart rate. That is a
+        // real change, so it must be stored and announced — otherwise the UI keeps
+        // drawing the last bpm forever.
+        assert!(s.record(vitals(11, None, None)));
+        assert_eq!(s.latest().unwrap().heart_rate_bpm, None);
+        // With the reading already retracted there is nothing left to retract, so a
+        // further reading-less push is ignored rather than re-stored forever.
+        assert!(!s.record(vitals(12, None, None)));
+    }
+
+    #[test]
+    fn live_bus_records_vitals_and_clears_them_on_detach() {
+        let p = Arc::new(LiveSensorProvider::new(Vec::new(), 0));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        p.subscribe(Arc::new(move |c: &StreamChange| {
+            sink.lock()
+                .unwrap_or_else(|g| g.into_inner())
+                .push(c.clone());
+        }));
+
+        p.record_vitals(vitals(1, Some(42.0), Some(66.0)));
+        assert_eq!(p.vitals_store().latest().unwrap().steps_total, Some(42.0));
+        assert!(matches!(
+            seen.lock().unwrap_or_else(|g| g.into_inner()).first(),
+            Some(StreamChange::Vitals(_))
+        ));
+
+        p.clear_samples();
+        assert_eq!(p.vitals_store().latest(), None);
     }
 }

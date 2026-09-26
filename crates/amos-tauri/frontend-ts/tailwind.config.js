@@ -39,6 +39,9 @@ export default {
       colors: {
         accent: "rgb(var(--accent) / <alpha-value>)",
         danger: "rgb(var(--danger) / <alpha-value>)",
+        // Small white-on-red chips (badges) — AA in both themes, unlike theme-reactive
+        // `danger` whose dark HIG value only meets AA-Large. See src/index.css.
+        "danger-solid": "rgb(var(--danger-solid) / <alpha-value>)",
         // iOS system colors for consistency
         ios: {
           blue: "#007AFF",

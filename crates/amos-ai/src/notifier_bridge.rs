@@ -17,8 +17,9 @@
 //!    active id set and only fires on **appear** / **disappear**.
 //! 3. **Severity is the alert's, not the bridge's.** A `Warn` from
 //!    `alerts.rs` becomes a P1 (notifier semantics); an `Error` becomes a P0.
-//!    This mapping is the **single** place it lives — change it here, change
-//!    it everywhere.
+//!    This mapping lives **only** in [`severity_to_p_level`], which returns
+//!    the dependency-free [`PLevel`]; the `notifier_sink` adapter renders that
+//!    level into the notifier's `Alert` instead of re-deriving it.
 //!
 //! ## Why a feature flag
 //!
@@ -29,7 +30,7 @@
 //! the bridge compiles to a no-op `Option::None` and the daemon's tests do
 //! not pull `amos-notifier`.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -69,29 +70,51 @@ impl Alert {
     }
 }
 
-/// Map `amos-ai` severity to the notifier's P-level. This is the **single**
-/// place that owns the mapping; both sides' documentation points at it.
-pub fn severity_to_p_level(s: Severity) -> &'static str {
+/// The notifier's page level, as this dependency-free bridge represents it.
+///
+/// The bridge must compile without `amos-notifier` (see the module docs), so
+/// it states the level as its own type; the adapter (`notifier_sink`, which
+/// *does* depend on the notifier) renders the returned level into the
+/// notifier's `Alert`. Only `P0` (Error) and `P1` (Warn) have bridge sources —
+/// the notifier's own `P2` is never produced here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PLevel {
+    P0,
+    P1,
+}
+
+/// Map `amos-ai` severity to the notifier's page level. **The** mapping:
+/// `Error → P0`, `Warn → P1` is stated here and nowhere else — the adapter
+/// consumes the returned [`PLevel`] rather than re-deriving it, so the two
+/// cannot drift apart.
+pub fn severity_to_p_level(s: Severity) -> PLevel {
     match s {
-        Severity::Error => "P0",
-        Severity::Warn => "P1",
+        Severity::Error => PLevel::P0,
+        Severity::Warn => PLevel::P1,
     }
 }
 
 /// The bridge state — a small per-id "was it active last poll?" table so we
 /// fire on transitions, not on every observation.
 ///
-/// The bookkeeping is intentionally simple: a `HashSet<&'static str>`. The
-/// keys are the alert ids, not the messages, because an alert's *condition*
-/// is what matters; if the same id re-fires with a different detail (the
-/// numbers behind it changed), the operator wants the new number, not a
-/// suppressed duplicate.
+/// The bookkeeping is intentionally simple: a map from the alert id to its
+/// severity. The keys are the alert ids, not the messages, because an alert's
+/// *condition* is what matters; if the same id re-fires with a different
+/// detail (the numbers behind it changed), the operator wants the new number,
+/// not a suppressed duplicate.
+///
+/// The **value** is the severity, and it exists solely for the clear path:
+/// the "resolved" line must carry the severity of the alert that resolved
+/// (rule 3), which means the severity has to survive from the poll that saw
+/// the alert to the poll that sees it gone. A `HashSet<String>` dropped it,
+/// and the clear path then had nothing to render but a hardcoded `Warn` — so
+/// every `Error`/P0 incident was "resolved" as a P1.
 #[derive(Debug, Default)]
 pub struct AlertBridge {
-    /// `true` when an alert id was active on the previous poll. A re-poll
-    /// while still active = no fire (the notifier's suppression window
-    /// handles the cross-channel side).
-    last_active: HashSet<String>,
+    /// The severity each active id last carried. A re-poll while still active
+    /// = no fire (the notifier's suppression window handles the cross-channel
+    /// side).
+    last_active: HashMap<String, Severity>,
     /// Optional sink — the bridge is a no-op when not wired.
     sink: Option<Arc<dyn AlertSink>>,
 }
@@ -116,23 +139,27 @@ impl AlertBridge {
     /// attached, every transition is silently a no-op and the return is
     /// `0`, regardless of how many alerts are active.
     ///
-    /// The bookkeeping (the `last_active` set) is kept in sync even when
+    /// The bookkeeping (the `last_active` map) is kept in sync even when
     /// there is no sink, so attaching a sink later picks up immediately
     /// at the current state rather than re-firing everything that was
     /// already true.
     pub fn observe(&mut self, alerts: &[ActiveAlert]) -> usize {
-        // The "now" set is what `alerts` reports; the comparison uses
+        // The "now" map is what `alerts` reports; the comparison uses
         // `String` ids (the bridge's own format) rather than the `&'static str`
         // ids from `alerts.rs` so a future rename on either side does not
-        // silently break the transition tracking.
-        let now: HashSet<String> = alerts.iter().map(|a| format!("amos-ai.{}", a.id)).collect();
+        // silently break the transition tracking. The severity rides along so
+        // the clear path below can render it.
+        let now: HashMap<String, Severity> = alerts
+            .iter()
+            .map(|a| (format!("amos-ai.{}", a.id), a.severity))
+            .collect();
 
         let mut fired = 0;
 
         // Newly active — fire (only when a sink is attached).
         for a in alerts {
             let id = format!("amos-ai.{}", a.id);
-            if !self.last_active.contains(&id) {
+            if !self.last_active.contains_key(&id) {
                 if let Some(sink) = self.sink.as_ref() {
                     sink.fire(Alert::from_active(a));
                     fired += 1;
@@ -146,13 +173,17 @@ impl AlertBridge {
 
         // Cleared — fire a "resolved" alert so the operator's timeline reads
         // "P0: daemon down at 12:01; resolved at 12:14" rather than "P0
-        // still paged" forever. The notifier's suppression window collapses
-        // any redundant `P0 cleared` from the same id within the window.
-        for prev in &self.last_active {
-            if !now.contains(prev) {
+        // still paged" forever. The line carries the **cleared alert's own
+        // severity** (rule 3): a `P0` incident resolves as a `P0`, not as the
+        // `P1` a hardcoded `Warn` would emit — a resolution at the wrong level
+        // is what leaves a pager unacknowledged. The notifier's suppression
+        // window collapses any redundant `P0 cleared` from the same id within
+        // the window.
+        for (prev, severity) in &self.last_active {
+            if !now.contains_key(prev) {
                 if let Some(sink) = self.sink.as_ref() {
                     sink.fire(Alert {
-                        severity: Severity::Warn,
+                        severity: *severity,
                         id: format!("{prev}.cleared"),
                         message: format!("the condition that drove alert '{prev}' has cleared"),
                     });
@@ -259,13 +290,62 @@ mod tests {
         assert_eq!(log.len(), 2, "appear + clear");
         assert_eq!(log[0].id, "amos-ai.breaker_open");
         assert_eq!(log[1].id, "amos-ai.breaker_open.cleared");
+        // The resolved line carries the **cleared alert's** severity (rule 3):
+        // this alert was an `Error`/P0, so the resolution is a P0 too. The
+        // prior assertion pinned `Warn` — which is exactly the defect: a P0
+        // incident resolving as a P1 leaves the P0 page unacknowledged.
+        assert_eq!(log[1].severity, Severity::Error);
+    }
+
+    #[test]
+    fn a_cleared_warn_alert_resolves_as_warn_not_a_blanket_error() {
+        // The other half of the table: the resolution's severity is the
+        // cleared alert's, so a `Warn` resolves as a `Warn`. Without this a
+        // "hardcode `Error`" fix would pass the P0 test above.
+        let capture = Arc::new(Capture::default());
+        let mut bridge = AlertBridge::new().with_sink(capture.clone());
+
+        bridge.observe(&[alert("log_trail_incomplete", Severity::Warn, "lost")]);
+        bridge.observe(&[]);
+        let log = capture.fired.lock().unwrap();
+        assert_eq!(log.len(), 2, "appear + clear");
+        assert_eq!(log[1].id, "amos-ai.log_trail_incomplete.cleared");
         assert_eq!(log[1].severity, Severity::Warn);
     }
 
     #[test]
+    fn two_alerts_of_different_severity_each_resolve_at_their_own_level() {
+        // Per-id, not per-poll: clearing both at once must give each its own
+        // severity rather than one level for the batch.
+        let capture = Arc::new(Capture::default());
+        let mut bridge = AlertBridge::new().with_sink(capture.clone());
+
+        bridge.observe(&[
+            alert("breaker_open", Severity::Error, "open"),
+            alert("log_trail_incomplete", Severity::Warn, "lost"),
+        ]);
+        bridge.observe(&[]);
+        let log = capture.fired.lock().unwrap();
+        let cleared: Vec<_> = log
+            .iter()
+            .filter(|a| a.id.ends_with(".cleared"))
+            .map(|a| (a.id.as_str(), a.severity))
+            .collect();
+        assert_eq!(cleared.len(), 2, "both clears fire");
+        assert!(
+            cleared.contains(&("amos-ai.breaker_open.cleared", Severity::Error)),
+            "the Error alert resolves as Error, got {cleared:?}"
+        );
+        assert!(
+            cleared.contains(&("amos-ai.log_trail_incomplete.cleared", Severity::Warn)),
+            "the Warn alert resolves as Warn, got {cleared:?}"
+        );
+    }
+
+    #[test]
     fn the_severity_mapping_is_p0_for_error_p1_for_warn() {
-        assert_eq!(severity_to_p_level(Severity::Error), "P0");
-        assert_eq!(severity_to_p_level(Severity::Warn), "P1");
+        assert_eq!(severity_to_p_level(Severity::Error), PLevel::P0);
+        assert_eq!(severity_to_p_level(Severity::Warn), PLevel::P1);
     }
 
     #[test]

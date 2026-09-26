@@ -132,6 +132,25 @@ export const PLATFORM_ACTIONS = {
   "android.net.conn.CONNECTIVITY_CHANGE": { who: "receiver", sender: null },
   "android.media.browse.MediaBrowserService": { who: "service", sender: null },
   "android.media.MediaBrowserService": { who: "service", sender: null },
+  // The system input method (REQ-A1893 / docs/input-method.md §System IME). `BIND_INPUT_METHOD`
+  // is what the **system** must hold to bind an IME on behalf of the app the user is typing
+  // into — a signature|privileged permission no third-party app can hold, which is what keeps
+  // an `android:exported="true"` IME from being bindable by anyone.
+  //
+  // The action is the trap this table cannot catch by itself: it is the value of
+  // `android.view.inputmethod.InputMethod.SERVICE_INTERFACE`, and that constant is the
+  // **camelCase** `android.view.InputMethod` — not the package-shaped
+  // `android.view.inputmethod.InputMethod` a manifest author reaches for by analogy with the
+  // class name. A wrong-but-plausible spelling here is invisible to this scan (the entry just
+  // sits unused) and to every other host gate, and shows up only on a device as an IME that
+  // installs, resolves in `dumpsys package`, and is still absent from the platform's method
+  // map. Read it off the platform class (`javap -constants
+  // android.view.inputmethod.InputMethod` against the SDK's `android.jar`) before editing.
+  // See `scripts/ime-action-scan.mjs`, which compares this literal to that constant.
+  "android.view.InputMethod": {
+    who: "service",
+    sender: "android.permission.BIND_INPUT_METHOD",
+  },
 };
 
 /** `argv[1]` names this file (so the module can also be imported by a test). */

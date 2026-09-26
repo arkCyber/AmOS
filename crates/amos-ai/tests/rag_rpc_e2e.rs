@@ -75,6 +75,9 @@ async fn rag_index_query_remove_over_uds() {
         .into_inner();
     assert_eq!(fresh.indexed, 0);
     assert_eq!(fresh.embedder, "mock");
+    // "Dimension unknown" is carried as absence, not as a `0` a panel would draw
+    // as 「0 维」 — no embedder can produce a zero-width vector.
+    assert_eq!(fresh.dimension, None);
 
     // Index one passage, then retrieve it back by a self-matching query.
     let text = "关于 q4 预算的唯一独份会议记录".to_string();
@@ -112,7 +115,7 @@ async fn rag_index_query_remove_over_uds() {
         .expect("status")
         .into_inner();
     assert_eq!(after.indexed, 1);
-    assert_eq!(after.dimension, idx.dimension);
+    assert_eq!(after.dimension, Some(idx.dimension));
 
     // Remove → empty again, and a query returns no hits (not an error).
     let rm = client

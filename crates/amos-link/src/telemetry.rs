@@ -112,7 +112,7 @@ impl Heartbeat {
 ///
 /// The JSON document this renders (`to_json`) is the CLI's `status`, and it speaks the control
 /// plane's vocabulary: a **flat** peer table (the same keys as `proto.Peer`) and a verdict whose
-/// reasons are [`HealthReason::detail`] tokens.
+/// reasons are [`HealthReason::detail`](crate::health::HealthReason::detail) tokens.
 ///
 /// `Serialize`-only: a status is produced by a node and read by a human or a script; nothing in
 /// the workspace turns a document back into a `NodeStatus`, and claiming a round-trip for a
@@ -430,6 +430,16 @@ mod tests {
         };
         let value: serde_json::Value =
             serde_json::from_str(&status.to_json().expect("json")).expect("json");
+
+        // The node's **own** role, in the same document: it reaches the JSON through the
+        // *derived* `Serialize` of `NodeKind` (`rename_all = "lowercase"`), where every
+        // `peers[].kind` below reaches it through `PeerView`'s `key()`. Both spell one
+        // vocabulary (REQ-A804) — a script must not meet two words for the same role.
+        assert_eq!(
+            value["kind"],
+            NodeKind::Tool.key(),
+            "the node's role and its peers' `kind` are one vocabulary"
+        );
 
         // The peer table: the proto's `Peer`, not a nested `info` wrapper.
         assert_eq!(

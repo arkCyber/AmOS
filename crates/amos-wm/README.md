@@ -20,8 +20,17 @@ Design record: [`docs/multi-window.md`](../../docs/multi-window.md).
   headless class: `has_ui()` is false and window numbers are inert there.
 - `layout.rs` (`Bounds`, `split_panes`): integer geometry with the constraints a real screen
   imposes (a pane never becomes zero/negative).
+- `identity.rs` (`WindowIdentity`, `identity_of_label`, `next_window_label`, `cycle_target`):
+  the **app-window identity** — which application a window shows and which *instance* of it
+  (`files`, `files#2`, …). One spelling per window, bounded ordinals, deterministic
+  allocation and a deterministic ⌘` ring, so "one window per app" is no longer a property of
+  the label scheme.
 - `split.rs` (`SplitScreen`): a two-pane session at a divider percent, with `resize_to`/
   `resize_by`/`swap`/`set_screen`, built only when the panes + gap actually fit.
+- `display.rs` (`Display`, `DisplaySet`): the **multi-display** vocabulary — each screen's
+  full rect and its **usable** work area, with `primary()`/`containing(rect)`/`work_area_for(rect)`
+  answering "which screen is this window on" by its **centre**. Pure geometry in the caller's
+  coordinate space, so the placement rules are unit-tested without a monitor.
 - **Pure and synchronous**: the model produces events; `crates/amos-tauri` applies them to
   real `WebviewWindow`s and composes the `LayoutSnapshot` the UI reads.
 
@@ -35,7 +44,9 @@ what the OS actually did.
 | `src/lib.rs` | `WindowManager`, `WindowId`, `WindowKind`, `WindowState`, `WmEvent`, focus/recents |
 | `src/form.rs` | `FormFactor`, `LayoutPolicy` (+ `of`, `columns_for`), `resolve_hint`, `ShellFit` |
 | `src/layout.rs` | `Bounds`, `split_panes` — the integer geometry |
+| `src/identity.rs` | `WindowIdentity`, `identity_of_label`, `next_window_label`, `cycle_target` — the app/instance identity |
 | `src/split.rs` | `SplitScreen` — the two-pane session |
+| `src/display.rs` | `Display`, `DisplaySet` — which screen a window is on and its usable area |
 
 ## Build & test
 

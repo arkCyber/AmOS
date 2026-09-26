@@ -30,9 +30,10 @@ import {
 } from "../keyboardConfigHook.svelte";
 import { formatShortcut, modulesFor, type ShellShortcut } from "../shellModule";
 import { mergeOverlayBindings, readKeyboardConfig } from "../keyboardConfig";
+import { STORE_CHANGED_EVENT } from "../amosStore";
 import { SHELL_MODULES } from "../../svelte/shellModules";
 
-type Listener = (e: { type: string; key?: string }) => void;
+type Listener = (e: { type: string; key?: string; detail?: unknown }) => void;
 
 const memory = new Map<string, string>();
 const listeners = new Map<string, Set<Listener>>();
@@ -52,7 +53,7 @@ const windowStub = {
     listeners.get(type)?.delete(l);
   },
   /** `amosStore.writeJson` 会 `new CustomEvent(...)`；bun 里没有那个构造器，异常被它自己吞掉。 */
-  dispatchEvent: (e: { type: string; key?: string }) => {
+  dispatchEvent: (e: { type: string; key?: string; detail?: unknown }) => {
     for (const l of listeners.get(e.type) ?? []) l(e);
     return true;
   },
@@ -207,8 +208,23 @@ describe("createKeyboardBindings：提示字符串（formatShortcut 的入口）
   });
 });
 
-describe("createKeyboardBindings：storage 监听是「改了就生效」的唯一通路", () => {
-  test("startListening 后：本键的 storage 事件触发重组", () => {
+describe("createKeyboardBindings：三条变更通路（同窗口 / 兄弟窗口 / 宿主推送）", () => {
+  test("同窗口写者派发的 amos-store-changed 会触发重组（设置窗自己那一扇）", () => {
+    const hook = createKeyboardBindings();
+    hook.startListening();
+    expect(hook.getSystemShortcut("closeWindow")).not.toBeNull();
+
+    // `writeKeyboardConfig` → `writeStoreValueChecked` 在**写它的这个文档**里只留下
+    // `amos-store-changed`：同一次 `localStorage` 写入**不会**在自己的文档里派发
+    // `storage`（浏览器只在别的文档里派发它）。设置 ▸ 键盘与 `DesktopWindowKeys` 同在
+    // 一扇窗口里，所以这一条正是"在设置里改了窗口快捷键，设置窗自己却还按旧弦关窗"。
+    writeConfig({ system: { closeWindow: null } });
+    windowStub.dispatchEvent({ type: STORE_CHANGED_EVENT, detail: { key: KEYBOARD_CONFIG_KEY } });
+
+    expect(hook.getSystemShortcut("closeWindow")).toBeNull();
+  });
+
+  test("本键的 storage 事件（兄弟 webview 写入）触发重组", () => {
     const hook = createKeyboardBindings();
     hook.startListening();
     expect(hook.getSystemShortcut("closeWindow")).not.toBeNull();
@@ -219,23 +235,47 @@ describe("createKeyboardBindings：storage 监听是「改了就生效」的唯�
     expect(hook.getSystemShortcut("closeWindow")).toBeNull();
   });
 
-  test("其他键的 storage 事件不触发重组", () => {
+  test("别的键的 store 事件不会凭空改变绑定（重组的依据始终是存储里的值）", () => {
     const hook = createKeyboardBindings();
     hook.startListening();
+    expect(hook.getSystemShortcut("closeWindow")).not.toBeNull();
 
-    writeConfig({ system: { closeWindow: null } });
+    // 只派一个**别的键**的通告、这枚键一个字节没动：合并结果必须还是存储里的那份。
     windowStub.dispatchEvent({ type: "storage", key: "amos.something.else" });
-
+    windowStub.dispatchEvent({ type: STORE_CHANGED_EVENT, detail: { key: "amos.something.else" } });
     expect(hook.getSystemShortcut("closeWindow")).not.toBeNull();
   });
 
-  test("stopListening 之后事件不再生效（监听真的摘掉了）", () => {
+  test("stopListening 之后 storage 事件不再生效（监听真的摘掉了）", () => {
     const hook = createKeyboardBindings();
     hook.startListening();
     hook.stopListening();
 
     writeConfig({ system: { closeWindow: null } });
     windowStub.dispatchEvent({ type: "storage", key: KEYBOARD_CONFIG_KEY });
+
+    expect(hook.getSystemShortcut("closeWindow")).not.toBeNull();
+  });
+
+  test("stopListening 之后同窗口事件也不再生效（订阅真的拆掉了）", () => {
+    const hook = createKeyboardBindings();
+    hook.startListening();
+    hook.stopListening();
+
+    writeConfig({ system: { closeWindow: null } });
+    windowStub.dispatchEvent({ type: STORE_CHANGED_EVENT, detail: { key: KEYBOARD_CONFIG_KEY } });
+
+    expect(hook.getSystemShortcut("closeWindow")).not.toBeNull();
+  });
+
+  test("重复 startListening 不会叠加订阅（停止一次就够）", () => {
+    const hook = createKeyboardBindings();
+    hook.startListening();
+    hook.startListening();
+    hook.stopListening();
+
+    writeConfig({ system: { closeWindow: null } });
+    windowStub.dispatchEvent({ type: STORE_CHANGED_EVENT, detail: { key: KEYBOARD_CONFIG_KEY } });
 
     expect(hook.getSystemShortcut("closeWindow")).not.toBeNull();
   });

@@ -247,8 +247,8 @@ export function removeList(lists: ReminderList[], id: string): ReminderList[] {
 }
 
 /* ---- smart views ---- */
-export type SmartView = "all" | "today" | "scheduled" | "flagged" | "completed";
-export const SMART_VIEWS: readonly SmartView[] = ["all", "today", "scheduled", "flagged", "completed"];
+export const SMART_VIEWS = ["all", "today", "scheduled", "flagged", "completed"] as const;
+export type SmartView = (typeof SMART_VIEWS)[number];
 
 export interface ViewCounts {
   total: number;

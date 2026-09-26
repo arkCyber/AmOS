@@ -103,13 +103,10 @@ impl Sensor for SensorService {
 
     async fn get_imu(&self, _request: Request<Empty>) -> Result<Response<ImuReply>, Status> {
         let sample = self.manager.imu_sample().map_err(err_status)?;
-        Ok(Response::new(ImuReply {
-            timestamp_ms: sample.timestamp_ms,
-            accel_m_s2: Some(proto_vec3(sample.accel_m_s2)),
-            gyro_rad_s: Some(proto_vec3(sample.gyro_rad_s)),
-            temperature_c: sample.temperature_c,
-            rate_hz: self.manager.imu_rate_hz(),
-        }))
+        Ok(Response::new(imu_reply(
+            &sample,
+            self.manager.imu_rate_hz(),
+        )))
     }
 
     async fn get_mode(&self, _request: Request<Empty>) -> Result<Response<ModeReply>, Status> {
@@ -241,9 +238,78 @@ fn gnss_reply(enabled: bool, fix: Option<&GeoFix>) -> GnssReply {
     }
 }
 
+/// Map one domain IMU sample onto the wire reply. Pure, so the sentinel rule
+/// below is testable without a running service (the sibling [`gnss_reply`] is
+/// split out for the same reason).
+fn imu_reply(sample: &crate::spec::ImuSample, rate_hz: u32) -> ImuReply {
+    ImuReply {
+        timestamp_ms: sample.timestamp_ms,
+        accel_m_s2: Some(proto_vec3(sample.accel_m_s2)),
+        // The proto's `gyro_rad_s` is a message field, so it *has* presence —
+        // unlike `temperature_c` below, absence needs no sentinel here. A device
+        // with no gyroscope (the field S5) leaves this `None`, and the consumer
+        // reads `null`; writing `Some(Vec3::ZERO)` in its place would put a
+        // measurement on the wire — "not rotating" — for a rate nothing measured.
+        gyro_rad_s: sample.gyro_rad_s.map(proto_vec3),
+        // `float temperature_c` has no field presence, so an absent die
+        // temperature — a device with no source for one, the Android glue's
+        // normal case — cannot be expressed as a missing field. It goes out as the
+        // zero-sentinel this message family already uses for "not reported"
+        // (`rate_hz`, and GNSS's `accuracy_m` / `sats_in_view`), and the Tauri seam
+        // reads `0` back as **unknown**, never as a measured `0 °C`.
+        temperature_c: sample.temperature_c.unwrap_or(0.0),
+        rate_hz,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_absent_die_temperature_goes_on_the_wire_as_the_zero_sentinel() {
+        let base = crate::spec::ImuSample::new(
+            7,
+            crate::spec::Vec3::new(0.1, -9.8, 0.2),
+            Some(crate::spec::Vec3::new(0.0, 0.0, 0.0)),
+            None,
+        );
+        // `None` is "no source for a die temperature" — the wire's only way to say
+        // that is the family's zero-sentinel, and the Tauri seam reads it back as
+        // unknown. It must **not** become a fabricated plausible number.
+        assert_eq!(imu_reply(&base, 200).temperature_c, 0.0);
+        // A real reading survives the round trip (positive control).
+        let measured = crate::spec::ImuSample {
+            temperature_c: Some(36.5),
+            ..base
+        };
+        assert_eq!(imu_reply(&measured, 200).temperature_c, 36.5);
+    }
+
+    /// A device with no gyroscope leaves `gyro_rad_s` `None`, and the wire must
+    /// carry that as a **missing field** — not as `Some(Vec3::ZERO)`, which is the
+    /// measurement "not rotating". The proto field is a message, so absence is
+    /// representable; folding it to zero is a choice, and the wrong one
+    /// (REQ-A1872 / F-SEN-008: the field S5 has no gyroscope).
+    #[test]
+    fn an_absent_gyroscope_goes_on_the_wire_as_a_missing_field_not_a_zero_vec() {
+        let no_gyro =
+            crate::spec::ImuSample::new(7, crate::spec::Vec3::new(0.1, -9.8, 0.2), None, None);
+        assert_eq!(
+            imu_reply(&no_gyro, 200).gyro_rad_s,
+            None,
+            "a gyroscope-less device must not report a zero angular rate"
+        );
+        // Positive control: a real gyro reading survives the round trip as a value.
+        let with_gyro = crate::spec::ImuSample {
+            gyro_rad_s: Some(crate::spec::Vec3::new(0.01, -0.02, 0.03)),
+            ..no_gyro
+        };
+        let g = imu_reply(&with_gyro, 200)
+            .gyro_rad_s
+            .expect("a measured gyro reading must be present on the wire");
+        assert_eq!((g.x, g.y, g.z), (0.01, -0.02, 0.03));
+    }
 
     #[test]
     fn mode_round_trips_via_wire_values() {

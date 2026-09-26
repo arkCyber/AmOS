@@ -33,28 +33,52 @@ object CameraGlue : ImageReader.OnImageAvailableListener {
     private const val NV21 = 1 // amos_sensor::PixelFormat::Nv21
     private const val PREVIEW_FPS = 30
 
-    private var manager: CameraManager? = null
-    private var camera: CameraDevice? = null
-    private var session: CameraCaptureSession? = null
-    private var reader: ImageReader? = null
-    private var thread: HandlerThread? = null
-    private var handler: Handler? = null
-    private var cameraNumber: Int = 0
+    // Every one of these is written on the caller's thread (`attach`/`detach` run from
+    // `AmosGlue.onStart`, i.e. the main thread) and read on the `amos-camera` handler
+    // thread — `reader` and `generation` by the guards in [onImageAvailable] and the
+    // `CameraDevice` callbacks. Without `@Volatile` there is no happens-before edge
+    // between the write in [teardown] and the read in the callback, so the reader-
+    // identity guard can observe a **stale** `reader` (the one being torn down), take it
+    // for current, and read a plane whose native memory `close()` already released —
+    // exactly the use-after-free REQ-A45 fixed, reintroduced through the guard instead of
+    // around it (REQ-A776). `volatile` gives visibility, not atomicity; that is enough
+    // here because `generation` is only ever written from the caller's thread.
+    @Volatile private var manager: CameraManager? = null
+    @Volatile private var camera: CameraDevice? = null
+    @Volatile private var session: CameraCaptureSession? = null
+    @Volatile private var reader: ImageReader? = null
+    @Volatile private var thread: HandlerThread? = null
+    @Volatile private var handler: Handler? = null
+    @Volatile private var cameraNumber: Int = 0
 
     /**
      * Capture epoch. Bumped on every teardown so a camera/session callback from an
      * older open cannot write state into a newer one (e.g. a late `onDisconnected`
      * of a released device nulling the freshly-opened camera).
+     *
+     * `@Volatile` for the same reason as [reader]: `teardown` bumps this on the main
+     * thread while the `CameraDevice`/`CameraCaptureSession` callbacks compare it on
+     * the handler thread, and an unseen bump lets a callback for the old epoch pass
+     * its `gen == generation` check and close/write into the new session.
      */
-    private var generation: Long = 0
+    @Volatile private var generation: Long = 0
 
-    /** Frames dropped by the per-frame guard (readable for bring-up triage). */
+    /** Frames dropped by the per-frame guard. Every increment is logged (see below). */
     private val droppedFrames = java.util.concurrent.atomic.AtomicLong(0)
 
     /** Is a capture session currently open? */
     fun isCapturing() = camera != null
 
-    /** How many frames have been dropped by the per-frame guard so far. */
+    /**
+     * How many frames have been dropped by the per-frame guard so far.
+     *
+     * Honest boundary (REQ-A776): **nothing calls this**. There is no JNI entry point,
+     * no `amos_*` command, and no Kotlin caller — `grep -rn droppedFrameCount` finds
+     * this definition and nothing else. REQ-A45's device acceptance protocol names it
+     * as an acceptance criterion, so as written that criterion was never obtainable.
+     * It is kept because the counter is real and the per-drop log lines now carry the
+     * running total (from which a device run can derive it); claim nothing more.
+     */
     fun droppedFrameCount(): Long = droppedFrames.get()
 
     /**
@@ -192,22 +216,45 @@ object CameraGlue : ImageReader.OnImageAvailableListener {
             val nv21 = try {
                 Nv21.packYuv420ToNv21(image)
             } catch (t: Throwable) {
-                droppedFrames.incrementAndGet()
-                Log.w(TAG, "frame encode dropped: ${t.javaClass.simpleName}: ${t.message}")
+                // Carry the running total in the line. `droppedFrameCount()` has no
+                // caller anywhere (see its doc), so the log *is* the drop accounting a
+                // device run can read; incrementing once into a local keeps the counter
+                // and the printed n in step (REQ-A776).
+                val n = droppedFrames.incrementAndGet()
+                Log.w(TAG, "frame encode dropped (n=$n): ${t.javaClass.simpleName}: ${t.message}")
                 null
             }
             if (nv21 == null) {
-                droppedFrames.incrementAndGet()
+                // A `null` return is a *structural* refusal by the packer (non-positive
+                // or odd geometry, no planes, unknown format) rather than a throw — so
+                // this branch used to bump the counter and log **nothing**: a drop the
+                // device log could not see at all. Same accounting as the catch above.
+                val n = droppedFrames.incrementAndGet()
+                Log.w(TAG, "frame encode dropped (n=$n): unusable YUV_420_888 geometry")
                 return
             }
-            recordFrame(
-                cameraNumber,
-                image.width,
-                image.height,
-                NV21,
-                PREVIEW_FPS,
-                nv21,
-            )
+            // This upcall runs on the `amos-camera` handler thread, outside any Java
+            // caller that could catch for us. `advertiseCamera` (in [attach]) and the
+            // packer path above are both guarded, but this was the one native entry in
+            // the file wrapped only in `try { … } finally`: a JNI failure here — an
+            // `UnsatisfiedLinkError` on a build whose classpath has no `libamos_tauri_lib`,
+            // a pending exception, an OOM inside the native decode — escaped
+            // `onImageAvailable` and killed the thread. That is precisely the
+            // "a peripheral video producer must never crash the System UI" invariant this
+            // file states for the packer, broken by its own outlier (REQ-A1446/F-TAU-024).
+            try {
+                recordFrame(
+                    cameraNumber,
+                    image.width,
+                    image.height,
+                    NV21,
+                    PREVIEW_FPS,
+                    nv21,
+                )
+            } catch (t: Throwable) {
+                val n = droppedFrames.incrementAndGet()
+                Log.w(TAG, "frame upcall dropped (n=$n): ${t.javaClass.simpleName}: ${t.message}")
+            }
         } finally {
             image.close()
         }
@@ -222,11 +269,20 @@ object CameraGlue : ImageReader.OnImageAvailableListener {
         override fun onOpened(camera: CameraDevice) {
             // Torn down (or superseded) while the device was still opening, or no
             // reader to capture into: close it rather than leaking an open camera.
-            if (gen != generation || reader == null) {
+            val r = this@CameraGlue.reader
+            if (gen != generation || r == null) {
                 camera.close()
                 return
             }
             this@CameraGlue.camera = camera
+            // Positive evidence that the producer actually opened. Until this line
+            // existed the only camera lines were *negative* ("attach skipped: ..."), so
+            // a device run could never distinguish "the camera opened and stayed up"
+            // from "attach was never reached at all" — the vacuous-green shape. The
+            // acceptance driver (scripts/android-camera-bringup.sh) refuses to pass a
+            // run with no such evidence; the sibling MediaStore glue logs
+            // `media backend attached` for the same reason (REQ-A776).
+            Log.i(TAG, "camera attached: id=${this@CameraGlue.cameraNumber} ${r.width}x${r.height}")
             startCapture(camera, gen)
         }
 
@@ -297,6 +353,21 @@ object CameraGlue : ImageReader.OnImageAvailableListener {
             }
         } catch (_: Exception) {
             null
+        }
+    }
+
+    init {
+        // Best-effort, the same shape as the sibling glues (SensorGlue, ClipboardGlue, …):
+        // a host lint pass has no `.so` on the classpath and a device build ships
+        // `libamos_tauri_lib.so`. Loading here rather than depending on `AmosGlue` having
+        // initialised a *sibling* class first makes this class self-sufficient —
+        // `recordFrame` fires on the `amos-camera` thread, where an unresolved symbol is
+        // the fatal escape the guard in [onImageAvailable] now catches (REQ-A1446/F-TAU-024).
+        try {
+            System.loadLibrary("amos_tauri_lib")
+        } catch (_: UnsatisfiedLinkError) {
+            // Native lib not on the classpath yet: the frame upcall stays inert and every
+            // attempt is counted as a drop (see the guard in [onImageAvailable]).
         }
     }
 }

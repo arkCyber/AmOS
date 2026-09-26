@@ -59,6 +59,12 @@
   });
 
   const installedMap = $derived(new Map((installed ?? []).map((a) => [a.manifest.id, a])));
+  // REQ-A1455: `appstore_installed` is its own command and can fail alone (e.g. the
+  // installed-registry Mutex poisoned → `StoreError::Provider`); `invoke` answers `null`
+  // (REQ-A296), never `[]`. An unread list must not be drawn as "you have none": the
+  // footer would claim 「我的应用：0」 and every row would offer 「获取」 for apps already
+  // installed. Mirrors the catalog's own `=== null` branch above.
+  const installedKnown = $derived(installed !== null);
 
   /**
    * Run the catalog search the user asked for.
@@ -246,6 +252,22 @@
         class="shrink-0 rounded-full bg-accent px-3 py-1.5 text-xs text-white disabled:opacity-50"
       >{t("store.searchAction")}</button>
     </div>
+    {#if !installedKnown}
+      <!-- REQ-A1455: the catalog answered but the installed read did not. Saying so (and
+           suppressing 「获取」) is the honest report; a count of 0 is not. -->
+      <div
+        role="status"
+        data-testid="store-installed-unread"
+        class="mb-2 flex items-center justify-between gap-3 rounded-2xl bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300"
+      >
+        <span>{t("store.installedUnread")}</span>
+        <button
+          onclick={() => void load()}
+          data-testid="store-installed-retry"
+          class="shrink-0 rounded-full bg-black/5 px-2.5 py-1 dark:bg-white/10"
+        >{t("store.retry")}</button>
+      </div>
+    {/if}
     {#if searchErr}
       <p data-testid="store-search-error" role="alert" class="mb-2 px-1 text-xs text-danger">{searchErr}</p>
     {/if}
@@ -297,7 +319,7 @@
                   {busy ? "…" : t("store.update")}
                 </button>
               {/if}
-              {#if !own}
+              {#if installedKnown && !own}
                 <button
                   disabled={busy}
                   onclick={() => void run(() => storeInstall(app.id), app.id, "appstore_install")}
@@ -323,7 +345,7 @@
     </div>
     {/if}
     <div class="mt-4 rounded-2xl bg-white/40 px-3 py-2 text-[11px] opacity-60 dark:bg-white/[0.04]">
-      {t("store.myApps")}: {installed?.length ?? 0}
+      <span data-testid="store-my-apps">{t("store.myApps")}: {installed !== null ? installed.length : "—"}</span>
     </div>
     {#if actingError}
       <div

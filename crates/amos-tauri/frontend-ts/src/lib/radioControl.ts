@@ -117,5 +117,14 @@ export function radioRefusalView(
       typeof refusal.surface === "string" && refusal.surface !== "" ? refusal.surface : null;
     return { noteKey: MANAGED_KEYS[radio], surface };
   }
-  return { noteKey: REFUSAL_KEYS[refusal.kind] ?? "", surface: null };
+  // A refused *attempt* still carries the surface where the user can work the switch by
+  // hand when the device has one — the AP is the case: a normal install's tethering call
+  // is refused and the system's tethering settings is where it can still be switched, so
+  // the payload's token is passed through instead of dropping the user at a dead end
+  // (REQ-A1456). The sentence stays the kind's own ("the device refused"); no cause is
+  // claimed. Kinds the device sends no surface for (the airplane guard, a missing
+  // backend) keep `null`.
+  const surface =
+    typeof refusal.surface === "string" && refusal.surface !== "" ? refusal.surface : null;
+  return { noteKey: REFUSAL_KEYS[refusal.kind] ?? "", surface };
 }

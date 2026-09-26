@@ -31,6 +31,9 @@ const ASSIGN: Record<string, CategoryId> = {
   music: "media",
   player: "media",
   vmemos: "media",
+  // 播客是音频内容应用：与音乐/播放器/录音机同类（media），不是"工具"或"系统"。
+  // 必须在这里归类，否则 App Library 会多出一个"其他"文件夹。
+  podcast: "media",
   notes: "productivity",
   reminders: "productivity",
   calendar: "productivity",
@@ -57,7 +60,15 @@ const ASSIGN: Record<string, CategoryId> = {
   webman: "utilities",
   compass: "utilities",
   measure: "utilities",
+  health: "productivity",
   shortcuts: "productivity",
+  // NFC 读写与蓝牙（BLE）是设备工具：与指南针/测距仪同类（tools），不是"系统设置"。
+  // 同样必须归类，否则 App Library 会多出一个"其他"文件夹。
+  nfc: "utilities",
+  ble: "utilities",
+  // 机器人指挥台是操作员工具：与终端/指南针/测距仪同类（tools），不是"系统设置"。
+  // 同样必须归类，否则 App Library 会多出一个"其他"文件夹。
+  robot: "utilities",
 };
 
 export function categoryOf(id: string): CategoryId {

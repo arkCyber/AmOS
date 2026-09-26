@@ -13,7 +13,6 @@
 
   import { templateManager } from "../../lib/enterprise";
   import type { EnterpriseTemplate } from "../../lib/enterprise/templates";
-  import { loadShortcuts } from "../../lib/shortcuts";
   import { t } from "../locale.svelte";
   import { attachFocusTrap } from "../../lib/focusTrap";
   import { debounce } from "../../lib/utils/debounce";
@@ -31,6 +30,7 @@
   let showDetailModal = $state(false);
   let selectedTemplate = $state<EnterpriseTemplate | null>(null);
   let installing = $state(false);
+  let uninstalling = $state(false);
   let parameterValues = $state<Record<string, any>>({});
 
   /** 详情模态的根元素（焦点陷阱 + Escape 关闭挂在它身上）。 */
@@ -61,14 +61,28 @@
   // 计算属性
   // ============================================================================
 
-  const filteredTemplates = $derived(
-    templateManager.getTemplates({
+  /**
+   * 目录版本号：`getTemplates()` 是一次**非响应式**的库读，`$derived` 记不住它里面
+   * 变了什么。装成功之后 `installedCount` 变了、卡片该跟着动 —— 靠 `bumpCatalogue()`
+   * 把这个数 +1，下面那个 `$derived` 读它一次，重算才会发生。
+   */
+  let catalogueVersion = $state(0);
+  function bumpCatalogue() {
+    catalogueVersion += 1;
+  }
+
+  const filteredTemplates = $derived.by(() => {
+    void catalogueVersion;
+    // 浅拷贝一层：`getTemplates()` 把管理器里**同一个**对象交出来，而 `{#each}` 认
+    // 引用 —— 装上之后 `installedCount` 变了、引用没变，卡片上的次数就一动不动。
+    // 拷贝让每次目录重读都给出新引用，`each` 才会重画。
+    return templateManager.getTemplates({
       search: debouncedSearchQuery.trim() || undefined,
       category: selectedCategory,
       department: selectedDepartment,
       status: "published",
-    })
-  );
+    }).map(t => ({ ...t }));
+  });
 
   const categories = $derived(
     Array.from(new Set(templates.map(t => t.category))).sort()
@@ -78,21 +92,25 @@
     Array.from(new Set(templates.map(t => t.department).filter(Boolean))).sort()
   );
 
-  // 获取已安装的快捷指令
-  const installedShortcuts = $derived(loadShortcuts());
+  /**
+   * 已安装的模板 id 集合，**从安装记录读**（REQ-A1326）。
+   *
+   * 旧实现读的是 `loadShortcuts()` 里一个 `Shortcut` 类型上根本不存在的 `templateId`
+   * 字段（`(s: any)` 把这个错误从 `tsc` 底下带了过去）—— 两条独立的理由让它永远不亮：
+   * 那个字段没有任何写者，而模板装出来的快捷指令那时也从来没落过盘。安装记录的
+   * `templateId`/`status` 才是这件事的**唯一所有者**，判「在不在册」是问它的。
+   */
+  const installedTemplateIds = $derived.by(() => {
+    void catalogueVersion; // 装 / 卸之后 `bumpCatalogue()` 让它重算
+    return new Set(templateManager.getInstalledTemplates().map(i => i.templateId));
+  });
 
   // ============================================================================
   // 辅助函数
   // ============================================================================
 
-  function getInstallCount(_templateId: string): number {
-    // 简化实现：暂不支持安装计数
-    return 0;
-  }
-
   function isInstalled(templateId: string): boolean {
-    // 检查是否已安装此模板
-    return installedShortcuts.some((s: any) => s.templateId === templateId);
+    return installedTemplateIds.has(templateId);
   }
 
   function getCategoryIcon(category: string): string {
@@ -150,10 +168,20 @@
       );
 
       if (result.success) {
-        alert(t("templates.installSuccess", { id: result.shortcutId ?? "" }));
+        // 重装时上一条快捷指令被企业策略挡住删不掉 ⇒ 库里现在两条同名指令，回执仍是成功
+        // （新的那条真的建出来了）。只报「安装成功」就是把一次半途而废的更新画成干净的：
+        // 多出来的那条既不在安装记录里（`uninstallTemplate` 找不到它），也删不掉。
+        if (result.leftoverShortcutId) {
+          alert(t("templates.installSuccessLeftover"));
+        } else {
+          alert(t("templates.installSuccess", { id: result.shortcutId ?? "" }));
+        }
         closeDetailModal();
-        // 刷新模板列表以更新安装数量
+        // 装上了 ⇒ 这个模板的 installedCount 变了，目录重读一次。
+        // （旧代码在这里写 `templates = templateManager.getTemplates()`，而网格读的是
+        // `filteredTemplates` —— 那次赋值只喂了分类/部门两个下拉，卡片上的次数一动不动。）
         templates = templateManager.getTemplates();
+        bumpCatalogue();
       } else {
         alert(t("templates.installFailed", { reason: result.message ?? t("templates.unknownError") }));
       }
@@ -165,6 +193,38 @@
       );
     } finally {
       installing = false;
+    }
+  }
+
+  /**
+   * 卸载当前详情里的模板（REQ-A1326）。
+   *
+   * 在这之前，`uninstallTemplate()` 在生产里**一个调用者也没有** —— 装是单向门：
+   * 一旦装上，面板上再没有任何入口能反悔，而它其实只是把安装记录的状态改了一下。
+   */
+  async function uninstallTemplate() {
+    if (!selectedTemplate) return;
+
+    uninstalling = true;
+    try {
+      const result = await templateManager.uninstallTemplate(selectedTemplate.id);
+
+      if (result.success) {
+        alert(t("templates.uninstallSuccess"));
+        closeDetailModal();
+        templates = templateManager.getTemplates();
+        bumpCatalogue();
+      } else {
+        alert(t("templates.uninstallFailed", { reason: result.message ?? t("templates.unknownError") }));
+      }
+    } catch (error) {
+      alert(
+        t("templates.uninstallFailed", {
+          reason: error instanceof Error ? error.message : t("templates.unknownError"),
+        }),
+      );
+    } finally {
+      uninstalling = false;
     }
   }
 
@@ -273,7 +333,7 @@
             </span>
             <span class="meta-item">
               <span class="meta-icon">👥</span>
-              {t("templates.installCount", { count: getInstallCount(template.id) })}
+              {t("templates.installCount", { count: template.installedCount })}
             </span>
           </div>
           
@@ -335,7 +395,7 @@
           {/if}
           <div class="info-row">
             <span class="info-label">{t("templates.installCountLabel")}</span>
-            <span class="info-value">{getInstallCount(selectedTemplate.id)}</span>
+            <span class="info-value">{selectedTemplate.installedCount}</span>
           </div>
         </section>
 
@@ -397,15 +457,23 @@
                       <span>{param.description}</span>
                     </label>
                   {:else if param.type === "select" && param.options}
+                    <!-- 每个 option 是 `{ label, value }`，与 `validateParameters` 逐字读的
+                         `param.options.map(opt => opt.value)` 同一份（REQ-A1534）。画的是 label；
+                         `<option>` 的 DOM value 只能是字符串，所以落回模型时按它找回原始 value
+                         —— 直接把字符串塞回去会让一个数字型的选项值永远判不进允许范围。 -->
                     <select
                       id={`tpl-param-${param.key}`}
                       class="parameter-select"
                       value={parameterValues[param.key] || ""}
-                      onchange={(e) => updateParameter(param.key, (e.target as HTMLSelectElement).value)}
+                      onchange={(e) => {
+                        const picked = (e.target as HTMLSelectElement).value;
+                        const option = param.options?.find((o) => String(o.value) === picked);
+                        updateParameter(param.key, option ? option.value : picked);
+                      }}
                     >
                       <option value="">{t("templates.selectPlaceholder")}</option>
                       {#each param.options as option}
-                        <option value={option}>{option}</option>
+                        <option value={String(option.value)}>{option.label}</option>
                       {/each}
                     </select>
                   {/if}
@@ -423,11 +491,11 @@
         <section class="shortcut-info-section">
           <div class="info-row">
             <span class="info-icon">⚙️</span>
-            <span>包含 {selectedTemplate.shortcutData.actions.length} 个动作</span>
+            <span>{t("templates.actionCount", { n: selectedTemplate.shortcutData.actions.length })}</span>
           </div>
           <div class="info-row">
             <span class="info-icon">⏱️</span>
-            <span>预计耗时 ~{Math.ceil(selectedTemplate.shortcutData.actions.length * 0.4)} 分钟</span>
+            <span>{t("templates.estimatedMinutes", { n: Math.ceil(selectedTemplate.shortcutData.actions.length * 0.4) })}</span>
           </div>
         </section>
       </div>
@@ -436,6 +504,17 @@
         <button class="btn-secondary" onclick={closeDetailModal}>
           {t("templates.cancel")}
         </button>
+        {#if isInstalled(selectedTemplate.id)}
+          <!-- 强制模板也把按钮显示出来：`uninstallTemplate` 的拒绝带理由
+               （「强制模板不可卸载」），比一个静默消失的按钮有用。 -->
+          <button
+            class="btn-uninstall"
+            onclick={uninstallTemplate}
+            disabled={uninstalling}
+          >
+            {uninstalling ? t("templates.uninstalling") : t("templates.uninstall")}
+          </button>
+        {/if}
         <button
           class="btn-primary"
           onclick={installTemplate}
@@ -462,19 +541,19 @@
   .library-header h2 {
     font-size: 24px;
     font-weight: 600;
-    color: #000;
+    color: rgb(var(--label));
     margin: 0 0 8px 0;
   }
 
   .subtitle {
     font-size: 14px;
-    color: #8E8E93;
+    color: rgb(var(--label-3));
     margin: 0;
   }
 
   /* 搜索和筛选 */
   .filters-section {
-    background: #fff;
+    background: rgb(var(--surface));
     border-radius: 12px;
     padding: 20px;
     margin-bottom: 24px;
@@ -497,16 +576,16 @@
   .search-input {
     width: 100%;
     padding: 12px 40px 12px 40px;
-    border: 1px solid #E5E5EA;
+    border: 1px solid rgb(var(--separator));
     border-radius: 8px;
     font-size: 15px;
-    background: #F2F2F7;
+    background: rgb(var(--surface-2));
   }
 
   .search-input:focus {
     outline: none;
-    border-color: #007AFF;
-    background: #fff;
+    border-color: rgb(var(--accent));
+    background: rgb(var(--surface));
   }
 
   .clear-btn {
@@ -517,7 +596,7 @@
     width: 24px;
     height: 24px;
     border: none;
-    background: #8E8E93;
+    background: rgb(var(--label-3));
     color: white;
     border-radius: 50%;
     font-size: 18px;
@@ -539,23 +618,23 @@
     flex: 1;
     min-width: 150px;
     padding: 10px 12px;
-    border: 1px solid #E5E5EA;
+    border: 1px solid rgb(var(--separator));
     border-radius: 8px;
     font-size: 14px;
-    background: #fff;
+    background: rgb(var(--surface));
     cursor: pointer;
   }
 
   .filter-select:focus {
     outline: none;
-    border-color: #007AFF;
+    border-color: rgb(var(--accent));
   }
 
   .reset-filters-btn {
     padding: 10px 16px;
     border: none;
-    background: #F2F2F7;
-    color: #007AFF;
+    background: rgb(var(--surface-2));
+    color: rgb(var(--accent));
     border-radius: 8px;
     font-size: 14px;
     font-weight: 500;
@@ -565,17 +644,17 @@
   /* 指针契约：只在真能 hover 的设备上生效（REQ-A385） */
   @media (hover: hover) {
     .reset-filters-btn:hover {
-    background: #E5E5EA;
+    background: rgb(var(--separator));
   }
   }
 
   .results-count {
     font-size: 13px;
-    color: #8E8E93;
+    color: rgb(var(--label-3));
   }
 
   .searching-indicator {
-    color: #007AFF;
+    color: rgb(var(--accent));
     font-weight: 500;
   }
 
@@ -587,8 +666,8 @@
   }
 
   .template-card {
-    background: #fff;
-    border: 1px solid #E5E5EA;
+    background: rgb(var(--surface));
+    border: 1px solid rgb(var(--separator));
     border-radius: 12px;
     padding: 16px;
     text-align: left;
@@ -601,7 +680,7 @@
     .template-card:hover {
     transform: translateY(-2px);
     box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
-    border-color: #007AFF;
+    border-color: rgb(var(--accent));
   }
   }
 
@@ -625,25 +704,25 @@
   }
 
   .badge-required {
-    background: #FFE5E5;
-    color: #FF3B30;
+    background: rgb(var(--danger) / 0.15);
+    color: rgb(var(--danger));
   }
 
   .badge-installed {
-    background: #E5F7ED;
-    color: #34C759;
+    background: rgb(var(--success) / 0.15);
+    color: rgb(var(--success));
   }
 
   .card-title {
     font-size: 17px;
     font-weight: 600;
-    color: #000;
+    color: rgb(var(--label));
     margin: 0 0 8px 0;
   }
 
   .card-description {
     font-size: 14px;
-    color: #3C3C43;
+    color: rgb(var(--label-2));
     margin: 0 0 12px 0;
     line-height: 1.4;
     display: -webkit-box;
@@ -660,7 +739,7 @@
     gap: 16px;
     margin-bottom: 12px;
     font-size: 13px;
-    color: #8E8E93;
+    color: rgb(var(--label-3));
   }
 
   .meta-item {
@@ -688,13 +767,13 @@
   }
 
   .category-tag {
-    background: #E5F1FF;
-    color: #007AFF;
+    background: rgb(var(--accent) / 0.12);
+    color: rgb(var(--accent));
   }
 
   .department-tag {
-    background: #F2F2F7;
-    color: #3C3C43;
+    background: rgb(var(--surface-2));
+    color: rgb(var(--label-2));
   }
 
   /* 空状态 */
@@ -712,13 +791,13 @@
   .empty-title {
     font-size: 20px;
     font-weight: 600;
-    color: #000;
+    color: rgb(var(--label));
     margin: 0 0 8px 0;
   }
 
   .empty-text {
     font-size: 15px;
-    color: #8E8E93;
+    color: rgb(var(--label-3));
     margin: 0;
   }
 
@@ -748,7 +827,7 @@
 
   .modal-content {
     position: relative; /* 盖在遮罩之上（同层内后出现的元素在上） */
-    background: #fff;
+    background: rgb(var(--surface));
     border-radius: 16px;
     max-width: 600px;
     width: 100%;
@@ -763,7 +842,7 @@
     align-items: center;
     justify-content: space-between;
     padding: 20px;
-    border-bottom: 1px solid #E5E5EA;
+    border-bottom: 1px solid rgb(var(--separator));
   }
 
   .modal-title-row {
@@ -779,7 +858,7 @@
   .modal-title {
     font-size: 20px;
     font-weight: 600;
-    color: #000;
+    color: rgb(var(--label));
     margin: 0;
   }
 
@@ -787,8 +866,8 @@
     width: 32px;
     height: 32px;
     border: none;
-    background: #F2F2F7;
-    color: #3C3C43;
+    background: rgb(var(--surface-2));
+    color: rgb(var(--label-2));
     border-radius: 50%;
     font-size: 24px;
     line-height: 1;
@@ -801,7 +880,7 @@
   /* 指针契约：只在真能 hover 的设备上生效（REQ-A385） */
   @media (hover: hover) {
     .close-btn:hover {
-    background: #E5E5EA;
+    background: rgb(var(--separator));
   }
   }
 
@@ -814,7 +893,7 @@
   .section-title {
     font-size: 15px;
     font-weight: 600;
-    color: #000;
+    color: rgb(var(--label));
     margin: 0 0 12px 0;
   }
 
@@ -826,7 +905,7 @@
     display: flex;
     justify-content: space-between;
     padding: 8px 0;
-    border-bottom: 1px solid #F2F2F7;
+    border-bottom: 1px solid rgb(var(--surface-2));
   }
 
   .info-row:last-child {
@@ -835,12 +914,12 @@
 
   .info-label {
     font-size: 14px;
-    color: #8E8E93;
+    color: rgb(var(--label-3));
   }
 
   .info-value {
     font-size: 14px;
-    color: #000;
+    color: rgb(var(--label));
     font-weight: 500;
   }
 
@@ -850,7 +929,7 @@
 
   .description-text {
     font-size: 14px;
-    color: #3C3C43;
+    color: rgb(var(--label-2));
     line-height: 1.6;
     margin: 0;
   }
@@ -874,18 +953,18 @@
   .parameter-label {
     font-size: 14px;
     font-weight: 500;
-    color: #000;
+    color: rgb(var(--label));
   }
 
   .required-mark {
-    color: #FF3B30;
+    color: rgb(var(--danger));
   }
 
   .parameter-input,
   .parameter-select {
     width: 100%;
     padding: 10px 12px;
-    border: 1px solid #E5E5EA;
+    border: 1px solid rgb(var(--separator));
     border-radius: 8px;
     font-size: 14px;
   }
@@ -893,7 +972,7 @@
   .parameter-input:focus,
   .parameter-select:focus {
     outline: none;
-    border-color: #007AFF;
+    border-color: rgb(var(--accent));
   }
 
   .checkbox-label {
@@ -902,7 +981,7 @@
     gap: 8px;
     cursor: pointer;
     font-size: 14px;
-    color: #3C3C43;
+    color: rgb(var(--label-2));
   }
 
   .checkbox-label input {
@@ -913,7 +992,7 @@
 
   .parameter-help {
     font-size: 12px;
-    color: #8E8E93;
+    color: rgb(var(--label-3));
     margin: 0;
   }
 
@@ -922,7 +1001,7 @@
     flex-direction: column;
     gap: 8px;
     padding: 12px;
-    background: #F2F2F7;
+    background: rgb(var(--surface-2));
     border-radius: 8px;
   }
 
@@ -934,11 +1013,12 @@
     display: flex;
     gap: 12px;
     padding: 20px;
-    border-top: 1px solid #E5E5EA;
+    border-top: 1px solid rgb(var(--separator));
   }
 
   .btn-primary,
-  .btn-secondary {
+  .btn-secondary,
+  .btn-uninstall {
     flex: 1;
     padding: 12px 24px;
     border: none;
@@ -950,7 +1030,7 @@
   }
 
   .btn-primary {
-    background: #007AFF;
+    background: rgb(var(--accent));
     color: white;
   }
 
@@ -962,14 +1042,19 @@
   }
 
   .btn-secondary {
-    background: #F2F2F7;
-    color: #007AFF;
+    background: rgb(var(--surface-2));
+    color: rgb(var(--accent));
+  }
+
+  .btn-uninstall {
+    background: rgb(var(--surface-2));
+    color: rgb(var(--danger));
   }
 
   /* 指针契约：只在真能 hover 的设备上生效（REQ-A385） */
   @media (hover: hover) {
     .btn-secondary:hover {
-    background: #E5E5EA;
+    background: rgb(var(--separator));
   }
   }
 

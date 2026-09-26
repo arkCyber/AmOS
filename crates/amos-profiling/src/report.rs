@@ -25,7 +25,7 @@ pub struct ProfileReport {
     pub decode_tokens_per_s: Option<f64>,
     /// Mean per-token decode latency, ms.
     pub decode_ms_per_token: Option<f64>,
-    /// Time to first token, ms (≈ prefill wall time).
+    /// Time to first token, ms (mean prefill wall per prompt-eval stretch).
     pub ttft_ms: f64,
     /// Total wall time of the window, ms.
     pub total_wall_ms: f64,

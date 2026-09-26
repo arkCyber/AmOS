@@ -1125,10 +1125,14 @@ const THRUST: Actuator = Actuator {
 };
 
 /// The envelope a test profile declares, unless the envelope is the thing being tested.
+///
+/// A manoeuvre, not a stop, because the profile below is a **drone** and a drone cannot stop
+/// safely (REQ-A852): the point of the valid profile is that every part of it agrees with every
+/// other part, and a `stop` here would be the contradiction the rule refuses.
 fn envelope() -> SafetyEnvelope {
     SafetyEnvelope {
         watchdog: Duration::from_millis(250),
-        failsafe: Failsafe::Stop,
+        failsafe: Failsafe::ReturnToBase,
     }
 }
 
@@ -1485,14 +1489,15 @@ fn a_misdeclared_profile_is_refused_naming_the_rule_it_broke() {
     }
 
     // The envelope is part of the profile, so it is checked with it — including the bound a
-    // *report* imposes (`SafetyEnvelope::validate`, docs/robot-domains.md §5).
+    // *report* imposes (`SafetyEnvelope::validate`, docs/robot-domains.md §5). The manoeuvre is
+    // the drone's own (`ReturnToBase`) so each case is refused for the one reason it names.
     let zero = Platform::from_parts(
         PlatformKind::Drone,
         VALID_ACTUATORS,
         VALID_ACTIONS,
         SafetyEnvelope {
             watchdog: Duration::ZERO,
-            failsafe: Failsafe::Stop,
+            failsafe: Failsafe::ReturnToBase,
         },
         false,
     )
@@ -1504,10 +1509,74 @@ fn a_misdeclared_profile_is_refused_naming_the_rule_it_broke() {
         VALID_ACTIONS,
         SafetyEnvelope {
             watchdog: Duration::from_millis(MAX_WATCHDOG_MS + 1),
-            failsafe: Failsafe::Stop,
+            failsafe: Failsafe::ReturnToBase,
         },
         false,
     )
     .expect_err("past what a report may carry");
     assert!(too_long.to_string().contains("exceeds"), "{too_long}");
+}
+
+#[test]
+fn a_machine_that_cannot_stop_safely_cannot_declare_stop_as_its_lost_link_answer() {
+    // REQ-A852 / F-LK-028. The rule is stated in this crate's module doc — "an aircraft in cruise
+    // must not treat 'cut the motors' as its link-loss plan" — and `Platform::from_parts` promises
+    // to check a deployment by "the same rules the six built-ins are held to". It did not: the
+    // contradiction was caught only by the built-in sweep above, so every machine a *deployment*
+    // wrote could declare `stop` on a kind whose safest end state is not stopped.
+    for kind in [PlatformKind::Drone, PlatformKind::SurfaceVessel] {
+        assert!(
+            kind.must_manoeuvre_when_lost(),
+            "{kind:?} is a manoeuvre case"
+        );
+        let message = Platform::from_parts(
+            kind,
+            VALID_ACTUATORS,
+            VALID_ACTIONS,
+            SafetyEnvelope {
+                watchdog: Duration::from_millis(250),
+                failsafe: Failsafe::Stop,
+            },
+            false,
+        )
+        .expect_err("a torque cut is not a landing")
+        .to_string();
+        assert!(
+            message.contains("cannot stop safely"),
+            "{kind:?}: the refusal must name the rule: {message}"
+        );
+        assert!(
+            message.contains(kind.key()),
+            "{kind:?}: the refusal must name the machine: {message}"
+        );
+    }
+    // `Hold` is a stop too (`Failsafe::is_stop`), so it cannot be smuggled through as a spelling
+    // of the same mistake.
+    assert!(
+        Platform::from_parts(
+            PlatformKind::Drone,
+            VALID_ACTUATORS,
+            VALID_ACTIONS,
+            SafetyEnvelope {
+                watchdog: Duration::from_millis(250),
+                failsafe: Failsafe::Hold,
+            },
+            false,
+        )
+        .is_err(),
+        "`hold` is a stopped machine under another name"
+    );
+    // …and the answer that *is* honest for the same machine is still accepted, so the rule refuses
+    // the contradiction rather than the kind.
+    assert!(Platform::from_parts(
+        PlatformKind::Drone,
+        VALID_ACTUATORS,
+        VALID_ACTIONS,
+        SafetyEnvelope {
+            watchdog: Duration::from_millis(250),
+            failsafe: Failsafe::ReturnToBase,
+        },
+        false,
+    )
+    .is_ok());
 }

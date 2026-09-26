@@ -9,17 +9,17 @@
  */
 
 // 导出类型和管理器
-export type { MDMConfig, MDMPolicy, MDMCheckResult, MDMRestrictions } from "./mdm";
+export type { MDMConfig, MDMPolicy, MDMCheckResult, MDMConnectionResult, MDMRestrictions } from "./mdm";
 export type { EnterpriseTemplate, TemplateParameter, TemplateInstallation } from "./templates";
 export type { AuditLog, AuditLogQuery, AuditStatistics } from "./audit";
 export type { APIConfig, APIResponse } from "./api";
-export type { WebhookConfig, WebhookEvent, WebhookResponse } from "./webhooks";
+export type { WebhookConfig, WebhookEvent, WebhookResponse, WebhookEventName } from "./webhooks";
 
 export { mdmManager } from "./mdm";
 export { templateManager } from "./templates";
 export { auditLogger } from "./audit";
 export { apiClient } from "./api";
-export { webhookManager } from "./webhooks";
+export { webhookManager, emitWebhookEvent } from "./webhooks";
 
 import { mdmManager } from "./mdm";
 import { templateManager } from "./templates";

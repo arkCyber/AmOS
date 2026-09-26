@@ -1,13 +1,18 @@
 // airplay.rs — AirPlay / screen mirroring / media casting service.
 //
-// Provides device discovery, stream initiation, and playback control for AirPlay
-// receivers (Apple TV, HomePod, smart TVs with AirPlay 2, etc.). Follows the
-// same honest-boundary pattern as radio.rs and media.rs: unavailable platforms
-// return well-typed failures rather than silently pretending to work.
+// Provides device discovery and playback **control** for AirPlay receivers (Apple TV, HomePod,
+// smart TVs with AirPlay 2, etc.). Follows the same honest-boundary pattern as radio.rs and
+// media.rs: an operation with no implementation returns a well-typed refusal that explains
+// itself, rather than flipping local state and reporting success (REQ-A467).
 //
-// On macOS / iOS: uses system AirPlay APIs (AVFoundation)
-// On Android: supports DLNA / Cast protocols
-// On Linux desktop: supports RAOP (AirPort Express protocol) or Cast
+// Honest boundary (REQ-A467): **receiver control is not implemented on any platform.** There is
+// no public API by which a third-party app may enumerate or select an AirPlay receiver — the
+// Apple surfaces are either UI-level (`AVRoutePickerView`, which presents *system* UI) or need a
+// live `AVPlayer` session on the main thread — and there is no in-tree RAOP/Cast client for
+// Android/Linux. So `connect` / `start_stream` / `set_volume` refuse with a reason instead of
+// returning `Ok`; `is_available()` answers the narrower question "does this platform have
+// AirPlay at all", which is why the panel can still offer the feature and then explain itself.
+//
 // On unsupported hosts: returns "unavailable" (no fake success)
 
 use serde::{Deserialize, Serialize};
@@ -78,9 +83,16 @@ pub enum StreamKind {
     Mirroring,
 }
 
-/// AirPlay command result
+/// AirPlay command result.
+///
+/// The `kind` strings are part of the frontend contract (`lib/airplay.ts`), so they are pinned by
+/// `test_airplay_result_wire_form` (REQ-A467). They are `snake_case` on purpose: with the previous
+/// `rename_all = "lowercase"` a two-word variant became one word (`PermissionDenied` →
+/// `"permissiondenied"`), which is **not** what the declared TypeScript union said
+/// (`permission_denied`) — a mismatch no code compared, because the panel only ever tested
+/// `kind === "ok"`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "lowercase")]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AirPlayResult {
     /// Command succeeded
     Ok,
@@ -92,7 +104,20 @@ pub enum AirPlayResult {
     DeviceNotFound,
     /// Operation failed
     Failed { reason: String },
+    /// The surface exists but nothing implements it here (REQ-A467) — distinct from
+    /// `Unavailable`, which means "this platform has no AirPlay at all": the two need different
+    /// sentences in front of the user.
+    NotImplemented { reason: String },
 }
+
+/// Why the three **mutating** operations refuse instead of reporting success (REQ-A467).
+///
+/// There is no platform call behind them. Reporting `Ok` while flipping local state put
+/// "connected" / "streaming" in front of the user for a receiver nothing had talked to — the one
+/// thing this module's header promises not to do. The reason names the constraint so a reader can
+/// tell "we cannot do this" apart from "it broke".
+const NOT_IMPLEMENTED: &str = "AirPlay receiver control is not implemented: no platform API lets \
+     an app select or drive a receiver, so nothing was sent to any device";
 
 /// Manager state
 pub struct AirPlayManager {
@@ -239,7 +264,12 @@ impl AirPlayManager {
         self.status.clone()
     }
 
-    /// Connect to a device
+    /// Connect to a device.
+    ///
+    /// Refuses with a reason (REQ-A467). The body used to hold no platform call at all: it
+    /// flipped `device.connected` / `status.active` and returned `Ok`, so the panel showed
+    /// "connected" for a receiver nothing had talked to. `DeviceNotFound` still means *that* — the
+    /// caller named a device this manager is not tracking.
     pub fn connect(&mut self, device_id: &str) -> AirPlayResult {
         if !self.is_available() {
             return AirPlayResult::Unavailable {
@@ -247,23 +277,13 @@ impl AirPlayManager {
             };
         }
 
-        // Find device
-        let device = self.devices.iter().find(|d| d.id == device_id);
-        let Some(mut device) = device.cloned() else {
+        if !self.devices.iter().any(|d| d.id == device_id) {
             return AirPlayResult::DeviceNotFound;
-        };
-
-        // TODO: Platform-specific connection logic
-        device.connected = true;
-        self.status.active = true;
-        self.status.device = Some(device.clone());
-
-        // Update device list
-        if let Some(d) = self.devices.iter_mut().find(|d| d.id == device_id) {
-            d.connected = true;
         }
 
-        AirPlayResult::Ok
+        AirPlayResult::NotImplemented {
+            reason: NOT_IMPLEMENTED.to_string(),
+        }
     }
 
     /// Disconnect from current device
@@ -328,14 +348,18 @@ impl AirPlayManager {
             _ => {}
         }
 
-        // TODO: Platform-specific streaming logic
-        self.status.stream_kind = Some(kind);
-        self.status.playing = true;
-
-        // Suppress unused variable warning
+        // Refuse rather than pretend (REQ-A467): the old body flipped `stream_kind` / `playing`
+        // and returned `Ok` while dropping `url` on the floor, so the status claimed a stream no
+        // receiver had been told about.
+        //
+        // `url` stays in the signature because it is part of the command's argument contract
+        // (`lib/airplay.ts::startStream(kind, url)`); it is deliberately not delivered anywhere —
+        // the operation refuses, so there is no receiver to deliver it to.
         let _ = url;
 
-        AirPlayResult::Ok
+        AirPlayResult::NotImplemented {
+            reason: NOT_IMPLEMENTED.to_string(),
+        }
     }
 
     /// Stop current stream
@@ -352,7 +376,12 @@ impl AirPlayManager {
         AirPlayResult::Ok
     }
 
-    /// Set playback volume
+    /// Set playback volume.
+    ///
+    /// Refuses with a reason (REQ-A467). It used to clamp the value into `status.volume` and
+    /// return `Ok` with a `TODO: Send volume command to device` beneath it, so the status reported
+    /// a device volume nobody had set. The clamp went with it: it only had an effect through that
+    /// write, and `status.volume` now keeps the value the last **real** answer reported.
     pub fn set_volume(&mut self, volume: f32) -> AirPlayResult {
         if !self.is_available() {
             return AirPlayResult::Unavailable {
@@ -360,12 +389,12 @@ impl AirPlayManager {
             };
         }
 
-        let volume = volume.clamp(0.0, 1.0);
-        self.status.volume = volume;
+        // Part of the command's argument contract too; nothing is sent anywhere.
+        let _ = volume;
 
-        // TODO: Send volume command to device
-
-        AirPlayResult::Ok
+        AirPlayResult::NotImplemented {
+            reason: NOT_IMPLEMENTED.to_string(),
+        }
     }
 
     /// Generate demo devices for development
@@ -534,7 +563,8 @@ mod tests {
                 // with a `_ => {}` arm, so *every* outcome passed silently.
                 AirPlayResult::Unavailable { reason }
                 | AirPlayResult::PermissionDenied { reason }
-                | AirPlayResult::Failed { reason } => {
+                | AirPlayResult::Failed { reason }
+                | AirPlayResult::NotImplemented { reason } => {
                     assert!(!reason.is_empty(), "a refusal must explain itself");
                 }
                 AirPlayResult::DeviceNotFound => {}
@@ -542,24 +572,53 @@ mod tests {
         }
     }
 
+    /// REQ-A467: `connect` used to flip `device.connected` / `status.active` and answer `Ok` with
+    /// no platform call behind it. This pins the opposite: a refusal that explains itself, and a
+    /// state that did not move. "It worked" is not something this operation may say while nothing
+    /// was contacted.
+    ///
+    /// The device is put into the manager's own list instead of going through `start_discovery()`:
+    /// on macOS/iOS discovery legitimately fails in a test thread (AVRouteDetector needs the main
+    /// thread), which is exactly how the previous version of this test became a no-op — it read an
+    /// empty list and asserted nothing at all.
     #[test]
-    fn test_connect_disconnect() {
+    fn test_connect_refuses_and_does_not_fake_a_connection() {
         let mut mgr = AirPlayManager::new();
-        if mgr.is_available() {
-            mgr.start_discovery();
-            #[cfg(debug_assertions)]
-            {
-                let devices = mgr.get_devices();
-                if let Some(device) = devices.first() {
-                    let result = mgr.connect(&device.id);
-                    assert!(matches!(result, AirPlayResult::Ok));
-                    assert!(mgr.get_status().active);
-
-                    let result = mgr.disconnect();
-                    assert!(matches!(result, AirPlayResult::Ok));
-                    assert!(!mgr.get_status().active);
-                }
-            }
+        if !mgr.is_available() {
+            return;
         }
+
+        let device = AirPlayDevice {
+            id: "probe-device".to_string(),
+            name: "A receiver the manager believes in".to_string(),
+            kind: DeviceKind::AppleTv,
+            supports_video: true,
+            supports_audio: true,
+            supports_mirroring: true,
+            signal_strength: 50,
+            connected: false,
+        };
+        mgr.devices.push(device);
+
+        match mgr.connect("probe-device") {
+            AirPlayResult::NotImplemented { reason } => {
+                assert!(!reason.is_empty(), "a refusal must explain itself");
+            }
+            other => panic!("connect must refuse, got {other:?}"),
+        }
+
+        let status = mgr.get_status();
+        assert!(
+            !status.active,
+            "a refused connect must not report an active session"
+        );
+        assert!(
+            status.device.is_none(),
+            "a refused connect must not name a device"
+        );
+        assert!(
+            !mgr.get_devices().iter().any(|d| d.connected),
+            "a refused connect must not mark the device connected"
+        );
     }
 }

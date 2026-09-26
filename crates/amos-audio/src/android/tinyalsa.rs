@@ -16,57 +16,10 @@ use crate::capture::AudioCapture;
 use crate::error::{device_err, AudioError};
 use crate::sink::AudioSink;
 use crate::spec::{f32_to_i16, i16_to_f32, AudioSpec, ASR_SAMPLE_RATE};
-
-/// `enum pcm_format` (subset AmOS uses).
-#[allow(dead_code)]
-mod fmt {
-    pub const PCM_FORMAT_INVALID: i32 = -1;
-    pub const PCM_FORMAT_S16_LE: i32 = 0;
-    pub const PCM_FORMAT_S32_LE: i32 = 1;
-}
-
-/// `enum pcm_flags`.
-#[allow(dead_code)]
-mod flags {
-    pub const PCM_OUT: u32 = 0x0000_0000;
-    pub const PCM_IN: u32 = 0x1000_0000;
-    pub const PCM_MONO: u32 = 0x0000_0001;
-    pub const PCM_STEREO: u32 = 0x0000_0002;
-}
-
-/// Mirrors `struct pcm_config` (field order + layout must match `pcm.h`).
-#[repr(C)]
-struct PcmConfig {
-    channels: u32,
-    rate: u32,
-    period_size: u32,
-    period_count: u32,
-    format: i32,
-    start_threshold: u32,
-    stop_threshold: u32,
-    silence_threshold: u32,
-    avail_min: i32,
-}
-
-impl PcmConfig {
-    /// Sensible defaults for a blocking mono S16 stream. `period_size` is one
-    /// ~20 ms period at the requested rate.
-    fn new(rate: u32, capture: bool) -> Self {
-        let period_size = (rate / 50).max(160);
-        let period_count = 4u32;
-        Self {
-            channels: 1,
-            rate,
-            period_size,
-            period_count,
-            format: fmt::PCM_FORMAT_S16_LE,
-            start_threshold: period_size,
-            stop_threshold: period_size * period_count,
-            silence_threshold: 0,
-            avail_min: if capture { period_size as i32 } else { 1 },
-        }
-    }
-}
+// The `pcm.h` facts (struct layout, enum values, period sizing) live in
+// `crate::tinyalsa_layout`, which a host build compiles and tests — so the FFI
+// contract is checked on every `cargo test`, not only on a device (F-SH-112).
+use crate::tinyalsa_layout::{open_flags, PcmConfig};
 
 extern "C" {
     fn pcm_open(card: u32, device: u32, flags: u32, config: *const PcmConfig) -> *mut c_void;
@@ -102,13 +55,8 @@ unsafe fn open(
     capture: bool,
     rate: u32,
 ) -> Result<*mut c_void, AudioError> {
-    let flags = if capture {
-        flags::PCM_IN | flags::PCM_MONO
-    } else {
-        flags::PCM_OUT | flags::PCM_MONO
-    };
     let cfg = PcmConfig::new(rate, capture);
-    let pcm = pcm_open(card, device, flags, &cfg);
+    let pcm = pcm_open(card, device, open_flags(capture), &cfg);
     ready_or_err(pcm, if capture { "capture" } else { "playback" })?;
     Ok(pcm)
 }
@@ -246,6 +194,13 @@ impl AudioSink for TinyAlsaSink {
         if n < 0 {
             return Err(device_err("tinyalsa pcm_write", n));
         }
+        // `pcm_write` returns the frames it accepted; a short write is a failure, not a
+        // success — see `sink::accepted_all_frames` (REQ-A1450/F-AUD-001).
+        if !crate::sink::accepted_all_frames(i64::from(n), frames as usize) {
+            return Err(AudioError::Device(format!(
+                "tinyalsa pcm_write accepted {n}/{frames} frames"
+            )));
+        }
         Ok(())
     }
 }
@@ -255,9 +210,7 @@ pub fn open_asr_mic() -> Result<TinyAlsaCapture, AudioError> {
     TinyAlsaCapture::open(ASR_SAMPLE_RATE)
 }
 
-/// The `pcm.h` facts AmOS depends on, surfaced so Android bring-up tests can
-/// assert the header has not drifted (field order/values).
-pub fn header_layout_notes() -> &'static str {
-    "pcm_config{channels,rate,period_size,period_count,format,start_threshold,\
-     stop_threshold,silence_threshold,avail_min}; S16_LE=0; PCM_IN=0x10000000; PCM_MONO=1"
-}
+/// The `pcm.h` facts AmOS depends on — re-exported from
+/// [`crate::tinyalsa_layout`], where the host-runnable drift test that actually
+/// asserts them lives (this module is compiled only on Android; see F-SH-112).
+pub use crate::tinyalsa_layout::header_layout_notes;

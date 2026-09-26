@@ -15,22 +15,22 @@
 //! ```text
 //! [ WebView / CLI ] --> MailClient<P> --> P: MailProvider
 //!                                        ├─ MockMailProvider  (deterministic, in-memory)
-//!                                        └─ Imap/SmtpProvider (future, feature `live`)
+//!                                        └─ ImapSmtpProvider  (live, feature `live`)
 //! ```
 //!
 //! * [`MailClient`] is the high-level, state-light engine the CLI and UI call:
 //!   it carries the default [`Account`], fills the sender on drafts and drives
 //!   the provider (list / fetch / send / mark / delete).
-//! * [`MailProvider`] is the single seam. Today only the deterministic
-//!   [`MockMailProvider`] implements it — emails live in memory, so tests and
-//!   offline demos work with zero network. Real IMAP/SMTP providers implement
-//!   the same trait later and light up behind the `live` feature with no change
-//!   to callers.
+//! * [`MailProvider`] is the single seam. The deterministic [`MockMailProvider`]
+//!   is the default (emails live in memory, so tests and offline demos work with
+//!   zero network); the real IMAP+SMTP backends ship behind the `live` feature
+//!   (`live::ImapSmtpProvider`) with no change to callers.
 //! * The models in [`model`] are the wire-format that a future JSON bridge /
 //!   CLI table printer will serialize (`serde`).
 //!
-//! This crate performs **no I/O** of its own: it only defines types, validation
-//! and the provider contract, plus the in-memory mock.
+//! The default (featureless) build performs **no I/O** of its own: it only
+//! defines types, validation and the provider contract, plus the in-memory mock.
+//! The `live` feature adds the real network backends under the `live` module.
 
 // P0-1 gate: production code must not panic on programmer error (tests exempt).
 #![cfg_attr(

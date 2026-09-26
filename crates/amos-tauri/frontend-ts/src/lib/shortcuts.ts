@@ -3,29 +3,42 @@
  * 
  * 功能:
  * - 可视化流程构建器 (拖拽式操作块)
- * - 400+ 内置操作 (Apps, Scripting, Web, Media, Text, Location, etc.)
+ * - 内置操作 (Apps, Scripting, Web, Media, Text, Location, etc. —— 见 BUILTIN_ACTIONS)
  * - 变量与控制流 (if/else, repeat, for each)
- * - 快速操作 (Share Sheet integration)
- * - 自动化触发器 (时间、位置、NFC、应用启动)
+ * - 快速操作 (Share Sheet integration；驱动逻辑在 lib/shareSheet.ts)
+ * - 自动化触发器 (时间、WiFi、应用、电量 —— 有宿主信号源的那几种)
  * - 快捷指令库 (预设模板)
- * - Siri 集成 (语音触发)
- * - 分享与导入/导出
- * 
+ * - 分享面板 (导出/导入尚未实现，勿在此宣称)
+ *
  * 安全特性:
  * - 操作权限系统
  * - 沙箱隔离执行
  * - 输入验证
  * - 执行超时
  * - 错误恢复
+ *
+ * 审计注记 (REQ-A708): 本模块曾宣称 "400+ 内置操作"、"Siri 集成 (语音触发)"、
+ * "分享与导入/导出"，并声明了 `siriPhrase`、`ExecutionContext.fromSiri` 与整个
+ * 文件夹子系统 (`ShortcutFolder` / `SHORTCUT_FOLDERS_KEY` / `LIMITS.MAX_FOLDERS`)。
+ * 这些字段既无生产者也无消费者 —— 与"画了个不响的开关"同类。除分享面板（已落地，
+ * 见 `lib/shareSheet.ts`）外，其余声明均已删除，只保留真实存在的部分。
  */
 
 import { readStoreValue, writeStoreValue, writeStoreValueChecked } from "./amosStore";
 import { localId } from "./localId";
-import { mdmManager, auditLogger } from "./enterprise/index";
-import { invoke } from "./backend";
+import { mdmManager, auditLogger, emitWebhookEvent } from "./enterprise/index";
+import { wmOpenWithDiag } from "./wm";
 import { clipboardRead, clipboardWrite } from "./clipboard";
-import { NOTIF_CAP, NOTIF_KEY, addNotif, newNotifId, type Notif } from "./settings";
+import {
+  NOTIF_CAP,
+  NOTIF_KEY,
+  addNotif,
+  newNotifId,
+  normalizeNotifs,
+  type Notif,
+} from "./settings";
 import { sanitizeUrl } from "./webman";
+import { bgT } from "../svelte/bgText";
 
 // ============================================================================
 // 类型定义
@@ -109,8 +122,6 @@ export interface Shortcut {
   createdAt: number;
   updatedAt: number;
   runCount: number;
-  /** Siri 短语 */
-  siriPhrase?: string;
   /** 是否允许在锁屏运行 */
   runOnLockScreen: boolean;
   /** 是否需要确认 */
@@ -119,12 +130,15 @@ export interface Shortcut {
   tags: string[];
 }
 
-/** 快速操作类型 */
-export type QuickActionType =
-  | "shareSheet"     // 分享菜单
-  | "widget"         // 小组件
-  | "watchApp"       // 手表应用
-  | "menuBar";       // 菜单栏
+/**
+ * 快速操作类型 —— 该指令出现在系统的哪些"快捷表面"上。
+ *
+ * 曾经这里列了四种（`shareSheet` / `widget` / `watchApp` / `menuBar`），但后三种
+ * **全仓没有任何生产者也没有任何消费者**：没有小组件容器、没有手表 app、没有菜单栏
+ * 注册表。一个只能被声明、永远不会被兑现的枚举值与"画了个不响的开关"是同一类缺陷，
+ * 故只保留**真的存在**的那一种。分享面板由 `lib/shareSheet.ts` 驱动。
+ */
+export type QuickActionType = "shareSheet";
 
 /** 触发器类型 */
 export type TriggerType =
@@ -152,7 +166,7 @@ export interface Trigger {
  * 一次"信号"—— 触发器的输入。
  *
  * 触发器判定被拆成**纯函数**（`triggerMatches`），所以它不订阅任何东西：宿主把
- * 现实世界的事件（`online`/`offline`、电池变化、窗口打开、定时器到点……）翻译成
+ * 现实世界的事件（Wi-Fi 存储的变化、电池变化、窗口打开、定时器到点……）翻译成
  * `TriggerEvent`，`ShortcutTriggerRuntime` 只负责把事件喂给匹配器。这样时区、星期、
  * 电量阈值这些容易写错的规则可以在纯 bun 环境里逐条钉死。
  */
@@ -183,14 +197,19 @@ export interface ExecutionContext {
   input?: unknown;
   /** 上一步的输出（供 `{output}` 插值使用）。每执行一步刷新。 */
   output?: unknown;
-  /** 是否来自 Siri */
-  fromSiri: boolean;
   /** 是否来自自动化 */
   fromAutomation: boolean;
   /** 触发器 ID */
   triggerId?: string;
   /** 执行开始时间 */
   startTime: number;
+  /**
+   * 这一跑的**绝对**截止时刻（`Date.now()` 口径）。缺省 ⇒ 只有引擎自己那道上限。
+   *
+   * 由 `executeShortcut` 在进门时算好：`startTime + min(LIMITS.MAX_EXECUTION_TIME_MS,
+   * 策略上限)` —— 策略只能**收紧**引擎上限，永远不会放宽（REQ-A824）。
+   */
+  deadlineAt?: number;
 }
 
 /** 执行结果 */
@@ -201,14 +220,6 @@ export interface ExecutionResult {
   duration: number;
   actionsCompleted: number;
   actionsTotal: number;
-}
-
-/** 快捷指令文件夹 */
-export interface ShortcutFolder {
-  id: string;
-  name: string;
-  icon: string;
-  shortcuts: string[]; // shortcut IDs
 }
 
 // ============================================================================
@@ -223,8 +234,6 @@ export const LIMITS = {
   MAX_DESCRIPTION_LENGTH: 500,
   MAX_EXECUTION_TIME_MS: 300000, // 5 minutes
   MAX_VARIABLE_SIZE_BYTES: 10485760, // 10 MB
-  MAX_FOLDERS: 50,
-  MAX_SHORTCUTS_PER_FOLDER: 200,
   /** 控制流最大嵌套深度 —— 防止 `if`/`repeat` 互相嵌套到栈溢出。 */
   MAX_CONTROL_DEPTH: 10,
   /** 单个 `repeat` 的最大迭代次数 —— 防止 `repeat 10000000` 冻死界面。 */
@@ -949,12 +958,10 @@ export const BUILTIN_ACTIONS: ActionType[] = [
 // ============================================================================
 
 export const SHORTCUTS_KEY = "amos.shortcuts";
-export const SHORTCUT_FOLDERS_KEY = "amos.shortcuts.folders";
 export const SHORTCUT_EXEC_LOG_KEY = "amos.shortcuts.execLog";
 
 const STORE_KEYS = {
   SHORTCUTS: SHORTCUTS_KEY,
-  FOLDERS: SHORTCUT_FOLDERS_KEY,
   EXECUTION_LOG: SHORTCUT_EXEC_LOG_KEY,
 } as const;
 
@@ -1035,8 +1042,13 @@ export function createShortcut(
   name: string,
   options?: Partial<Omit<Shortcut, "id" | "createdAt" | "updatedAt" | "runCount">>
 ): Shortcut | null {
-  // MDM 权限检查
-  const mdmCheck = mdmManager.checkCanCreate();
+  // 列表要先读进来：MDM 的每用户上限（`maxShortcutsPerUser`）判的就是**它的长度**，
+  // 而那个数在下面本来也要用来判本应用自己的硬上限。REQ-A842：这条策略此前没有任何
+  // 读者 —— 管理员把上限设成 5，用户照样能建到 1000（`LIMITS.MAX_SHORTCUTS`）。
+  const shortcuts = loadShortcuts();
+
+  // MDM 权限检查（策略先于输入：被拒时不该再去挑剔名字）
+  const mdmCheck = mdmManager.checkCanCreate(shortcuts.length);
   if (!mdmCheck.allowed) {
     logger.error("shortcuts", "MDM blocked shortcut creation", mdmCheck.reason);
     return null;
@@ -1047,8 +1059,7 @@ export function createShortcut(
     logger.error("shortcuts", "Invalid shortcut name", validation.error ?? "Unknown error");
     return null;
   }
-  
-  const shortcuts = loadShortcuts();
+
   if (shortcuts.length >= LIMITS.MAX_SHORTCUTS) {
     logger.error("shortcuts", `Cannot create shortcut: limit of ${LIMITS.MAX_SHORTCUTS} reached`);
     return null;
@@ -1067,7 +1078,6 @@ export function createShortcut(
     createdAt: now,
     updatedAt: now,
     runCount: 0,
-    siriPhrase: options?.siriPhrase,
     runOnLockScreen: options?.runOnLockScreen ?? false,
     requiresConfirmation: options?.requiresConfirmation ?? false,
     tags: options?.tags ?? [],
@@ -1090,7 +1100,10 @@ export function createShortcut(
     result: "success",
     tags: ["create", "shortcut"],
   }).catch(err => logger.error("shortcuts", "Failed to log audit", err));
-  
+
+  // 企业 webhook（REQ-A980）：与上面那条审计同一个时刻 —— 「一条指令刚被建出来」。
+  emitWebhookEvent("shortcut_create", { shortcutId: shortcut.id, name: shortcut.name });
+
   logger.info("shortcuts", `Created shortcut: ${shortcut.name}`, shortcut.id);
   return shortcut;
 }
@@ -1146,9 +1159,45 @@ export function updateShortcut(id: string, updates: Partial<Shortcut>): boolean 
     changesAfter: { name: shortcuts[index]?.name, updatedAt: shortcuts[index]?.updatedAt },
     tags: ["update", "shortcut"],
   }).catch(err => logger.error("shortcuts", "Failed to log audit", err));
-  
+
+  // 企业 webhook（REQ-A980）。带上是**哪些字段**变了，而不是把整条指令发出去：
+  // 一条指令可能带凭据参数，审计与 webhook 都只需要知道"改过"。
+  //
+  // `runCount` 不算"改过"：`executeShortcut()` 每跑一次就自己 +1（本文件两处，都会紧接着
+  // 发 `shortcut_run`）。不过滤的话，一个订阅"指令被修改"的用户会在**每次运行**后收到一条
+  // `changed:["runCount"]` 的通知 —— 运行这件事已经由 `shortcut_run`（带时长、动作数）说过了。
+  const changed = Object.keys(updates).filter((key) => key !== "runCount");
+  if (changed.length > 0) {
+    emitWebhookEvent("shortcut_update", {
+      shortcutId: id,
+      name: shortcuts[index]?.name,
+      changed,
+    });
+  }
+
   logger.info("shortcuts", `Updated shortcut: ${id}`);
   return true;
+}
+
+/**
+ * 运行计数 +1 —— **重新读当前值**，而不是用调用方手里那份快照。
+ *
+ * `executeShortcut()` 是 async 的：它在开头 `loadShortcuts()` 读一份快照，中间在
+ * `mdmManager.ensureInitialized()` / `runActions()` 等处 `await`，跑完了才 +1。
+ * 同一进程里两条入口（触发器与用户手点、或两个触发器同时命中）完全可能重叠，
+ * 若两边都写 `快照.runCount + 1`，它们从同一个 `N` 出发、都写回 `N + 1` ——
+ * 一次**成功**的运行被静默吞掉，而 `runCount` 是用户看得见的（「已运行 N 次」）。
+ * 这与相邻的 `recordExecution()` 语义**故意不同**：那个计的是「启动」，朝严格一侧，
+ * 多算无妨；这个记的是成果，少一次就是屏幕说错了话。
+ *
+ * 为什么这一层就够了：`loadShortcuts()` 与 `updateShortcut()` 都是**同步**的，
+ * 两者之间没有 `await`，所以「读当前值 → 写回」在事件循环里是原子的，重叠的
+ * 两次运行必定一先一后地各自看到对方的结果。
+ */
+function bumpRunCount(id: string): void {
+  const fresh = loadShortcuts().find((s) => s.id === id);
+  if (!fresh) return;
+  updateShortcut(id, { runCount: fresh.runCount + 1 });
 }
 
 /** 删除快捷指令 */
@@ -1185,7 +1234,10 @@ export function deleteShortcut(id: string): boolean {
     result: "success",
     tags: ["delete", "shortcut"],
   }).catch(err => logger.error("shortcuts", "Failed to log audit", err));
-  
+
+  // 企业 webhook（REQ-A980）：`name` 取自被删掉的那一份（删完就查不到了）。
+  emitWebhookEvent("shortcut_delete", { shortcutId: id, name: toDelete?.name });
+
   logger.info("shortcuts", `Deleted shortcut: ${id}`);
   return true;
 }
@@ -1207,7 +1259,6 @@ export function duplicateShortcut(id: string): Shortcut | null {
     actions: JSON.parse(JSON.stringify(original.actions)),
     quickActions: [...original.quickActions],
     triggers: [],
-    siriPhrase: undefined,
     runOnLockScreen: original.runOnLockScreen,
     requiresConfirmation: original.requiresConfirmation,
     tags: [...original.tags],
@@ -1226,8 +1277,18 @@ export function duplicateShortcut(id: string): Shortcut | null {
       actionDetails: { originalId: id, originalName: original.name },
       tags: ["duplicate", "shortcut"],
     }).catch(err => logger.error("shortcuts", "Failed to log audit", err));
+
+    /**
+     * 这里**故意没有** webhook 发射点（REQ-A980）。
+     *
+     * 复制走的就是上面那次 `createShortcut(...)` 调用，而 `shortcut_create` 的发射点
+     * 在 `createShortcut` 里 —— 在这里再发一次，一次复制会朝订阅者发**两条**同名事件
+     * （事件名相同、`shortcutId` 不同），而面板上根本没有 `shortcut_duplicate` 这个可勾
+     * 事件，凭它发明一个新名字等于发给一个没人能订阅的队列。
+     * 复制关系留在审计的 `actionDetails.originalId` 里，不在 webhook 里。
+     */
   }
-  
+
   return duplicated;
 }
 
@@ -1270,7 +1331,6 @@ export interface SkippedShortcut {
 
 /** `executeShortcut` 的调用选项。 */
 export interface ExecuteOptions {
-  fromSiri?: boolean;
   triggerId?: string;
   /** 用户已在确认对话框里按过"运行"（`requiresConfirmation` 的指令需要它）。 */
   confirmed?: boolean;
@@ -1329,8 +1389,39 @@ export async function executeShortcut(
     };
   }
   
-  // MDM 权限检查
-  const mdmCheck = mdmManager.checkCanExecute(shortcutId, total);
+  /**
+   * MDM 权限检查。
+   *
+   * 三条判据问的是三件事，但**共用同一个拒绝出口**（同一句 `mdmCheck.reason`、
+   * 同一条 `result: "blocked"` 审计行、同一条回到用户的渲染路径）：
+   * ①`checkCanExecute` 问**这条指令**还能不能跑（操作数上限、每日执行次数）；
+   * ②`firstDisabledAction` 问**它里面的操作**有没有被管理员整类禁掉 —— 这一问以前
+   * 从没发生过：`disabledCategories` / `disabledActions` 当时只被 `checkActionAllowed()`
+   * 与 `isActionDisabled()` 读，而这两个方法在生产里**零调用者**，所以管理员在
+   * 控制台里勾掉的分类/操作，设备照跑不误。**②就是当时补上的那一半**（`firstDisabledAction`
+   * 转发给 `checkActionAllowed(category, actionId)`，理由原样回到用户），所以上面那段
+   * 描述的是**修复前**的状态，别照着它去"再修一遍"：那个缺陷已经不在了 ——
+   * `mdm-restriction-scan` 的读站点表钉着 `disabledActions` / `disabledCategories`
+   * 的唯一读者就是 `checkActionAllowed`，多一个读取点它就红。
+   *
+   * 顺序刻意让**内容**先于**配额**：分类被禁是这条指令**永久**跑不了的理由，而
+   * 每日次数是今天暂时用完了 —— 两件事同时成立时，该告诉用户的是前者。
+   *
+   * ③`deviceBlockVerdict` 问**设备本身**还能不能用（远端锁定 / 远端擦除）——
+   * 排在①②**之前**，理由同上但更重：设备被锁不是"这条指令"或"今天"的事，是
+   * **这台设备**的事，所以该先说这句。它此前**从没有在这里被问过**：锁/擦的表述
+   * 只写在 `mdmManager.initialize()` 里（抛错），而那个入口在生产里零调用者 ——
+   * 于是一条"远端锁定"对设备的效果是**零**（既看不见，也不拦任何东西）。
+   * REQ-A945 把同一句话搬成**判词**，复用下面这**同一个**拒绝出口。
+   */
+  await mdmManager.ensureInitialized();
+  const deviceBlock = mdmManager.deviceBlockVerdict();
+  const disabledAction = firstDisabledAction(shortcut.actions);
+  const mdmCheck = !deviceBlock.allowed
+    ? deviceBlock
+    : disabledAction !== null
+      ? { allowed: false as const, reason: disabledAction }
+      : mdmManager.checkCanExecute(shortcutId, total);
   if (!mdmCheck.allowed) {
     logger.error("shortcuts", "MDM blocked shortcut execution", mdmCheck.reason);
     
@@ -1358,24 +1449,71 @@ export async function executeShortcut(
     };
   }
   
+  const budgetMs = effectiveExecutionBudgetMs();
+  if (budgetMs <= 0) {
+    // 预算为 0 ⇒ 这一次执行**根本不允许开始**（REQ-A824）。这条路只在策略值不可信时走得到：
+    // `mdm.ts` 把 `NaN`／负数折成 0，正是为了不让它变成「没有上限」。理由用策略自己的措辞
+    // 与数字（`Number.POSITIVE_INFINITY` 表示「任何时长都越界」）。
+    const reason = mdmManager.checkExecutionTime(Number.POSITIVE_INFINITY).reason || "执行超时";
+    logger.error("shortcuts", "MDM execution-time policy forbids any run", reason);
+    return {
+      success: false,
+      error: reason,
+      duration: Date.now() - startTime,
+      actionsCompleted: 0,
+      actionsTotal: total,
+    };
+  }
+
   const context: ExecutionContext = {
     shortcutId,
     variables: new Map(),
     input,
     output: input,
-    fromSiri: options?.fromSiri ?? false,
     fromAutomation: !!options?.triggerId,
     triggerId: options?.triggerId,
     startTime,
+    deadlineAt: startTime + budgetMs,
   };
   const state: RunState = { completed: 0 };
 
+  /**
+   * 记下这一次**启动**（REQ-A831）。
+   *
+   * 为什么在这里：`checkCanExecute`（上面那道门禁）判定「每日执行次数」时读的是
+   * `mdmManager` 里那张 `executionCounts` 表，而**全仓没有一处执行路径去写它** ——
+   * 唯一的写者 `recordExecution()` 从落地起只有测试调用过。于是那张表在生产里恒为空，
+   * `currentCount` 恒为 0，`0 >= maxExecutionsPerDay` 恒为假：**「每日执行次数」
+   * 这条管理员能在面板里改、能落盘、能下发的限制，在生产里永远不会拒绝任何一次执行。**
+   * 门禁是活的，它读的那个数没人生产。
+   *
+   * 位置的两条约束：
+   *   1. 在**所有拒绝之后**（不存在 / 未确认 / 锁屏 / MDM 门禁 / 预算为 0）——
+   *      被拒绝的那一次没有启动，就不该占额度，否则拒绝本身会消耗配额；
+   *   2. 在 `runActions` **之前**，也就是这次执行真正被提交的那一刻。
+   *
+   * 方向是**朝严格的一侧**：这里计的是「启动」而不是「成功」。失败或超时的运行照样占额度，
+   * 否则一个每次都跑挂的指令就能无限次绕过配额。这里与 `runCount` 的语义**故意不同** ——
+   * `runCount` 是用户可见的成功计数（超时的运行不计，见上面跑完再看的表）。
+   */
+  mdmManager.recordExecution(shortcutId);
+
   try {
     const output = await runActions(shortcut.actions, context, input, state, 0);
-    
+
+    /**
+     * 跑完**再**看一次表（REQ-A824）。截止时刻只在操作之间检查，所以一个自己就跑超了的
+     * 长动作会从边界之间溜过去 —— `wait 60` 在 10 秒策略下、且它是**最后一个**动作时，
+     * 循环走到末尾就结束了，没有任何一次检查看过表。这里补上那一次，且在**更新运行计数
+     * 之前**：一次被策略判为超时的运行不该被计成一次成功运行。
+     */
+    if (Date.now() > context.deadlineAt!) {
+      throw new Error(executionTimeoutReason(context));
+    }
+
     // 更新运行计数
-    updateShortcut(shortcutId, { runCount: shortcut.runCount + 1 });
-    
+    bumpRunCount(shortcutId);
+
     const duration = Date.now() - startTime;
     logger.info("shortcuts", `Shortcut completed in ${duration}ms`);
     
@@ -1413,7 +1551,7 @@ export async function executeShortcut(
      * 会让"到此为止"在用户眼里变成红色错误（iOS 上它是正常完成）。
      */
     if (err instanceof StopSignal) {
-      updateShortcut(shortcutId, { runCount: shortcut.runCount + 1 });
+      bumpRunCount(shortcutId);
       logger.info("shortcuts", `Shortcut stopped early after ${state.completed} actions`);
       auditLogger.logExecution({
         shortcutId,
@@ -1477,6 +1615,38 @@ export async function executeShortcut(
 }
 
 /**
+ * 这一跑真正的时间预算（毫秒）：引擎自己的上限与 MDM 策略上限**取更紧的那个**。
+ *
+ * 引擎的上限（`LIMITS.MAX_EXECUTION_TIME_MS`）是保命用的：它让一份手改过 / 导入的 JSON
+ * 不能把界面冻住。它**不是**企业策略 —— 管理员在 MDM 里设的 `maxExecutionTime`
+ * （默认 300 秒）此前没有任何一处执行路径问过（REQ-A824），于是「启用后将应用企业策略和
+ * 使用限制」这句话对它而言是假的。策略只收紧、不放宽：`min()` 保证管理员无法用一条
+ * 更宽的策略解除引擎的保命上限。
+ *
+ * 导出是给测试用的（同 `LIMITS`）：这条「只收紧、不放宽」的性质是本轮的要害，
+ * 而它只能靠读这个数来钉 —— 引擎那道上限是 300 秒，没有哪个用例等得起。
+ */
+export function effectiveExecutionBudgetMs(): number {
+  const policyMs = mdmManager.executionTimeLimitMs();
+  if (policyMs === null) return LIMITS.MAX_EXECUTION_TIME_MS;
+  return Math.min(LIMITS.MAX_EXECUTION_TIME_MS, policyMs);
+}
+
+/**
+ * 超时被触发时，**是哪一道上限**越了界 —— 理由要说得出数字。
+ *
+ * 两个上限可能同时越界，也可能只有一道。这里让 `checkExecutionTime` 当判据：它答
+ * 「策略上限越界了吗」，答是就把管理员设的那个数说出来；答否就说明这一次是引擎自己的
+ * 保命上限拦下的，不能把责任推给一条没有越界的策略。这也是 `checkExecutionTime` 的
+ * **唯一生产调用点** —— 它此前只有测试调用过。
+ */
+function executionTimeoutReason(context: ExecutionContext): string {
+  const elapsedSeconds = (Date.now() - context.startTime) / 1000;
+  const verdict = mdmManager.checkExecutionTime(elapsedSeconds);
+  return verdict.allowed ? "执行超时" : verdict.reason || "执行超时";
+}
+
+/**
  * 递归执行一串操作，返回管道输出。
  *
  * 控制流（`if` / `repeat` / `for_each` / `stop_shortcut`）**在这里**处理而不是放进
@@ -1498,8 +1668,11 @@ async function runActions(
   let output: unknown = input;
 
   for (const action of actions) {
-    if (Date.now() - context.startTime > LIMITS.MAX_EXECUTION_TIME_MS) {
-      throw new Error("执行超时");
+    // 截止时刻在进门时算好（`executeShortcut`）；没有它时退回引擎上限 —— 直接调
+    // `runActions` 的旧调用点（测试等）因此行为不变。
+    const deadline = context.deadlineAt ?? context.startTime + LIMITS.MAX_EXECUTION_TIME_MS;
+    if (Date.now() > deadline) {
+      throw new Error(executionTimeoutReason(context));
     }
 
     const actionType = getActionType(action.actionTypeId);
@@ -1590,6 +1763,38 @@ function countActions(actions: ActionInstance[]): number {
     if (a.elseChildren) n += countActions(a.elseChildren);
   }
   return n;
+}
+
+/**
+ * MDM 策略预检：返回这棵操作树里**第一个**被管理员禁用的分类/操作的理由，没有则 `null`。
+ *
+ * 与 `countActions` 同形（同一棵树的另外一面），**深度优先走 `children` 与 `elseChildren`**
+ * —— 少了这一步，藏在 `repeat` / `if` 分支里的被禁操作就能绕过去，而那一层恰恰是最容易
+ * 被漏掉的一层。
+ *
+ * 读的是 `getActionType` 解析出来的真类型：管理员禁的是**操作**（`open_app`），不是某一条
+ * 指令里那个随机生成的 `ActionInstance.id`。未知操作类型不是策略问题 —— 执行器本来就跳过它
+ * （`runActions` 里的 `Unknown action type`），这里保持同一口径，免得多报一句用户看不懂的话。
+ */
+function firstDisabledAction(actions: ActionInstance[]): string | null {
+  for (const a of actions) {
+    const actionType = getActionType(a.actionTypeId);
+    if (actionType) {
+      const verdict = mdmManager.checkActionAllowed(actionType.category, actionType.id);
+      if (!verdict.allowed) {
+        return verdict.reason ?? `操作 "${actionType.id}" 已被管理员禁用`;
+      }
+    }
+    if (a.children) {
+      const inner = firstDisabledAction(a.children);
+      if (inner !== null) return inner;
+    }
+    if (a.elseChildren) {
+      const inner = firstDisabledAction(a.elseChildren);
+      if (inner !== null) return inner;
+    }
+  }
+  return null;
 }
 
 /** 迭代次数护栏：非有限 / 负数 / 超上限一律夹到合法区间。 */
@@ -1771,10 +1976,38 @@ async function executeAction(
     case "open_app": {
       const appId = String(params.app ?? "").trim();
       if (!appId) throw new Error("打开 App 需要应用标识");
-      // `wm_open` 是桌面形态建窗口 / 移动形态路由的唯一入口（与 Launchpad/Spotlight 同一命令）。
-      // 桥不在（纯浏览器 / 单测）时返回 null —— 如实记一条警告，不假装打开了。
-      const opened = await invoke<unknown>("wm_open", { label: appId });
-      if (opened === null) logger.warn("shortcuts", `open_app: wm_open(${appId}) not bridged`);
+      // `wm_open` 是桌面形态建窗口 / 移动形态路由的唯一入口（与 Launchpad/Spotlight 同一命令），
+      // 所以走**同一个所有者**（`lib/wm::wmOpenWithDiag`）而不是在这里再 `invoke` 一次。
+      //
+      // REQ-A1193 / FMEA F-SH-481：原先这一处只把 `null` 折成一句
+      // `wm_open(${appId}) not bridged`，然后**无论如何 `return input`**。可 `null` 同时代表
+      // 两件事（`lib/backend::invoke` 从不 reject，它记完账本答 `null`）：「这里没有宿主」
+      // 与「宿主答了、它说不」。于是两处都错：理由说错了（把拒绝说成没桥），而这一趟执行
+      // 无论发生了什么都以成功收尾 —— `runCount` 加一、执行日志记一条成功，用户看到的却是
+      // 什么也没打开。宿主拒绝 `wm_open` 的理由都是用户到得了的（不认识的 id、非首实例的
+      // label、该类的 `multi_window` 上限），而 `app` 是必填的自由 id。
+      //
+      // 界线：**没有宿主**不是这条指令的失败（浏览器预览 / 单测里根本没有可以开的东西），
+      // 如实记一条警告；**宿主拒绝**是失败，按这个执行器自己的规矩（`open_url` 对无效 URL
+      // 同样抛，`executeShortcut` 把动作的抛错折成 `success:false`）折成一条带理由的失败。
+      const opened = await wmOpenWithDiag(appId);
+      if (!opened.ok) {
+        const diag = opened.diag;
+        if (diag.ok) {
+          // Unreachable in practice: `wmOpenWithDiag` only hands back a diag after a `null`
+          // reply, and the ledger records a failure there. Kept so the union is narrowed.
+          throw new Error(`打开 ${appId} 失败`);
+        }
+        if (diag.kind === "not-bridged") {
+          logger.warn("shortcuts", `open_app: wm_open(${appId}) not bridged`);
+          return input;
+        }
+        const code =
+          diag.kind === "command-failed" && diag.detail && typeof diag.detail === "object"
+            ? (diag.detail as { code?: string }).code
+            : undefined;
+        throw new Error(`打开 ${appId} 被拒绝${code ? `（${code}）` : ""}`);
+      }
       return input;
     }
 
@@ -1906,19 +2139,26 @@ function splitText(text: unknown, separator: string): string[] {
  * 快捷指令的通知没有自己的列表：它**投影**进 `amos.notifications`，于是
  * `NotificationCenter` / `NotificationBanner`（横幅、提示音、触感、免打扰门禁）自动
  * 全部生效 —— 与 push 通知走的是同一个商店（`pushNotifBridge` 的同一决策）。
+ *
+ * `app` 是**推送当刻**的显示名（`Notif.app` 是显示串，不是 id），所以它走
+ * `bgT("app.shortcuts")` —— 与 `MailApp` / `MessagesApp` / `PhoneApp` / `ContactsApp`
+ * 以及 timer ∕ reminder ∕ calendar 的生产者同一条规则（`svelte/bgText.ts`、`lib/notifApp.ts`）。
+ * 这里原先写死中文字面量「快捷指令」：REQ-A1134 的清扫找的是字典查表（`zh[...]`），
+ * 而字面量不是查询，于是英文界面下这条通知的署名一直是中文 —— 正是 `bgText.ts` 开头
+ * 记的那个危害。这一层不在渲染里（快捷指令由动作执行器在任意时刻触发），只能用 `bgT`。
  */
 function postNotification(title: unknown, body: unknown, icon: string): void {
   const n: Notif = {
     id: newNotifId(),
-    app: "快捷指令",
+    app: bgT("app.shortcuts"),
     icon,
-    title: stringify(title) || "快捷指令",
+    title: stringify(title) || bgT("app.shortcuts"),
     body: stringify(body),
     time: Date.now(),
     source: "system",
   };
-  const existing = readStoreValue<Notif[]>(NOTIF_KEY, []);
-  const next = Array.isArray(existing) ? addNotif(existing, n).slice(0, NOTIF_CAP) : [n];
+  const existing = normalizeNotifs(readStoreValue<unknown>(NOTIF_KEY, []));
+  const next = addNotif(existing, n).slice(0, NOTIF_CAP);
   writeStoreValue(NOTIF_KEY, next);
 }
 
@@ -2269,6 +2509,30 @@ function appendExecutionLog(entry: ExecutionLogEntry): void {
   } catch (err) {
     logger.error("shortcuts", "Failed to append execution log", err);
   }
+
+  /**
+   * 企业 webhook（REQ-A980）：**`shortcut_run` 只有这一处发射点**。
+   *
+   * 放在这里而不是 `executeShortcut` 的三个出口各写一遍：`executeShortcut` 的三条
+   * 终局（跑完 / `stop_shortcut` 提前结束 / 抛错）都恰好经过这个函数，所以三个出口
+   * 一个数不了；而"一次执行结束了"这件事的**事实**就在 `entry` 里（成败、耗时、
+   * 哪个触发器），不需要再传一遍参数。
+   *
+   * 在 `try` **之外**：写执行日志失败不该连带把 webhook 吞掉，两件事互不依赖。
+   * MDM 拦下的执行**不发** —— 它没有跑（`auditLogger` 那里记的是 `result: "blocked"`，
+   * 走的是另一条出口，不经过这里）。
+   */
+  emitWebhookEvent("shortcut_run", {
+    shortcutId: entry.shortcutId,
+    name: entry.shortcutName,
+    success: entry.success,
+    stopped: entry.stopped ?? false,
+    durationMs: entry.duration,
+    actionsCompleted: entry.actionsCompleted,
+    actionsTotal: entry.actionsTotal,
+    ...(entry.triggerId !== undefined ? { triggerId: entry.triggerId } : {}),
+    ...(entry.error !== undefined ? { error: entry.error } : {}),
+  });
 }
 
 /** 窗口事件名：某个 app 屏幕被打开（`app` 触发器的信号源）。 */

@@ -163,6 +163,28 @@ Because the hook **value is unchanged**, the DOM-test rewrite is mechanical: 119
 inlined to the same attribute). Hard gate — a new `aria-label="some-thing"` cannot
 creep back in.
 
+### The expression half (REQ-A1080 / F-DEV-136)
+
+The check above read only **static** attribute literals — `slugLabel` ran
+`(aria-label|title)="…"`. A hook written as a **template literal**,
+``aria-label={`call-back-${n}`}``, was invisible to it while still being the
+announced name: a screen reader read the *evaluated* string
+(`call-back-18616091470`), and `aria-label` still overrode the control's visible
+text. Measured before the fix: 7 live production sites slipped past the gate —
+`PhoneApp.svelte` 865/867/869 (`call-back-` / `sms-back-` / `block-caller-`) and
+996 (`block-remove-`), `MessagesApp.svelte` 835/839 (`draft-edit-` /
+`draft-delete-`) and 894 (`block-sender-`). This is the same family as REQ-A461
+(the English-copy half): the predicate's **scope** was narrower than its claim.
+
+`slugLabel` now also reads `(aria-label|title)={`, takes the balanced `{…}` body,
+and extracts its template *static segments* (`wholeLiteralTexts`). The new exported
+predicate `weldedSlug(seg)` decides whether a segment is a hook welded to an
+interpolation: it strips only real hook separators (`-_.`) and requires what
+remains to match `SLUG_ID` — so `remove ${id}` and `page ${i} of ${n}` (copy welded
+to a value) are **not** false positives. All 7 sites now carry a localized
+`aria-label={t("…")}` **plus** `data-testid={`hook-${id}`}`; one new key,
+`message.openDraft`. 7 expression cases pin the predicate in `--selftest`.
+
 
 ## Check 7 — a `t(…)` reference the dictionary cannot answer (REQ-A183)
 

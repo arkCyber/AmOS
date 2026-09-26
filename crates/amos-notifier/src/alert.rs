@@ -37,9 +37,16 @@ impl Severity {
         }
     }
 
-    /// Per-channel rate limit (alerts per second). P0 is **unlimited**
-    /// (0 means "no token bucket — every alert ships immediately") because
-    /// a P0 you rate-limit away is the worst possible outcome.
+    /// Rate limit (alerts per second) for one `(channel, fingerprint)`
+    /// token bucket. P0 is **unlimited** (`0.0` means "effectively no token
+    /// bucket — every alert ships immediately") because a P0 you rate-limit
+    /// away is the worst possible outcome.
+    ///
+    /// This is not a per-channel ceiling, and today it refuses nothing: the
+    /// throttle keys its bucket per fingerprint, and the suppression window
+    /// already swallows every repeat of a fingerprint, so the bucket is
+    /// always full when the window lets an alert through — see
+    /// `crate::throttle::ThrottleDecision::RateLimit`.
     pub fn rate_per_sec(self) -> f64 {
         match self {
             Severity::P0 => 0.0,

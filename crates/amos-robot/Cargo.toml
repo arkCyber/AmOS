@@ -33,3 +33,10 @@ rand = { version = "0.8", default-features = false, features = ["small_rng"] }
 # do the same so the trait-object dispatch stays a single shape across the workspace.
 async-trait = { workspace = true }
 
+[dev-dependencies]
+# `test-util` is what `#[tokio::test(start_paused = true)]` needs: the `watchdog::supervise`
+# tests drive a real timer, and a paused clock makes "did the supervisor expire, and when"
+# an exact question rather than a timing race. Dev-only — production code reads no clock it
+# was not handed.
+tokio = { version = "1", features = ["test-util"] }
+

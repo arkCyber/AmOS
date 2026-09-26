@@ -859,7 +859,147 @@ drift — the probe stays a manual round because doc prose quotes external comma
 need a whitelist roughly as large as the corpus; the honest boundary is recorded
 instead.
 
-### Value-export backlog (ratcheted, 43 entries)
+### Round 46 — a call the UI makes whose command the host never had (REQ-A517)
+
+
+Round 45 read the docs against the code. This round read the **two sides of the bridge**
+against each other, in the one direction nothing looked at: every other gate starts from
+either the frontend exports (`unwired-scan`), the Rust `pub fn`s (`rust-unwired-scan`), or
+the **registered** command list (`tauri-command-scan` check 2 — "a command no screen asks
+for"). Nothing asked the mirror question — *does the command the UI calls exist at all?*
+
+Measured (production `frontend-ts/src`, tests excluded): 243 distinct literal
+`invoke("…")` / `call("…")` names, 268 registered commands, and **exactly one** call with
+no command behind it: `lib/media.ts::mediaStreamBase()` → `media_stream_base`. That name
+appears nowhere else in the repository — no `#[tauri::command]` fn, not in
+`generate_handler![]`. So the call always resolved to the offline value **and** wrote a
+`command-failed` entry into the diagnostic ledger on every call: a failure the user cannot
+act on, invented by the client.
+
+Where it came from is the interesting part. `docs/archive/2026-09/zh/MOBILE_FINAL_AUDIT_2026_SEP17.md`
+records a **build** failure on 2026-09-17 (`PhotosApp` imported functions that did not
+exist) and its fix: write the three functions. The build went green; the audit recorded the
+effect as "照片应用可正确获取媒体流基础URL / 可正确渲染原生媒体缩略图". The capability never
+existed — `nativeStreamUrl()` is downstream of a base that is always `null`, and
+`nativeTileKind()` had no caller at all. A fix that satisfies the compiler is not a fix.
+
+| What | State before | State now |
+| --- | --- | --- |
+| `media.ts::mediaStreamBase` | calls a command that does not exist; always `null`; plants a fake `command-failed` | **deleted** |
+| `photoLibrary.ts::nativeStreamUrl` | always `null` (no base can ever exist) | **deleted** |
+| `photoLibrary.ts::nativeTileKind` | a second shape of the glyph decision that `photoGlyph` already makes; no caller | **deleted** |
+| The claim in `photoLibrary.ts`'s header | "kept for a later, device-only thumbnail load" (reads as a choice) | the truth: **no host streaming endpoint exists**; restore the host half first |
+| `scripts/tauri-command-scan.mjs` | registered → consumed only | **check 3: every literal call the UI makes must be registered**, with `scripts/tauri-call-allowlist.json` (currently `[]` — zero tolerance) and stale-entry reporting |
+
+Evidence: `node scripts/tauri-command-scan.mjs` ⇒ `242 distinct literal call(s) (34 computed,
+not checkable)` and OK; the three deleted exports show up as the ratchet shrinking
+(`unwired-baseline.json` **111 → 108** `values`, "referenced nowhere" **18 → 15**).
+**Negative control**: putting `mediaStreamBase` back verbatim makes check 3 fail on exactly
+that name (naming the caller file); restoring the file byte-for-byte returns the run to
+green (`sha256` compared).
+
+**Honest boundary**: real thumbnails are **not** implemented by this round — the Photos screen
+shows the same glyph tiles it always did (that path was always the honest one). What changed
+is that the repository no longer describes a pipeline it does not have, and the next
+frontend stub of this shape is refused by a gate instead of discovered by an audit.
+Restoring the feature needs the **host half** first (a media stream endpoint per
+`docs/android-storage-unify.md` Phase B/C, plus a *registered* `media_stream_base`), then the
+consumer. Also worth recording: the "Value-export backlog (ratcheted, 43 entries)" heading
+further down this page is a count from an earlier round — the baseline measures **108**
+`values` today (`wm.ts` 7, `bundle.ts` 0, `backend.ts` 5, `pushNotifications.ts` 22,
+`nfc.ts` 18).
+
+### Round 47 — a wrapper nothing imports is not a screen (REQ-A518)
+
+Round 46 read the two sides of the **bridge call**. This round followed the same thread one step
+further: the three dead modules that round had just been staring at (`biometric.ts`, `ble.ts`,
+`nfc.ts`) call host commands — *are those registered?* Yes. And `tauri-command-scan` reported all
+of them as **consumed**, because check 2's rule was "the name appears as a quoted literal anywhere
+in production frontend code" — including inside a module **no screen can import**.
+
+Measured (two independent methods agree: the scan after the fix, and a scratch probe before it):
+**15 registered commands** — `biometric_available`, `biometric_authenticate`, the seven `ble_*`,
+six `nfc_*` — have *every* frontend mention inside `src/lib/biometric.ts` / `ble.ts` / `nfc.ts`,
+three files `unwired-allowlist.json` records (with reasons, under `unwired-scan`'s **hard** gate)
+as unreachable. The gate whose header cites the dead "selection → AI" flow as its reason to exist
+was blind to its own defect class for these 15.
+
+The heavier half is what the blindness *did*:
+
+| Step | What happened |
+| --- | --- |
+| 1 | The blind rule counted the wrapper's literals as a consumer, so the commands reported as wired. |
+| 2 | With the commands "wired", their accurate allow-list entries became `[stale]`. |
+| 3 | The stale state was a **`console.log` note**, not a failure, worded "now consumed — shrink with a reason". Deleting an accurate record looked like housekeeping. |
+| 4 | The records were deleted. The reasons in `unwired-allowlist.json` still assert the opposite ("the two commands are registered and already allow-listed in `scripts/tauri-command-allowlist.json`") — a claim that had been false for at least one commit, and **no gate cross-checks the two files**. |
+
+So the fix is threefold: check 2's consumer corpus now **excludes** the modules the frontend's own
+ledger records as unreachable (pure `liveConsumerFiles`, pinned by three selftest assertions); a
+**stale allow-list entry now fails** the run (matching `unwired-scan`, with a message telling the
+reader to `git log -p` the name before deleting anything); and the **15 records are restored** with
+substantive reasons that name the missing screen, which makes those two cited claims true again.
+
+Two deliberate boundaries: check 3 ("does this command exist?") does **not** apply the filter —
+reachability is irrelevant to existence, and a bad call inside a dead module is the same defect the
+moment the module is wired (filtering would be the *miss* direction); and the reachability decision
+is taken from `unwired-allowlist.json` rather than by recomputing the import graph, because
+`unwired-scan.mjs` runs its scan and calls `process.exit` at module top level, so it cannot be
+imported. The composition is sound: an unreachable module *must* be listed there (hard gate), and a
+listed module is excluded here.
+
+**Honest boundary**: none of the 15 capabilities gained a UI in this round — the BLE, NFC and
+biometric screens still do not exist. What changed is the ledger: it now says "registered host API
+whose wrapper is unreachable — the missing piece is a screen" instead of "wired", and the mechanism
+that erased that statement cannot run silently any more.
+
+
+### Round 48 — the promise the search box already made (REQ-A528)
+
+Rounds 46–47 cleared the *instrument* side of these dead modules. This round wired one of them,
+and the entry point was not a plan or an audit note — it was the **settings search alias**:
+
+```ts
+lock: ["password", "passcode", "pin", "密码", "面容"],   // SettingsApp.svelte
+```
+
+A user who searches 面容 / Face ID is sent to the passcode page. That page had **only** a passcode
+field and a switch; `src/lib/biometric.ts` (host wrapper *and* the written-down semantics for the
+prompt: user gesture required, `available` does not explain why, `fallback` must be handled as
+verified) was reachable from nothing, and the two host commands were registered with no consumer.
+So the shell had a promise (the alias), a seam (the module, fully tested) and a host (two live
+commands) — and no surface. That is the same shape as Round 46/47's findings, one layer up.
+
+What the page now does, each line taken from the module's own contract:
+
+| Situation | The row says | Why not something shorter |
+| --- | --- | --- |
+| the answer has not arrived | “正在检查设备…” | before REQ-A528 the page painted “this device has no biometrics” on the first frame — a false statement on a phone that has Face ID (the **i18n dead-key check** caught it: `lock.biometricChecking` was written but unused) |
+| `null` (no bridge / desktop) | “此设备没有生物识别” and **no button** | a button that cannot work is the REQ-A468 defect |
+| hardware, nothing enrolled | “要先在系统设置里登记”, **no button** | the platform would refuse with `not_enrolled` immediately |
+| ready | “{label} 已可用” + a verify button | the label is the **host's** (the platform's own localized name) |
+| `authenticated` / `fallback` / `cancelled` / `unavailable` | four distinct sentences | a fallback is not a success-by-biometrics and a cancellation is not a failure; collapsing them hides what the platform told us |
+| `not_enrolled` / `locked_out` / other error | guidance, or the platform's own string verbatim | a swallowed error reads as “the button did nothing” |
+
+Two things were **deleted** rather than kept:
+
+* `lib/biometric.ts::biometricLabel()` — it returned hard-coded Chinese (`面容 ID` / `指纹` / `虹膜`),
+  and it is now called from a locale-aware screen, so an English UI would have shown Chinese. Naming
+  a biometric is copy: it moved to i18n (`lock.biometricKind*`, both locales), with the host's label
+  preferred over any local list.
+* the module's entry in `unwired-allowlist.json` and the two commands' entries in
+  `tauri-command-allowlist.json` — the ratchets **fired by themselves** the moment the page existed
+  (`5 baseline entr(y/ies) now wired`, `1 allow-list entr(y/ies) no longer name a hole`,
+  `2 allow-list entr(y/ies) no longer name a hole`), which is how the shrink was found rather than
+  remembered. Baseline values **108 → 103**, command allow-list **35 → 33**, unreachable modules
+  **12 → 11**.
+
+Boundary, said out loud: the row **verifies identity and gates nothing** — no path in this repository
+is released by it yet, and the copy says so (`lock.biometricHint`) instead of implying “unlock”.
+
+
+
+### Value-export backlog (ratcheted)
+
 
 The baseline today (43), by module:
 
@@ -924,9 +1064,9 @@ Both are fixed (see `CHANGELOG.md` REQ-A412); the third member of the family,
 
 | Module | What it is | What is missing |
 | --- | --- | --- |
-| `src/lib/biometric.ts` | host wrapper for `biometric_available` / `biometric_authenticate` + prompt labels | a biometric prompt surface (Settings → Security, or the Lock screen's unlock path) |
+| `src/lib/biometric.ts` | host wrapper for `biometric_available` / `biometric_authenticate` | **wired in REQ-A528**: the biometric row lives on the passcode page (`LockPage.svelte`), which is where the settings search alias (`面容` / `face id`) had been pointing all along — the entry is gone from this backlog and from `unwired-allowlist.json` |
 | `src/lib/ble.ts` | BLE GATT client (Kotlin bridge + Web Bluetooth fallback) | the BLE screen (scan → connect → services → read/write/subscribe) |
-| `src/lib/gps.ts` | read-only location view model (`gnssSnapshot`, `accuracyLabel`, `describeLocation`, …) | a dedicated Location screen (the **wired** GNSS path is `sensors.ts`'s snapshot) |
+| `src/lib/gps.ts` | read-only location view model (`readGnss`, `accuracyLabel`, `describeLocation`, `isAndroidBackend`) | **wired in REQ-A582**: the 「定位」 block in `LiveSensors.svelte` (Settings ▸ Diagnostics) is the screen this module was waiting for — it shows the four honest states (`unavailable` / `absent` / `no-fix` / `fix`), the accuracy label, the coordinates and the device-vs-simulated badge. Wiring it exposed an ambiguity the module's own docs called out but its reader did not honour (`gnssSnapshot` collapsed "no bridge" and "no GNSS hardware" into one `null`), so `readGnss` names the four states instead. The entry is gone from `unwired-allowlist.json`; the three wired exports are gone from `unwired-baseline.json` (98 remain, down from 101). |
 | `src/lib/nfc.ts` | NDEF encode/decode + dispatch/read/write/format + tag subscription | the NFC screen |
 
 **Honest boundary**: these four are still unwired — the rows above are a work list,
@@ -934,3 +1074,243 @@ not a claim that the features work. What changed is that the gate now reads the
 truth (a documented, tested library surface awaiting a screen) instead of a defect
 invisible to `tsc`, and that the two *broken* seams inside them are fixed and pinned
 by tests.
+
+### Round 49 — the remote PWA opener: a tested host command with no screen yet (Gap 6) — **wired in REQ-A560**
+
+`appstore::pwa_open_remote` is the Gap-6 **remote PWA opener** host command. Its whole
+chain is implemented and tested in the `amos-appstore` domain (`open_remote_pwa`:
+`https://` enforced at the seam, operator host allow-list from `AMOS_PWA_REMOTE_ALLOW`
+with no wildcard, 10 s timeout, 256 KiB body cap, the *existing* strict
+`PwaManifest::parse` + `validate`, `eval_js` refused by name), and the command itself is
+a thin `spawn_blocking` wrapper that maps a refusal to `ErrorCode::AppStoreInstallFailed`
+with the `StoreError` attached as the cause.
+
+| Command | What it is | What is missing |
+| --- | --- | --- |
+| `pwa_open_remote` | fetch → validate → install a remote PWA manifest | **nothing: wired in REQ-A560.** Both halves of this round's pair landed — the one-line `generate_handler!` registration (`appstore::pwa_open_remote,`) that makes the name *registered*, and the screen: `PwaHubApp.svelte`'s "add from URL" form (outside the load-state branches, so an **empty** index is exactly where it shows up), backed by `lib/pwaIndex.ts::openRemotePwa`, which returns the host's refusal verbatim and **reloads the index** on success — the new tile is the proof. The entry is gone from this backlog and from `scripts/tauri-command-allowlist.json` (the scan now reports the command as consumed: `255 distinct literal call(s)`, `32 allow-listed`). Honest boundary unchanged: the real HTTPS client needs `--features appstore-live`, and without it the host answers with a typed error naming the missing feature, which the form displays as-is. |
+
+This entry was the forward-looking half of the pair: it became *valid* only once the
+one-line `generate_handler!` registration landed in `crates/amos-tauri/src/lib.rs`
+(`appstore::pwa_open_remote,`), because the scan's stale rule requires an allow-list
+name to be a **registered** command. That registration has now landed — as has the
+screen, so the allow-list entry is removed rather than valid-but-unused.
+
+---
+
+### Round 50 — the enterprise section is built: three finished panels + their list consumer leave the backlog (REQ-A584)
+
+`docs/SHORTCUTS_ENTERPRISE_UI_SPEC.md` places four enterprise surfaces in **Settings ▸ 企业功能**
+(MDM / 模板 / 审计 / API). All four panels existed (700–1140 lines each, fully i18n'd, backed by the
+wired `lib/enterprise/*` managers and — for MDM — the `amos-mdm` crate with end-to-end tests), and the
+section was never built, so **nothing in the UI could reach any of them**: the audit trail
+(`lib/enterprise/audit.ts`, wired) had no reading UI at all, and MDM could not be configured from the
+shell that ships it.
+
+`settings/EnterprisePage.svelte` is that section, and the entry chain is complete end to end:
+`Sub` member → `PAGE_KEY` title → an index row (its own group, above 系统) → search aliases
+(`enterprise` / `mdm` / `audit` / `api` / `webhook` / 企业 / 审计 / 接口 …) → the render branch.
+The two contract tests that exist for exactly this (`settingsReach.test.ts` REQ-A488 and
+`settingsPageBodies.test.ts` REQ-A499) pass without being touched.
+
+| Entry | What it was | Disposition |
+| --- | --- | --- |
+| `src/svelte/modules/MDMPanel.svelte` | MDM configuration panel | **mounted** — first tab |
+| `src/svelte/modules/AuditLogViewer.svelte` | audit-trail reader | **mounted** — second tab (this is the audit trail's first reading UI) |
+| `src/svelte/modules/APISettings.svelte` | API token + webhooks | **mounted** — third tab |
+| `src/svelte/components/VirtualList.svelte` | list virtualization component | **reachable again** — its only consumer is the audit panel, so it stopped being "dead because its consumer was dead" |
+| `src/svelte/modules/TemplateLibrary.svelte` | the spec's fourth tab (企业模板) | **deliberately NOT mounted**: its catalogue has no producer (`templateManager.syncTemplates` / `initializeEnterprise` are called only from tests), so it would render a permanently empty screen. The page names this in the user's words (`settings.enterpriseTemplatesMissing`) instead of showing a tab that looks broken; the entry stays in `unwired-allowlist.json` with its reason. |
+
+**Ratchet**: `unwired-allowlist.json` **12 → 8** entries, `unwired-baseline.json` values **98 → 97**
+(`lib/enterprise/index.ts::initializeEnterprise` is now called from production — the panels initialize
+the enterprise layer on mount — so its baseline entry had to go too).
+
+**Honest boundary**: this makes the three panels *reachable and rendered*; it does not add device MDM
+enrollment or a template-sync producer. The MDM **backend** was already wired and tested
+(`amos-mdm`, `admin_auth`); what was missing was the surface, and that is what landed.
+
+---
+
+### Round 51 — the un-adopted lazy loader is adopted, and the three defects that only a caller sees are fixed (REQ-A587)
+
+The backlog's own words for `src/svelte/components/LazyImage.svelte` were: *"Adopting it is a
+**measured** performance change (the photo grid renders one page of 60 tiles), not a wiring detail — so
+it is kept, not deleted."* This round does exactly that and records the measurement.
+
+**Wired**: the gallery tile is now *glyph underneath, lazy image on top*, so a page of 60 tiles starts
+**0** image decodes at render time (60 before) and a tile whose image fails is no longer a blank box.
+Widening the measurement: only the tiles the viewport has seen get a real `src` (asserted as "reveal 4 →
+exactly 4").
+
+**Three defects that only a real caller sees** (all fixed):
+
+| # | What it was | Why it matters to a caller |
+| --- | --- | --- |
+| 1 | no placeholder ⇒ `src={placeholder \|\| ""}` | `<img src="">` makes the browser request the **page's own URL** and paint a broken-image glyph |
+| 2 | preloaded through `new Image()`, then handed the URL to the element | a data URL was decoded **twice**, and nothing appeared until the off-DOM load finished |
+| 3 | its `<style>` forced `width: 100%; height: auto` | fights any caller that positions the image (`absolute inset-0 h-full w-full object-cover`) |
+
+The rewrite is **element-driven** (the `<img>`'s own `load`/`error` events), carries no layout of its
+own (`display: block` plus a `hidden-until-loaded` hook for the no-placeholder case), and adds
+`loading="lazy"` / `decoding="async"` so the "no `IntersectionObserver` ⇒ show it immediately"
+fallback is backed by the browser too.
+
+**Tests**: the component had none (that is what "un-adopted" meant). It now has seven, plus a
+controllable `IntersectionObserver` helper for this suite (`svelte-tests/lazy-observer.ts`) — happy-dom
+ships one that can never fire, since it has no layout and no scroll.
+
+**Ratchet**: the entry is gone from `unwired-allowlist.json` (components allow-listed: **1**).
+
+**Honest boundary**: the gain is counted in *decodes started at render*, not in milliseconds — no
+real-browser timing was done. The other two surfaces the entry named (the camera preview and tab
+favicons) are **still eager**: they have no measurement behind them, and wiring them to claim a win
+nobody read would be the shape this repo refuses.
+
+---
+
+### Round 52 — the Dock's request-attention half gets the caller the ledger asked for (REQ-A589)
+
+The entry for `dock_request_attention` said exactly what was missing: *"nothing requests attention:
+the shell has no 'this app wants you' moment that a bounce would add to … **Wire it when a background
+delivery that the user might miss exists.**"* This round both names that moment and wires it.
+
+**The moment**: a remote push that lands while the shell window is **hidden**
+(`document.visibilityState !== "visible"`) — i.e. minimized / not being presented. The push watcher
+(`svelte/osPushWatcher.ts`) already knows when a delivery really landed (it returns how many were
+added), so the bounce is one line after that write.
+
+**Why the signal is visibility, not focus**: an AmOS *app window* is its own WebView, so the launcher
+window's `document.hasFocus()` is `false` while the user is actively working inside AmOS — bouncing
+then would be a false alarm, and a false bounce is user-visible noise. The host offers nothing better:
+there is no "is the application frontmost" query (checked: the only `is_active` in the tree is
+AirPlay's discovery state), and deriving one from *window* focus would answer a different question. So
+the rule is "the user cannot see the window", and the honest consequence is that a delivery arriving
+while the window is merely *behind* other windows does not bounce — the badge still carries the count.
+
+**Level**: `"info"` only (one bounce). `"critical"` keeps bouncing until the user clicks, and the push
+payload carries no interruption level, so asking for critical would invent urgency the sender never
+expressed. `requestAttention(level)` can send either; the watcher deliberately sends `"info"`.
+
+**A defect the new caller exposed**: the watcher's "how many were added" was
+`merged.length - held.length`, and the merge **caps** the list — so at the cap a delivery that really
+landed reported **0**. Harmless while nothing read the number; wrong the moment the bounce keyed on it
+(the user most behind would get no bounce). It now counts ids that were not already held.
+
+**Tests**: `lib/__tests__/dockBadge.test.ts` grew the attention half (the pure decision, the visibility
+read incl. "no `document` ⇒ never claim the user is away", and the command's wire contract incl. the
+lowercase `"critical"`), and `src/__tests__/osPushWatcher.test.ts` grew the four end-to-end cases
+(hidden ⇒ one `{level:"info"}` call, visible ⇒ none, nothing new ⇒ none, at the cap ⇒ still counted).
+
+**Ratchet**: the entry is gone from `scripts/tauri-command-allowlist.json` (**32 → 31** allow-listed;
+`256` distinct literal calls). The command was already registered; what changed is that a screen now
+asks for it.
+
+### `interpret_end_of_speech` — wired in REQ-A741 (the interpreter's "end this sentence")
+
+The allow-list entry read, verbatim: *"Manual/VAD utterance boundary for the interpreter session.
+The screen drives start/audio/pause/resume/stop; a \"finish this sentence\" affordance does not exist
+yet."* That was honest about the gap and stayed true for a while — the command existed
+(`interpret.rs:398`, registered at `lib.rs:465`), and its four strings sat in the **i18n** allow-list
+under the same excuse (*"stubbed … not yet wired to a UI button"*). Two exemptions, one missing
+button.
+
+**What landed**: `lib/backend.ts::interpretEndOfSpeech(sessionId)` (wire key `sessionId`, pinned by
+`tauri-args-scan.mjs`), and a button in `InterpApp.svelte`'s `{#if running}` control group
+(`data-testid="interp-end-sentence"`) driving `endUtterance()`. The handler is deliberately honest on
+two edges: it only sends the command when `partial` is non-empty (the screen's only signal that a
+sentence is in flight — the daemon sets it on a `partial` event and clears it on `segment_final`), and
+it reads the outcome from `bridgeDiag`, because the command answers `Result<(), String>` and `()`
+serializes to `null` — the same value `invoke` returns on failure. `PhoneApp` uses the same pattern
+for its `()`-returning commands.
+
+**Ratchet**: the entry is gone from `scripts/tauri-command-allowlist.json` (**18 → 17** allow-listed;
+`278` distinct literal calls), and the four `interp.end*` strings are gone from
+`frontend-ts/scripts/i18n-allowlist.json` (**41 → 37**), now referenced by production. Both shrinks
+fired by themselves when the button existed, rather than being remembered — which is the point of the
+ratchet.
+
+### `WebhookManager.trigger` — the ledger's excuse was the opposite of the truth (REQ-A910 / F-DEV-121)
+
+This section is not about a *wired* export. It is about the excuse that kept an export off this
+document's radar, and about the second method that excuse quietly hid.
+
+`scripts/dead-member-allowlist.json` carries an entry for `webhooks.ts::getWebhook`, and its reason
+read, verbatim: *"triggerWebhook 在生产里是活的，所以这不是「整套没接」，是**读半边没接**"* — "the
+publisher (`triggerWebhook`) is live in production, so this is not 'the whole thing is unwired', it is
+just the read half." Both halves of that sentence are false:
+
+* **The named method does not exist.** `grep -rn triggerWebhook` across the repository returns **zero**
+  hits. The real name is `WebhookManager.trigger` (`webhooks.ts:193`). A phantom name in a ledger reason
+  is exactly the shape `scripts/claim-scan.mjs` was built to catch — and it did catch it, which is how
+  the round started.
+* **The method it *meant* is also unwired.** `grep -rn '\.trigger(' src/` (excluding `__tests__`)
+  returns **zero** production call sites. So the whole chain `trigger → processEventQueue →
+  sendWebhook` never runs in production. `modules/APISettings.svelte` (`availableEvents`, line 424) lets
+  a user attach a webhook to each of seven events (`shortcut_create` / `shortcut_run` /
+  `shortcut_update` / `shortcut_delete` / `shortcut_share` / `template_install` / `mdm_policy_change`),
+  and **nothing ever emits them** — so `triggerCount` and the success rate are permanently `0`.
+
+So the gap is not "the read half of the panel is unconnected." It is **the entire delivery chain has no
+producer**. Wiring a read-only list would not make a single webhook fire.
+
+**Why the second method stayed invisible**: `dead-member-scan` decides "is this member referenced?"
+with a **substring** test, and `trigger` is a substring of `triggerCount` and `lastTriggeredAt`. So this
+zero-caller public method never appears on that lamp — the same class as F-DEV-098 (`contains` asks
+whether a word occurs, not whether it is the binding). **Same file, same reason line, two lamps
+disagreeing.**
+
+**What this round changed (scope correction only — no behaviour)**: the `getWebhook` reason now states
+the measured truth and says the old wording was false in two places; the two `ForTest` reasons were
+repointed at real symbols (`setConfigForTest` / `clearConfigForTest`) instead of the bare tag `ForTest`;
+and `@deprecated` (a TSDoc/JSDoc tag, not a repo identifier — the same class as `EADDRINUSE` and
+`NSApplication.dockTile`: a thing written in a comment, which a comment-stripped corpus can never
+resolve by construction) is registered in `scripts/claim-allowlist.json`. **Not** touched:
+`webhooks.ts`, `APISettings.svelte`, and `dead-member-scan`'s substring predicate.
+
+**Ratchet**: `scripts/claim-scan.mjs` went from **3 FAIL** (`@deprecated`, `ForTest`, `triggerWebhook`)
+to **OK** — 40 ledger files, 755 claimed tokens (580 distinct), 12 allow-listed — with its 26-assertion
+`--selftest` passing. The remaining gap (no event source) is left for a round that has a producer.
+
+### `quickEmergencyNumber` — wired in REQ-A912 / F-TEL-007 (the lock screen's one-tap emergency number)
+
+The ledger listed `src/lib/emergency.ts::quickEmergencyNumber` as unwired. It was — and the consequence
+was life-safety, not cosmetic.
+
+`quickEmergencyNumber(region)` is the TypeScript mirror of the Rust `EmergencyMap::quick_dial`
+(`crates/amos-telephony/src/number.rs`): CN/CN-HK/CN-MO/JP → `110`, KR → `112`, US/CA/MX → `911`,
+AU/NZ → `000`, and the empty/unknown region → the universal `112`. It has a unit test that pins every
+one of those regions. What it did **not** have was a single production caller — which is exactly why the
+scanner wrote it into this ledger.
+
+`LockScreen.svelte` — the whole-screen surface shown while the device is locked — dialed a **constant**:
+`telephonyDial(EMERGENCY_QUICK_NUMBER, true)`, with `EMERGENCY_QUICK_NUMBER === "110"` (used for the
+dial and for the label at four sites, so they were at least self-consistent — consistently wrong). For a
+locked user in any jurisdiction that does not recognize `110` (Korea's police is `112`, AU/NZ dial
+`000`, the US dials `911`…), the lock screen's **only** emergency affordance dialed a number that
+connects to nobody — no ring, no error, and `telephonyDial`'s optimistic result gives the user no way
+to tell.
+
+**This is the correction of a booked mitigation.** FMEA **F-TEL-005** (REQ-A685) records its mitigation
+as including "前端镜像同步" — the front-end mirror brought in line. The mirror *was* brought in line
+(KR/AU/NZ all now agree with Rust). But a mirror nothing reads is not a mitigation: the lock screen kept
+dialing the constant. The separation — *the mirror is right, the screen is wrong* — is invisible to
+every gate: `unwired-scan` records "an unused export in an otherwise-wired module" as a **baseline line**
+(treated as known/deliberate), and the unit test only asks *what the function returns per region*, never
+*who reads it*.
+
+**What this round changed**: `emergency.ts` gains `deviceQuickEmergencyNumber()`, which reads the
+device's own BCP-47 locale (`navigator.language`) through a new `regionFromLocale` helper (2-letter
+region subtag, skipping 4-letter scripts, underscore separator accepted, 3-digit M.49 passthrough, and
+`""` when the tag names no region) and maps it with `quickEmergencyNumber`. A locale naming no region
+falls to the universal `112` — never a single country's code. `LockScreen.svelte` reads it once on mount
+(the OS locale does not change under a locked screen) and uses that one value for **both the dial and
+the label**, so the displayed number and the dialed number cannot drift. `EMERGENCY_QUICK_NUMBER` is
+**kept** — it is still the dialer Emergency page's highlighted primary code (`PhoneApp.svelte:787`); only
+the lock-screen affordance changed.
+
+**Ratchet**: the `::quickEmergencyNumber` line is removed from `scripts/unwired-baseline.json` by hand —
+**not** via `--update-baseline`, which would also have rewritten a concurrent round's ledger entries
+(`PUSH_STATUS_FIELDS`, `hostFsWriteText`). `bun test src/__tests__/emergency.test.ts` ⇒ 10 pass;
+`bunx vitest run svelte-tests/lockscreen.svelte.test.ts` ⇒ 9 pass (four new DOM cases dial from
+`ko-KR` / `en-US` / `en` / `en-AU` through a captured `invoke` and assert the label contains the dialed
+number). Two negative controls, each restored byte-identically by sha256: hardcoding `110` again turns 4
+DOM cases red; breaking the region regex turns 4 unit + 2 DOM cases red.

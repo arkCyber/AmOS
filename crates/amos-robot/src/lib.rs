@@ -9,7 +9,7 @@
 //! control" (`docs/robot-domains.md` §6.6). This crate is that missing half:
 //!
 //! ```text
-//!   ① where am I / which way am I pointing     fusion    ← IMU samples
+//!   ① which way am I pointing                   fusion    ← IMU samples
 //!   ② how do I get there                        planning  ← occupancy grid + pose
 //!   ③ keep doing it on time                     control   ← profile set points
 //!         ▲                                                     │
@@ -42,15 +42,22 @@
 //! * [`safety`] — the **safety monitor** that sits *before* the bus. Heartbeat +
 //!   watchdog + divergence + sanity checks, with a bounded fault log and named rules
 //!   (`R1` … `R5`).
-//! * [`slam`] — EKF-SLAM 2-D (state, prediction, JCBB-style data association,
-//!   Mahalanobis-gated nearest neighbour, brute-force 2-D scan-match loop closure, log-odds
-//!   occupancy grid mapper, bounded landmark count).
+//! * [`watchdog`] — the **external supervisor** the monitor cannot be: it owns a clock and
+//!   watches a [`watchdog::PetCounter`] the control loop bumps each tick, so it detects a
+//!   loop that has *stopped calling in altogether* — the one case `safety`'s in-loop `R1`
+//!   states it cannot see. It reports ([`watchdog::WatchdogVerdict`]); it does not act.
+//! * [`slam`] — EKF-SLAM 2-D (state, prediction, Mahalanobis-gated nearest-neighbour
+//!   data association, **Joint Compatibility Branch and Bound** for whole-batch
+//!   association, brute-force 2-D scan-match loop closure, log-odds occupancy grid
+//!   mapper, bounded landmark count). The single-reading path is the innovation gate;
+//!   [`slam::SlamState::observe_batch`] runs JCBB so a batch's pairing stays one-to-one.
 //! * [`vision`] — sparse visual-odometry pipeline (FAST-9 corner detection, sparse
 //!   Lucas–Kanade optical flow, 8-point essential matrix + RANSAC, frame-to-frame VO
 //!   glue).
-//! * [`driver`] — real motor-driver skeletons (`SerialRobotHal`, `CanRobotHal`,
-//!   `UdpControlRobotHal`) backed by [`amos_link::robot_hal::StreamRobotHal`]. The
-//!   mock HAL remains the default in tests; these drivers are the production wire.
+//! * [`driver`] — the three physical-layer motor drivers (`SerialRobotHal`,
+//!   `CanRobotHal`, `UdpControlRobotHal`) backed by
+//!   [`amos_link::robot_hal::StreamRobotHal`]. The mock HAL remains the default in tests;
+//!   these drivers are the production wire.
 //!
 //! Every module here is pure Rust and offline: no network, no device, no clock beyond the
 //! caller's. The one cross-crate contract is the profile table — plan output is checked
@@ -65,42 +72,62 @@
     not(test),
     deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
 )]
+// Doc-integrity gate (REQ-A707, FMEA F-SH-166): the API docs must not carry dead links.
+// `broken_intra_doc_links`
+// catches a name that does not resolve at all; `private_intra_doc_links` catches a public
+// item linking a *private* one, which rustdoc silently renders as plain text — a reader
+// following the doc finds no target and cannot tell the link was ever meant to be one.
+#![deny(
+    rustdoc::broken_intra_doc_links,
+    rustdoc::private_intra_doc_links,
+    rustdoc::redundant_explicit_links
+)]
 
 pub mod control;
 pub mod driver;
 pub mod fusion;
+pub mod localization;
 pub mod mrac;
 pub mod planning;
 pub mod safety;
 pub mod slam;
 pub mod vision;
+pub mod watchdog;
 
 pub use control::{
     CadenceHealth, ControlLoop, CycleStats, CycleVerdict, LoopError, MAX_CYCLE_SAMPLES,
 };
 pub use driver::{
     CanFrame, CanId, CanRobotHal, SerialConfig, SerialRobotHal, UdpControlRobotHal,
-    UdpDiscoveryRobotHal, MAX_CAN_PAYLOAD, MAX_CAN_TX_RETRIES, MAX_UDP_DISCOVERY_BYTES,
+    UdpDiscoveryRobotHal, UdpSink, MAX_CAN_PAYLOAD, MAX_CAN_TX_RETRIES, MAX_UDP_DISCOVERY_BYTES,
 };
 pub use fusion::{
     AccelRejection, AllanVariance, AllanVerdict, Attitude, AttitudeEstimator, FusionError,
     GravityCorrection, ImuSample, MagSample, NineAxisStep, YawReference, ACCEL_MAX_G, ACCEL_MIN_G,
     MAX_DT_S, MIN_MAG_FIELD_UT, STANDARD_GRAVITY_M_S2,
 };
+pub use localization::{
+    LocalizationError, LocalizationHealth, McControl, McLocalizer, Particle, PoseEstimate,
+    DEFAULT_PARTICLES, INITIAL_SPREAD_MARGIN_M, MATCH_QUALITY_FLOOR, MAX_LOCALIZATION_LANDMARKS,
+    MAX_OBSERVATIONS_PER_UPDATE, MAX_PARTICLES,
+};
 pub use mrac::{MracController, MracStep, Pid};
 pub use planning::{
-    plan, Cell, Connectivity, DriveCommand, Grid, Path, PlanError, Pose, PursuitLimits,
-    MAX_GRID_CELLS,
+    dwa, plan, Cell, Connectivity, DriveCommand, DwaError, DwaLimits, DwaScore, DwaVelocity, Grid,
+    LocalPlanner, Path, PlanError, Pose, PursuitLimits, VehicleGeometry, MAX_GRID_CELLS,
 };
 pub use safety::{FaultCode, FaultRecord, Heartbeat, SafetyLimits, SafetyMonitor, MAX_FAULT_LOG};
 pub use slam::{
-    scan_match, AssocScratch, Association, EkfSlam, Landmark, LoopClosureReport, OccupancyCell,
-    OccupancyError, OccupancyGrid, OccupancyLogodds, ScanMatchConfig, ScanMatchError,
-    ScanMatchResult, SlamControl, SlamError, SlamObservation, SlamState, VelocityCommand,
-    MAX_LANDMARKS, MAX_SCAN_OPERATIONS, MAX_SCAN_SIZE,
+    scan_match, AssocScratch, Association, AssociationOutcome, EkfSlam, Landmark,
+    LoopClosureReport, OccupancyCell, OccupancyError, OccupancyGrid, OccupancyLogodds,
+    ScanMatchConfig, ScanMatchError, ScanMatchResult, SlamControl, SlamError, SlamObservation,
+    SlamState, VelocityCommand, MAX_LANDMARKS, MAX_SCAN_OPERATIONS, MAX_SCAN_SIZE,
 };
 pub use vision::{
     track_frame_to_frame, CameraIntrinsics, Corner, Essential, FastConfig, FastDetector,
     FlowVector, LkConfig, LkOutcome, Pose2D, RansacReport, VisualObservation, VisualTracker,
     MAX_RANSAC_ITERATIONS, MAX_TRACKED_FEATURES,
+};
+pub use watchdog::{
+    supervise, PetCounter, Watchdog, WatchdogError, WatchdogOutcome, WatchdogVerdict,
 };

@@ -35,8 +35,10 @@ fn change_sink() -> &'static Mutex<Option<ChangeSink>> {
     CHANGE_SINK.get_or_init(|| Mutex::new(None))
 }
 
-/// The constructed provider, installed once by [`attach`] so Kotlin-side upcalls
-/// can reach it if needed.
+/// The constructed provider, installed once by
+/// [`Java_com_amos_ai_glue_AndroidClipboardGlue_attach`] so Kotlin-side upcalls
+/// can reach it if needed. (That name is the whole reason this module is *not* an orphan: the
+/// installer is an FFI entry point reached from Kotlin, not from Rust — REQ-A832.)
 static INSTANCE: OnceLock<Arc<AndroidClipboardProvider>> = OnceLock::new();
 
 /// Real guest-side [`ClipboardProvider`] over a Kotlin bridge object.

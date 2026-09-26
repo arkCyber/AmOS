@@ -4,7 +4,13 @@
 //! inference or external API calls. It deliberately exposes the same *streaming*
 //! shape so the transport / UI layers never need to change.
 
+// Rockchip RK3588 NPU (RKNN) + in-process llama.cpp bring-up seams (Gap 7).
+// Both compile unconditionally but return a typed `BackendError` (never a
+// fabricated success, never a mock) until the matching SDK/feature is linked and
+// the binding is written — see `docs/rk3588-bringup.md`.
+pub mod llama_cpp;
 pub mod real;
+pub mod rknn;
 
 use std::time::Duration;
 

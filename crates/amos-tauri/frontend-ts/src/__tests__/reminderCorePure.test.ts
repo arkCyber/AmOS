@@ -91,7 +91,15 @@ describe("reminderCore pure cores (window-free, counted by pure coverage gate)",
 
   test("alertsToNotifs builds stable ids, localized app, truncated titles", () => {
     const short = alertsToNotifs([r("s", 100)], zh["app.reminders"], NOW);
-    expect(short[0]).toMatchObject({ id: "rem:s", app: zh["app.reminders"], icon: "✅", time: 100 });
+    // The id names the arrival: `<reminder>:<its dueAt>` — the same discriminator the
+    // fired-marker carries, so a reminder edited to a new due time is a new arrival
+    // (REQ-A1400 ∕ F-SH-658).
+    expect(short[0]).toMatchObject({
+      id: "rem:s:100",
+      app: zh["app.reminders"],
+      icon: "✅",
+      time: 100,
+    });
     const long = r("l", 200, { title: "很长的".repeat(30) });
     const n = alertsToNotifs([long], "app", NOW)[0]!;
     expect(n.title!.length).toBeLessThanOrEqual(61);

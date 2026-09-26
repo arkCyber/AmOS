@@ -14,7 +14,10 @@ record: [`docs/display-idle.md`](../../docs/display-idle.md).
   `ScreenChange`: `None | On | Off` — so "nothing happened" is distinguishable from "we just
   turned it off", and a caller never re-fires the same transition.
 - `IdlePolicy` holds the *numbers* (battery timeout, charging timeout, hold rules) as data,
-  so a policy change is a value change, not a code edit.
+  so a policy change is a value change, not a code edit. A **zero** timeout means auto-off is
+  **disabled** for that source — the shipped contract's `0` (Settings' 「关闭」, the shell's
+  `AUTO_OFF_DEFAULT_SEC`), matched by the shell's `autoOffDue` (`<= 0` ⇒ never due). The
+  sub-second floor applies only to a **positive** `<1 s` timeout (REQ-A627).
 - **`src/host.rs` is the file contract**: the daemon's energy beat reads the screen state
   from a path (`AMOS_SCREEN_STATE_PATH`), and `parse_screen_state` /
   `read_screen_state_from` are the only parsers — a missing or malformed file is reported,

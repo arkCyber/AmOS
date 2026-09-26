@@ -17,6 +17,8 @@ import { describe, expect, test } from "vitest";
 import {
   HOST_RADIO_COMMANDS,
   mergeRadioQuick,
+  radioDisplayOn,
+  radioGated,
   readManagedSwitches,
   syncQuickRadios,
   tapRadio,
@@ -248,6 +250,44 @@ describe("tapRadio — who is allowed to touch the device", () => {
     const out = await tapRadio({ key: "wifi", settings: settings({ airplane: true }), host: true, cmds });
     expect(out).toMatchObject({ kind: "gated", persist: false });
     expect(cmds.calls).toEqual([]); // no `set`, no `status` — nothing was touched
+  });
+
+  test("radioGated is the same predicate the tap applies — a screen cannot answer it differently", async () => {
+    // The screens mark their tiles with this, and `tapRadio` gates on it. One predicate,
+    // two readers (REQ-A1082) — so "is this tile dead?" and "will this tap do anything?"
+    // cannot drift apart.
+    const plane = settings({ airplane: true });
+    expect(radioGated(plane, "wifi")).toBe(true);
+    expect(radioGated(plane, "bluetooth")).toBe(true);
+    expect(radioGated(plane, "hotspot")).toBe(true);
+    // The airplane switch itself is the way *out* of airplane mode: never gated.
+    expect(radioGated(plane, "airplane")).toBe(false);
+    expect(radioGated(settings({ airplane: false }), "wifi")).toBe(false);
+    // And what `tapRadio` answers for the same inputs is the `gated` branch, not a write.
+    const cmds = port();
+    const out = await tapRadio({ key: "hotspot", settings: plane, host: true, cmds });
+    expect(out).toMatchObject({ kind: "gated", persist: false });
+    expect(cmds.calls).toEqual([]);
+  });
+
+  test("radioDisplayOn: a gated radio reads OFF even when its own bit is set", () => {
+    // The other half of the same rule, and the one that was answered per-screen. The
+    // snapshot here is the one that makes the two answers visible: airplane mode on, and
+    // the radios' own bits still set (a device read, a restored store, a platform that
+    // does not force them off). Every switch must read these as OFF — the app's own model
+    // is that airplane mode owns them, and the sentence beside the switch says so.
+    const inconsistent = settings({ wifi: true, bluetooth: true, hotspot: true, airplane: true });
+    expect(radioDisplayOn(inconsistent, "wifi")).toBe(false);
+    expect(radioDisplayOn(inconsistent, "bluetooth")).toBe(false);
+    expect(radioDisplayOn(inconsistent, "hotspot")).toBe(false);
+    // The airplane switch itself is not gated: it reads its own bit (the way out).
+    expect(radioDisplayOn(inconsistent, "airplane")).toBe(true);
+    // With the gate off it is simply the stored bit — the predicate adds nothing.
+    const free = settings({ wifi: true, bluetooth: false, hotspot: true, airplane: false });
+    expect(radioDisplayOn(free, "wifi")).toBe(true);
+    expect(radioDisplayOn(free, "bluetooth")).toBe(false);
+    expect(radioDisplayOn(free, "hotspot")).toBe(true);
+    expect(radioDisplayOn(free, "airplane")).toBe(false);
   });
 
   test("managed: the system surface is opened instead of a write that cannot land", async () => {

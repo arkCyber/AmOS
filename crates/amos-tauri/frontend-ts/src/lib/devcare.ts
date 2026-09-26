@@ -11,7 +11,13 @@
  * Invariant mirrored from Rust: the WebView only ever names **category keys**,
  * never a path. `devcareClean` re-plans inside Rust from the bridge's own scan.
  */
-import { invoke } from "./backend";
+import { invoke, type BridgeDiag } from "./backend";
+// `callActionDetailText` is the repo's single home for "the host's own words about a
+// refused command" — it is *not* phone-specific despite sitting beside the in-call
+// verdict, and the rule it encodes (a detail carrying only a machine token has no words
+// to show a human) is what every surface needs. Reusing it keeps one spelling for that
+// rule instead of a second one drifting into this module.
+import { callActionDetailText } from "./phone";
 
 /** The junk categories the domain models (mirror of the Rust `JunkKind` tags). */
 export const JUNK_KINDS = [
@@ -38,7 +44,6 @@ export const SENSITIVE_RESOURCES = [
 ] as const;
 export type ResourceKey = (typeof SENSITIVE_RESOURCES)[number];
 
-export type CareAreaKey = "storage" | "apps" | "battery" | "permissions";
 export type SeverityKey = "info" | "suggestion" | "warning" | "critical";
 
 const JUNK_I18N: Record<JunkKindKey, string> = {
@@ -142,15 +147,33 @@ export interface JunkReportView {
   groups: JunkGroupView[];
   total_items: number;
   total_bytes: number;
-  reclaimable_bytes: number;
-  review_bytes: number;
 }
 
 export interface ScanView {
   status: DevCareStatusView;
   report: JunkReportView;
+  /** Category keys a one-tap clean may select on its own (seeds the selection). */
   auto_kinds: string[];
+  /**
+   * Category keys that require an explicit acknowledgement.
+   *
+   * The **authority** on review-ness: the screen asks this list (both for the
+   * 「需确认」 chip and for whether to offer the acknowledgement), rather than
+   * re-deriving it from a literal kind — see [`validateCleanRequest`]
+   * (REQ-A1409 ∕ F-SH-667).
+   */
   review_kinds: string[];
+  /**
+   * Bytes cleanable without a second confirmation, and bytes needing one.
+   *
+   * On the **root**, mirroring `ScanOut`: the domain `JunkReport` serializes only
+   * `groups`/`total_items`/`total_bytes` (these two are *methods*, and only
+   * `StorageOut` spells them as fields). Reading them off `report` always yielded
+   * `0` — the junk card's 「可回收」 header printed a fabricated `0 B` over a list
+   * of real groups (REQ-A1405 ∕ F-SH-662).
+   */
+  reclaimable_bytes: number;
+  review_bytes: number;
 }
 
 /**
@@ -346,6 +369,83 @@ export function normalizeStatus(raw: unknown): DevCareStatusView {
   };
 }
 
+/**
+ * What the `devcare_status` read actually produced (REQ-A793 / F-DEV-097).
+ *
+ * `devcareStatus()` answers `null` for **two** situations this screen must not render
+ * the same way:
+ *
+ *   • the bridge answered and the host has **no backend at all** — an honest fact about
+ *     the device, which `care.offlineHint` describes correctly; and
+ *   • the command **failed** (no bridge, daemon unreachable, transport error) — in which
+ *     case **nothing is known** about the backend, and the host's own words are the only
+ *     truthful thing to show.
+ *
+ * The screen used to fold both into `available = st?.available ?? false`, so a failed
+ * read rendered as 「未连接」 **plus** a sentence asserting what the device can do
+ * (「在真机运行，或设置 AMOS_DEVCARE_ROOT …」) — a claim about the world that the read
+ * never established — and, because the rescan button lives in the `{:else}` branch, that
+ * state offered no way to try again. Every sibling read on the same screen
+ * (`loadApps`, `loadTrail`, `loadStorage`, the scan itself) already carries its own
+ * `*Err` flag for exactly this reason; the one read that gates the whole card did not.
+ *
+ * Pure, so the distinction is pinned by an offline test rather than only in a component.
+ * `diag` is the caller's own `bridgeDiag("devcare_status")` — read **after** its `await`,
+ * because the bridge slot is written on every path (REQ-A296).
+ */
+export type DevCareStatusOutcome =
+  /** The host answered (its `available` may still be `false` — that is an answer too). */
+  | { kind: "read"; status: DevCareStatusView }
+  /**
+   * Nothing was read. `detail` is the host's own words, empty when it gave none
+   * (including "not bridged") — the surface says "could not read" rather than
+   * dressing the silence up as a statement about the device.
+   */
+  | { kind: "failed"; detail: string };
+
+export function devcareStatusOutcome(
+  status: DevCareStatusView | null,
+  diag: BridgeDiag,
+): DevCareStatusOutcome {
+  if (status !== null) return { kind: "read", status };
+  // `not-bridged` has no host to quote, so it shares the "no words" spelling; both are
+  // "we do not know", which is the one thing the failed branch is allowed to say.
+  return {
+    kind: "failed",
+    detail: callActionDetailText("detail" in diag ? diag.detail : undefined),
+  };
+}
+
+/**
+ * A backend's wire word as it may be shown to a user, or `null` when there is nothing
+ * worth naming.
+ *
+ * Both `devcare_status` and `devcare_storage` spell "no backend attached" as the literal
+ * `none` (`BACKEND_NONE` on the Rust side), and an absent `backend` field normalizes to
+ * the same word. Printing it verbatim puts a machine code in front of the user
+ * (`SpacesPanel::spacesErrorLabel` follows the same rule), so it — like an empty name —
+ * reads as unknown instead. One definition, so a second surface quoting the field cannot
+ * drift from the first.
+ */
+export function printableBackend(name: string | null | undefined): string | null {
+  return name === null || name === undefined || name === "" || name === "none" ? null : name;
+}
+
+/**
+ * The backend name to print for a **successful** status, or `null` when none was reported.
+ *
+ * `scan?.status.backend ?? "host-fs"` (the old template) **invented** a backend name for
+ * a scan that never ran: a failed scan leaves `scan` null, and the line then claimed the
+ * device was being cleaned through `host-fs` — the same defect as the one above, one line
+ * down, turning "unknown" into a specific claim. `care.unknown` is rendered for `null`.
+ */
+export function devcareBackendName(
+  status: DevCareStatusView | null,
+  scan: ScanView | null,
+): string | null {
+  return printableBackend(scan?.status.backend ?? status?.backend ?? null);
+}
+
 export function normalizeJunkReport(raw: unknown): JunkReportView {
   const r = isObj(raw) ? raw : {};
   const groups: JunkGroupView[] = Array.isArray(r.groups)
@@ -365,8 +465,6 @@ export function normalizeJunkReport(raw: unknown): JunkReportView {
     groups,
     total_items: num(r.total_items),
     total_bytes: num(r.total_bytes),
-    reclaimable_bytes: num(r.reclaimable_bytes),
-    review_bytes: num(r.review_bytes),
   };
 }
 
@@ -378,6 +476,9 @@ export function normalizeScan(raw: unknown): ScanView | null {
     report: normalizeJunkReport(raw.report),
     auto_kinds: strArr(raw.auto_kinds),
     review_kinds: strArr(raw.review_kinds),
+    // The host's own sums, on the reply root — see `ScanView`.
+    reclaimable_bytes: num(raw.reclaimable_bytes),
+    review_bytes: num(raw.review_bytes),
   };
 }
 
@@ -603,12 +704,8 @@ export function reportHasData(r: ReportView | null): boolean {
  * The areas a care report can assess, in the domain's `CareArea` enum order
  * (mirrors `amos-devocare`'s `CareArea`: Storage → Apps → Battery → Permissions).
  */
-export const CARE_AREAS: readonly CareAreaKey[] = [
-  "storage",
-  "apps",
-  "battery",
-  "permissions",
-];
+export const CARE_AREAS = ["storage", "apps", "battery", "permissions"] as const;
+export type CareAreaKey = (typeof CARE_AREAS)[number];
 
 /**
  * Split a report's `assessed` list into the modelled areas that **were observed**
@@ -633,14 +730,34 @@ export function careAreaSplit(r: ReportView | null): {
 
 /* -------------------------------- commands ------------------------------- */
 
+/**
+ * The `devcare_trail` reply **as it comes off the wire** (Rust `devcare::TrailOut`).
+ *
+ * Separate from [`TrailView`] because that view renames this field: the wire carries
+ * `records`, the screen reads `entries` (see `normalizeTrail`). The rename is fine — what
+ * was not fine is that nothing named the *reply* at all, so `scripts/tauri-reply-scan.mjs`
+ * could not compare the host's shape with what the shell reads (REQ-A555). Declaring the
+ * wire spelling here makes the next Rust-side rename a gate failure instead of a silently
+ * empty trail.
+ *
+ * Not exported: nothing outside this module reads the raw reply, and `unwired-scan`
+ * (frontend-ts) treats an unused export as a finding.
+ */
+interface TrailOutWire {
+  /** The durable records, newest first as the daemon returns them. */
+  records: TrailEntryView[];
+  /** False when the daemon has no durable sink — see [`TrailView.durable`]. */
+  durable: boolean;
+}
+
 export async function devcareStatus(): Promise<DevCareStatusView | null> {
-  const raw = await invoke<unknown>("devcare_status");
+  const raw = await invoke<DevCareStatusView>("devcare_status");
   return raw === null ? null : normalizeStatus(raw);
 }
 
 /** Re-scan the backend. `null` ⇒ not bridged / no backend / the command failed. */
 export async function devcareScan(): Promise<ScanView | null> {
-  const raw = await invoke<unknown>("devcare_scan");
+  const raw = await invoke<ScanView>("devcare_scan");
   return raw === null ? null : normalizeScan(raw);
 }
 
@@ -652,19 +769,26 @@ export async function devcareScan(): Promise<ScanView | null> {
  * the card renders "—" instead of a fabricated `0 B`. `null` ⇒ not bridged.
  */
 export async function devcareStorage(): Promise<StorageView | null> {
-  const raw = await invoke<unknown>("devcare_storage");
+  const raw = await invoke<StorageView>("devcare_storage");
   return raw === null ? null : normalizeStorage(raw);
 }
 
 /**
  * Clean the named categories. Only category **keys** are accepted — the Rust
  * side re-plans from its own scan, so a path can never reach the cleaner.
+ *
+ * The reply is `CleanReply { #[serde(flatten)] clean: CleanOut, audit }`: serde inlines
+ * `CleanOut`'s fields beside `audit`, which is exactly the flat `CleanView` the screen
+ * reads — but the reply scanner cannot verify a **flattened** struct (it refuses to guess
+ * which fields a flattened member contributes), so this pair is one of the few that stay
+ * unverifiable. Typed anyway (REQ-A555): the blindness is the instrument's, and it is
+ * recorded as such instead of hiding behind `unknown` on the shell's side.
  */
 export async function devcareClean(
   kinds: string[],
   acknowledgeReview: boolean,
 ): Promise<CleanView | null> {
-  const raw = await invoke<unknown>("devcare_clean", { kinds, acknowledgeReview });
+  const raw = await invoke<CleanView>("devcare_clean", { kinds, acknowledgeReview });
   return raw === null ? null : normalizeClean(raw);
 }
 
@@ -678,7 +802,7 @@ export async function devcareClean(
  * command failed.
  */
 export async function devcareApps(): Promise<AppView[] | null> {
-  const raw = await invoke<unknown>("devcare_apps");
+  const raw = await invoke<AppView[]>("devcare_apps");
   return raw === null ? null : normalizeApps(raw);
 }
 
@@ -691,7 +815,7 @@ export async function devcareApps(): Promise<AppView[] | null> {
  * source of truth for whether the app is gone.
  */
 export async function devcareUninstall(id: string): Promise<UninstallView | null> {
-  const raw = await invoke<unknown>("devcare_uninstall", { id });
+  const raw = await invoke<UninstallView>("devcare_uninstall", { id });
   return raw === null ? null : normalizeUninstall(raw);
 }
 
@@ -704,18 +828,23 @@ export async function devcareUninstall(id: string): Promise<UninstallView | null
  * **not** the same as "nothing is granted".
  */
 export async function devcarePermissions(): Promise<PermReviewView | null> {
-  const raw = await invoke<unknown>("devcare_permissions");
+  const raw = await invoke<PermReviewView>("devcare_permissions");
   return raw === null ? null : normalizePermReview(raw);
 }
 
-/** Build the care report from this process's real observations. */
+/**
+ * Build the care report from this process's real observations.
+ *
+ * Only the sensitive-grant count is passed in (the daemon owns the ledger over
+ * RPC). The reviewable-app count is **not** a shell input: the host derives it
+ * from the uninstall policy's own authority, so a screen cannot report a review
+ * affordance the apps list does not draw.
+ */
 export async function devcareReport(
   sensitiveGrants: number | null,
-  reviewableApps: number | null,
 ): Promise<ReportView | null> {
-  const raw = await invoke<unknown>("devcare_report", {
+  const raw = await invoke<ReportView>("devcare_report", {
     sensitiveGrants,
-    reviewableApps,
   });
   return raw === null ? null : normalizeReport(raw);
 }
@@ -729,7 +858,7 @@ export async function devcareReport(
  * "nothing ever happened".
  */
 export async function devcareTrail(limit = 20): Promise<TrailView | null> {
-  const raw = await invoke<unknown>("devcare_trail", { limit });
+  const raw = await invoke<TrailOutWire>("devcare_trail", { limit });
   return raw === null ? null : normalizeTrail(raw);
 }
 
@@ -738,7 +867,7 @@ export async function devcareTrail(limit = 20): Promise<TrailView | null> {
  * reclaim target list). `null` ⇒ not bridged.
  */
 export async function devcareMemory(): Promise<MemoryView | null> {
-  const raw = await invoke<unknown>("devcare_memory");
+  const raw = await invoke<MemoryView>("devcare_memory");
   return raw === null ? null : normalizeMemory(raw);
 }
 
@@ -750,7 +879,7 @@ export async function devcareMemory(): Promise<MemoryView | null> {
  * plus the readings around it. `null` ⇒ not bridged.
  */
 export async function devcareBoost(): Promise<BoostView | null> {
-  const raw = await invoke<unknown>("devcare_boost");
+  const raw = await invoke<BoostView>("devcare_boost");
   return raw === null ? null : normalizeBoost(raw);
 }
 
@@ -764,15 +893,25 @@ export async function devcareBoost(): Promise<BoostView | null> {
  * well-formed. This is a *convenience*, not the security boundary — Rust still
  * validates (its `plan` refuses unknown and unacknowledged review kinds) and is
  * the only authority.
+ *
+ * `reviewKinds` is the **host's** own list of review-only categories
+ * (`ScanOut.review_kinds`, built from `JunkKind::needs_review()`). It is a
+ * required argument on purpose: this guard used to re-derive "needs an
+ * acknowledgement" from the literal `stale_download`, so the host's general
+ * contract was implemented as a special case here *and* in the screen — and a
+ * second review-only category would have been visible and selectable yet
+ * refused forever, with no affordance to acknowledge it (REQ-A1409 ∕ F-SH-667).
  */
 export function validateCleanRequest(
   kinds: string[],
   acknowledgeReview: boolean,
+  reviewKinds: readonly string[],
 ): string | null {
   if (kinds.length === 0) return "care.err.noSelection";
   const known = new Set<string>(JUNK_KINDS);
   if (kinds.some((k) => !known.has(k))) return "care.err.unknownKind";
-  // `stale_download` is review-only: it needs the explicit acknowledgement.
-  if (kinds.includes("stale_download") && !acknowledgeReview) return "care.err.needsReview";
+  if (kinds.some((k) => reviewKinds.includes(k)) && !acknowledgeReview) {
+    return "care.err.needsReview";
+  }
   return null;
 }

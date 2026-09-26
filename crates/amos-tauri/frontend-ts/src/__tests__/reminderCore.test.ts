@@ -12,6 +12,7 @@ import {
 } from "../lib/reminderCore";
 import { REMINDERS_KEY, type Reminder } from "../lib/reminders";
 import { NOTIF_KEY } from "../lib/settings";
+import { LOCALE_KEY } from "../svelte/i18n";
 
 try {
   GlobalRegistrator.register();
@@ -35,6 +36,7 @@ afterEach(() => {
   window.localStorage.removeItem(REMINDERS_KEY);
   window.localStorage.removeItem(FIRED_KEY);
   window.localStorage.removeItem(NOTIF_KEY);
+  window.localStorage.removeItem(LOCALE_KEY);
 });
 
 describe("reminderCore — OS-level due alerts", () => {
@@ -69,7 +71,8 @@ describe("reminderCore — OS-level due alerts", () => {
 
   test("alertsToNotifs shapes stable id + localized app name", () => {
     const n = alertsToNotifs([r("a", 123, { title: "很长的".repeat(40) })], zh["app.reminders"], NOW);
-    expect(n[0]!.id).toBe("rem:a");
+    // The id names the arrival: `<reminder>:<its dueAt>` (REQ-A1400 ∕ F-SH-658).
+    expect(n[0]!.id).toBe("rem:a:123");
     expect(n[0]!.app).toBe(zh["app.reminders"]);
     expect(n[0]!.time).toBe(123);
     expect(n[0]!.title!.length).toBeLessThanOrEqual(61); // truncated
@@ -85,21 +88,34 @@ describe("reminderCore — OS-level due alerts", () => {
 
     syncDueReminderAlerts(NOW);
     let notifs = JSON.parse(window.localStorage.getItem(NOTIF_KEY) ?? "[]") as { id: string }[];
-    expect(notifs.filter((x) => x.id === "rem:dueNow")).toHaveLength(1);
-    expect(notifs.filter((x) => x.id === "rem:later")).toHaveLength(0); // not due
-    expect(notifs.filter((x) => x.id === "rem:completedOverdue")).toHaveLength(0); // done
+    expect(notifs.filter((x) => x.id.startsWith("rem:dueNow:"))).toHaveLength(1);
+    expect(notifs.filter((x) => x.id.startsWith("rem:later:"))).toHaveLength(0); // not due
+    expect(notifs.filter((x) => x.id.startsWith("rem:completedOverdue:"))).toHaveLength(0); // done
     const fired = JSON.parse(window.localStorage.getItem(FIRED_KEY) ?? "{}") as Record<string, number>;
     expect(fired["dueNow"]).toBe(NOW - 5_000);
 
     // Same instant again → no duplicate arrivals, markers unchanged.
     syncDueReminderAlerts(NOW);
     notifs = JSON.parse(window.localStorage.getItem(NOTIF_KEY) ?? "[]");
-    expect(notifs.filter((x) => x.id === "rem:dueNow")).toHaveLength(1);
+    expect(notifs.filter((x) => x.id.startsWith("rem:dueNow:"))).toHaveLength(1);
 
     // A second reminder reaching its due time later appends exactly one more.
     syncDueReminderAlerts(NOW + 3_600_000);
     notifs = JSON.parse(window.localStorage.getItem(NOTIF_KEY) ?? "[]");
-    expect(notifs.filter((x) => x.id === "rem:later")).toHaveLength(1);
+    expect(notifs.filter((x) => x.id.startsWith("rem:later:"))).toHaveLength(1);
+  });
+
+  test("the pushed notification's app name follows the UI locale", () => {
+    // The app label is baked into the stored notification when the alert is pushed
+    // (this is not a render path), so it used to be Chinese in every locale.
+    window.localStorage.setItem(LOCALE_KEY, "en");
+    window.localStorage.setItem(REMINDERS_KEY, JSON.stringify([r("dueNow", NOW - 5_000)]));
+    syncDueReminderAlerts(NOW);
+    const notifs = JSON.parse(window.localStorage.getItem(NOTIF_KEY) ?? "[]") as {
+      id: string;
+      app?: string;
+    }[];
+    expect(notifs.find((x) => x.id.startsWith("rem:dueNow:"))!.app).toBe("Reminders");
   });
 
   test("a corrupt notifications store is repaired, not left wedging every tick", () => {
@@ -110,6 +126,6 @@ describe("reminderCore — OS-level due alerts", () => {
     expect(() => syncDueReminderAlerts(NOW)).not.toThrow();
     const notifs = JSON.parse(window.localStorage.getItem(NOTIF_KEY) ?? "[]") as { id: string }[];
     expect(Array.isArray(notifs)).toBe(true);
-    expect(notifs.filter((x) => x.id === "rem:dueNow")).toHaveLength(1);
+    expect(notifs.filter((x) => x.id.startsWith("rem:dueNow:"))).toHaveLength(1);
   });
 });

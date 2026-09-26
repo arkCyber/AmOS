@@ -15,11 +15,16 @@
 
 interface BluetoothRemoteGATTCharacteristic {
   readonly uuid: string;
+  /** The most recently read/notified value. Set by the platform before it fires
+   *  `characteristicvaluechanged`; `undefined` until the first one arrives. */
+  readonly value?: DataView;
   readValue(): Promise<DataView>;
   writeValueWithResponse(value: BufferSource): Promise<void>;
   writeValueWithoutResponse(value: BufferSource): Promise<void>;
   startNotifications(): Promise<BluetoothRemoteGATTCharacteristic>;
   stopNotifications(): Promise<BluetoothRemoteGATTCharacteristic>;
+  addEventListener(type: "characteristicvaluechanged", listener: (ev: Event) => void): void;
+  removeEventListener(type: "characteristicvaluechanged", listener: (ev: Event) => void): void;
 }
 
 interface BluetoothRemoteGATTService {

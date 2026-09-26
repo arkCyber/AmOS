@@ -24,12 +24,24 @@
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
+/// Multi-display domain — which screen a window is on and what its usable area is
+/// (see [`crate::display`]).
+pub mod display;
 /// Form-factor / layout-policy domain (see [`crate::form`]).
 pub mod form;
+/// App-window **identity** domain — which app a window shows and which instance of it
+/// (see [`crate::identity`]).
+pub mod identity;
 /// Desktop geometry / split-screen domain (see [`crate::layout`]).
 pub mod layout;
+/// **Slide Over** session for a floating third window (see [`crate::slide`]).
+pub mod slide;
+/// Window snapping / edge-tiling geometry (see [`crate::snap`]).
+pub mod snap;
 /// Split-screen session over two windows (see [`crate::split`]).
 pub mod split;
+/// Stage Manager rail geometry (see [`crate::stage`]).
+pub mod stage;
 
 /// Opaque identifier for a window, allocated by [`WindowManager::register`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

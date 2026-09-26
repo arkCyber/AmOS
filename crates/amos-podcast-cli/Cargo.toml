@@ -1,0 +1,29 @@
+[package]
+name = "amos-podcast-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Amos podcast CLI: drives an amos_podcast::PodcastManager over the default offline MockFeedProvider to subscribe, refresh, browse episodes and track playheads from the terminal. A real HTTP backend slots in behind the same FeedProvider seam with no CLI changes."
+
+[lib]
+name = "amos_podcast_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "amos-podcast-cli"
+path = "src/main.rs"
+
+[dependencies]
+amos-podcast = { path = "../amos-podcast" }
+tokio.workspace = true
+anyhow.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+
+# Forward the real HTTP capability: with `--features live`, `--live` drives the
+# HttpFeedProvider (real feed fetches) instead of the offline mock catalog.
+# Default build stays offline-green (mirrors amos-appstore-cli forwarding
+# amos-appstore/live).
+[features]
+default = []
+live = ["amos-podcast/live"]

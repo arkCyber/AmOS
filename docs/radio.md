@@ -641,3 +641,136 @@ API 34，`adb` 直连）上跑通 —— 与 §9 一样，本节所有结论都�
   UI 级 `provider_refused`（热点页拒绝行 + 截图）。
 - **截图时序如实记录**：截图摄于飞行位经 adb 还原之后 —— 拒绝行按设计存留（写成功或离开页面才清除），
   所以它仍是那次拒绝的屏幕事实；取证结束时设备已还原（`airplane_mode_on=0`）。
+
+## 15. 站点侧 Wi-Fi 尚不存在；而「是否在 Wi-Fi 上」已有唯一答案（REQ-A1120，2026-09-23）
+
+**本轮做了什么、没做什么。** 这是对「手机操作系统 WiFi 功能」的一次代码审计与补全。结论要
+分开说，否则会把「缺口」和「缺陷」混成一句：
+
+- **站点侧 Wi-Fi（扫描 / 加入 / 忘记 / 自动重连）在真机上没有桥。** §1–§14 里 Wi-Fi 只存在于
+  **电台开关**这一层（`radio_set("wifi", …)`、平台托管、飞行级联）。设置页的「附近网络」是
+  `lib/wifi.ts` 的确定性演示列表 `NEIGHBORHOOD`，扫描是一次 700 ms 的假延时，加入只改
+  `amos.wifi` 这个纯模型 —— 没有一处触到 Android 的 `WifiManager`。所以「补一个真扫描桥」是
+  **真缺口**，但它需要真机验收（📱），不在本轮可验证范围。按本仓纪律，缺口要**如实登记**，
+  而不是摆一个假实现充数。
+- **本轮补的是同一层里一个真实、可离线验证、且已经伤到别处功能的缺陷**：UI 向宿主回报
+  「是否在 Wi-Fi 上」（`on_wifi`）时答错了题。详见下。
+
+**缺陷（REQ-A1120 ∕ F-SH-430）。** `AboutPage.svelte::checkForUpdate` 把 OTA 的 `on_wifi` 算作
+`amos.wifi.current !== null`。而 `WifiCfg.current` 的语义是**加入过**的 SSID（见 `lib/wifi.ts`
+的接口注释），它按设计**不随电台开关清零** —— iOS 也如此。于是：Wi-Fi 关掉（或飞行模式把它
+级联关掉）之后，`current` 仍在，UI 就向宿主报 `on_wifi: true`，宿主的 `wifi_only` 策略
+（`amos-ota` 的 `if policy.wifi_only && !facts.on_wifi { defer }`）**不再 defer**，把更新在计费
+蜂窝上摆到用户面前。用户明示的「只在 Wi-Fi 上下载」被越过。
+
+**为什么全绿。** `svelte-tests/about-page.svelte.test.ts` 那条更新测试**不种任何 store**，
+`wifi.current` 为 null ⇒ 断言的 `onWifi:false` 只是**碰巧**成立 —— 断言的真值恰好等于坏实现
+的默认输出（与 F-SH-429 ∕ F-SH-426 同一形状）。没有任何测试种过「有 SSID 而 Wi-Fi 关」。
+
+**修法：不新写判据，复用既有那一条。** 「是否在 Wi-Fi 上」这个问题的既有答案就在
+`lib/netStatus.ts::wifiConnState` —— 状态栏的 Wi-Fi 图标读的就是它，而且它第一条就是「电台没开
+就不算连上」。`checkForUpdate` 现在从 `SETTINGS_KEY` 读电台位，把两个读者（状态栏、OTA 事实）
+都收到这**一个**函数上：
+
+```ts
+on_wifi: wifiConnState({
+  enabled: !!quick.wifi,
+  online: navigator.onLine,
+  joinedSsid: wifi.current,
+}).connected,
+```
+
+同一个问题，全仓从此只有一个答案 —— 这正是本仓反复写下的教训（`quickRadio.ts` 的头注：
+失效模式从不是「一个值错了」，而是「一个值有 N 份拷贝」）。
+
+**测试与负控。** `svelte-tests/about-page.svelte.test.ts` 新增两条：回归
+`on_wifi is false when the Wi-Fi radio is off, even with a remembered SSID (REQ-A1120)`（种
+`amos.wifi` 的 `current:"Cafe_Free"` + `amos.settings` 的 `{wifi:false}` ⇒ 断言 `onWifi:false`）
+与正控 `on_wifi is true when the radio is on and an AP is joined`（`{wifi:true}` + SSID ⇒ `true`）。
+负控：把 `on_wifi` 那行还原成 `wifi.current !== null` ⇒ **恰 1 红**（其余 6 绿），
+`cp` 快照 + `shasum -a 256` 逐字节还原。
+
+**仍未做（诚实边界）。** 真机站点侧桥（`WifiManager` 扫描 ∕ 加入 ∕ `NETWORK_STATE_CHANGED`
+回读）未实现；`amos.wifi.current` 与设备真实连接状态之间没有同步源，UI 的「已加入」仍是
+AmOS 自有的意图位，而不是设备事实。这与 §13 ∕ §14 记录的「平台托管的开关只给可执行路径」
+是同一条边界的另一面。
+
+## 16. 「连着哪个网」是一个三态事实，现在只有一个答案（REQ-A1123，2026-09-23）
+
+上一节（§15）说明的是「**此刻是否在 Wi-Fi 上**」这一**二态**问题（在 ∕ 不在），它已有唯一
+判据 `lib/netStatus.ts::wifiConnState`。本节记的是它的**三态**邻居：「**连着哪个网**」——
+Wi-Fi 关 ∕ 开着但未连 ∕ 已连 `<SSID>`。审计发现这个三态事实在三个界面上被各答一个错题：
+
+- **设置索引行**（`SettingsApp.svelte` 的 `wifiVal`）只用快设 `qs` 二态作答，已连接时说
+  「未连接」，与同屏的状态栏图标当场矛盾；
+- **Wi-Fi 详情页的「当前网络」行**（`RadioPage.svelte`）反过来把**电台位**当答案（`on` 就渲染
+  「开」），标签问「哪个网」、值答「开了没」；
+- **桌面顶栏的 Wi-Fi 图标**（`RadiosWidget.svelte`）把 `typeof quick.wifi === "string" ? quick.wifi : null`
+  当作已连 SSID 交给 `statusIcons`，而 `normalizeQuick` 对快设键只保留布尔值，这个三元恒为
+  `null`，于是桌面永远说不出网络名。
+
+唯一答对的面是手机状态栏（`StatusBar.svelte` 传 `wifi.current`）。修法是把三态规则收到一处
+纯判据，三个消费面各读它、各自只提供措辞（纯模型不返回句子，与 `statusIcons` 返回 i18n key
+同律）：
+
+```ts
+export type WifiLink =
+  | { kind: "off" }
+  | { kind: "unjoined" }
+  | { kind: "joined"; ssid: string };
+
+export function wifiLink(enabled: boolean, ssid: string | null): WifiLink {
+  if (!enabled) return { kind: "off" };
+  return ssid ? { kind: "joined", ssid } : { kind: "unjoined" };
+}
+```
+
+索引行新增 `wifiSsid` 状态，并在 `goHome` 里随锁屏 ∕ 蜂窝行一起重读（`readStoreValue` 非响应式，
+长驻组件不会自己看到后写的 `amos.wifi`）；详情行改读 `wifiLink(on && !qs.airplane, cfg.current)`；
+桌面图标订阅 `amos.wifi` 后读 `wifi.current`。未改 Rust ∕ proto ∕ store 结构 ∕ i18n 键。
+
+**测试保护。** 纯测 `src/__tests__/wifi.test.ts` 三条 `wifiLink` 用例；DOM 测
+`svelte-tests/settings.svelte.test.ts` 五条（索引行 3 + 详情页 2）与
+`svelte-tests/chrome-widgets.svelte.test.ts` 一条（断言图标 `title === zh["a11y.wifiWithSsid"].replace("{ssid}", …)`）。
+负控：把两处设置面一并还原得索引 1 红 + 详情 1 红，桌面图标还原得 1 红，另 3 条为防过修守卫
+（旧实现同样通过）。`cp` 快照 + `shasum -a 256` 逐字节还原。
+
+**仍未做（诚实边界）。** 与 §15 同：真机站点侧桥（`WifiManager`）未实现，`amos.wifi.current`
+仍是 AmOS 自有的意图位而不是设备回读；本节修的是**这一意图位在全部界面上的说法自洽**，
+不是把它接到真机。
+
+## 17. 密码表的「连接」必须只承诺它真能做的事（REQ-A1127，2026-09-23）
+
+§15 ∕ §16 修的是「连着哪个网」这一事实在各界面上的说法。本节修的是同一页上另一处**界面与事实的
+背离**，方向相反：不是「答错」，而是「把没能做渲染成做完了」。
+
+Wi-Fi 详情页的密码表（点一个需要密码、又没存过密码的网络时弹出）里，`submitPassword` 调
+
+```ts
+connectWithPassword(cfg, NEIGHBORHOOD, pwFor, pwVal)
+```
+
+`lib/wifi.ts` 的这条纯函数对 `pw.trim() === ""` **如实原样返回 `cfg`** —— 它从不伪造一次无凭据的
+加入（这是对的）。可调用方紧接着无条件地
+
+```ts
+pwFor = null;
+pwVal = "";
+```
+
+把面板收了起来。于是「按了连接」与「连上了」在屏幕上看起来一模一样：面板都消失、都没有提示，
+而 store 一字未动、网络并未被加入。`pwVal` 的初值就是空串，输入框上的 `Enter` 也走同一个
+`submitPassword` —— 两条入口都通向这条静默路径。既有测试只在**填了密码之后**点「连接」
+（`target: { value: "secret5g" }`），从不点空表，所以这一路全绿。
+
+修法是把**可点范围收到它真正能做的事**：
+
+- `submitPassword` 先取 `const pw = pwVal.trim()`，`pw === ""`（或 `pwFor` 为空）直接 `return`，
+  不再关面板 —— 空表按下去，面板留着，因为确实什么也没发生；
+- 「连接」按钮加 `disabled={pwVal.trim() === ""}`（配 `disabled:opacity-40`）—— 禁用本身就是那句话。
+
+两者缺一不可：`disabled` 只挡住鼠标点击，`Enter` 是一次 keydown，绕过 `disabled` 直接调
+`submitPassword`。负控因此分两次跑 —— 整段还原得 **1 红**；**仅**还原 `submitPassword` 的守卫、
+保留 `disabled`，仍是 **1 红**，且红在 `Enter` 那条断言上。这正好证明两半各自独立地担着一半。
+
+未改 Rust ∕ proto ∕ store 结构 ∕ i18n 键 ∕ `lib/wifi.ts`（纯函数本就如实返回）。

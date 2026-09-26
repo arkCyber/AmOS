@@ -7,6 +7,7 @@
   import {
     DEMO_LYRICS,
     MUSIC_KEY,
+    REPEAT_LABEL_KEY,
     lyricIndex,
     nextIndex,
     nextIndexAfterRemoval,
@@ -165,7 +166,7 @@
     <div class="mt-5 flex items-center justify-center gap-7">
       <button onclick={() => step(-1)} aria-label={t("player.prev")} data-icon="skipBack"
         class="grid h-14 w-14 place-items-center rounded-full bg-neutral-300 text-xl text-neutral-700 transition active:scale-90 dark:bg-white/10 dark:text-white">{@html iconSvg("skipBack", "h-7 w-7")}</button>
-      <button onclick={() => (playing = !playing)} aria-label={playing ? "pause" : "play"}
+      <button onclick={() => (playing = !playing)} aria-label={playing ? t("player.pause") : t("player.play")}
         class="grid h-[72px] w-[72px] place-items-center rounded-full bg-accent text-3xl text-white shadow-[0_8px_20px_rgba(0,122,255,0.35)] transition active:scale-95">
         {@html iconSvg(playing ? "pause" : "play", "h-9 w-9")}
       </button>
@@ -174,11 +175,11 @@
     </div>
 
     <div class="mt-4 flex items-center justify-center gap-12 text-sm">
-      <button onclick={cycleRepeat} title={t("music.repeat")} aria-label={t("music.repeat")} data-icon="repeat"
+      <button onclick={cycleRepeat} title={t("music.repeat")} aria-label={t(REPEAT_LABEL_KEY[repeat])} data-icon="repeat"
         class={"grid h-11 w-11 place-items-center rounded-full text-base transition active:scale-90 " + (repeat === "off" ? "opacity-35" : repeat === "one" ? "text-accent opacity-90" : "opacity-80")}>
         {@html iconSvg("repeat", "h-6 w-6")}
       </button>
-      <button onclick={cycleLyrics} title={t("music.lyrics")} aria-label={t("music.lyrics")} data-icon="lyrics"
+      <button onclick={cycleLyrics} title={t("music.lyrics")} aria-label={t("music.lyrics")} aria-expanded={showLyrics} data-icon="lyrics"
         class="grid h-11 w-11 place-items-center rounded-full text-base transition active:scale-90 {showLyrics ? 'text-accent opacity-90' : 'opacity-35'}">{@html iconSvg("messageCircle", "h-6 w-6")}</button>
     </div>
 

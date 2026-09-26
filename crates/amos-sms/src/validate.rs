@@ -90,16 +90,44 @@ pub fn validate_text(text: &str) -> Result<(), SmsError> {
     Ok(())
 }
 
+/// Whether `c` is a GSM 03.38 **extension**-table character. These travel as
+/// `ESC` + the character, so each occupies **two** septets, not one.
+fn is_gsm7_extension(c: char) -> bool {
+    matches!(
+        c,
+        '\u{0c}' | '^' | '{' | '}' | '\\' | '[' | ']' | '~' | '|' | '€'
+    )
+}
+
+/// Septet count of a GSM-7 message: one per basic char, **two** per extension
+/// char (`is_gsm7_extension`). The escape is real payload — charging it is what
+/// keeps [`segment_count`] honest for `^`/`{`/`~`/… instead of undercounting.
+fn gsm7_units(text: &str) -> usize {
+    text.chars()
+        .map(|c| if is_gsm7_extension(c) { 2 } else { 1 })
+        .sum()
+}
+
 /// `true` when every character is in the GSM 03.38 7-bit alphabet (basic or
 /// extension table), i.e. the message can travel as GSM-7 instead of UCS-2.
+///
+/// This is a **fixed table**, not "is ASCII". `[ \ ] ^` and `{ | } ~` are ASCII
+/// graphics too, but they travel as *extension* chars (see
+/// [`is_gsm7_extension`]), so `is_ascii_graphic` is right for them. The
+/// **backtick** (U+0060) is the one ASCII graphic in **neither** table — the
+/// basic set has `¿` at that position — so it is excluded by name; claiming it as
+/// GSM-7 let [`segment_count`] undercount a body the platform would send as
+/// UCS-2. `€` is the mirror case: an extension char that must **not** be pushed
+/// to UCS-2 (REQ-A1781).
 pub fn is_gsm7(text: &str) -> bool {
     text.chars().all(|c| {
-        c.is_ascii_graphic()
+        (c.is_ascii_graphic() && c != '`')
             || c == ' '
             || matches!(
                 c,
                 '@' | '$'
                     | '_'
+                    | '€'
                     | '¡'
                     | '£'
                     | '¥'
@@ -149,9 +177,10 @@ pub fn is_gsm7(text: &str) -> bool {
 }
 
 /// Number of SMS segments `text` will occupy (1 for empty text, so a "0/1"
-/// counter style stays honest). GSM-7 ⇒ 160 single / 153 concatenated;
-/// otherwise UCS-2 ⇒ 70 single / 67 concatenated. Pure arithmetic — the Kotlin
-/// glue performs the actual split.
+/// counter style stays honest). GSM-7 ⇒ 160 single / 153 concatenated septets
+/// (extension chars count double — see [`gsm7_units`]); otherwise UCS-2 ⇒ 70
+/// single / 67 concatenated code units. Pure arithmetic — the Kotlin glue
+/// performs the actual split. (REQ-A585)
 pub fn segment_count(text: &str) -> usize {
     let gsm = is_gsm7(text);
     let (single, multi) = if gsm {
@@ -160,7 +189,7 @@ pub fn segment_count(text: &str) -> usize {
         (UCS2_SINGLE, UCS2_MULTI)
     };
     let units = if gsm {
-        text.chars().count()
+        gsm7_units(text)
     } else {
         text.encode_utf16().count() // an emoji outside the BMP costs 2
     };
@@ -234,5 +263,53 @@ mod tests {
         assert!(is_gsm7("price: £5"));
         assert!(!is_gsm7("中文"));
         assert!(!is_gsm7("😀"));
+    }
+
+    /// The GSM-7 alphabet is a **fixed table**, not "ASCII". Every ASCII graphic
+    /// char is GSM-7 *except* the backtick (U+0060), which is in neither the basic
+    /// nor the extension table — a body containing one must travel as UCS-2. And
+    /// `€` **is** GSM-7 (extension table: ESC + char), so it must not be pushed to
+    /// UCS-2. [`segment_count`] mirrors what the platform's `divideMessage` will
+    /// actually send, so a misclassified body makes the counter on the receipt
+    /// disagree with the radio (REQ-A1781).
+    #[test]
+    fn gsm7_is_the_gsm_table_not_ascii_the_backtick_and_the_euro() {
+        // Over-claim: the backtick is not representable in GSM-7 at all.
+        assert!(!is_gsm7("`"), "a backtick is in neither GSM-7 table");
+        assert!(!is_gsm7("code `x`"), "one backtick makes the body UCS-2");
+        assert!(
+            is_gsm7("code x"),
+            "positive control: the same body without it"
+        );
+
+        // The undercount that followed: 80 backticks are UCS-2, not one 160-septet
+        // segment — the platform sends 2 parts, so the counter must say 2.
+        assert_eq!(segment_count(&"`".repeat(UCS2_SINGLE)), 1);
+        assert_eq!(segment_count(&"`".repeat(UCS2_SINGLE + 1)), 2);
+
+        // Under-claim: `€` is a GSM-7 extension char (ESC + char ⇒ 2 septets), so
+        // 80 of them fill exactly one segment instead of being sent as UCS-2.
+        assert!(
+            is_gsm7("€5"),
+            "the euro sign is in the GSM-7 extension table"
+        );
+        assert_eq!(segment_count(&"€".repeat(GSM7_SINGLE / 2)), 1);
+        assert_eq!(segment_count(&"€".repeat(GSM7_SINGLE / 2 + 1)), 2);
+    }
+
+    #[test]
+    fn gsm7_extension_chars_cost_two_septets() {
+        // `^ { } [ ] ~ | \` and form-feed are GSM-7 *extension* characters:
+        // they travel as ESC + char, i.e. two septets each. A single segment
+        // holds 160 septets, so 80 extension chars fit exactly and 81 do not.
+        assert_eq!(segment_count(&"^".repeat(GSM7_SINGLE / 2)), 1);
+        assert_eq!(segment_count(&"^".repeat(GSM7_SINGLE / 2 + 1)), 2);
+        // Every ASCII extension char is charged the same way, and form-feed too.
+        for c in ['^', '{', '}', '[', ']', '~', '|', '\\', '\u{0c}'] {
+            let text = c.to_string().repeat(GSM7_SINGLE / 2 + 1);
+            assert_eq!(segment_count(&text), 2, "extension char {c:?} undercounted");
+        }
+        // A plain ASCII message of the same length is still one segment.
+        assert_eq!(segment_count(&"a".repeat(GSM7_SINGLE / 2 + 1)), 1);
     }
 }

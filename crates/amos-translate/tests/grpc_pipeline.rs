@@ -26,15 +26,18 @@ async fn drain(rx: &mut mpsc::Receiver<InterpretationOutput>) -> Vec<Interpretat
     v
 }
 
-/// Start a deterministic daemon (mock provider + mock ASR) on a UDS.
-async fn spawn_daemon(path: &PathBuf) -> tokio::task::JoinHandle<()> {
+/// Start a deterministic daemon (mock provider + the given ASR) on a UDS.
+async fn spawn_daemon_with(
+    path: &PathBuf,
+    recognizer: Arc<dyn amos_translate::asr::SpeechRecognizer>,
+) -> tokio::task::JoinHandle<()> {
     let listener = tokio::net::UnixListener::bind(path).unwrap();
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
     let svc = TranslatorService::new(
         Arc::new(MockProvider::default()),
         TranslateConfig::default(),
     )
-    .with_recognizer(Arc::new(MockRecognizer::default()));
+    .with_recognizer(recognizer);
     tokio::spawn(async move {
         tonic::transport::Server::builder()
             .add_service(TranslatorServer::new(svc))
@@ -42,6 +45,27 @@ async fn spawn_daemon(path: &PathBuf) -> tokio::task::JoinHandle<()> {
             .await
             .unwrap();
     })
+}
+
+/// Start a deterministic daemon (mock provider + mock ASR) on a UDS.
+async fn spawn_daemon(path: &PathBuf) -> tokio::task::JoinHandle<()> {
+    spawn_daemon_with(path, Arc::new(MockRecognizer::default())).await
+}
+
+/// A recognizer that never finds words — what real Whisper returns for silence:
+/// an **empty** string. Used to pin the one-reply-per-audio-frame contract.
+struct SilentRecognizer;
+
+#[async_trait::async_trait]
+impl amos_translate::asr::SpeechRecognizer for SilentRecognizer {
+    async fn transcribe(
+        &self,
+        _audio: &[u8],
+        _language: &str,
+        _format: &str,
+    ) -> anyhow::Result<String> {
+        Ok(String::new())
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -250,6 +274,50 @@ async fn tts_request_emitted_over_daemon_when_enabled() {
             .any(|o| matches!(o, InterpretationOutput::TtsRequest(_))),
         "TTS must be requested for the translation when enabled: {out:?}"
     );
+
+    daemon.abort();
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Silence is routine in continuous interpretation, and a real ASR returns an
+/// empty string for it. Every audio frame must be answered with exactly one
+/// message (REQ-A592): before the fix the daemon sent **nothing** for an empty
+/// transcription, so the client waited out its 30-second response timeout,
+/// invalidated the stream and surfaced a spurious error — tearing down the audio
+/// path on the first quiet moment. The empty reply is surfaced as an ordinary
+/// `Final`, which the session absorbs (`translate_source` guards empty text), so
+/// silence stays a no-op rather than becoming an empty segment.
+#[tokio::test(flavor = "multi_thread")]
+async fn silence_is_answered_and_yields_no_segment() {
+    let path: PathBuf =
+        std::env::temp_dir().join(format!("amos-int-grpc-silence-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let daemon = spawn_daemon_with(&path, Arc::new(SilentRecognizer)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let pipeline = Box::new(GrpcPipeline::new(&path, "auto", "zh"));
+    let config = SessionConfig::one_way("auto", "zh");
+    let (mut session, mut rx) = Session::new(config, pipeline);
+
+    session.start().unwrap();
+    // A tight timeout is the assertion: a missing reply would hang until the
+    // client's own 30 s response timeout, which this test must never reach.
+    let fed = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        session.feed_audio(&vec![0.0; 160]),
+    )
+    .await
+    .expect("an empty transcription must be answered promptly, not hang the audio path");
+    fed.expect("silence is not an error");
+    session.stop().unwrap();
+
+    let out = drain(&mut rx).await;
+    assert!(
+        !out.iter()
+            .any(|o| matches!(o, InterpretationOutput::SegmentFinal(_))),
+        "silence must produce no segment: {out:?}"
+    );
+    assert_eq!(session.state(), SessionState::Ended);
 
     daemon.abort();
     let _ = std::fs::remove_file(&path);

@@ -27,10 +27,19 @@ pub struct TtsAudioPayload {
 /// Maximum bytes in a TTS text input handed in via `tts_synthesize`.
 ///
 /// Real TTS inputs are one utterance / one translated sentence (≤ 2 KiB). A
-/// 32 KiB cap mirrors `MAX_AI_PROMPT_BYTES` and `MAX_INTERPRET_TEXT_BYTES`
-/// and keeps a single TTS call bounded by a sensible upper bound (Piper / onnx
-/// memory is per-phoneme; a paste-sized text input would tip past seconds of
-/// audio and balloon the response payload sent to the WebView).
+/// 32 KiB cap mirrors `MAX_INTERPRET_TEXT_BYTES` (and `MAX_TRANSLATE_TEXT_BYTES`,
+/// the same one-utterance bound) and keeps a single TTS call bounded by a
+/// sensible upper bound (Piper / onnx memory is per-phoneme; a paste-sized text
+/// input would tip past seconds of audio and balloon the response payload sent
+/// to the WebView).
+///
+/// It is deliberately **8× below** `MAX_AI_PROMPT_BYTES` (256 KiB): a prompt /
+/// context is a different beast from one utterance, so this cap does **not**
+/// track the prompt cap. The earlier wording named the 256 KiB prompt cap as a
+/// "mirror", which was simply false — nothing bound it, so the sentence could
+/// only ever mislead a reader into 8×-ing the TTS bound. The true relations are
+/// now enforced by `the_text_caps_that_claim_to_mirror_each_other_agree`
+/// (REQ-A738 / F-SH-195).
 pub const MAX_TTS_TEXT_BYTES: usize = 32 << 10;
 
 /// App-managed TTS backend.
@@ -62,17 +71,18 @@ impl TtsBridge {
         Arc::new(MockTtsProvider::default())
     }
 
-    /// Load a local Piper voice from `AMOS_PIPER_MODEL_DIR` (expected to contain
-    /// `en_US-lessac-low.onnx` + its `.onnx.json`). Returns `None` when the
-    /// models are missing or fail to load, so the caller keeps the mock.
+    /// Load a local Piper voice from `AMOS_PIPER_MODEL_DIR`. The directory holds
+    /// a provisioned voice — a `<stem>.onnx` + `<stem>.onnx.json` pair whose stem
+    /// [`amos_tts::VOICE_STEMS`] accepts. That list is the same one
+    /// `scripts/fetch-models.sh` provisions (bound by
+    /// `amos_tts::voice::tests::the_provisioned_voice_is_one_we_accept`), so a
+    /// fetched voice is never silently ignored and the loader can't drift from
+    /// the provisioner (REQ-A750 / F-SH-207). Returns `None` when no complete
+    /// voice is present or loading fails, so the caller keeps the mock.
     #[cfg(feature = "piper-tts")]
     fn local_piper_provider() -> Option<Arc<dyn TtsProvider>> {
         let dir = PathBuf::from(std::env::var("AMOS_PIPER_MODEL_DIR").ok()?);
-        let onnx = dir.join("en_US-lessac-low.onnx");
-        let voice = dir.join("en_US-lessac-low.onnx.json");
-        if !onnx.exists() || !voice.exists() {
-            return None; // Piper models not downloaded; keep the mock
-        }
+        let (onnx, voice) = amos_tts::resolve_voice(&dir)?;
         match PiperProvider::new(onnx, voice) {
             Ok(p) => {
                 tracing::info!("tts: using local Piper voice from {}", dir.display());
@@ -172,8 +182,9 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires AMOS_PIPER_MODEL_DIR with a downloaded Piper voice"]
     async fn piper_voice_loads_when_configured() {
-        let _ = std::env::var("AMOS_PIPER_MODEL_DIR")
-            .expect("export AMOS_PIPER_MODEL_DIR=.../models/piper-low for this test");
+        let _ = std::env::var("AMOS_PIPER_MODEL_DIR").expect(
+            "export AMOS_PIPER_MODEL_DIR=.../models/piper-en_US-lessac-medium for this test",
+        );
         let bridge = TtsBridge::new();
         assert_eq!(
             bridge.provider.name(),
@@ -187,5 +198,49 @@ mod tests {
             .await
             .expect("piper synthesize");
         assert!(!audio.samples.is_empty(), "Piper produced non-empty audio");
+    }
+
+    /// The 32 KiB text caps across the bridge **declare** that they mirror one
+    /// another, but only in prose: `tts.rs` "mirrors `MAX_INTERPRET_TEXT_BYTES`",
+    /// `translate.rs` "matches `MAX_INTERPRET_TEXT_BYTES`", and `wm.rs` promises to
+    /// keep the merged AI prompt "well under `MAX_AI_PROMPT_BYTES`". Nothing bound
+    /// any of them, so a rename/relaxation on one side would drift silently (all
+    /// values are individually legal — no panic, just a bigger/smaller bound than
+    /// the comment claims). `tts.rs` even named the 256 KiB *prompt* cap as a
+    /// "mirror" — already false by 8×. This table binds the claimed relations
+    /// (REQ-A738 / F-SH-195).
+    #[test]
+    fn the_text_caps_that_claim_to_mirror_each_other_agree() {
+        use crate::ai_bridge::MAX_AI_PROMPT_BYTES;
+        use crate::interpret::MAX_INTERPRET_TEXT_BYTES;
+        use crate::translate::MAX_TRANSLATE_TEXT_BYTES;
+        use crate::wm::MAX_CONTEXT_TEXT_BYTES;
+
+        // Self-pin: the cap the doc advertises is actually 32 KiB.
+        assert_eq!(MAX_TTS_TEXT_BYTES, 32 << 10);
+
+        // "mirrors `MAX_INTERPRET_TEXT_BYTES`" (tts.rs) and "matches
+        // `MAX_INTERPRET_TEXT_BYTES`" (translate.rs): both are the *same* bound.
+        assert_eq!(MAX_TTS_TEXT_BYTES, MAX_INTERPRET_TEXT_BYTES);
+        assert_eq!(MAX_TRANSLATE_TEXT_BYTES, MAX_INTERPRET_TEXT_BYTES);
+
+        // The corrected tts doc claims the cap is deliberately 8× below the AI
+        // prompt cap (one utterance, not a prompt) — enforce the exact ratio, so
+        // the sentence stays true if either side moves.
+        assert_eq!(
+            MAX_TTS_TEXT_BYTES * 8,
+            MAX_AI_PROMPT_BYTES,
+            "the TTS cap is documented as 8x below the AI prompt cap"
+        );
+
+        // `wm.rs` claims only an inequality — the merged system-selection context
+        // stays "well under" the prompt cap, not equal to it. A const block so the
+        // relation is checked at compile time (clippy: assertions_on_constants).
+        const {
+            assert!(
+                MAX_CONTEXT_TEXT_BYTES < MAX_AI_PROMPT_BYTES,
+                "the system-context text cap must stay under the AI prompt cap"
+            );
+        }
     }
 }

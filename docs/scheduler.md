@@ -47,6 +47,7 @@ deferred_runnable():
 - `due(now, power)`：AlarmExact 先返回（用户可见优先），随后把**窗口覆盖 now 且被门控放行**的 Deferred **一次性批量**返回——所有可延后活在一个维护窗里一起跑 = 合并对齐、少唤醒。
 - `next_wake(now)`：返回下一个 `earliest > now` 的 **AlarmExact**（仅精确闹钟给保证唤醒；Deferred 不保证），caller 可据此 `setExactAndAllowWhileIdle` / 睡到该 tick。
 - `register/cancel/complete/counts`。
+- `ExactAlarmClock`（`exact` 模块）：上面的 `Scheduler` 用**调用方的单调 tick**推理，而「到点响铃不依赖 WebView 是否在计时」需要一面**绝对墙钟**的账本 —— 故 `exact` 用 epoch 毫秒建模「某 alarm-id 在绝对时刻响一次」。**存储按 id 排序、不是按时间**：`due` 的「按点火时间有序（同刻按 id）」由方法内一次**显式 `sort()`** 提供 —— 该 sort 是**承载语义的**，删掉它 `due` 会静默退化成 id 序；`next_at` 是对 id 映射的**线性扫描**（O(n)），没有可依赖的时间索引。绑到 Android `AlarmManager` / 宿主线程见 `docs/native-alarm-bridge.md`。
 
 ## 5. Crate 结构
 
@@ -54,9 +55,10 @@ deferred_runnable():
 |---|---|
 | `spec` | `JobId`、`JobType`（AlarmExact/Deferred + key）、`PowerState` + `deferred_runnable()` |
 | `scheduler` | `ScheduledJob`（`alarm/deferred/new` 校验窗口）+ `Scheduler`（register/due/next_wake/cancel/complete/counts） |
+| `exact` | `ExactAlarmClock`：**墙钟**面的一次性精确闹钟账本（绝对 epoch 毫秒），`register/due/next_at/cancel` |
 | `error` | `SchedulerError::InvalidWindow` |
 
-纯 `std`，无依赖。`cargo test -p amos-scheduler`（7 lib + 1 集成）。
+纯 `std`，无依赖。`cargo test -p amos-scheduler`（13 lib + 2 集成）。
 
 ## 6. 验证
 

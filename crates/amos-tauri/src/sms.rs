@@ -7,7 +7,8 @@
 //!   device. Tauri runs *synchronous* commands on the main thread, so every
 //!   command here is `async` and the provider call is moved to the blocking pool
 //!   (`tauri::async_runtime::spawn_blocking`) with a hard [`SMS_TIMEOUT`] — a
-//!   wedged platform call surfaces as an honest error instead of a frozen UI.
+//!   wedged platform call surfaces as an honest timeout instead of a frozen UI
+//!   (an error for a read; `unconfirmed` for a send, which may still go out).
 //! * **Honest state.** `sms_status` reports which backend is in effect so the UI
 //!   can tell the device inbox apart from the host mock (which is *not* an empty
 //!   inbox); permission denial is an error, never an empty list.
@@ -24,7 +25,7 @@ use std::time::Duration;
 
 use amos_sms::{
     normalize_address, segment_count, validate_text, MockSms, PreviewOverride, SmsFolder,
-    SmsMessage, SmsProvider, SmsThread, SmsTrash, TrashEntry, DEFAULT_TRASH_CAP,
+    SmsMessage, SmsProvider, SmsSendOutcome, SmsThread, SmsTrash, TrashEntry, DEFAULT_TRASH_CAP,
 };
 use serde::Serialize;
 use tauri::State;
@@ -35,23 +36,28 @@ use crate::error::{AmosError, ErrorCode};
 /// renaming a variant is a wire break. Kept alongside the constants so the
 /// code names match the typed envelopes below without grepping.
 pub mod codes {
+    use crate::error::ErrorCode;
     /// Caller passed a blank `thread_id` / `message_id` / `address` to an SMS command.
-    pub const BLANK_ID: &str = "amos.sms.blank_id";
+    pub const BLANK_ID: &str = ErrorCode::SmsBlankId.as_str();
     /// Caller passed a thread / message / address id that is over [`super::MAX_SMS_ID_BYTES`].
-    pub const ID_TOO_LONG: &str = "amos.sms.id_too_long";
+    pub const ID_TOO_LONG: &str = ErrorCode::SmsIdTooLong.as_str();
     /// Caller passed an unknown folder name (`inbox` | `sent` | `draft` only).
-    pub const UNKNOWN_FOLDER: &str = "amos.sms.unknown_folder";
+    pub const UNKNOWN_FOLDER: &str = ErrorCode::SmsUnknownFolder.as_str();
     /// Caller asked for messages from a sender the blocklist has blocked for SMS.
-    pub const BLOCKED_SENDER: &str = "amos.sms.blocked_sender";
+    pub const BLOCKED_SENDER: &str = ErrorCode::SmsBlockedSender.as_str();
     /// The `sms_send` text body exceeds [`super::MAX_SMS_TEXT_BYTES`].
-    pub const TEXT_TOO_LONG: &str = "amos.sms.text_too_long";
+    pub const TEXT_TOO_LONG: &str = ErrorCode::SmsTextTooLong.as_str();
     /// SMS provider rejected the read / send (SmsError kind); the user-visible
     /// reason lives in `message` and the SmsError kind in `cause[0]`.
-    pub const PROVIDER_REJECTED: &str = "amos.sms.provider_rejected";
+    pub const PROVIDER_REJECTED: &str = ErrorCode::SmsProviderRejected.as_str();
+    /// A read carrying the user's messages came from a window the user is not looking at.
+    pub const FOREGROUND_REQUIRED: &str = ErrorCode::SmsForegroundRequired.as_str();
 }
 
 /// Hard cap on one provider call. The blocking task itself cannot be cancelled,
-/// but the caller is released with an honest timeout error instead of hanging.
+/// but the caller is released with an honest timeout instead of hanging — a
+/// [`amos_sms::SmsError::TimedOut`], which a *read* surfaces as an error and a
+/// *send* answers as `unconfirmed` (the message may still go out; REQ-A1759).
 const SMS_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Maximum bytes in an SMS `thread_id` / `message_id` / `address` string the
@@ -70,7 +76,15 @@ pub const MAX_SMS_ID_BYTES: usize = 256;
 /// ceiling so a JSON failure (e.g. an over-cap text deserialised as empty
 /// after a JS bug) cannot bypass the engine's check by a path where the
 /// underlying library is rebuilt without the validation crate.
-pub const MAX_SMS_TEXT_BYTES: usize = 4 << 10;
+///
+/// A backstop must never be **tighter** than the gate it backs up, so the ceiling
+/// is the byte-image of the engine's char limit: a legal body occupies at most four
+/// UTF-8 bytes per char. The former `4 << 10` (4096) was *below* that image for
+/// every non-ASCII body — 1600 Chinese characters are 4800 bytes, i.e. an SMS the
+/// engine accepts was refused at the bridge (audit P1-S1). Raising the ceiling
+/// cannot weaken validation: [`checked_send`] runs `validate_text` on every call,
+/// immediately after this guard.
+pub const MAX_SMS_TEXT_BYTES: usize = amos_sms::validate::MAX_TEXT_CHARS * 4;
 
 /// Bridge state managed by Tauri.
 pub struct SmsBridge {
@@ -212,10 +226,35 @@ where
         Ok(Err(join_err)) => Err(SmsError::Failed(format!(
             "SMS worker did not complete: {join_err}"
         ))),
-        Err(_) => Err(SmsError::Failed(format!(
-            "SMS provider timed out after {}s",
+        // A caller-side timeout is an *absent* verdict, not a failure of the
+        // operation: the blocking task keeps running (it cannot be cancelled), so
+        // for a send the radio may still take the message. Kept a distinct variant
+        // so `sms_send` can answer honestly instead of claiming a refusal
+        // (REQ-A1759/F-TEL-045).
+        Err(_) => Err(SmsError::TimedOut(format!(
+            "no verdict within {}s",
             timeout.as_secs()
         ))),
+    }
+}
+
+/// Fold a failed provider call into the *send* command's answer.
+///
+/// [`SmsError::TimedOut`] is a caller-side timeout — the provider never named a
+/// verdict — so the honest answer is the glue's own `unconfirmed` ("no verdict
+/// within our window; keep the text, it may still go out"), **not** an error the
+/// UI renders as 「发送失败」. The whole send path is built so "a missing verdict
+/// is a question, a refusal is a fact" (REQ-A1620/F-TEL-040); a timeout is the one
+/// place the fold could still happen. Every other failure *is* a named refusal and
+/// stays a typed error (REQ-A1759/F-TEL-045).
+fn send_outcome_from_failure(e: amos_sms::SmsError) -> Result<SmsSendOutcome, AmosError> {
+    match e {
+        amos_sms::SmsError::TimedOut(why) => Ok(SmsSendOutcome::Unconfirmed(why)),
+        other => Err(AmosError::with_cause(
+            ErrorCode::SmsProviderRejected,
+            codes::PROVIDER_REJECTED,
+            other,
+        )),
     }
 }
 
@@ -598,17 +637,29 @@ fn trash_message(
             .max()
             == Some(m.ts_ms)
     };
-    let newly = trash
+    let added = trash
         .write()
         .add(thread_id, &m.id, m.ts_ms, trashed_ms)
         .map_err(|e| TrashReject::Refused(e.to_string()))?;
-    if newly {
+    if added.newly {
         tracing::info!(
             target: "amos::sms",
             thread = %thread_id,
             msg_id = %m.id,
             trashed_count = trash.read().len(),
             "message moved to the trash (hidden from AmOS; platform store untouched)"
+        );
+    }
+    // The churn the module promises to log, never silent: at the cap a new trash
+    // pushes the oldest entry out, which makes that message visible again. The
+    // count above cannot show this (it is pinned at the cap), so the evicted
+    // entry `add` now returns is what makes the churn observable.
+    if let Some(ev) = added.evicted {
+        tracing::warn!(
+            target: "amos::sms",
+            evicted_thread = %ev.thread_id,
+            evicted_msg_id = %ev.message_id,
+            "trash cap reached — the oldest trashed message was evicted and is visible again"
         );
     }
     // Preview bookkeeping (only matters when the trashed row was the latest).
@@ -782,8 +833,13 @@ pub fn sms_trash_list() -> Vec<TrashOut> {
 }
 
 /// Undo a trash: the message shows in AmOS again. `true` when it was trashed.
+///
+/// `async` + [`blocking`] even though the mutation itself is in-memory: `restore`
+/// **persists** (a temp-file write + rename), and a *sync* command runs on the
+/// main thread — a slow or full disk would freeze the UI mid-frame. The worker
+/// error is mapped like the other trash commands' (docs/sms.md §13).
 #[tauri::command]
-pub fn sms_trash_restore(thread_id: String, message_id: String) -> bool {
+pub async fn sms_trash_restore(thread_id: String, message_id: String) -> Result<bool, AmosError> {
     // The bridge ID check is a **boundary** guard (empty / over-cap) — its
     // `Err` is not propagated because the underlying `restore` keys by raw
     // string, so an out-of-range id is a **no-op match** there and a quiet
@@ -806,26 +862,65 @@ pub fn sms_trash_restore(thread_id: String, message_id: String) -> bool {
             "sms_trash_restore called with an invalid message_id"
         );
     }
-    let ok = trash_shared().restore(&thread_id, &message_id);
-    if ok {
-        tracing::info!(
-            target: "amos::sms",
-            thread = %thread_id,
-            msg_id = %message_id,
-            "message restored from the trash"
-        );
-    }
-    ok
+    blocking(move || {
+        let ok = trash_shared().restore(&thread_id, &message_id);
+        if ok {
+            tracing::info!(
+                target: "amos::sms",
+                thread = %thread_id,
+                msg_id = %message_id,
+                "message restored from the trash"
+            );
+        }
+        Ok(ok)
+    })
+    .await
+    .map_err(|e| AmosError::with_cause(ErrorCode::SmsProviderRejected, codes::PROVIDER_REJECTED, e))
 }
 
 /// Empty the trash; returns how many entries were purged.
 #[tauri::command]
-pub fn sms_trash_purge() -> usize {
-    let n = trash_shared().purge();
-    if n > 0 {
-        tracing::info!(target: "amos::sms", purged = n, "sms trash purged");
-    }
-    n
+pub async fn sms_trash_purge() -> Result<usize, AmosError> {
+    blocking(move || {
+        let n = trash_shared().purge();
+        if n > 0 {
+            tracing::info!(target: "amos::sms", purged = n, "sms trash purged");
+        }
+        Ok(n)
+    })
+    .await
+    .map_err(|e| AmosError::with_cause(ErrorCode::SmsProviderRejected, codes::PROVIDER_REJECTED, e))
+}
+
+/// The foreground rule for every SMS read that hands back the user's messages — **the only
+/// entry point a read command may use** (F-SH-654).
+///
+/// The user's messages are a disclosure, so they follow the same rule `clipboard_read`, the
+/// in-call recording toggle and `device_mic_start` follow: only the window the user is
+/// actually looking at may read them. Without this, any window's WebView could reach
+/// `sms_snapshot` / `sms_messages` / `sms_counts` with an `invoke` and drain the inbox — the
+/// frontend's capability ledger is a `$state` in the very JS context that would be doing the
+/// reaching, so it can never be the guard. The caller's label is injected by Tauri (not an
+/// argument), so a caller cannot claim to be another window.
+///
+/// Named and compiled on **every** target (not behind `#[cfg(feature = "android")]`) for the
+/// same reason [`crate::clipboard::require_foreground`] is: a host test can pin both
+/// directions, and the device is what is pending, not the rule.
+pub fn require_sms_foreground(wm: &crate::wm::WmState, caller: &str) -> Result<(), AmosError> {
+    crate::clipboard::require_foreground(wm, caller).map_err(|e| {
+        // Same shape as the mic gate (`assistant_voice::require_mic_foreground`): the rule is
+        // `clipboard::require_foreground`'s alone, and its words (the caller's label and the
+        // focused one) ride along as the cause so an operator can read which window did have
+        // the read.
+        AmosError::with_cause(
+            ErrorCode::SmsForegroundRequired,
+            format!(
+                "sms read refused: {e} (only the window the user is looking at may read \
+                 messages; F-SH-654)"
+            ),
+            e,
+        )
+    })
 }
 
 /// Read one folder's threads (newest first), with **blocked senders removed**.
@@ -835,8 +930,13 @@ pub fn sms_trash_purge() -> usize {
 #[tauri::command]
 pub async fn sms_snapshot(
     state: State<'_, SmsBridge>,
+    wm: State<'_, crate::wm::WmState>,
+    window: tauri::WebviewWindow,
     folder: String,
 ) -> Result<Vec<SmsThreadOut>, AmosError> {
+    // Before the provider is even asked: reading the inbox is a disclosure, so only the
+    // window the user is looking at may do it (F-SH-654).
+    require_sms_foreground(wm.inner(), window.label())?;
     let folder = amos_sms::SmsFolder::from_wire(&folder).map_err(|e| {
         AmosError::with_cause(ErrorCode::SmsUnknownFolder, codes::UNKNOWN_FOLDER, e)
     })?;
@@ -887,7 +987,14 @@ pub async fn sms_snapshot(
 /// high). When nothing can be hidden the provider's cheap `counts()` is
 /// authoritative and no extra read happens.
 #[tauri::command]
-pub async fn sms_counts(state: State<'_, SmsBridge>) -> Result<SmsFolderCountsOut, AmosError> {
+pub async fn sms_counts(
+    state: State<'_, SmsBridge>,
+    wm: State<'_, crate::wm::WmState>,
+    window: tauri::WebviewWindow,
+) -> Result<SmsFolderCountsOut, AmosError> {
+    // The counts are the inbox's size and per-folder shape — a fact about the user's
+    // messages, so the same foreground rule as the list itself (F-SH-654).
+    require_sms_foreground(wm.inner(), window.label())?;
     let provider = active_arc(&state);
     let rules = crate::blocklist::shared();
     let trash = trash_shared();
@@ -932,19 +1039,62 @@ fn filtered_counts(
     Ok(out)
 }
 
+/// The address a thread read must be judged against: the party the provider lists for
+/// `thread_id`, falling back to the caller's `address` field **only** when no snapshot lists
+/// the thread. `None` when neither is available.
+///
+/// The doc on [`sms_messages`] promises a blocked sender's content is refused "even if a
+/// caller asks for the thread id directly" — which can only hold if the command finds the
+/// address itself; the caller's field is a convenience, not the authority (P1-B2 / REQ-A1836). A snapshot
+/// that errors is not a match: the caller's field, if given, is still judged.
+fn thread_read_address(
+    p: &dyn SmsProvider,
+    thread_id: &str,
+    provided: Option<&str>,
+) -> Option<String> {
+    SmsFolder::ALL
+        .iter()
+        .filter_map(|f| p.snapshot(*f).ok())
+        .flatten()
+        .find(|t| t.id == thread_id)
+        .map(|t| t.address)
+        .or_else(|| {
+            provided
+                .map(str::to_string)
+                .filter(|a| !a.trim().is_empty())
+        })
+}
+
+/// The blocklist verdict for a thread read, judged on [`thread_read_address`].
+fn blocked_thread_read(
+    p: &dyn SmsProvider,
+    rules: &crate::blocklist::BlocklistState,
+    thread_id: &str,
+    provided: Option<&str>,
+) -> Option<amos_blocklist::BlockReason> {
+    thread_read_address(p, thread_id, provided)
+        .and_then(|addr| rules.check(&addr, amos_blocklist::Channel::Sms))
+}
+
 /// Read one thread's messages (chronological). An empty/absent `folder` means
 /// "the whole conversation"; otherwise only that folder's rows.
 ///
-/// `address` is the thread's remote party: when it is blocked for SMS the read
-/// is refused with an honest error (a blocked sender's content must not appear
-/// even if a caller asks for the thread id directly).
+/// The read is judged on the address the **thread** belongs to (found from the provider's
+/// snapshot), so a blocked sender's content is refused with an honest error **even when the
+/// caller sends only the thread id** — the optional `address` is a fallback for a thread no
+/// snapshot lists, not the authority the decision rests on (P1-B2 / REQ-A1836).
 #[tauri::command]
 pub async fn sms_messages(
     state: State<'_, SmsBridge>,
+    wm: State<'_, crate::wm::WmState>,
+    window: tauri::WebviewWindow,
     thread_id: String,
     folder: Option<String>,
     address: Option<String>,
 ) -> Result<Vec<SmsMessageOut>, AmosError> {
+    // A thread's messages are the most specific disclosure of the three, so the gate comes
+    // first — before the id checks, which describe a malformed request, not a refused one.
+    require_sms_foreground(wm.inner(), window.label())?;
     if thread_id.trim().is_empty() {
         return Err(AmosError::new(
             ErrorCode::SmsBlankId,
@@ -954,12 +1104,20 @@ pub async fn sms_messages(
     check_sms_id(&thread_id)?;
     if let Some(addr) = address.as_deref().filter(|a| !a.trim().is_empty()) {
         check_sms_id(addr)?;
-        if let Some(reason) = crate::blocklist::shared().check(addr, amos_blocklist::Channel::Sms) {
-            return Err(AmosError::new(
-                ErrorCode::SmsBlockedSender,
-                format!("blocked by rule: {reason:?}"),
-            ));
-        }
+    }
+    let provider = active_arc(&state);
+    // Judge the party the **thread** belongs to, not the address the caller happened to send:
+    // a caller who sends only the thread id must not read a blocked sender's messages (P1-B2 / REQ-A1836).
+    if let Some(reason) = blocked_thread_read(
+        provider.as_ref(),
+        &crate::blocklist::shared(),
+        &thread_id,
+        address.as_deref(),
+    ) {
+        return Err(AmosError::new(
+            ErrorCode::SmsBlockedSender,
+            format!("blocked by rule: {reason:?}"),
+        ));
     }
     let folder = match folder.as_deref().map(str::trim) {
         None | Some("") => None,
@@ -967,7 +1125,6 @@ pub async fn sms_messages(
             AmosError::with_cause(ErrorCode::SmsUnknownFolder, codes::UNKNOWN_FOLDER, e)
         })?),
     };
-    let provider = active_arc(&state);
     let msgs = blocking(move || provider.messages(&thread_id, folder))
         .await
         .map_err(|e| {
@@ -1002,8 +1159,14 @@ pub async fn sms_messages(
 }
 
 /// Send a text (real `SmsManager` on device; the mock never claims delivery).
-/// Returns `"sent"` on success so the caller can tell success from the `null`
-/// that an unavailable/errored bridge yields.
+///
+/// Returns the platform's verdict as a wire string: `"sent"` only when the
+/// radio confirmed it took the message, `"unconfirmed"` when the platform gave
+/// no verdict within its window — including our own [`SMS_TIMEOUT`] expiring
+/// first (keep the text; it may still go out) — or an
+/// `Err` when the send was refused. A bridge that cannot name a verdict must
+/// never be read as success — on Android `SmsManager` returns without throwing
+/// even when the radio cannot send.
 #[tauri::command]
 pub async fn sms_send(
     state: State<'_, SmsBridge>,
@@ -1027,30 +1190,37 @@ pub async fn sms_send(
     let masked = mask_address(&addr);
     let provider = active_arc(&state);
     let send_addr = addr.clone();
-    match blocking(move || provider.send(&send_addr, &text)).await {
-        Ok(()) => {
-            tracing::info!(
-                target: "amos::sms",
-                to = %masked,
-                segments,
-                "SMS send accepted by the provider"
-            );
-            Ok("sent".to_string())
-        }
+    let outcome = match blocking(move || provider.send(&send_addr, &text)).await {
+        Ok(outcome) => outcome,
         Err(e) => {
             tracing::warn!(
                 target: "amos::sms",
                 to = %masked,
+                segments,
                 kind = e.kind(),
-                "SMS send failed"
+                "SMS send call returned no verdict from the provider"
             );
-            Err(AmosError::with_cause(
-                ErrorCode::SmsProviderRejected,
-                codes::PROVIDER_REJECTED,
-                e,
-            ))
+            // A caller-side timeout becomes an `unconfirmed` outcome (logged by the
+            // shared verdict line below); a genuine refusal stays a typed error.
+            match send_outcome_from_failure(e) {
+                Ok(outcome) => outcome,
+                Err(err) => return Err(err),
+            }
         }
-    }
+    };
+    let detail = match &outcome {
+        SmsSendOutcome::Sent => String::new(),
+        SmsSendOutcome::Unconfirmed(why) => why.clone(),
+    };
+    tracing::info!(
+        target: "amos::sms",
+        to = %masked,
+        segments,
+        verdict = outcome.wire(),
+        detail = %detail,
+        "SMS send verdict from the provider"
+    );
+    Ok(outcome.wire().to_string())
 }
 
 /// Mapping helpers kept pure so they are unit-testable without a Tauri runtime.
@@ -1080,6 +1250,20 @@ fn incoming_payload(address: &str) -> SmsIncomingOut {
     SmsIncomingOut {
         address: address.trim().to_string(),
     }
+}
+
+/// Must the device-signalled incoming SMS be suppressed (no AmOS notification,
+/// no inbox refresh)?
+///
+/// Judged on the address the device reported, **including an empty/withheld
+/// one**: `blocklist::check` answers `BlockReason::Unknown` for an unparseable
+/// address exactly when the unknown-number switch is on, so a hidden number with
+/// `block_unknown` is suppressed like any other unknown sender. Gating the
+/// verdict on a non-empty address would hide the thread from the list while the
+/// arrival still notified (P1-B1 / REQ-A1836).
+#[cfg(any(feature = "android", test))]
+fn incoming_is_suppressed(rules: &crate::blocklist::BlocklistState, address: &str) -> bool {
+    rules.blocks_sms(address)
 }
 
 /// On-device push: the Kotlin `SmsGlue` registers a `SMS_RECEIVED` receiver and
@@ -1129,7 +1313,7 @@ mod events {
         // A blocked sender must not raise an AmOS notification or refresh the
         // Messages screen. (The message row itself is owned by the platform's
         // default SMS app; we cannot delete it — see docs/sms.md.)
-        if !payload.address.is_empty() && crate::blocklist::shared().blocks_sms(&payload.address) {
+        if incoming_is_suppressed(&crate::blocklist::shared(), &payload.address) {
             tracing::info!(
                 target: "amos::sms",
                 from = %mask_address(&payload.address),
@@ -1352,6 +1536,40 @@ mod tests {
     }
 
     #[test]
+    fn a_blocked_sender_is_refused_even_when_the_caller_sends_only_the_thread_id() {
+        // P1-B2 / REQ-A1836: the read is judged on the party the **thread** belongs to. Thread "1" is
+        // 13800138000 (`MockSms::seeded`); before the fix the command consulted the blocklist
+        // only when the caller supplied `address`, so `None` served the blocked sender's
+        // messages — the doc's promise ("…even if a caller asks for the thread id directly")
+        // was enforced by no line.
+        let rules = crate::blocklist::BlocklistState::empty();
+        rules.add("13800138000", "exact", "sms", "", 1).unwrap();
+        let p = MockSms::seeded();
+
+        assert!(
+            blocked_thread_read(&p, &rules, "1", None).is_some(),
+            "a blocked sender's thread must be refused with only the thread id"
+        );
+        // The caller's field still judges a thread no snapshot lists.
+        assert!(blocked_thread_read(&p, &rules, "no-such-thread", Some("13800138000")).is_some());
+    }
+
+    #[test]
+    fn an_unblocked_thread_is_not_refused_and_an_empty_rule_set_refuses_nothing() {
+        // Positive controls: the verdict must not be an "always refuse" predicate.
+        let p = MockSms::seeded();
+
+        // No rules at all → the very thread the sibling test blocks is served.
+        let empty = crate::blocklist::BlocklistState::empty();
+        assert!(blocked_thread_read(&p, &empty, "1", None).is_none());
+
+        // With a rule for a *different* sender, thread "3" (10086) is still served.
+        let rules = crate::blocklist::BlocklistState::empty();
+        rules.add("13800138000", "exact", "sms", "", 1).unwrap();
+        assert!(blocked_thread_read(&p, &rules, "3", None).is_none());
+    }
+
+    #[test]
     fn a_call_only_rule_does_not_shrink_the_sms_badges() {
         // Only SMS rules feed the filter; a call rule must leave the counts as the
         // provider reported them (the UI keys the role prompt off call rules).
@@ -1403,10 +1621,10 @@ mod tests {
                 draft: 0,
             })
         }
-        fn send(&self, address: &str, text: &str) -> Result<(), SmsError> {
+        fn send(&self, address: &str, text: &str) -> Result<SmsSendOutcome, SmsError> {
             let _ = normalize_address(address)?;
             validate_text(text)?;
-            Ok(())
+            Ok(SmsSendOutcome::Sent)
         }
     }
 
@@ -1439,6 +1657,25 @@ mod tests {
                 .inbox,
             2
         );
+    }
+
+    #[test]
+    fn a_withheld_number_under_block_unknown_suppresses_the_arrival_too() {
+        // The thread list hides an unparseable sender when the switch is on
+        // (`filters_sms`); the arrival event must reach the same verdict, or a
+        // hidden number still raises a notification and refreshes the inbox.
+        let rules = crate::blocklist::BlocklistState::empty();
+        // No rule, switch off → an ordinary (even empty) address arrives.
+        assert!(!incoming_is_suppressed(&rules, "13800138000"));
+        assert!(!incoming_is_suppressed(&rules, ""));
+        rules.set_block_unknown(true);
+        // Withheld (empty) address now suppressed like any unparseable sender.
+        assert!(
+            incoming_is_suppressed(&rules, ""),
+            "a withheld number must be suppressed under block_unknown"
+        );
+        // …and an ordinary number still arrives (it is not "block everything").
+        assert!(!incoming_is_suppressed(&rules, "13800138000"));
     }
 
     #[test]
@@ -1487,8 +1724,10 @@ mod tests {
             fn counts(&self) -> Result<amos_sms::SmsFolderCounts, SmsError> {
                 Ok(amos_sms::SmsFolderCounts::default())
             }
-            fn send(&self, _a: &str, _t: &str) -> Result<(), SmsError> {
-                Ok(())
+            fn send(&self, _a: &str, _t: &str) -> Result<SmsSendOutcome, SmsError> {
+                Ok(SmsSendOutcome::Unconfirmed(
+                    "fake device has no radio".into(),
+                ))
             }
         }
         assert_eq!(
@@ -1516,6 +1755,218 @@ mod tests {
         assert_eq!(checked_send("10086", &"a".repeat(200)).unwrap().1, 2);
     }
 
+    /// The bridge's byte-guard backs up the engine's character limit, so it must
+    /// never be *tighter* than the gate it backs up — otherwise it becomes the
+    /// stricter gate and refuses a body [`validate_text`] accepts. The former
+    /// `4 << 10` (4096) had exactly that inversion for every non-ASCII body: 1600
+    /// Chinese characters are 4800 bytes, so the engine's legal maximum was
+    /// unreachable from the bridge (audit P1-S1).
+    #[test]
+    fn the_byte_guard_admits_every_engine_legal_body() {
+        // The ceiling is the byte-image of the engine's char limit (4 bytes/char
+        // is the widest UTF-8 encoding of a single `char`).
+        assert_eq!(MAX_SMS_TEXT_BYTES, amos_sms::validate::MAX_TEXT_CHARS * 4);
+
+        // The exact body that was refused at the bridge while the engine accepted it.
+        let cjk = "中".repeat(amos_sms::validate::MAX_TEXT_CHARS);
+        assert_eq!(cjk.len(), 4800);
+        assert!(cjk.len() <= MAX_SMS_TEXT_BYTES);
+        assert!(checked_send("10086", &cjk).is_ok(), "the engine agrees");
+
+        // Positive control: the guard is not what refuses an over-long body — one
+        // char past the limit still fits the byte ceiling, and the engine refuses it.
+        let over = "中".repeat(amos_sms::validate::MAX_TEXT_CHARS + 1);
+        assert!(over.len() <= MAX_SMS_TEXT_BYTES);
+        assert!(checked_send("10086", &over).is_err());
+    }
+
+    /// The fake-send defect was structural in Kotlin: `send` passed `null`
+    /// status intents, so the platform never reported a verdict and the glue
+    /// answered `{"ok":true}` for a message the radio may never have taken. Pin
+    /// the pairing at the source (REQ-A1620 / F-TEL-040):
+    ///
+    /// 1. `send` hands `SmsManager` a real sent-intent per part (and no longer
+    ///    passes `null` for them);
+    /// 2. the glue registers a `NOT_EXPORTED` receiver for its own `SMS_SENT`
+    ///    action, or the verdicts would never come back;
+    /// 3. the wire carries the three verdicts, and the `{"ok":true}` fold is gone;
+    /// 4. the glue's wait stays **under** the Rust caller's own timeout — a
+    ///    slow radio must surface as the glue's honest `unconfirmed`, not as a
+    ///    caller-side timeout that loses the reason.
+    #[test]
+    fn sms_send_reports_a_real_verdict_not_an_ok_flag() {
+        const GLUE: &str = include_str!("../android-glue/com/amos/ai/glue/SmsGlue.kt");
+
+        // (1) The platform is actually given a status target for every part.
+        assert!(
+            GLUE.contains("sendMultipartTextMessage(normalized, null, parts, sentIntents, null)"),
+            "multipart send must pass its per-part sent intents, not null"
+        );
+        assert!(
+            GLUE.contains("sendTextMessage(normalized, null, text, sentIntents[0], null)"),
+            "single-part send must pass its sent intent, not null"
+        );
+        assert!(
+            !GLUE.contains("parts, null, null)") && !GLUE.contains("text, null, null)"),
+            "a null sent intent is the defect: the platform then reports no verdict"
+        );
+
+        // (2) The verdicts come back through a receiver we registered ourselves.
+        assert!(
+            GLUE.contains("IntentFilter(ACTION_SMS_SENT)"),
+            "SmsGlue must register a receiver for its own SMS_SENT action"
+        );
+        assert!(
+            // Registered through `ContextCompat` (REQ-A1627): below API 33 the platform's
+            // 3-arg overload does not exist, so the two-arg call there is the only option
+            // — and Android Lint cannot see that, so it flagged the version branch. The
+            // helper keeps the NOT_EXPORTED property the assertion is about.
+            GLUE.contains("ContextCompat.registerReceiver(ctx, r, filter, ContextCompat.RECEIVER_NOT_EXPORTED)"),
+            "the SENT receiver is in-package only: the PendingIntent fires as this app"
+        );
+        assert!(
+            GLUE.contains("sendProbes[token]?.settle(resultCode)"),
+            "the receiver must settle the probe for the token the broadcast carries"
+        );
+
+        // (3) The three verdicts on the wire; the old fold is gone.
+        for state in ["sent", "unconfirmed"] {
+            assert!(
+                GLUE.contains(&format!("put(\"state\", \"{state}\")")),
+                "the send reply must be able to say '{state}'"
+            );
+        }
+        assert!(
+            GLUE.contains("\"rejected\""),
+            "a radio refusal is a typed error (error_kind: rejected), not a verdict"
+        );
+        assert!(
+            !GLUE.contains("put(\"ok\", true)"),
+            "an ok-flag was the defect: 'it did not throw' is not a verdict"
+        );
+
+        // (4) The glue's wait is strictly inside the Rust caller's timeout.
+        let wait = GLUE
+            .split("SENT_WAIT_MS = ")
+            .nth(1)
+            .and_then(|rest| rest.split('L').next())
+            .and_then(|digits| digits.trim().parse::<u128>().ok())
+            .expect("SENT_WAIT_MS must be declared as a literal millisecond value");
+        let caller_ms = SMS_TIMEOUT.as_millis();
+        assert!(
+            wait < caller_ms,
+            "SENT_WAIT_MS ({wait}ms) must stay under SMS_TIMEOUT ({caller_ms}ms), or a slow \
+             radio becomes a caller-side timeout that loses the glue's reason"
+        );
+    }
+
+    /// Source-level pin (red-first for PH-P2-06): `SmsGlue.bind` must **re-attempt** the
+    /// `SMS_RECEIVED` receiver on every call.
+    ///
+    /// `registerIncomingReceiver` is permission-gated — it returns without registering when
+    /// `RECEIVE_SMS` is not held. It lives inside `bind`, whose first line was
+    /// `if (app != null) return`: the first `bind` (from `AmosGlue.onStart`) typically runs
+    /// **before** the runtime grant, so the receiver was skipped there and every later `bind`
+    /// early-returned — the receiver was never registered, live refresh never started, and
+    /// `docs/sms.md`'s「授权后即生效，无需重绑」was false for this half. The pin is the
+    /// **absence** of that guard (plus the positive control that `bind` still does its
+    /// first-time work), so deleting the whole body cannot satisfy it.
+    #[test]
+    fn the_incoming_receiver_is_re_attempted_on_every_bind() {
+        const GLUE: &str = include_str!("../android-glue/com/amos/ai/glue/SmsGlue.kt");
+        let code = strip_kotlin_comments(GLUE);
+        let body = kotlin_fun_body(&code, "fun bind(");
+        assert!(
+            body.contains("registerIncomingReceiver(ctx)"),
+            "bind must (re)register the SMS_RECEIVED receiver: got\n{body}"
+        );
+        assert!(
+            !body.contains("if (app != null) return"),
+            "the `if (app != null) return` guard skips the permission-gated receiver on every \
+             later bind, so a bind before RECEIVE_SMS was granted leaves live refresh dead \
+             forever (PH-P2-06): got\n{body}"
+        );
+        // Positive control: bind still does exactly-once first-time work, so an emptied body
+        // fails here rather than satisfying the pin above by accident.
+        for needle in [
+            "if (app == null)",
+            "app = ctx",
+            "attach(this)",
+            "registerSendReceiver(ctx)",
+        ] {
+            assert!(
+                body.contains(needle),
+                "bind is missing `{needle}`: got\n{body}"
+            );
+        }
+    }
+
+    /// Source-level pin (red-first for PH-P2-06): the SMS grant result must itself re-attempt
+    /// the receiver registration, so the grant takes effect **without** an app restart.
+    ///
+    /// `SmsPermissionGlue.onSmsResult` is the callback the platform invokes when the user
+    /// answers `REQ_SMS`. Registering the receiver only from the lifecycle `bind` would make
+    /// the take-effect moment depend on the Activity happening to `onStart` again; the grant
+    /// callback is the deterministic seam (the camera sibling does the same — see
+    /// `AmosGlue.onCameraPermissionGranted`). Verdict re-read and Rust resolution are kept as
+    /// positive controls so the pin cannot be satisfied by gutting the function.
+    #[test]
+    fn the_sms_grant_re_attempts_the_incoming_receiver() {
+        const PERM: &str = include_str!("../android-glue/com/amos/ai/glue/SmsPermissionGlue.kt");
+        let code = strip_kotlin_comments(PERM);
+        let body = kotlin_fun_body(&code, "fun onSmsResult(");
+        assert!(
+            body.contains("SmsGlue.bind("),
+            "after the user grants RECEIVE_SMS, the grant result must re-attempt the receiver \
+             registration (SmsGlue.bind) — otherwise the grant never takes effect without an \
+             app restart and docs/sms.md's 「授权后即生效，无需重绑」 is false (PH-P2-06): \
+             got\n{body}"
+        );
+        assert!(
+            body.contains("allGranted()"),
+            "onSmsResult must still re-read the grant from the platform: got\n{body}"
+        );
+        assert!(
+            body.contains("onResult(granted)"),
+            "onSmsResult must still resolve the Rust await: got\n{body}"
+        );
+    }
+
+    /// Source-level pin (red-first for PH-P2-07): a message row's `from_me` must mean "the
+    /// user's own outgoing side", which is **every type except inbox** — not "sent".
+    ///
+    /// Before the fix the glue wrote `from_me = (type == TYPE_SENT)`, so a `TYPE_DRAFT` row
+    /// read as `false`. `SmsMessage::from_me` is documented as "true when we sent it
+    /// (outgoing)" and the **mock authority** (`MockSms::seeded_rows`, `provider.rs`) seeds
+    /// its draft row (`m6`, folder `Draft`) with `from_me: true`; the UI bubble side/colour
+    /// follows `from_me` (`MessagesApp.svelte`), so host and device disagreed about a field the
+    /// spec pins. Inbox is the only received (`MESSAGE_TYPE_INBOX`) type — sent, draft, outbox,
+    /// failed and queued are all the user's own.
+    #[test]
+    fn a_draft_row_is_from_me_not_a_received_message() {
+        const GLUE: &str = include_str!("../android-glue/com/amos/ai/glue/SmsGlue.kt");
+        let code = strip_kotlin_comments(GLUE);
+        let body = kotlin_fun_body(&code, "fun messages(");
+        assert!(
+            body.contains(r#""from_me", c.getInt(iType) != TYPE_INBOX"#),
+            "from_me must be `type != TYPE_INBOX` (every non-inbox type is the user's own), \
+             or a draft reads as a received message (PH-P2-07): got\n{body}"
+        );
+        assert!(
+            !body.contains("c.getInt(iType) == TYPE_SENT"),
+            "`type == TYPE_SENT` was the defect: it folds draft/outbox/failed/queued into \
+             `from_me:false` (PH-P2-07): got\n{body}"
+        );
+        // Positive control: the row shape is otherwise intact, so an emptied/truncated body
+        // cannot satisfy the pin above by accident.
+        for needle in [r#""id""#, r#""text""#, r#""ts_ms""#, r#""read""#] {
+            assert!(
+                body.contains(needle),
+                "the message row is missing {needle}: got\n{body}"
+            );
+        }
+    }
+
     #[test]
     fn audit_masks_the_address() {
         assert_eq!(mask_address("13800138000"), "***8000");
@@ -1541,6 +1992,52 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("timed out"), "got: {err}");
+        // And it is a *timeout*, not a generic failure: the send path keys on this
+        // to answer `unconfirmed` instead of claiming the message was refused
+        // (REQ-A1759/F-TEL-045).
+        assert_eq!(err.kind(), "timeout");
+    }
+
+    /// A caller-side timeout is an absent verdict, never a refusal. Before the fix
+    /// this folded into `SmsError::Failed` → `SmsProviderRejected` → the UI's
+    /// 「发送失败」 for a message that may well have gone out (REQ-A1759/F-TEL-045).
+    #[test]
+    fn a_timed_out_send_reads_as_unconfirmed_not_a_refusal() {
+        let verdict = send_outcome_from_failure(SmsError::TimedOut("no verdict within 8s".into()))
+            .expect("a timeout must not be an error");
+        assert_eq!(verdict.wire(), "unconfirmed");
+        assert_eq!(
+            verdict,
+            SmsSendOutcome::Unconfirmed("no verdict within 8s".into()),
+            "the provider's own words must survive into the verdict"
+        );
+    }
+
+    /// Positive control: a *named* refusal is still a typed error, so widening the
+    /// timeout arm did not turn every failure into a silent "unconfirmed".
+    #[test]
+    fn a_named_refusal_is_still_an_error() {
+        for e in [
+            SmsError::PermissionDenied("SEND_SMS not granted".into()),
+            SmsError::Failed("radio off".into()),
+            SmsError::Invalid("unknown state".into()),
+            SmsError::Unavailable("no telephony service".into()),
+        ] {
+            let kind = e.kind();
+            let err = send_outcome_from_failure(e)
+                .expect_err("a named refusal must stay an error, not a verdict");
+            assert_eq!(err.code(), codes::PROVIDER_REJECTED, "kind was {kind}");
+            assert_eq!(
+                err.cause.first().map(String::as_str),
+                Some(match kind {
+                    "permission" => "SMS permission denied: SEND_SMS not granted",
+                    "invalid" => "invalid SMS payload: unknown state",
+                    "unavailable" => "SMS provider unavailable: no telephony service",
+                    _ => "SMS operation failed: radio off",
+                }),
+                "the refusal's own words must reach the envelope for kind {kind}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1684,7 +2181,7 @@ mod tests {
             fn counts(&self) -> Result<amos_sms::SmsFolderCounts, SmsError> {
                 Err(SmsError::Unavailable("no device SMS backend".into()))
             }
-            fn send(&self, address: &str, text: &str) -> Result<(), SmsError> {
+            fn send(&self, address: &str, text: &str) -> Result<SmsSendOutcome, SmsError> {
                 let _ = (normalize_address(address), validate_text(text));
                 Err(SmsError::Unavailable("no device SMS backend".into()))
             }
@@ -1956,5 +2453,237 @@ mod tests {
         let v = serde_json::to_value(&e).unwrap();
         assert_eq!(v["code"], "amos.sms.provider_rejected");
         assert_eq!(v["cause"][0], "permission denied");
+    }
+
+    // ---- Foreground gate (F-SH-654) ------------------------------------------
+
+    /// The focused window may read. `WmState::new()` seeds the launcher (`"main"`) focused —
+    /// the phone/tablet shell's single window, which is where `MessagesApp` runs there.
+    #[test]
+    fn the_focused_window_may_read_sms() {
+        let wm = crate::wm::WmState::new();
+        assert_eq!(crate::clipboard::foreground_label(&wm).unwrap(), "main");
+        assert!(
+            require_sms_foreground(&wm, "main").is_ok(),
+            "the window the user is looking at must be able to read messages"
+        );
+    }
+
+    /// Any other window is refused — and the refusal is honest about *which* fact it is. The
+    /// code is its own (`foreground_required`), **not** the provider's: "this window may not
+    /// read right now" is a different fact from "the OS refused READ_SMS", and only the code
+    /// can carry that distinction to a caller.
+    #[test]
+    fn a_background_window_is_refused_a_read() {
+        let wm = crate::wm::WmState::new();
+        let err = require_sms_foreground(&wm, "messages").unwrap_err();
+        assert_eq!(err.code(), "amos.sms.foreground_required");
+        assert_eq!(err.code(), codes::FOREGROUND_REQUIRED);
+        assert_ne!(
+            err.code(),
+            codes::PROVIDER_REJECTED,
+            "a foreground refusal must not be reported as the provider rejecting the read"
+        );
+        // The cause chain keeps `require_foreground`'s own words: both labels, so an operator
+        // can read which window *did* have the read.
+        let text = err.to_string();
+        assert!(
+            text.contains("messages") && text.contains("main"),
+            "the refusal must name the caller and the window that does have the read: got \
+             `{text}`"
+        );
+    }
+
+    /// The statement in `body` that calls the gate, trimmed (see the clipboard twin, whose
+    /// first version asked only whether the *name* appeared — a discarded `Result` denies
+    /// nothing, so a `let _ = …` left it green).
+    fn gate_statement<'a>(body: &'a str, fname: &str) -> &'a str {
+        let at = body.find("require_sms_foreground(").unwrap_or_else(|| {
+            panic!(
+                "{fname} must gate its read through require_sms_foreground — a background \
+                 window draining the user's messages is the F-SH-654 privacy failure"
+            )
+        });
+        let tail = &body[at..];
+        let semi = tail.find(';').unwrap_or(tail.len());
+        tail[..semi].trim()
+    }
+
+    /// The body of the `#[tauri::command] pub … fn <fname>` in this file, up to its matching
+    /// closing brace. Brace-counted (not "next `\n}`") so a nested block cannot cut it short.
+    fn command_body<'a>(src: &'a str, fname: &str) -> &'a str {
+        let needle = format!("fn {fname}(");
+        let start = src
+            .find(&needle)
+            .unwrap_or_else(|| panic!("{fname} not found in sms.rs"));
+        let open = src[start..]
+            .find('{')
+            .map(|o| start + o)
+            .unwrap_or_else(|| panic!("{fname} has no body"));
+        let mut depth = 0usize;
+        for (i, ch) in src[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &src[open..open + i + 1];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("{fname}'s body never closed");
+    }
+
+    /// The body of the Kotlin function whose signature begins with `signature` (e.g.
+    /// `"fun bind("`), up to its matching closing brace. Brace-counted so a nested block cannot
+    /// cut it short — the Kotlin twin of [`command_body`].
+    fn kotlin_fun_body<'a>(src: &'a str, signature: &str) -> &'a str {
+        let start = src
+            .find(signature)
+            .unwrap_or_else(|| panic!("{signature} not found in the glue source"));
+        let open = src[start..]
+            .find('{')
+            .map(|o| start + o)
+            .unwrap_or_else(|| panic!("{signature} has no body"));
+        let mut depth = 0usize;
+        for (i, ch) in src[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &src[open..open + i + 1];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("{signature}'s body never closed");
+    }
+
+    /// Comments are stripped before the Kotlin pins look at the source, so a prose sentence
+    /// mentioning a guard cannot satisfy (or defeat) a check meant for code — and a `//` inside
+    /// a string literal is not a comment. Sixth copy of this helper in the repo (`blocklist.rs`,
+    /// `incall.rs`, `rotation.rs`, `jni_glue.rs`, `amos-telephony/src/number.rs`); there is no
+    /// `tests/common`, and `amos-tauri` copies cannot share one without making this module's
+    /// tests depend on another module's test-only items.
+    fn strip_kotlin_comments(src: &str) -> String {
+        let chars: Vec<char> = src.chars().collect();
+        let mut out = String::with_capacity(src.len());
+        let mut i = 0usize;
+        let mut block_depth = 0usize;
+        while i < chars.len() {
+            let c = chars[i];
+            if block_depth > 0 {
+                if c == '/' && chars.get(i + 1) == Some(&'*') {
+                    block_depth += 1;
+                    i += 2;
+                } else if c == '*' && chars.get(i + 1) == Some(&'/') {
+                    block_depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+            if c == '/' && chars.get(i + 1) == Some(&'/') {
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            if c == '/' && chars.get(i + 1) == Some(&'*') {
+                block_depth = 1;
+                i += 2;
+                continue;
+            }
+            if c == '"' {
+                out.push(c);
+                i += 1;
+                while i < chars.len() && chars[i] != '"' {
+                    if chars[i] == '\\' && i + 1 < chars.len() {
+                        out.push(chars[i]);
+                        i += 1;
+                    }
+                    out.push(chars[i]);
+                    i += 1;
+                }
+                if i < chars.len() {
+                    out.push(chars[i]);
+                    i += 1;
+                }
+                continue;
+            }
+            out.push(c);
+            i += 1;
+        }
+        out
+    }
+
+    /// Source-level pin (red-first for P1-B2 / REQ-A1836): the thread read must judge the sender the
+    /// **thread** belongs to, not the address the caller happened to send.
+    ///
+    /// Before the fix `sms_messages` consulted the blocklist only inside
+    /// `if let Some(addr) = address…`, so a caller who sent just the thread id got a blocked
+    /// sender's messages — the doc above the command ("…must not appear even if a caller asks
+    /// for the thread id directly") was a promise no line enforced.
+    #[test]
+    fn the_thread_read_judges_the_senders_own_address() {
+        const SRC: &str = include_str!("sms.rs");
+        let body = command_body(SRC, "sms_messages");
+        assert!(
+            body.contains("blocked_thread_read("),
+            "sms_messages must judge the thread's own address (blocked_thread_read) — the \
+             caller's optional `address` is a fallback, not the authority: got\n{body}"
+        );
+    }
+
+    /// Source-level pin (red-first for P1-B1 / REQ-A1836): the JNI arrival handler is behind
+    /// `#[cfg(feature = "android")]`, so the lib test build never compiles it — the pure
+    /// `incoming_is_suppressed` test above cannot prove the handler *uses* it. Before the fix
+    /// the handler gated the verdict on `!payload.address.is_empty()`, so a withheld number
+    /// with `block_unknown` never reached the rule and still notified.
+    #[test]
+    fn the_arrival_handler_routes_through_the_shared_verdict() {
+        const SRC: &str = include_str!("sms.rs");
+        let body = command_body(SRC, "Java_com_amos_ai_glue_SmsGlue_onIncoming");
+        assert!(
+            body.contains("incoming_is_suppressed("),
+            "the JNI arrival handler must suppress through incoming_is_suppressed — gating on a \
+             non-empty address would notify for a withheld number under block_unknown: got\n{body}"
+        );
+    }
+
+    /// Source-level pin: every SMS command that hands back the user's messages calls the gate,
+    /// and the call **is** the statement (propagated with `?`), not a value dropped on the
+    /// floor. Deleting the gate from `sms_snapshot` makes this fail.
+    #[test]
+    fn every_read_command_propagates_the_foreground_gate() {
+        const SRC: &str = include_str!("sms.rs");
+        for fname in ["sms_snapshot", "sms_counts", "sms_messages"] {
+            let stmt = gate_statement(command_body(SRC, fname), fname);
+            assert!(
+                stmt.starts_with("require_sms_foreground("),
+                "{fname}'s gate must *be* the statement, not a value handed to something else \
+                 (a discarded `Result` denies nothing): got `{stmt}`"
+            );
+            assert!(
+                stmt.ends_with(")?"),
+                "{fname} must propagate the gate's refusal with `?`: got `{stmt}`"
+            );
+        }
+        // The contrast that makes it meaningful. `sms_trash_list` returns ids + times only
+        // ("no content" — see its doc), and the write verbs are deliberately *not* gated:
+        // posting a message from a background window is not a disclosure of the user's
+        // messages, which is the attack this rule is about. Gating them would be a different
+        // decision (an action rule), not this one.
+        for fname in ["sms_trash_list", "sms_trash_add", "sms_send"] {
+            assert!(
+                !command_body(SRC, fname).contains("require_sms_foreground("),
+                "{fname} must not carry the *read* gate — the rule here is about disclosure"
+            );
+        }
     }
 }

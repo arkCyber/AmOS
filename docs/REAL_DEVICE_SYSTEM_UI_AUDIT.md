@@ -114,14 +114,30 @@ manual copy goes stale, and a newly added glue file never reaches the APK):
 ```bash
 scripts/android-glue-mirror.sh   # mirrors the glue AND verifies the merges below
 ```
-The script also **checks** that the generated manifest declares every `android:name` the
-fragments declare (`AndroidManifest.permissions.xml` — permissions/features, and
-`AndroidManifest.components.xml` — the in-call/screening services and the SMS receiver),
-failing loudly with the missing entries and their source fragment. Both merges stay
-manual (the generated manifest is Tauri's); drift, however, is now loud — it already had
-happened twice: the hotspot's `TETHER_PRIVILEGED` sat declared-but-unmerged, and the three
-glue components existed **only** in the generated file (a clean checkout would have built
-an APK with no in-call UI, no call screening and no live SMS receive).
+The script also **checks both directions**:
+
+* **fragment → generated**: every `android:name` a tracked fragment declares must appear in
+  the generated manifest (`AndroidManifest.permissions.xml` — permissions/features,
+  `AndroidManifest.components.xml` — the in-call/screening services and the SMS receiver,
+  and `AndroidManifest.activity.xml` — the `<activity>`-level HOME/DIAL intent filters,
+  which must be merged **inside** the `<activity>` element, not at `<manifest>` level).
+* **generated → fragment** (REQ-A774 / F-AND-006): every `android:name` in the generated
+  manifest must be claimed by a tracked fragment, or be on the script's `TEMPLATE_OWNED`
+  allow-list of entries the Tauri template itself writes. Anything else is a finding and
+  the script exits non-zero.
+
+The reverse direction is not a nicety — it is the half that was missing. `crates/amos-tauri/gen/`
+is entirely git-ignored (`.gitignore:65`), so an entry that lives **only** there survives
+every local build and vanishes on a clean checkout, while the one-directional check stayed
+green. Twelve such entries were measured (REQ-A774): the NFC permission and feature, the two
+biometric features, the dialer/in-call permission set, `android.software.telephony`, and the
+HOME + DIAL filters.
+
+Both merges stay manual (the generated manifest is Tauri's); drift, however, is now loud in
+**both** directions — it already had happened three times: the hotspot's `TETHER_PRIVILEGED`
+sat declared-but-unmerged, the three glue components existed **only** in the generated file
+(a clean checkout would have built an APK with no in-call UI, no call screening and no live
+SMS receive), and the twelve entries above existed only there too.
 
 ### 5.2 Runtime CAMERA + WebView media (one‑time wiring)
 In the generated `MainActivity` (Tauri v2 activity) — the template with the full set of

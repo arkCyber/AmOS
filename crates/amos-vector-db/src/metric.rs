@@ -17,8 +17,8 @@ pub enum Metric {
     Dot,
 }
 
-/// Unit (L2) norm of a slice. Returns an error when lengths are zero (guarded
-/// upstream, but kept total/panic-free regardless).
+/// Unit (L2) norm of a slice. Total and panic-free: it returns `f32` (never a
+/// `Result`), and an empty slice yields `0.0`.
 fn norm(a: &[f32]) -> f32 {
     a.iter().fold(0.0_f32, |acc, v| acc + v * v).sqrt()
 }

@@ -26,11 +26,11 @@ use amos_link::metrics::LinkMetrics;
 use amos_link::node::LinkNode;
 use amos_link::qos::Qos;
 use amos_link::robot_hal::{
-    actuation_topic, ActuationState, AgentAction, MockRobotHal, RobotBridge,
+    actuation_topic, ActuationState, AgentAction, Gait, MockRobotHal, RobotBridge,
 };
 use amos_link::service::LinkService;
 use amos_proto::amos_link::robot_link_server::RobotLinkServer;
-use amos_tauri_lib::link::link_status;
+use amos_tauri_lib::link::{link_publish, link_status, link_topics};
 use tokio_stream::wrappers::UnixListenerStream;
 use tonic::{Request, Response, Status};
 
@@ -272,6 +272,205 @@ async fn link_status_carries_the_robots_own_actuation_reports() {
     server.abort();
     let _ = std::fs::remove_file(&path);
 }
+
+/// The console's **command surface**, end to end: `link_publish` builds the control topic, the
+/// daemon frames the payload, and the robot's *typed* subscriber decodes it as the same
+/// `AgentAction` a native publisher would have sent.
+///
+/// This is the half the unit tests cannot reach. The payload on the wire is the **bincode** of
+/// `AgentAction { json }`, not the raw JSON string, so a hand-rolled encode would still publish
+/// and still count a subscriber — yet be silently undecodable on the robot. Only a real
+/// typed subscriber can tell the two apart, which is exactly what this asserts.
+///
+/// The second half pins the boundary the console relies on: a wildcard robot id never reaches
+/// the bus. `control_action_topic` refuses it, so an operator cannot address the whole fleet
+/// with one press.
+#[tokio::test(flavor = "multi_thread")]
+async fn link_publish_delivers_a_frame_the_robot_decodes_and_refuses_a_wildcard() {
+    let _guard = env_lock().lock().await;
+    let path: PathBuf = std::env::temp_dir().join(format!(
+        "amos-tauri-link-publish-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    std::env::set_var("AMOS_SOCKET", &path);
+
+    let metrics = Arc::new(LinkMetrics::new());
+    let clock = Arc::new(Clock::host());
+    let transport = Broker::with_metrics(Arc::clone(&metrics)).shared();
+    let daemon = LinkNode::with_parts(
+        PeerId::new("amos-daemon").expect("peer"),
+        NodeKind::Tool,
+        Arc::clone(&transport),
+        Arc::clone(&clock),
+        Arc::clone(&metrics),
+    );
+    let robot = LinkNode::with_parts(
+        PeerId::new("dog1").expect("peer"),
+        NodeKind::Robot,
+        Arc::clone(&transport),
+        Arc::clone(&clock),
+        Arc::clone(&metrics),
+    );
+    // The robot's own typed subscriber on its control channel — the frame a native publisher
+    // would send is what this must decode.
+    let mut control = robot
+        .subscriber::<AgentAction>(
+            Topic::pattern("amos/dog1/control/*").expect("pattern"),
+            Qos::control(),
+        )
+        .await
+        .expect("subscribe control");
+
+    let socket = path.clone();
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(RobotLinkServer::new(LinkService::with_heartbeat(Arc::new(
+                daemon,
+            ))))
+            .serve_with_incoming(UnixListenerStream::new(
+                tokio::net::UnixListener::bind(socket).expect("bind uds"),
+            ))
+            .await
+            .expect("the control plane served");
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let json = r#"{"action":"trot","speed":0.6}"#;
+    let reply = link_publish("dog1".to_string(), json.to_string())
+        .await
+        .expect("the console's command is published");
+    assert!(reply.seq > 0, "the daemon stamped a sequence");
+    assert_eq!(
+        reply.matched, 1,
+        "the in-process broker counts the robot's subscription"
+    );
+    assert_eq!(reply.delivered, 1);
+    assert_eq!(
+        reply.dropped, 0,
+        "the reliable control channel drops nothing"
+    );
+
+    let received = control
+        .recv()
+        .await
+        .expect("the robot's subscriber receives the frame");
+    assert_eq!(
+        received.message.json, json,
+        "the payload is the operator's JSON, verbatim"
+    );
+    let command = received
+        .message
+        .parse()
+        .expect("the frame decodes as the typed action");
+    assert_eq!(command.gait, Gait::Trot);
+    assert!((command.speed - 0.6).abs() < f32::EPSILON);
+
+    // A wildcard id is refused before anything reaches the bus.
+    let refused = link_publish("*".to_string(), json.to_string()).await;
+    assert!(
+        refused.is_err(),
+        "a wildcard robot id must be refused: {refused:?}"
+    );
+
+    server.abort();
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The console's **diagnostics surface**, end to end: `link_topics` asks a real control plane
+/// for its live topic inventory and hands the panel the `{topics, complete}` pair it renders.
+///
+/// What this pins that the unit tests cannot:
+/// * the *wire* mapping (`TopicList { topics, complete }` → `LinkTopicsOut`) over a socket.
+///   `LinkTopicsOut` is mirrored field-for-field by `lib/robot.ts`, but `declaredMirrors` only
+///   checks that the two *declarations* agree — nothing checked that the daemon's answer
+///   actually *lands* in those fields.
+/// * the inventory is the node's **observed** traffic, so the operator's own command appears in
+///   it after a publish — which is what makes the diagnostics panel a view of the link rather
+///   than a static list.
+/// * `complete` travels with the list. The UI can only tell 「这是全部」 from 「这只是我的一部分」
+///   because this flag rides along; a hardcoded `true` would render a capped inventory as the
+///   whole truth. (The *capped* direction is pinned by `broker.rs`'s own unit test — reaching
+///   `MAX_TRACKED_TOPICS` over gRPC is not a reasonable e2e.)
+#[tokio::test(flavor = "multi_thread")]
+async fn link_topics_reads_a_real_control_plane_and_serializes_the_ui_contract() {
+    let _guard = env_lock().lock().await;
+    let path: PathBuf = std::env::temp_dir().join(format!(
+        "amos-tauri-link-topics-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    std::env::set_var("AMOS_SOCKET", &path);
+
+    let metrics = Arc::new(LinkMetrics::new());
+    let clock = Arc::new(Clock::host());
+    let transport = Broker::with_metrics(Arc::clone(&metrics)).shared();
+    let daemon = LinkNode::with_parts(
+        PeerId::new("amos-daemon").expect("peer"),
+        NodeKind::Tool,
+        Arc::clone(&transport),
+        Arc::clone(&clock),
+        Arc::clone(&metrics),
+    );
+
+    let socket = path.clone();
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(RobotLinkServer::new(LinkService::with_heartbeat(Arc::new(
+                daemon,
+            ))))
+            .serve_with_incoming(UnixListenerStream::new(
+                tokio::net::UnixListener::bind(socket).expect("bind uds"),
+            ))
+            .await
+            .expect("the control plane served");
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // The exact key set `lib/robot.ts`'s `LinkTopicsOut` interface promises.
+    let before = link_topics().await.expect("the inventory answers");
+    let json = serde_json::to_value(&before).expect("serialize the inventory");
+    let obj = json.as_object().expect("a JSON object");
+    let mut keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec!["complete", "topics"],
+        "the bridge's JSON keys are the UI's contract"
+    );
+    // An uncapped broker *is* complete — an answered 「全部」, not a default. If `complete`
+    // were ever hardcoded or dropped, the console would render a capped list as the whole set.
+    assert!(
+        before.complete,
+        "an uncapped inventory must report itself complete"
+    );
+    let action_topic = "amos/dog1/control/action";
+    assert!(
+        !before.topics.iter().any(|t| t == action_topic),
+        "nothing has been published to dog1's action channel yet: {:?}",
+        before.topics
+    );
+
+    // The inventory is *observed* traffic: after the operator's own command goes out, the
+    // diagnostics panel lists the channel it travelled on.
+    link_publish(
+        "dog1".to_string(),
+        r#"{"action":"trot","speed":0.5}"#.to_string(),
+    )
+    .await
+    .expect("publish the operator's command");
+    let after = link_topics().await.expect("the inventory answers");
+    assert!(
+        after.topics.iter().any(|t| t == action_topic),
+        "the operator's own channel appears in the inventory: {:?}",
+        after.topics
+    );
+    assert!(after.complete, "still under the ceiling");
+
+    server.abort();
+    let _ = std::fs::remove_file(&path);
+}
+
 /// **A daemon that does not answer the return path must not take the panel down.**
 ///
 /// `docs/amos-link.md` §6.5 promises exactly this: "老版本的 daemon 没有这个 RPC 时，界面只是少显示
@@ -385,6 +584,15 @@ async fn a_daemon_without_the_return_path_still_answers_the_panel() {
         json["peers"],
         serde_json::json!([]),
         "…while the peer table is still an answered (empty) list"
+    );
+
+    // …and the topic inventory is **unavailable**, not empty. `link_topics` propagates the
+    // RPC's `Unimplemented`, so `lib/robot.ts`'s `linkTopics()` resolves to null and the
+    // console says 「不可用」 — a daemon that cannot answer must not be rendered as an empty
+    // link, the same doctrine the return path above follows.
+    assert!(
+        link_topics().await.is_err(),
+        "a daemon with no ListTopics must fail the command, not answer an empty inventory"
     );
 
     server.abort();

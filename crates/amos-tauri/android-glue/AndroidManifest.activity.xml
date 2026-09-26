@@ -1,0 +1,85 @@
+<!--
+  AmOS System UI — Android **Activity** fragment (real-device step).
+
+  This is NOT a complete manifest, and unlike the permissions/components fragments
+  it is not `<manifest>`-level: these entries belong **inside** the `<activity>`
+  element Tauri's template writes. When the Tauri-Android project is generated
+  (cargo tauri android init), merge them into that `<activity>` block in
+  gen/android/app/src/main/AndroidManifest.xml — as sibling `<intent-filter>`
+  elements of the template's own MAIN/LAUNCHER filter. The template block, verbatim
+  from `strings ~/.cargo/bin/cargo-tauri`, is:
+
+      <activity android:name=".MainActivity" …>
+          <intent-filter>
+              <action android:name="android.intent.action.MAIN" />
+              <category android:name="android.intent.category.LAUNCHER" />
+              <!-- AndroidTV support -->
+              <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+          </intent-filter>
+      </activity>
+
+  WHY this file exists (REQ-A774 / F-AND-006): the filters below were hand-added
+  during bring-up straight into the git-ignored generated manifest, so a clean
+  checkout built an APK without them. Two product surfaces depend on them:
+
+   * HOME — AmOS is an *optional* launcher. Without the filter the app cannot be
+     picked as the device's default home app, so the system Home gesture can never
+     return to AmOS and the whole launcher/dock surface is unreachable on device.
+   * DIAL — AmOS is a *candidate* default phone app. Without the filter it never
+     appears in the "Default phone app" list, so `ROLE_DIALER` (and with it
+     `AmosInCallService`, see AndroidManifest.components.xml) can never be granted,
+     and the dialer falls back to the `ACTION_CALL` path only. This surface needs
+     **two** filters, not one — see the note on the pair below (REQ-A1873 /
+     F-AND-018): a `tel`-scoped filter alone does not qualify the app at all.
+
+  Neither absence throws: the feature simply never becomes available, which is why
+  no compile and no permission check could see it. `scripts/android-glue-mirror.sh`
+  now checks the generated manifest in both directions, so an entry that lives only
+  in the generated file fails the build (docs/REAL_DEVICE_SYSTEM_UI_AUDIT.md §5.1).
+
+  `android.intent.category.DEFAULT` is repeated in both filters on purpose — it is
+  what makes the filter match an implicit `startActivity`/`queryIntentActivities`,
+  and it is the only reason this file lists a name twice.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Optional HOME (launcher): lets the user pick AmOS as the device's default
+         home app in Settings, so the system Home gesture returns to AmOS. -->
+    <intent-filter>
+        <action android:name="android.intent.action.MAIN" />
+        <category android:name="android.intent.category.HOME" />
+        <category android:name="android.intent.category.DEFAULT" />
+    </intent-filter>
+
+    <!-- Dialer candidate (ROLE_DIALER): lets the user make AmOS the default phone
+         app so real Telecom Calls bind our AmosInCallService and show in AmOS's own
+         in-call / incoming-call UI (docs/telephony.md).
+
+         TWO filters, and the FIRST one is what makes the app eligible at all.
+         RoleManager qualifies a package for `android.app.role.DIALER` by building
+         an intent with action DIAL and **no data URI** — its RequiredComponent
+         carries `mDataScheme=null` — and asking the PackageManager who handles it.
+         A filter that declares `<data android:scheme="tel"/>` cannot match a
+         no-data intent (`IntentFilter.matchData` answers NO_MATCH_DATA), so a
+         single `tel`-scoped filter leaves AmOS absent from that query. Measured on
+         the S5 (Android 14): `adb shell cmd package query-activities -a
+         android.intent.action.DIAL` returned only `com.google.android.dialer`,
+         and `cmd role add-role-holder android.app.role.DIALER com.amos.ai` failed
+         with "Package does not qualify for the role". The bare filter (no <data>)
+         is what the role's own query matches; the `tel` filter beside it is what
+         handles `tel:` URIs. Dropping either one silently removes a surface — the
+         role, or tel-link dialing — with nothing failing to build. -->
+    <intent-filter>
+        <action android:name="android.intent.action.DIAL" />
+        <category android:name="android.intent.category.DEFAULT" />
+    </intent-filter>
+
+    <!-- `tel:` URI handler (dial links from browsers / contacts). Scoped to the
+         scheme on purpose; on its own it does NOT qualify for ROLE_DIALER. -->
+    <intent-filter>
+        <action android:name="android.intent.action.DIAL" />
+        <category android:name="android.intent.category.DEFAULT" />
+        <data android:scheme="tel" />
+    </intent-filter>
+
+</manifest>

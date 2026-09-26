@@ -177,15 +177,17 @@ pub async fn exec_line(
             "pause" => report(out, "pause", session.pause()),
             "resume" => report(out, "resume", session.resume()),
             "status" => out.push(format!("  [status] {:?}", session.state())),
-            "lang" => {
-                if let Some(l) = parts.next() {
-                    report(
-                        out,
-                        "lang",
-                        session.handle(SessionEvent::SetSourceLang(l.into())).await,
-                    );
-                }
-            }
+            // `.lang` is declared as `.lang <LANG>`, so a bare `.lang` is a refused
+            // command and must say so — like every other command here, silence means
+            // "done", and a missing argument is not done.
+            "lang" => match parts.next() {
+                Some(l) => report(
+                    out,
+                    "lang",
+                    session.handle(SessionEvent::SetSourceLang(l.into())).await,
+                ),
+                None => out.push("  [error] .lang: missing <LANG>".to_string()),
+            },
             "help" => out.push(USAGE.trim_end().to_string()),
             other => out.push(format!("  unknown command: .{other}")),
         }
@@ -297,6 +299,21 @@ mod tests {
         assert!(
             out.iter().any(|l| l.contains("[ja] こんにちは")),
             "lang hint should be applied: {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bare_lang_without_a_tag_is_reported_not_silently_ignored() {
+        // `.lang <LANG>` is declared in USAGE; a bare `.lang` cannot run. Silence is
+        // how a *successful* command reports, so the missing-argument case must name
+        // itself just like a refused `.restart` does (REQ-A623).
+        let (mut s, mut rx) = fresh();
+        s.start().unwrap();
+        let mut out = Vec::new();
+        exec_line(&mut s, &mut rx, ".lang", &mut out).await;
+        assert!(
+            out.iter().any(|l| l == "  [error] .lang: missing <LANG>"),
+            "a bare .lang must report the missing argument: {out:?}"
         );
     }
 

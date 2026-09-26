@@ -5,6 +5,7 @@
 // the String<->String JSON contract the Rust AndroidMediaProvider calls over JNI:
 //   fun listCollection(dir: String): String      // JSON array of MediaItem
 //   fun saveCollection(dir, name, kind, mime, dataB64): String  // MediaItem | {"error":…}
+//   fun saveFileFromPath(dir, name, kind, mime, srcPath): String // MediaItem | {"error":…}
 //   fun loadContent(uri: String): String         // {"base64":…} | {"error":…}
 //
 // Wire shapes must match the serde snake_case tags in crates/amos-media/src/spec.rs
@@ -39,6 +40,7 @@ import android.provider.MediaStore
 import android.util.Base64
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
 
 /** Media permissions for AmOS external-storage access (see crates/amos-media mapping.rs). */
 object MediaPermissions {
@@ -70,6 +72,11 @@ object MediaPermissions {
 class MediaStoreGlue(private val context: Context) {
 
     private val resolver = context.contentResolver
+
+    private companion object {
+        /** Copy buffer for [saveFileFromPath] — large enough to be cheap, small enough to stay off the heap growth path. */
+        const val COPY_CHUNK_BYTES = 64 * 1024
+    }
 
     // ---- list ----
 
@@ -173,6 +180,75 @@ class MediaStoreGlue(private val context: Context) {
         }
     }
 
+    /**
+     * Persist a file **already on disk** into a shared collection, streaming it in
+     * fixed-size chunks instead of carrying it across JNI as one base64 String.
+     *
+     * `saveCollection` is fine for a small payload, but a WebMan download can be
+     * gigabytes: base64-encoding it here and materialising the whole String on the
+     * Rust side costs ~2.3× the file in peak memory across two address spaces. This
+     * path never holds the payload: `File(srcPath).inputStream().copyTo(out, 64 KiB)`.
+     *
+     * The final display name is **MediaStore's**, not the one passed in — on a name
+     * collision it appends ` (1)` and keeps the row it inserted. The reply therefore
+     * carries `displayNameOf(inserted)`, so the UI reports the name the device
+     * actually adopted rather than the one we proposed.
+     */
+    fun saveFileFromPath(dir: String, name: String, kind: String, mime: String, srcPath: String): String {
+        return try {
+            val collection = collectionUri(dir)
+                ?: return JSONObject().put("error", "unsupported collection $dir").toString()
+            val relPath = relativePathFor(dir)
+                ?: return JSONObject().put("error", "legacy write path (API<29) not wired").toString()
+            val source = File(srcPath)
+            if (!source.isFile) {
+                return JSONObject().put("error", "no such file $srcPath").toString()
+            }
+            val values = ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+                put(MediaStore.MediaColumns.MIME_TYPE, mime)
+                put(MediaStore.MediaColumns.RELATIVE_PATH, relPath)
+                if (Build.VERSION.SDK_INT >= 29) {
+                    put(MediaStore.MediaColumns.IS_PENDING, 1)
+                }
+            }
+            val inserted = resolver.insert(collection, values)
+                ?: return JSONObject().put("error", "MediaStore insert returned null").toString()
+            try {
+                val out = resolver.openOutputStream(inserted, "w")
+                    ?: return JSONObject().put("error", "no stream for $inserted").toString()
+                out.use { sink -> source.inputStream().use { it.copyTo(sink, COPY_CHUNK_BYTES) } }
+            } catch (t: Throwable) {
+                // Leaving the pending row behind would show the user a broken entry
+                // for a transfer that failed; drop ours before reporting.
+                runCatching { resolver.delete(inserted, null, null) }
+                throw t
+            }
+            if (Build.VERSION.SDK_INT >= 29) {
+                val done = ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }
+                resolver.update(inserted, done, null, null)
+            }
+            JSONObject()
+                .put("id", inserted.toString())
+                .put("kind", kind)
+                .put("collection", dir)
+                .put("name", displayNameOf(inserted) ?: name)
+                .put("uri", inserted.toString())
+                .put("mime", mime)
+                .put("size_bytes", source.length())
+                .put("ts", System.currentTimeMillis())
+                .toString()
+        } catch (t: Throwable) {
+            JSONObject().put("error", t.message ?: "media save failed").toString()
+        }
+    }
+
+    /** The `DISPLAY_NAME` MediaStore actually recorded for `uri` (it renames on a collision). */
+    private fun displayNameOf(uri: Uri): String? = runCatching {
+        resolver.query(uri, arrayOf(MediaStore.MediaColumns.DISPLAY_NAME), null, null, null)
+            ?.use { c -> if (c.moveToFirst()) c.getString(0) else null }
+    }.getOrNull()
+
     // ---- load (read bytes back for a thumbnail / open) ----
 
     /** Read back the bytes of a content URI as {"base64":…} or {"error":…}. */
@@ -243,9 +319,10 @@ class MediaStoreGlue(private val context: Context) {
         else -> null
     }
 
-    /** The MediaKind tag a collection's entries map to. */
+    /** The MediaKind tag a collection's entries map to (mirrors spec.rs `StandardDir::default_kind`). */
     private fun kindFor(dir: String): String = when (dir) {
         "recordings" -> "audio"
+        "music" -> "audio"
         "movies" -> "video"
         "download" -> "file"
         else -> "image"

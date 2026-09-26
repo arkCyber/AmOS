@@ -8,50 +8,6 @@
     "reason": "Spaces desktop hint text — the hint UI was not yet built in DesktopStage; reserved for future Spaces UX."
   },
   {
-    "key": "edit.moveEarlier",
-    "reason": "Home screen edit mode: move item earlier — the reorder UX was not yet wired in the home grid; reserved for future implementation."
-  },
-  {
-    "key": "edit.moveLater",
-    "reason": "Home screen edit mode: move item later — the reorder UX was not yet wired in the home grid; reserved for future implementation."
-  },
-  {
-    "key": "edit.remove",
-    "reason": "Home screen edit mode: remove item from home — the remove UX was not yet wired in the home grid; reserved for future implementation."
-  },
-  {
-    "key": "interp.endSentence",
-    "reason": "Interpreter end-sentence button label — the force-end feature was stubbed in the interpreter bridge but not yet wired to a UI button; reserved for future interpreter UX."
-  },
-  {
-    "key": "interp.endHint",
-    "reason": "Interpreter end-sentence tooltip — same as interp.endSentence."
-  },
-  {
-    "key": "interp.endNone",
-    "reason": "Interpreter end-sentence no-op message — same as interp.endSentence."
-  },
-  {
-    "key": "interp.endFailed",
-    "reason": "Interpreter end-sentence failure message — same as interp.endSentence."
-  },
-  {
-    "key": "media.loadMore",
-    "reason": "Media gallery load-more button — the cumulative paging feature (REQ-A316) is wired in mediaPaging.ts but not yet consumed by PhotosApp; reserved for when the gallery wires the pager."
-  },
-  {
-    "key": "media.showingNewest",
-    "reason": "Media gallery showing-count label — same as media.loadMore."
-  },
-  {
-    "key": "phone.dialedSimulated",
-    "reason": "Phone simulated call label — the simulated call feature was stubbed in the phone bridge but not yet wired to a UI surface; reserved for future phone UX."
-  },
-  {
-    "key": "phone.simulatedCall",
-    "reason": "Phone simulate incoming button — same as phone.dialedSimulated."
-  },
-  {
     "key": "phone.emergencyOneTap",
     "reason": "Phone one-tap emergency button on lock screen — the emergency one-tap feature was stubbed but not yet wired to the lock screen; reserved for future emergency UX."
   },
@@ -76,10 +32,6 @@
     "reason": "Player streaming denied error — the streaming feature was stubbed but not yet wired; reserved for future player UX."
   },
   {
-    "key": "player.streaming",
-    "reason": "Player streaming indicator label — same as player.streamRefused."
-  },
-  {
     "key": "player.streamingShort",
     "reason": "Player streaming short indicator — same as player.streamRefused."
   },
@@ -100,20 +52,8 @@
     "reason": "AirPlay streaming surface — the in-flight connect state the panel does not show (REQ-A384)."
   },
   {
-    "key": "airplay.deviceNotFound",
-    "reason": "AirPlay streaming surface — the 'device disappeared' state the panel does not render (REQ-A384)."
-  },
-  {
     "key": "airplay.devices",
     "reason": "AirPlay streaming surface — the device-list header; the panel renders the list without a heading (REQ-A384)."
-  },
-  {
-    "key": "airplay.failed",
-    "reason": "AirPlay streaming surface — the generic failure state (the panel shows per-command results only) (REQ-A384)."
-  },
-  {
-    "key": "airplay.permissionDenied",
-    "reason": "AirPlay streaming surface — the local-network permission state (Rust reports it; no panel row renders it yet) (REQ-A384)."
   },
   {
     "key": "airplay.startStream",
@@ -188,31 +128,11 @@
     "reason": "Shortcut gallery surface — the failed-run badge in the gallery grid (REQ-A384)."
   },
   {
-    "key": "shortcuts.galleryComingSoon",
-    "reason": "Shortcut gallery surface — its own 'coming soon' notice: this key is the written evidence that the gallery is a planned surface, not a mistake (REQ-A384)."
-  },
-  {
-    "key": "shortcuts.galleryTitle",
-    "reason": "Shortcut gallery surface — the gallery screen title (REQ-A384)."
-  },
-  {
     "key": "shortcuts.newShortcut",
     "reason": "Shortcut gallery surface — the create button of the gallery; the live button uses `shortcuts.newButton`/`newShortcutWithKey` (REQ-A384)."
   },
   {
     "key": "shortcuts.previewCompleted",
     "reason": "Shortcut gallery surface — the preview panel's completion line (REQ-A384)."
-  },
-  {
-    "key": "webman.downloadContent",
-    "reason": "Browser **download sheet** (REQ-A384): `WebManApp.svelte` renders tabs/bookmarks/history, but no download panel — the download helpers (`addDownload`/`updateDownload`/`removeDownload`/`clearCompletedDownloads`/`formatFileSize`) are baselined as unwired in `scripts/unwired-baseline.json`. This string is reserved for that panel."
-  },
-  {
-    "key": "webman.newTabButton",
-    "reason": "Browser download sheet / tab-strip affordance — the labelled new-tab button; today's tab strip adds a tab with an icon-only control (REQ-A384)."
-  },
-  {
-    "key": "webman.openInExternalBrowser",
-    "reason": "Browser download sheet / external-open affordance — opening the current page in the system browser is not offered yet (REQ-A384)."
   }
 ]

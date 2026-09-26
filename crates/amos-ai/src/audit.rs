@@ -66,6 +66,32 @@ pub enum Outcome {
     Error,
 }
 
+impl Outcome {
+    /// Every variant, in declaration order — the one list the disk writer, the
+    /// wire reader and the tests all derive from.
+    pub const ALL: [Outcome; 5] = [
+        Outcome::Success,
+        Outcome::Granted,
+        Outcome::Denied,
+        Outcome::Rejected,
+        Outcome::Error,
+    ];
+
+    /// The canonical lowercase tag: the serde spelling written to the on-disk
+    /// JSON-lines trail **and** the string handed over the gRPC wire, so the two
+    /// cannot disagree. The match is exhaustive, so adding a variant fails to
+    /// compile until it is given a tag.
+    pub const fn tag(&self) -> &'static str {
+        match self {
+            Outcome::Success => "success",
+            Outcome::Granted => "granted",
+            Outcome::Denied => "denied",
+            Outcome::Rejected => "rejected",
+            Outcome::Error => "error",
+        }
+    }
+}
+
 impl std::fmt::Display for Outcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {

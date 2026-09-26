@@ -12,7 +12,7 @@ use crate::wm::{inject_context, SystemContext, WmState};
 use amos_proto::ai_agent::client_message::Payload;
 use amos_proto::ai_agent::{
     ai_agent_client::AiAgentClient, AgentRequest, ClearSessionsRequest, ClientMessage,
-    GetHistoryRequest, ListSessionsRequest, RemoveSessionRequest, StatusRequest,
+    GetHistoryRequest, ListSessionsRequest, RemoveSessionRequest, StatusReply, StatusRequest,
 };
 use amos_proto::android_compat::{
     android_manager_client::AndroidManagerClient, AppIconRequest, AppLaunchRequest, Empty,
@@ -28,18 +28,19 @@ use crate::error::{AmosError, ErrorCode};
 /// these; renaming a variant is a wire break. Kept alongside the constants
 /// so the code names match the typed envelopes below without grepping.
 pub mod codes {
+    use crate::error::ErrorCode;
     /// Caller passed a `prompt` / `context` string over [`super::MAX_AI_PROMPT_BYTES`].
-    pub const PROMPT_TOO_LONG: &str = "amos.ai.prompt_too_long";
+    pub const PROMPT_TOO_LONG: &str = ErrorCode::AiPromptTooLong.as_str();
     /// Caller passed a `session_id` over [`super::MAX_SESSION_ID_BYTES`].
-    pub const SESSION_ID_TOO_LONG: &str = "amos.ai.session_id_too_long";
+    pub const SESSION_ID_TOO_LONG: &str = ErrorCode::AiSessionIdTooLong.as_str();
     /// Caller passed an `api_key` / `model` / `endpoint` string over its byte cap.
-    pub const BACKEND_PAYLOAD_TOO_LONG: &str = "amos.ai.backend_payload_too_long";
+    pub const BACKEND_PAYLOAD_TOO_LONG: &str = ErrorCode::AiBackendPayloadTooLong.as_str();
     /// Caller passed an Android `package_name` that is empty or over the cap.
-    pub const ANDROID_PACKAGE_INVALID: &str = "amos.ai.android_package_invalid";
+    pub const ANDROID_PACKAGE_INVALID: &str = ErrorCode::AiAndroidPackageInvalid.as_str();
     /// Any AI / Android-manager RPC failed (daemon unreachable / rejected).
-    pub const RPC_FAILED: &str = "amos.ai.rpc_failed";
+    pub const RPC_FAILED: &str = ErrorCode::AiRpcFailed.as_str();
     /// `ai_backend_switch` could not invoke / complete the `ai-backend.sh` script.
-    pub const BACKEND_SWITCH_FAILED: &str = "amos.ai.backend_switch_failed";
+    pub const BACKEND_SWITCH_FAILED: &str = ErrorCode::AiBackendSwitchFailed.as_str();
 }
 
 /// Maximum bytes in one `ask_ai_agent` / `chat_agent` prompt string.
@@ -499,7 +500,9 @@ pub struct DaemonStatus {
     pub running: bool,
     pub model: String,
     pub uptime_seconds: i64,
-    pub gpu_util: u32,
+    /// GPU/NPU utilisation percent; `None` = no metrics instrumented (never a
+    /// fabricated `0`, which would read as "idle" — AEROSPACE audit P0-3).
+    pub gpu_util: Option<u32>,
     pub active_sessions: u32,
     /// Active inference engine kind (mock|api|ollama|hermes|ggml).
     pub engine: String,
@@ -709,6 +712,79 @@ pub async fn list_sessions(bridge: &AiBridge) -> Result<Vec<SessionInfo>, AmosEr
     }
 }
 
+/// Fold a daemon `StatusReply` (prost) into the serializable [`DaemonStatus`].
+///
+/// Split out of [`fetch_status`] so this field mapping is unit-testable without a
+/// live daemon — in particular that a daemon which instruments **no** GPU/NPU
+/// metrics reports the field as **absent**, never as a fabricated `0` percent that
+/// a consumer would read as a measurement (P0-3).
+fn status_from_reply(r: StatusReply) -> DaemonStatus {
+    DaemonStatus {
+        running: r.running,
+        model: r.model,
+        uptime_seconds: r.uptime_seconds,
+        gpu_util: r.gpu_util,
+        active_sessions: r.active_sessions,
+        engine: r.engine,
+        engine_model: r.engine_model,
+        degraded: r.degraded,
+        asr: r.asr,
+        accelerator: r.accelerator,
+        generation_pool: r.generation_pool.map(|g| GenerationPoolStatus {
+            capacity: g.capacity,
+            in_flight: g.in_flight,
+            available: g.available,
+            acquired_total: g.acquired_total,
+            rejected_saturated: g.rejected_saturated,
+            rejected_timeout: g.rejected_timeout,
+            wait_ms: g.wait_ms,
+        }),
+        response_cache: r.response_cache.map(|c| ResponseCacheStatus {
+            enabled: c.enabled,
+            capacity: c.capacity,
+            ttl_seconds: c.ttl_seconds,
+            entries: c.entries,
+            hits: c.hits,
+            misses: c.misses,
+            stores: c.stores,
+            evicted: c.evicted,
+            expired: c.expired,
+            oversized: c.oversized,
+        }),
+        log_sink: r.log_sink.map(|l| LogSinkStatus {
+            enabled: l.enabled,
+            path: l.path,
+            bytes_written: l.bytes_written,
+            lost_bytes: l.lost_bytes,
+            write_failures: l.write_failures,
+            rotations: l.rotations,
+            active_bytes: l.active_bytes,
+        }),
+        breaker: r.breaker.map(|b| BreakerStatus {
+            enabled: b.enabled,
+            state: b.state,
+            fail_threshold: b.fail_threshold,
+            cooldown_seconds: b.cooldown_seconds,
+            consecutive_failures: b.consecutive_failures,
+            openings: b.openings,
+            rejections: b.rejections,
+            failures: b.failures,
+            successes: b.successes,
+        }),
+        alerts: r.alerts.map(|a| {
+            a.alerts
+                .into_iter()
+                .map(|x| AlertStatus {
+                    id: x.id,
+                    severity: x.severity,
+                    detail: x.detail,
+                    active_for_seconds: x.active_for_seconds,
+                })
+                .collect()
+        }),
+    }
+}
+
 /// Probe the daemon, retrying once after reconnecting (in case it restarted).
 pub async fn fetch_status(bridge: &AiBridge) -> Result<DaemonStatus, AmosError> {
     let mut attempt = 0;
@@ -716,71 +792,7 @@ pub async fn fetch_status(bridge: &AiBridge) -> Result<DaemonStatus, AmosError> 
         let mut client = bridge.connect().await?;
         match client.get_status(with_client_id(StatusRequest {})).await {
             Ok(reply) => {
-                let r = reply.into_inner();
-                return Ok(DaemonStatus {
-                    running: r.running,
-                    model: r.model,
-                    uptime_seconds: r.uptime_seconds,
-                    gpu_util: r.gpu_util,
-                    active_sessions: r.active_sessions,
-                    engine: r.engine,
-                    engine_model: r.engine_model,
-                    degraded: r.degraded,
-                    asr: r.asr,
-                    accelerator: r.accelerator,
-                    generation_pool: r.generation_pool.map(|g| GenerationPoolStatus {
-                        capacity: g.capacity,
-                        in_flight: g.in_flight,
-                        available: g.available,
-                        acquired_total: g.acquired_total,
-                        rejected_saturated: g.rejected_saturated,
-                        rejected_timeout: g.rejected_timeout,
-                        wait_ms: g.wait_ms,
-                    }),
-                    response_cache: r.response_cache.map(|c| ResponseCacheStatus {
-                        enabled: c.enabled,
-                        capacity: c.capacity,
-                        ttl_seconds: c.ttl_seconds,
-                        entries: c.entries,
-                        hits: c.hits,
-                        misses: c.misses,
-                        stores: c.stores,
-                        evicted: c.evicted,
-                        expired: c.expired,
-                        oversized: c.oversized,
-                    }),
-                    log_sink: r.log_sink.map(|l| LogSinkStatus {
-                        enabled: l.enabled,
-                        path: l.path,
-                        bytes_written: l.bytes_written,
-                        lost_bytes: l.lost_bytes,
-                        write_failures: l.write_failures,
-                        rotations: l.rotations,
-                        active_bytes: l.active_bytes,
-                    }),
-                    breaker: r.breaker.map(|b| BreakerStatus {
-                        enabled: b.enabled,
-                        state: b.state,
-                        fail_threshold: b.fail_threshold,
-                        cooldown_seconds: b.cooldown_seconds,
-                        consecutive_failures: b.consecutive_failures,
-                        openings: b.openings,
-                        rejections: b.rejections,
-                        failures: b.failures,
-                        successes: b.successes,
-                    }),
-                    alerts: r.alerts.map(|a| {
-                        a.alerts
-                            .into_iter()
-                            .map(|x| AlertStatus {
-                                id: x.id,
-                                severity: x.severity,
-                                detail: x.detail,
-                                active_for_seconds: x.active_for_seconds,
-                            })
-                            .collect()
-                    }),
-                });
+                return Ok(status_from_reply(reply.into_inner()));
             }
             Err(e) => {
                 attempt += 1;
@@ -1392,7 +1404,7 @@ pub async fn android_lmk_tasks(
 mod tests {
     use super::{
         codes, legacy_surface_label, merge_system_selection, persist_cloud_key,
-        persist_cloud_key_reporting,
+        persist_cloud_key_reporting, status_from_reply,
     };
     use crate::clipboard::GlobalClipboard;
     use crate::rag_client;
@@ -1569,5 +1581,19 @@ mod tests {
             rag_client::codes::PAYLOAD_TOO_LONG
         );
         assert_eq!(ErrorCode::RagRpcFailed.group(), "rag");
+    }
+
+    /// A daemon that instruments no GPU/NPU metrics must report the field as
+    /// **absent**, not as a fabricated `0` percent (P0-3). The wire carries no
+    /// value, so `DaemonStatus` must serialise `null` rather than `0`, which a
+    /// consumer would read as "the GPU is idle" — a measurement nobody made.
+    #[test]
+    fn a_daemon_with_no_gpu_metrics_reports_absent_not_zero() {
+        let d = status_from_reply(amos_proto::ai_agent::StatusReply::default());
+        let v = serde_json::to_value(&d).unwrap();
+        assert!(
+            v.get("gpu_util").is_some_and(|x| x.is_null()),
+            "an uninstrumented GPU must serialise as null, not a fabricated reading: {v}"
+        );
     }
 }

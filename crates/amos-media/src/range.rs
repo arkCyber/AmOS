@@ -161,6 +161,78 @@ pub fn plan_response(header: Option<&str>, total: u64, max_body: u64) -> Respons
     }
 }
 
+/// What to do for a request against a resource whose **size the backend does not report**
+/// (`MediaItem::size_bytes == None`).
+///
+/// [`plan_response`] cannot answer that shape: every [`RangeSpec`] branch but the malformed
+/// one is stated in terms of `total`. The cases below are exactly the ones that can still be
+/// decided *without* it — RFC 7233 §4.2 has a `Content-Range` spelling for this situation
+/// (`bytes a-b/*`), which is why the protocol layer can stream an unmeasured item at all
+/// instead of reading it (once per request, bounded by the whole-item ceiling) just to learn
+/// how long it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnknownPlan {
+    /// No usable range was requested: read one `probe`-byte body — the response bound
+    /// **plus one byte**, so that a body shorter than `probe` proves the whole item fit and
+    /// a body of exactly `probe` proves it did not.
+    WholeOrTooLarge { probe: u64 },
+    /// A suffix range (`bytes=-N`): its offset is `total - N`, so the length is the one
+    /// thing this shape cannot do without. The caller reads the item once (bounded by its
+    /// own whole-item ceiling) and re-plans with the length it learned.
+    NeedsLength,
+    /// A window that is fully determined without the length: read `len` bytes at `start`.
+    /// A **short read is then EOF**, which pins the total exactly — the caller reports it as
+    /// such instead of advertising a number it does not have.
+    Window { start: u64, len: u64 },
+}
+
+/// Plan a reply for a resource of **unknown** size. See [`UnknownPlan`].
+///
+/// Deliberately *not* a second range parser: it accepts the same inputs as [`parse_range`]
+/// and answers the same grammar (a malformed spec is ignored, not an error) — the only
+/// difference is which of those inputs can be served without the total.
+pub fn plan_unknown(header: Option<&str>, max_body: u64) -> UnknownPlan {
+    let bound = max_body.max(1); // a zero-byte body could never answer anything
+    let probe = bound.saturating_add(1);
+    let Some(raw) = header else {
+        return UnknownPlan::WholeOrTooLarge { probe };
+    };
+    let raw = raw.trim();
+    let Some(list) = raw.strip_prefix("bytes=") else {
+        return UnknownPlan::WholeOrTooLarge { probe }; // another unit (or garbage)
+    };
+    let first = list.split(',').next().unwrap_or("").trim();
+    // suffix-byte-range-spec: `bytes=-N` — the only shape whose *offset* is `total - N`.
+    if first.starts_with('-') {
+        return UnknownPlan::NeedsLength;
+    }
+    let mut it = first.splitn(2, '-');
+    let start_s = it.next().unwrap_or("").trim();
+    let end_s = it.next().unwrap_or("").trim();
+    let Ok(start) = start_s.parse::<u64>() else {
+        return UnknownPlan::WholeOrTooLarge { probe };
+    };
+    // An open-ended spec (`bytes=n-`) asks for "the rest"; without a total that is
+    // "as much as one bounded body carries". A closed spec is its own length, clamped.
+    let len = if end_s.is_empty() {
+        bound
+    } else {
+        match end_s.parse::<u64>() {
+            Ok(end) if end < start => return UnknownPlan::WholeOrTooLarge { probe },
+            Ok(end) => (end - start + 1).min(bound),
+            Err(_) => return UnknownPlan::WholeOrTooLarge { probe },
+        }
+    };
+    UnknownPlan::Window { start, len }
+}
+
+/// `Content-Range` for a window on a resource whose **total is unknown**: `bytes a-b/*`
+/// (RFC 7233 §4.2). Used when a full window was served — the end of the item may still lie
+/// beyond it, and claiming otherwise would truncate the client's view of the resource.
+pub fn content_range_unknown(start: u64, end: u64) -> String {
+    format!("bytes {start}-{end}/*")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,6 +422,135 @@ mod tests {
                 assert_eq!(total, 20 * 1024 * 1024);
             }
             other => panic!("expected partial, got {other:?}"),
+        }
+    }
+
+    // ---- unknown-length planning (the `UnknownPlan` half) ----------------------
+
+    #[test]
+    fn no_usable_range_asks_for_a_probe_one_byte_past_the_bound() {
+        // The probe is `bound + 1` so that a full-length body is *proof* the item did not
+        // fit, and a short body is *proof* it did (a body of exactly `bound` cannot happen).
+        for header in [
+            None,
+            Some(""),
+            Some("items=0-1"),
+            Some("bytes"),
+            Some("bytes="),
+            Some("bytes=x-3"),
+            Some("bytes=garbage"),
+            Some("bytes=20-10"), // malformed closed spec: end < start
+            Some("bytes=5-abc"),
+        ] {
+            assert_eq!(
+                plan_unknown(header, 4096),
+                UnknownPlan::WholeOrTooLarge { probe: 4097 },
+                "{header:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_open_range_is_one_bounded_window_without_the_length() {
+        assert_eq!(
+            plan_unknown(Some("bytes=0-"), 4096),
+            UnknownPlan::Window {
+                start: 0,
+                len: 4096
+            }
+        );
+        assert_eq!(
+            plan_unknown(Some("bytes=99-"), 4096),
+            UnknownPlan::Window {
+                start: 99,
+                len: 4096
+            }
+        );
+        // Leading/trailing whitespace and a following range are tolerated, as in `parse_range`.
+        assert_eq!(
+            plan_unknown(Some(" bytes=99- , 200-300"), 4096),
+            UnknownPlan::Window {
+                start: 99,
+                len: 4096
+            }
+        );
+    }
+
+    #[test]
+    fn a_closed_range_is_its_own_length_clamped_to_the_bound() {
+        assert_eq!(
+            plan_unknown(Some("bytes=10-20"), 4096),
+            UnknownPlan::Window { start: 10, len: 11 }
+        );
+        assert_eq!(
+            plan_unknown(Some("bytes=0-99999999"), 4096),
+            UnknownPlan::Window {
+                start: 0,
+                len: 4096
+            }
+        );
+        assert_eq!(
+            plan_unknown(Some("bytes=0-0"), 4096),
+            UnknownPlan::Window { start: 0, len: 1 }
+        );
+    }
+
+    #[test]
+    fn a_suffix_range_is_the_one_shape_that_needs_the_length() {
+        // Including the shapes `parse_range` will later reject or clamp: this planner answers
+        // "I cannot decide without the total", and the caller re-plans with the length —
+        // so the grammar stays in one place.
+        for header in ["bytes=-10", "bytes=-0", "bytes=-abc", "bytes=-"] {
+            assert_eq!(
+                plan_unknown(Some(header), 4096),
+                UnknownPlan::NeedsLength,
+                "{header}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_zero_bound_still_plans_a_one_byte_window() {
+        // A zero-byte body answers nothing, so the bound floors at 1 — and the probe is
+        // still `bound + 1` (never 1, which could not tell "fits" from "does not fit":
+        // an empty read is a *fits* verdict, a full one is the opposite).
+        assert_eq!(
+            plan_unknown(None, 0),
+            UnknownPlan::WholeOrTooLarge { probe: 2 }
+        );
+        assert_eq!(
+            plan_unknown(Some("bytes=5-"), 0),
+            UnknownPlan::Window { start: 5, len: 1 }
+        );
+    }
+
+    #[test]
+    fn content_range_unknown_spells_the_open_total() {
+        assert_eq!(content_range_unknown(0, 4095), "bytes 0-4095/*");
+        assert_eq!(content_range_unknown(1024, 1024), "bytes 1024-1024/*");
+        // …and is *not* the satisfied form: a known total must still say so.
+        assert_eq!(content_range(0, 4095, 4096), "bytes 0-4095/4096");
+    }
+
+    /// Anti-drift: `plan_unknown` must not be a second range parser. On a resource far
+    /// larger than the bound — where the length is *not* what limits the answer — the two
+    /// planners must produce the very same window.
+    #[test]
+    fn plan_unknown_agrees_with_parse_range_on_a_huge_resource() {
+        let huge = u64::MAX / 2;
+        let bound = 4096;
+        for header in ["bytes=0-", "bytes=99-", "bytes=10-20", "bytes=0-9999999"] {
+            let spec = parse_range(Some(header), huge);
+            let (start, end) =
+                window_for(spec, bound).expect("satisfiable against a huge resource");
+            assert_eq!(
+                plan_unknown(Some(header), bound),
+                UnknownPlan::Window {
+                    start,
+                    len: window_len(start, end)
+                },
+                "{header}"
+            );
         }
     }
 }

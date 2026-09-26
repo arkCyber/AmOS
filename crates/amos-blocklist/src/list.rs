@@ -7,22 +7,54 @@ use crate::rule::{
     digits_of, normalize_number, BlockReason, Channel, MatchKind, Rule, DEFAULT_CAP,
 };
 
-/// The persisted rule set (serde shape of `blocklist.json`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// The persisted rule set (the shape `blocklist.json` is *written* in).
+#[derive(Debug, Clone, Serialize)]
 struct Persisted {
     /// Schema version so a future change can migrate honestly.
+    version: u32,
+    block_unknown: bool,
+    rules: Vec<Rule>,
+}
+
+/// The persisted envelope as it is *read*: `rules` is kept as raw JSON values so
+/// a single structurally-malformed row is a **rejected row**, not a fatal envelope
+/// error (REQ-A1777).
+///
+/// Deserializing straight to `Vec<Rule>` runs the per-element parse *before*
+/// [`Blocklist::from_json`] can loop: one row missing a required field made
+/// `serde_json::from_str::<Persisted>` fail on the whole payload, so the
+/// "partial by design" promise of REQ-A1771 — one hand-edited bad row must not
+/// disable every other rule — was defeated by exactly the edit it was written
+/// for. Each element is therefore parsed on its own, in the loop.
+#[derive(Debug, Deserialize)]
+struct PersistedIn {
     #[serde(default = "Persisted::default_version")]
     version: u32,
     #[serde(default)]
     block_unknown: bool,
     #[serde(default)]
-    rules: Vec<Rule>,
+    rules: Vec<serde_json::Value>,
 }
 
 impl Persisted {
     fn default_version() -> u32 {
         1
     }
+}
+
+/// The outcome of [`Blocklist::from_json`]: the rules that survived, plus one
+/// error per rule the payload carried but that could not be re-derived.
+///
+/// Loading is **partial by design** (REQ-A1771): a single hand-edited bad row
+/// must not disable every other rule the user believes is active. It is never
+/// *silent* — each skipped rule is named in [`Self::rejected`], which the caller
+/// is expected to surface.
+#[derive(Debug, Clone)]
+pub struct Loaded {
+    /// The rules that parsed (malformed ones excluded).
+    pub list: Blocklist,
+    /// One entry per rule skipped, in payload order.
+    pub rejected: Vec<BlocklistError>,
 }
 
 /// A bounded set of blocking rules for calls and SMS.
@@ -98,9 +130,14 @@ impl Blocklist {
             BlocklistError::InvalidPattern(format!("{pattern:?} is not a usable number"))
         })?;
         let digits = digits_of(&normalized);
-        if kind == MatchKind::Prefix && digits.len() < crate::rule::MIN_PREFIX_DIGITS {
+        // Guard the **effective** prefix (after access-prefix normalization), not
+        // the typed digits — `010` really matches on `10`. Measuring the raw text
+        // let `010`/`0001` through and silently blocked every `10…`/`1…` number.
+        if kind == MatchKind::Prefix
+            && crate::rule::effective_prefix(&digits).len() < crate::rule::MIN_PREFIX_DIGITS
+        {
             return Err(BlocklistError::InvalidPattern(format!(
-                "prefix {digits:?} is shorter than {} digits",
+                "prefix {digits:?} is shorter than {} effective digits",
                 crate::rule::MIN_PREFIX_DIGITS
             )));
         }
@@ -178,33 +215,56 @@ impl Blocklist {
         serde_json::to_string_pretty(&p).unwrap_or_else(|_| "{}".to_string())
     }
 
-    /// Parse a persisted payload. **Never trusts it blindly**: an unknown
-    /// version, a malformed rule, or more rules than the cap is an honest error
-    /// (rather than silently dropping rules the user believes are active).
-    pub fn from_json(payload: &str, cap: usize) -> Result<Self, BlocklistError> {
-        let p: Persisted = serde_json::from_str(payload)
+    /// Parse a persisted payload. **Never trusts it blindly**, but a bad *rule*
+    /// no longer takes the whole list down with it.
+    ///
+    /// The *envelope* is all-or-nothing: unparseable JSON, an unknown version, or
+    /// more rules than the cap is an honest [`Err`]. A bad *rule* — whether
+    /// semantically invalid or structurally **unreadable** (a missing field, a
+    /// bare string) — is instead skipped and reported in [`Loaded::rejected`]
+    /// while every other rule loads: one hand-edited row must not disable the
+    /// protection the user believes is active (REQ-A1771, REQ-A1777). It is still
+    /// never silent: each skip is named. Callers wanting the old all-or-nothing
+    /// behaviour reject on `!loaded.rejected.is_empty()`.
+    pub fn from_json(payload: &str, cap: usize) -> Result<Loaded, BlocklistError> {
+        let env: PersistedIn = serde_json::from_str(payload)
             .map_err(|e| BlocklistError::InvalidPayload(format!("unparseable: {e}")))?;
-        if p.version != Persisted::default_version() {
+        if env.version != Persisted::default_version() {
             return Err(BlocklistError::InvalidPayload(format!(
                 "unsupported schema version {}",
-                p.version
+                env.version
             )));
         }
         let cap = cap.max(1);
-        if p.rules.len() > cap {
+        if env.rules.len() > cap {
             return Err(BlocklistError::InvalidPayload(format!(
                 "{} rules exceed the cap of {cap}",
-                p.rules.len()
+                env.rules.len()
             )));
         }
         let mut list = Self::with_cap(cap);
-        list.set_block_unknown(p.block_unknown);
-        for r in p.rules {
-            // Re-derive from the pattern so a hand-edited file cannot inject an
-            // inconsistent digits/id pair.
-            list.add(&r.pattern, r.kind, r.channel, &r.label, r.created_ms)?;
+        list.set_block_unknown(env.block_unknown);
+        let mut rejected = Vec::new();
+        for (idx, raw) in env.rules.into_iter().enumerate() {
+            // Each row is parsed *on its own*: a row that is not even readable as
+            // a `Rule` (a missing field, a typo'd enum, a bare string) is one
+            // skipped row, not a dead payload (REQ-A1777).
+            match serde_json::from_value::<Rule>(raw) {
+                Ok(r) => {
+                    // Re-derive from the pattern so a hand-edited file cannot
+                    // inject an inconsistent digits/id pair. A rejection is
+                    // recorded, not fatal.
+                    if let Err(e) = list.add(&r.pattern, r.kind, r.channel, &r.label, r.created_ms)
+                    {
+                        rejected.push(e);
+                    }
+                }
+                Err(e) => rejected.push(BlocklistError::InvalidPattern(format!(
+                    "rule {idx} is unreadable: {e}"
+                ))),
+            }
         }
-        Ok(list)
+        Ok(Loaded { list, rejected })
     }
 
     /// Keep at most `cap` rules, evicting the oldest first.
@@ -311,6 +371,47 @@ mod tests {
     }
 
     #[test]
+    fn a_leading_zero_prefix_that_normalizes_to_a_short_one_is_refused() {
+        // REQ-A1561 / F-TEL-035. The length guard (`MIN_PREFIX_DIGITS`) was applied
+        // to the *typed* digits, but matching `trim_zeros` the **pattern**, so
+        // `"010"` (3 typed digits ⇒ accepted) became an effective `"10"` prefix
+        // that swallowed every `10…` service number, and `"0001"` became `"1"` —
+        // every `1…` number on the planet. The guard's unit must be the matching
+        // unit's, so both are now refused with an honest error.
+        let mut l = Blocklist::new();
+        assert!(matches!(
+            l.add("010", MatchKind::Prefix, Channel::Both, "", 1),
+            Err(BlocklistError::InvalidPattern(_))
+        ));
+        assert!(matches!(
+            l.add("0001", MatchKind::Prefix, Channel::Both, "", 1),
+            Err(BlocklistError::InvalidPattern(_))
+        ));
+        // …and the list stays empty, so nothing is silently over-blocked.
+        assert!(l.is_empty());
+
+        // A prefix that normalizes to ≥3 effective digits is still accepted and
+        // matches *only* its own range (never a wider one).
+        let mut ok = Blocklist::new();
+        ok.add("01069", MatchKind::Prefix, Channel::Both, "", 1)
+            .unwrap();
+        assert!(ok.is_blocked("106942053200156", Channel::Sms)); // +86 1069…
+        assert!(ok.is_blocked("0106912345678", Channel::Call)); // trunk-0 form
+        assert!(!ok.is_blocked("10086", Channel::Sms));
+        assert!(!ok.is_blocked("13800138000", Channel::Call));
+    }
+
+    #[test]
+    fn prefix_match_still_tolerates_a_country_code_on_the_address() {
+        // The other half of the contract: dropping a 1–3 digit country-code
+        // segment from the *address* keeps working after the fix.
+        let l = list_with("1069", MatchKind::Prefix, Channel::Sms);
+        assert!(l.is_blocked("106942053200156", Channel::Sms));
+        assert!(l.is_blocked("86106942053200156", Channel::Sms));
+        assert!(!l.is_blocked("10086", Channel::Sms));
+    }
+
+    #[test]
     fn channels_are_respected() {
         let sms_only = list_with("10086", MatchKind::Exact, Channel::Sms);
         assert!(sms_only.is_blocked("10086", Channel::Sms));
@@ -414,7 +515,9 @@ mod contract {
             .unwrap();
         l.set_block_unknown(true);
         let json = l.to_json();
-        let back = Blocklist::from_json(&json, DEFAULT_CAP).unwrap();
+        let loaded = Blocklist::from_json(&json, DEFAULT_CAP).unwrap();
+        assert!(loaded.rejected.is_empty(), "{:?}", loaded.rejected);
+        let back = loaded.list;
         assert_eq!(back.len(), 2);
         assert!(back.block_unknown());
         assert!(back.is_blocked("+86 138-0013-8000", Channel::Call));
@@ -422,12 +525,9 @@ mod contract {
     }
 
     #[test]
-    fn corrupted_payloads_are_rejected_not_silently_dropped() {
+    fn a_corrupt_envelope_is_rejected_not_silently_dropped() {
         assert!(Blocklist::from_json("not json", DEFAULT_CAP).is_err());
         assert!(Blocklist::from_json(r#"{"version":99,"rules":[]}"#, DEFAULT_CAP).is_err());
-        // A hand-edited file can't smuggle in an unusable pattern…
-        let bad = r#"{"version":1,"rules":[{"pattern":"abc","digits":"abc","id":"x","kind":"exact","channel":"both","created_ms":1}]}"#;
-        assert!(Blocklist::from_json(bad, DEFAULT_CAP).is_err());
         // …nor more rules than the cap.
         let many: Vec<String> = (0..5)
                 .map(|i| format!(r#"{{"pattern":"1000{i}","digits":"1000{i}","id":"r{i}","kind":"exact","channel":"both","created_ms":{i}}}"#))
@@ -435,6 +535,95 @@ mod contract {
         let over = format!(r#"{{"version":1,"rules":[{}]}}"#, many.join(","));
         assert!(Blocklist::from_json(&over, 3).is_err());
         // An empty/absent payload is an honest empty list.
-        assert!(Blocklist::from_json("{}", DEFAULT_CAP).unwrap().is_empty());
+        let empty = Blocklist::from_json("{}", DEFAULT_CAP).unwrap();
+        assert!(empty.rejected.is_empty());
+        assert!(empty.list.is_empty());
+    }
+
+    /// One hand-edited bad rule must not disable every *other* rule (REQ-A1771).
+    /// The good rules load; the bad one is named, never silently dropped.
+    #[test]
+    fn one_bad_rule_does_not_empty_the_whole_list() {
+        let payload = r#"{"version":1,"rules":[
+            {"pattern":"abc","digits":"abc","id":"x","kind":"exact","channel":"both","created_ms":1},
+            {"pattern":"+8613800138000","digits":"8613800138000","id":"ok","kind":"exact","channel":"both","created_ms":2}
+        ]}"#;
+        let loaded = Blocklist::from_json(payload, DEFAULT_CAP).unwrap();
+        assert_eq!(loaded.list.len(), 1, "the good rule must survive");
+        assert!(
+            loaded.list.is_blocked("+8613800138000", Channel::Call),
+            "protection from the valid rule cannot be lost"
+        );
+        assert_eq!(loaded.rejected.len(), 1, "the bad rule must be reported");
+        assert_eq!(loaded.rejected[0].kind(), "invalid-pattern");
+    }
+
+    /// A row that cannot even be *read* as a rule is still a **rejected row**,
+    /// not a fatal envelope error (REQ-A1777). REQ-A1771's promise was "one
+    /// hand-edited bad row must not disable every other rule" — but the fatal
+    /// step was the per-element `Rule` deserialize, which ran before any row
+    /// was examined: a single row missing a required field (`created_ms`, or a
+    /// `kind` typo) made `serde_json::from_str::<Persisted>` fail on the whole
+    /// payload, so `configure` logged "unreadable — starting empty" and **every**
+    /// rule the user believed active was gone. The bad row must be named and
+    /// skipped, never allowed to take the list with it.
+    #[test]
+    fn a_structurally_unreadable_row_is_skipped_not_fatal() {
+        let payload = r#"{"version":1,"rules":[
+            {"pattern":"+8613800138000","kind":"exact","channel":"both"},
+            {"pattern":"1069","kind":"prefix","channel":"sms","created_ms":2},
+            "not even an object"
+        ]}"#;
+        let loaded = Blocklist::from_json(payload, DEFAULT_CAP)
+            .expect("an unreadable rule must not make the whole payload an error");
+        assert_eq!(
+            loaded.list.len(),
+            1,
+            "the one well-formed rule must still load"
+        );
+        assert!(
+            loaded.list.is_blocked("10690001", Channel::Sms),
+            "protection from the readable rule cannot be lost"
+        );
+        assert_eq!(
+            loaded.rejected.len(),
+            2,
+            "both the field-missing row and the non-object row are named"
+        );
+        assert!(
+            loaded
+                .rejected
+                .iter()
+                .all(|e| e.kind() == "invalid-pattern"),
+            "a per-row parse failure is a rule rejection, not a payload error: {:?}",
+            loaded.rejected
+        );
+    }
+
+    /// The two fields the loader **re-derives and then discards** (`id`, `digits`)
+    /// are not required to be present: a hand-editor deleting the redundant
+    /// `digits` from a row is making the benign edit, and the rule must load
+    /// from its `pattern`, not be rejected for the absence of a field nothing
+    /// reads (REQ-A1777).
+    #[test]
+    fn a_row_missing_the_derived_id_and_digits_still_loads() {
+        let payload = r#"{"version":1,"rules":[
+            {"pattern":"+8613800138000","kind":"exact","channel":"both","created_ms":3}
+        ]}"#;
+        let loaded = Blocklist::from_json(payload, DEFAULT_CAP).unwrap();
+        assert!(
+            loaded.rejected.is_empty(),
+            "the derived fields are optional: {:?}",
+            loaded.rejected
+        );
+        assert_eq!(loaded.list.len(), 1);
+        assert!(loaded.list.is_blocked("+86 138-0013-8000", Channel::Call));
+    }
+
+    /// The envelope errors REQ-A1771 named are still honest `Err`s — the fix
+    /// widens the *row* handling only. Positive control for the two above.
+    #[test]
+    fn the_envelope_still_fails_as_a_whole_for_an_unknown_version() {
+        assert!(Blocklist::from_json(r#"{"version":7,"rules":[]}"#, DEFAULT_CAP).is_err());
     }
 }

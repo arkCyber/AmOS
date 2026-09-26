@@ -26,7 +26,7 @@
     systemStatusWithHostBattery,
     type SystemStatus,
   } from "../lib/system";
-  import { bridged } from "../lib/backend";
+  import { bridgeDiag, bridged } from "../lib/backend";
   import { amosLog, amosWarn } from "../lib/debugLog";
   import { t } from "./locale.svelte";
   import { onDestroy, onMount } from "svelte";
@@ -62,14 +62,15 @@
         // bridge exists AND the UDS round-trip succeeded. A null here is either no
         // Tauri bridge or a failed command (daemon down) → offline; every poll is a
         // reconnect probe that flips us back to live the moment the daemon returns.
+        //
+        // The refusal is `null`, not a rejection: `lib/system.ts` routes through
+        // `backend.invoke`, which never rejects (REQ-A220) — so the `.catch` that used
+        // to sit here ("daemon went away mid-flight") could never run. The ledger keeps
+        // the reason: `bridgeDiag("system_health")` is `command-failed` vs `not-bridged`.
         online = raw !== null;
         if (raw) sys = raw;
-      })
-      .catch(() => {
-        /* daemon went away mid-flight → keep the previous reading, go offline */
-        if (!disposed) {
-          online = false;
-          amosWarn("monitor", "health read failed", { online });
+        else if (!bridgeDiag("system_health").ok) {
+          amosWarn("monitor", "health read refused", { online });
         }
       })
       .finally(() => {
@@ -128,18 +129,27 @@
   const pctLabel = (v: number | null): string => (v === null ? "—" : `${Math.round(v)}%`);
   const pctNow = (v: number): number => Math.min(100, Math.max(0, Math.round(v)));
 
-  const cpuNow = $derived(pctNow(sys.cpu_busy_pct ?? 0));
+  // REQ-A1481：The big readout already prints 「—」 for a metric this daemon answer did not carry
+  // (`pctLabel`), but the progressbar below it used to fold that same `null` through
+  // `?? 0` — an empty bar with `aria-valuenow="0"`, i.e. "0% CPU" claimed to the eye and
+  // to a screen reader for a reading that was never taken. A bar is a **reading**, so a
+  // metric the host did not report draws no bar at all, exactly like the number draws no
+  // number. (`overviewAny` is an OR across the fields, so a partial answer — battery but
+  // no `/proc` — reaches this branch with the other two still `null`.)
+  const cpuNow = $derived(sys.cpu_busy_pct === null ? null : pctNow(sys.cpu_busy_pct));
   const mem = $derived.by(() => {
     const pct = memUsedPct(sys);
     const used = memUsedBytes(sys);
     const total = sys.mem_total_bytes;
     return {
       big: pct === null ? "—" : `${Math.round(pct)}%`,
-      now: pct === null ? 0 : pctNow(pct),
+      now: pct === null ? null : pctNow(pct),
       sub: used === null || total === null ? "n/a" : `${fmtBytes(used)} / ${fmtBytes(total)}`,
     };
   });
-  const batteryNow = $derived(pctNow(sys.battery_level_pct ?? 0));
+  const batteryNow = $derived(
+    sys.battery_level_pct === null ? null : pctNow(sys.battery_level_pct),
+  );
   const batteryBig = $derived(pctLabel(sys.battery_level_pct));
   const batterySub = $derived.by(() => {
     const parts: string[] = [];
@@ -159,7 +169,6 @@
           <button
             onclick={refresh}
             disabled={busy}
-            aria-label={t("monitor.retry")}
             class="rounded-full bg-black/5 px-3 py-1 text-xs opacity-70 active:scale-95 disabled:opacity-40 dark:bg-white/10"
           >
             {t("settings.systemRefresh")}
@@ -169,47 +178,53 @@
           <div class={TILE}>
             <span class={LABEL}>{t("monitor.cpu")}</span>
             <span class={BIG}>{pctLabel(sys.cpu_busy_pct)}</span>
-            <span
-              role="progressbar"
-              aria-label={t("monitor.cpu")}
-              aria-valuemin="0"
-              aria-valuemax="100"
-              aria-valuenow={cpuNow}
-              class="block h-1.5 w-full overflow-hidden rounded-full bg-black/10 dark:bg-white/10"
-            >
-              <span class="block h-full rounded-full bg-accent" style={`width:${cpuNow}%`}></span>
-            </span>
+            {#if cpuNow !== null}
+              <span
+                role="progressbar"
+                aria-label={t("monitor.cpu")}
+                aria-valuemin="0"
+                aria-valuemax="100"
+                aria-valuenow={cpuNow}
+                class="block h-1.5 w-full overflow-hidden rounded-full bg-black/10 dark:bg-white/10"
+              >
+                <span class="block h-full rounded-full bg-accent" style={`width:${cpuNow}%`}></span>
+              </span>
+            {/if}
           </div>
           <div class={TILE}>
             <span class={LABEL}>{t("monitor.memory")}</span>
             <span class={BIG}>{mem.big}</span>
-            <span
-              role="progressbar"
-              aria-label={t("monitor.memory")}
-              aria-valuemin="0"
-              aria-valuemax="100"
-              aria-valuenow={mem.now}
-              class="block h-1.5 w-full overflow-hidden rounded-full bg-black/10 dark:bg-white/10"
-            >
-              <span class="block h-full rounded-full bg-accent" style={`width:${mem.now}%`}></span>
-            </span>
+            {#if mem.now !== null}
+              <span
+                role="progressbar"
+                aria-label={t("monitor.memory")}
+                aria-valuemin="0"
+                aria-valuemax="100"
+                aria-valuenow={mem.now}
+                class="block h-1.5 w-full overflow-hidden rounded-full bg-black/10 dark:bg-white/10"
+              >
+                <span class="block h-full rounded-full bg-accent" style={`width:${mem.now}%`}></span>
+              </span>
+            {/if}
           </div>
           <div class={TILE}>
             <span class={LABEL}>{t("monitor.battery")}</span>
             <span class={BIG}>{batteryBig}</span>
-            <span
-              role="progressbar"
-              aria-label={t("monitor.battery")}
-              aria-valuemin="0"
-              aria-valuemax="100"
-              aria-valuenow={batteryNow}
-              class="block h-1.5 w-full overflow-hidden rounded-full bg-black/10 dark:bg-white/10"
-            >
+            {#if batteryNow !== null}
               <span
-                class="block h-full rounded-full bg-accent"
-                style={`width:${batteryNow}%`}
-              ></span>
-            </span>
+                role="progressbar"
+                aria-label={t("monitor.battery")}
+                aria-valuemin="0"
+                aria-valuemax="100"
+                aria-valuenow={batteryNow}
+                class="block h-1.5 w-full overflow-hidden rounded-full bg-black/10 dark:bg-white/10"
+              >
+                <span
+                  class="block h-full rounded-full bg-accent"
+                  style={`width:${batteryNow}%`}
+                ></span>
+              </span>
+            {/if}
           </div>
         </div>
         <div class="flex items-center justify-between gap-2 border-t border-black/5 px-3 py-2 text-[10px] opacity-70 dark:border-white/10">

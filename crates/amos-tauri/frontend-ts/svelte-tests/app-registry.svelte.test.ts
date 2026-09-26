@@ -23,7 +23,7 @@
 import { afterEach, describe, expect, test } from "vitest";
 import { ALL_APP_LOADERS, svelteAppLoader } from "../src/svelte/appRegistry";
 import { APP_META } from "../src/lib/appMeta";
-import { setFormFactor } from "../src/lib/desktopApps";
+import { setFormFactor } from "../src/lib/formAuthority.svelte";
 import { PHONE_APP_IDS } from "../src/lib/phoneApps";
 
 /** Ids present in `tiles` but with no `loaders` entry — the defect this file exists for. */

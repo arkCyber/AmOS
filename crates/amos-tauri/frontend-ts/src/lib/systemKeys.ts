@@ -38,7 +38,12 @@ import {
   type ShellShortcut,
   type ShortcutEvent,
 } from "./shellModule";
-import { mergeOverlayBindings, readKeyboardConfig } from "./keyboardConfig";
+import {
+  mergeOverlayBindings,
+  mergeTouchBindings,
+  readKeyboardConfig,
+  TOUCH_DEFAULTS,
+} from "./keyboardConfig";
 
 /** A surface the touch shell can open by key. */
 export type TouchOverlay = "spot" | "recents" | "library";
@@ -108,22 +113,29 @@ function getMergedOverlayBindings(modules: readonly ShellModule[]): Map<string, 
  * §16.4's boundary ⑤ was "the admission is undiscoverable", and iPadOS answers that with a panel
  * you get by holding ⌘. Building that panel from a hand-written list would have re-created the
  * exact defect REQ-A335 removed (a second place that knows the keys, free to drift) — so the
- * catalog walks the registry rows and `TOUCH_SYSTEM_SHORTCUTS` instead, and
- * `systemKeys.test.ts` pins the result. Adding a key anywhere therefore fails a test until the
- * panel is told about it.
+ * catalog walks the registry rows and `TOUCH_CATALOG_IDS` instead, and `systemKeys.test.ts`
+ * pins the result. Adding a key anywhere therefore fails a test until the panel is told about
+ * it. Since REQ-A1200 the keycaps come from the **merged** touch table too, so a rebind the
+ * user made in Settings is what the panel teaches.
  *
  * Phase 3: 现在从合并后的绑定中读取快捷键。
  *
- * Rows are: the platform's own navigation keys first (⌘[ / ⌘,), then the registry's overlay rows
+ * Rows are: the platform's own navigation keys first (⌘[ / ⌘, by default), then the registry's
+ * overlay rows
  * in **registry order** (the same order the desktop chrome documents). A row with two bindings
  * shows both (`"F3 / ⌘Tab"`) — the desktop's tooltip shows only the first because it sits in a
  * tight menu; a panel whose whole job is teaching keys should not hide one that works.
  */
 export function touchShortcutCatalog(modules: readonly ShellModule[]): TouchShortcutHint[] {
-  const system = TOUCH_SYSTEM_SHORTCUTS.map(({ labelKey, shortcut }) => ({
-    keys: formatShortcut(shortcut),
-    labelKey,
-  }));
+  // Generate the platform rows from the **merged** table rather than the defaults, so a rebind
+  // the user made in Settings is what the panel teaches (REQ-A1200).
+  const touch = getMergedTouchBindings();
+  const system = TOUCH_CATALOG_IDS
+    .map(({ id, labelKey }) => {
+      const shortcut = touch.get(id);
+      return shortcut ? { keys: formatShortcut(shortcut), labelKey } : null;
+    })
+    .filter((r): r is TouchShortcutHint => r !== null);
 
   // Phase 3: 使用合并后的绑定
   const mergedBindings = getMergedOverlayBindings(modules);
@@ -148,20 +160,24 @@ export function touchShortcutCatalog(modules: readonly ShellModule[]): TouchShor
 }
 
 /**
- * The **system spellings** the touch shell admits (REQ-A336).
+ * What each **editable touch row** means (REQ-A1200).
  *
- * These are deliberately *not* in the chrome registry: the registry's overlay rows are about
- * "which key opens which surface", while these are the platform's own navigation keys. Their
- * modifier semantics are still not re-implemented — they go through the same
- * `shortcutMatches`, so Ctrl-as-⌘ and the exactness rule (Shift/Alt must match) hold here too.
+ * The chords themselves now live in `keyboardConfig.TOUCH_DEFAULTS` — the same table the
+ * Settings page renders and the user edits — so this file keeps no second copy of the keys.
+ * What stays here is the *intent* a row drives, which is admission semantics, not
+ * configuration. Before this change the shell matched a **hard-coded** chord table while the
+ * Settings page edited `config.touch`: rebinding 返回上一级 to ⌘B left ⌘[ live, disabling it
+ * left ⌘[ live, and the ⌘, row the panel taught could not be edited at all.
  *
- * What is here, and why:
- *   * ⌘[ — macOS's spelling of **Back**. Same intent as Escape, one level up. It is gated by
- *     the caller to the non-desktop forms: on macOS the desktop shell has real windows, so its
- *     "back" is the window chrome, not this shell's stack.
- *   * ⌘, — **Preferences**. Of the four desktop system keys (`DesktopShell.handleSystemShortcut`:
- *     ⌘W / ⌘M / ⌘H / ⌘,) this is the only one with a real touch counterpart, because Settings
- *     is a real app on every form factor.
+ *   * `back` (⌘[ by default) — macOS's spelling of **Back**: same intent as Escape, one level
+ *     up. The `via` discriminator records *which spelling* asked, because the caller treats
+ *     them differently (Escape is the platform's own dismissal, kept available on every form;
+ *     ⌘[ is admitted only where the touch shell is the navigation authority, REQ-A336).
+ *   * `dismiss` (Escape by default) — the platform's dismissal, routed through `backActionAt`
+ *     like the hardware back gesture.
+ *   * `settings` (⌘, by default) — **Preferences**. Of the four desktop system keys
+ *     (`DesktopShell.handleSystemShortcut`: ⌘W / ⌘M / ⌘H / ⌘,) this is the only one with a real
+ *     touch counterpart, because Settings is a real app on every form factor.
  *
  * What is **not** here, each for a reason (an audit, not an omission):
  *   * ⌘W "close window" — the touch shell has no windows. The only meaning left would be "close
@@ -174,24 +190,35 @@ export function touchShortcutCatalog(modules: readonly ShellModule[]): TouchShor
  *     entries and the next `pushState` truncates the browser's forward stack, so ⌘] would
  *     usually do nothing and occasionally lie about it. Not wired is the honest state; wiring
  *     it needs a real forward stack first.
+ *
+ * Their modifier semantics are still not re-implemented: a row goes through the same
+ * `shortcutMatches`, so Ctrl-as-⌘ and the exactness rule (Shift/Alt must match) hold here too.
  */
-const TOUCH_SYSTEM_SHORTCUTS: ReadonlyArray<{
-  intent: ShellKeyIntent;
-  shortcut: ShellShortcut;
-  /** The i18n key of what this key does, for the ⌘-hold panel (`touchShortcutCatalog`). */
-  labelKey: string;
-}> = [
-  {
-    intent: { kind: "dismiss", via: "cmd-bracket" },
-    shortcut: { key: "[", meta: true },
-    labelKey: "a11y.back",
-  },
-  {
-    intent: { kind: "settings" },
-    shortcut: { key: ",", meta: true },
-    labelKey: "app.settings",
-  },
+const TOUCH_INTENTS: Readonly<Record<string, ShellKeyIntent>> = {
+  back: { kind: "dismiss", via: "cmd-bracket" },
+  dismiss: { kind: "dismiss", via: "escape" },
+  settings: { kind: "settings" },
+};
+
+/**
+ * Which touch rows the ⌘-hold panel **teaches**, in order, and what each one reaches.
+ *
+ * `dismiss` is deliberately absent: Escape is the platform's dismissal, not a chord a panel
+ * needs to advertise (the old catalog excluded it by not listing it). A user rebind of
+ * `dismiss` is still admitted by `shellKeyIntent` — it is simply not a "shortcut" to teach.
+ */
+const TOUCH_CATALOG_IDS: ReadonlyArray<{ id: string; labelKey: string }> = [
+  { id: "back", labelKey: "a11y.back" },
+  { id: "settings", labelKey: "app.settings" },
 ];
+
+/** The touch rows as the **shell** sees them: `TOUCH_DEFAULTS` + the user's Settings rebinds
+ *  (a `null` row is disabled and therefore absent from the map — matching it can only ever see
+ *  what the user left enabled). `mergeTouchBindings` is the one rule book the Settings page's
+ *  own `resolveBindings` also calls. */
+function getMergedTouchBindings(): Map<string, ShellShortcut> {
+  return mergeTouchBindings(TOUCH_DEFAULTS, readKeyboardConfig());
+}
 
 /**
  * Turn a keystroke into an intent. Pure: no DOM, no shell state — the caller decides what
@@ -211,10 +238,17 @@ export function shellKeyIntent(
   if (e.isComposing || e.key === "Process") return NONE;
   if (e.repeat) return NONE;
 
-  // 2. Escape = "up one level" — the keyboard's spelling of the platform back gesture.
-  //    Whether that does anything is the caller's decision (at home/lock it does nothing at
-  //    all, and the caller must also let the event through then).
-  if (e.key === "Escape") return { kind: "dismiss", via: "escape" };
+  // 2. The touch shell's own navigation keys. Read from the **merged** table (defaults + the
+  //    user's Settings rebinds), not from a hard-coded copy: 「触屏导航」 now actually governs
+  //    this admission (REQ-A1200). A disabled row is absent from the map, so it is inert —
+  //    the property the old `if (e.key === "Escape")` / `TOUCH_SYSTEM_SHORTCUTS` pair could
+  //    not express, which is exactly why Escape kept working after it was switched off and
+  //    ⌘[ kept working after it was rebound. Escape is a row like any other now, and goes
+  //    through the same `shortcutMatches` (so ⇧Escape / ⌘Escape are no longer half-consumed).
+  for (const [id, shortcut] of getMergedTouchBindings()) {
+    const intent = TOUCH_INTENTS[id];
+    if (intent && shortcutMatches(e, shortcut)) return intent;
+  }
 
   // 3. Phase 3: 使用合并后的绑定
   const mergedBindings = getMergedOverlayBindings(modules);
@@ -232,10 +266,6 @@ export function shellKeyIntent(
     }
   }
 
-  // 4. The platform's navigation keys (⌘[ / ⌘,), matched with the same rules.
-  for (const { intent, shortcut } of TOUCH_SYSTEM_SHORTCUTS) {
-    if (shortcutMatches(e, shortcut)) return intent;
-  }
   return NONE;
 }
 

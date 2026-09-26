@@ -112,7 +112,9 @@ impl ResourceGovernor {
 
     /// Move an existing, registered app to a target lifecycle [`AppState`]
     /// (foreground/background/frozen-cached/service/stopped). `Visible` is not a
-    /// settable state here (it derives from surface visibility), so it is rejected.
+    /// settable state here (it derives from surface visibility), so it is rejected
+    /// — with the process's *actual* current state in `from`, and `Unknown` (like
+    /// every other target) when the id was never registered. (REQ-A579)
     pub fn move_app(
         &mut self,
         id: AppId,
@@ -125,11 +127,14 @@ impl ResourceGovernor {
             S::Cached => self.apps.freeze(id),
             S::ForegroundService => self.apps.start_service(id),
             S::Stopped => self.apps.stop(id),
-            S::Visible => Err(amos_applife::LifecycleError::InvalidTransition {
-                id: id.to_string(),
-                from: ".".to_string(),
-                to: "visible".to_string(),
-            }),
+            S::Visible => match self.apps.state(&id) {
+                Err(e) => Err(e),
+                Ok(from) => Err(amos_applife::LifecycleError::InvalidTransition {
+                    id: id.to_string(),
+                    from: from.key().to_string(),
+                    to: S::Visible.key().to_string(),
+                }),
+            },
         }
     }
 
@@ -295,20 +300,29 @@ impl ResourceGovernor {
 
 /// A resident DVFS applier for the daemon governor beat: discovers the CPUFreq
 /// topology from a Linux sysfs root once, then applies the frequency plan implied
-/// by the last [`ResourceGovernor`] energy decision — **only when it changed** —
-/// by writing `scaling_max_freq` (and the NPU node) via `amos_power`'s
-/// [`LinuxFreqGovernor`].
+/// by the last [`ResourceGovernor`] energy decision — **only when the hardware is
+/// not already known to hold it** — by writing `scaling_max_freq` (and the NPU
+/// node) via `amos_power`'s [`LinuxFreqGovernor`].
 ///
 /// Kinds (little/big) are labelled by a documented heuristic: a domain at ≥90% of
 /// the fastest domain's max is `Big`, the rest `Little` (efficient). Device
-/// bring-up should override with the real topology when it differs. Honest: any
-/// write failure is surfaced in the returned [`FreqApplyReport`]; nothing is
-/// claimed applied unless the seam reports it.
+/// bring-up should override with the real topology when it differs. Honest: a
+/// write failure is surfaced in the returned [`FreqApplyReport`] **and the plan is
+/// retried until it lands** — nothing is claimed applied unless the seam reported
+/// it clean (see [`Self::apply_if_changed`], REQ-A529).
 pub struct DvfsDriver {
     applier: LinuxFreqGovernor,
     clusters: Vec<Cluster>,
     npu_max_khz: Option<u32>,
-    last: Option<FreqPlan>,
+    /// The last plan whose apply came back **clean** — the one the hardware is
+    /// known to hold. A plan whose writes failed is deliberately *not* recorded
+    /// here, so it is retried on the next tick until the device accepts it
+    /// (REQ-A529).
+    last_clean: Option<FreqPlan>,
+    /// The `(plan, failures)` of the last failed apply we *reported*, so an
+    /// unchanged repeat of the same bad news is not logged every tick while real
+    /// news (a different plan, or a different failure set) still is.
+    last_reported: Option<(FreqPlan, Vec<(String, String)>)>,
     /// Total `scaling_max_freq` writes the seam reported as applied.
     applied_total: u64,
     /// Total write attempts the seam reported as failed.
@@ -361,7 +375,8 @@ impl DvfsDriver {
             applier,
             clusters,
             npu_max_khz,
-            last: None,
+            last_clean: None,
+            last_reported: None,
             applied_total: 0,
             failed_total: 0,
         })
@@ -399,17 +414,39 @@ impl DvfsDriver {
         }
     }
 
-    /// Apply `plan` if it differs from the last applied one. `None` when it is
-    /// unchanged (no sysfs write needed); otherwise the real [`FreqApplyReport`]
-    /// so the caller can log exactly what the device accepted / refused.
+    /// Apply `plan` unless the hardware is already known to hold it. Returns the
+    /// real [`FreqApplyReport`] whenever this tick produced something the caller
+    /// has not already been told, and `None` when there is nothing new to report.
+    ///
+    /// The baseline is the last plan whose apply came back **clean**. A plan whose
+    /// writes failed (a read-only `/sys`, a missing node, a cluster with no
+    /// representative cpu — see [`LinuxFreqGovernor::apply`]) is *not* recorded as
+    /// applied, so the next tick retries it: a transient write failure must not
+    /// leave the device silently uncapped while the driver believes it is capped.
+    /// Reporting is deduped *separately*, over `(plan, failures)`, so a retry that
+    /// reproduces the identical bad news is silent (no per-tick log spam) while a
+    /// changed failure set — or the recovery — is surfaced. (REQ-A529.)
     pub fn apply_if_changed(&mut self, plan: &FreqPlan) -> Option<FreqApplyReport> {
-        if self.last.as_ref() == Some(plan) {
+        // Nothing new: the hardware already holds this plan.
+        if self.last_clean.as_ref() == Some(plan) {
             return None;
         }
         let report = self.applier.apply(plan);
         self.applied_total += u64::from(report.applied);
         self.failed_total += report.failures.len() as u64;
-        self.last = Some(plan.clone());
+        if report.is_clean() {
+            self.last_clean = Some(plan.clone());
+            self.last_reported = None;
+            return Some(report);
+        }
+        // The ceiling is NOT confirmed on the hardware: leave `last_clean` alone so
+        // the same desired plan is retried next tick, and re-report only when the
+        // bad news actually changed.
+        let signature = (plan.clone(), report.failures.clone());
+        if self.last_reported.as_ref() == Some(&signature) {
+            return None;
+        }
+        self.last_reported = Some(signature);
         Some(report)
     }
 }
@@ -545,6 +582,43 @@ mod tests {
     }
 
     #[test]
+    fn move_app_visible_names_the_real_source_state() {
+        use amos_applife::{AppState as S, LifecycleError};
+        let mut g = ResourceGovernor::default();
+        g.register_app(AppId::new("notes")).unwrap();
+        g.background_app(AppId::new("notes")).unwrap();
+
+        let err = g.move_app(AppId::new("notes"), S::Visible).unwrap_err();
+        assert_eq!(
+            err,
+            LifecycleError::InvalidTransition {
+                id: "notes".to_string(),
+                // The process's *actual* state, not a placeholder.
+                from: "background".to_string(),
+                to: "visible".to_string(),
+            }
+        );
+        // The rejection is a refusal, not a transition.
+        assert_eq!(g.app_state(&AppId::new("notes")), Some(S::Background));
+    }
+
+    #[test]
+    fn move_app_visible_for_an_unknown_app_is_unknown() {
+        use amos_applife::{AppState as S, LifecycleError};
+        let mut g = ResourceGovernor::default();
+        // `Visible` must not stand in for the existence check every other target
+        // performs: an unregistered id is `Unknown`, exactly as for `Cached` etc.
+        assert_eq!(
+            g.move_app(AppId::new("ghost"), S::Visible).unwrap_err(),
+            LifecycleError::Unknown("ghost".to_string())
+        );
+        assert_eq!(
+            g.move_app(AppId::new("ghost"), S::Cached).unwrap_err(),
+            LifecycleError::Unknown("ghost".to_string())
+        );
+    }
+
+    #[test]
     fn expired_deferred_is_dropped_and_surfaced_in_outcome() {
         let mut g = ResourceGovernor::default();
         // A deferred job whose window passes while PowerSave throttles it, plus a
@@ -654,6 +728,25 @@ mod tests {
         fs::write(dir.join("cpuinfo_max_freq"), format!("{max_khz}\n")).unwrap();
         fs::write(dir.join("scaling_max_freq"), "999999\n").unwrap();
     }
+
+    /// Like [`prep_cpu`], but `scaling_max_freq` is a *directory* so every write to
+    /// it fails deterministically (EISDIR). Discovery only reads
+    /// `cpuinfo_max_freq` / `related_cpus`, so the domain is still found.
+    /// Deliberately not a permission trick: a root-run test would bypass a
+    /// read-only mode and silently stop exercising the failure path.
+    fn prep_cpu_unwritable(root: &Path, cpu: u32, max_khz: u32) {
+        let dir = root.join(format!("cpu{cpu}/cpufreq"));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("cpuinfo_max_freq"), format!("{max_khz}\n")).unwrap();
+        fs::create_dir_all(dir.join("scaling_max_freq")).unwrap();
+    }
+
+    /// Swap an unwritable `scaling_max_freq` directory back for a real file.
+    fn heal_scaling(root: &Path, cpu: u32) {
+        let node = root.join(format!("cpu{cpu}/cpufreq/scaling_max_freq"));
+        fs::remove_dir(&node).unwrap();
+        fs::write(&node, "999999\n").unwrap();
+    }
     fn read_scaling(root: &Path, cpu: u32) -> u32 {
         let s =
             fs::read_to_string(root.join(format!("cpu{cpu}/cpufreq/scaling_max_freq"))).unwrap();
@@ -692,6 +785,82 @@ mod tests {
         assert_eq!(read_scaling(root.path(), 4), 2_000_000);
         assert_eq!(d.applied_total(), 4);
         assert_eq!(d.failed_total(), 0);
+    }
+
+    #[test]
+    fn failed_ceiling_write_is_retried_until_it_lands() {
+        use amos_sensor::SensorMode;
+        let root = TempDir::new();
+        prep_cpu_unwritable(root.path(), 0, 1_800_000);
+        prep_cpu_unwritable(root.path(), 4, 2_500_000);
+
+        let mut d = DvfsDriver::from_cpufreq_root(root.path(), 8, None, Vec::new())
+            .expect("topology discovered");
+        let ps = plan(SensorMode::PowerSave, d.clusters(), None);
+
+        // First attempt: both writes fail, and the failure IS reported.
+        let rep = d
+            .apply_if_changed(&ps)
+            .expect("a failed apply is still reported");
+        assert!(!rep.is_clean());
+        assert_eq!(rep.applied, 0);
+        assert_eq!(rep.failures.len(), 2);
+        assert_eq!(d.failed_total(), 2);
+
+        // Same plan next tick: the write is RETRIED (failed_total grows) even
+        // though the identical failure is not re-reported (no per-tick spam).
+        assert!(d.apply_if_changed(&ps).is_none());
+        assert_eq!(d.failed_total(), 4, "a failed ceiling must be retried");
+
+        // The retry must pay off once /sys accepts writes again.
+        heal_scaling(root.path(), 0);
+        heal_scaling(root.path(), 4);
+        let rep2 = d
+            .apply_if_changed(&ps)
+            .expect("a recovery is news, not a silent dedup");
+        assert!(rep2.is_clean(), "failures: {:?}", rep2.failures);
+        assert_eq!(read_scaling(root.path(), 0), 1_440_000);
+        assert_eq!(read_scaling(root.path(), 4), 1_250_000);
+        assert_eq!(d.failed_total(), 4, "a clean apply adds no failures");
+        assert_eq!(d.applied_total(), 2);
+
+        // Only now that the hardware holds the plan is the same plan a no-op.
+        assert!(d.apply_if_changed(&ps).is_none());
+        assert_eq!(d.applied_total(), 2);
+    }
+
+    #[test]
+    fn a_changed_failure_set_is_reported_again() {
+        use amos_sensor::SensorMode;
+        let root = TempDir::new();
+        prep_cpu(root.path(), 0, 1_800_000); // writable
+        prep_cpu_unwritable(root.path(), 4, 2_500_000); // fails
+
+        let mut d = DvfsDriver::from_cpufreq_root(root.path(), 8, None, Vec::new()).unwrap();
+        let ps = plan(SensorMode::PowerSave, d.clusters(), None);
+
+        // Partial failure: cluster-0 landed, cluster-4 did not -> reported.
+        let rep = d.apply_if_changed(&ps).expect("partial failure reported");
+        assert_eq!(rep.applied, 1);
+        assert_eq!(rep.failures.len(), 1);
+        assert!(rep.failures[0].0.contains('4'), "{:?}", rep.failures);
+        assert_eq!(read_scaling(root.path(), 0), 1_440_000);
+        assert_eq!(d.failed_total(), 1);
+
+        // Identical retry -> retried, but silent.
+        assert!(d.apply_if_changed(&ps).is_none());
+        assert_eq!(d.failed_total(), 2);
+
+        // cluster-0 fails too: the failure set CHANGED, so it is news again.
+        let node0 = root.path().join("cpu0/cpufreq/scaling_max_freq");
+        fs::remove_file(&node0).unwrap();
+        fs::create_dir(&node0).unwrap();
+        let rep2 = d
+            .apply_if_changed(&ps)
+            .expect("a changed failure set is reported");
+        assert_eq!(rep2.applied, 0);
+        assert_eq!(rep2.failures.len(), 2);
+        assert_eq!(d.failed_total(), 4);
     }
 
     #[test]

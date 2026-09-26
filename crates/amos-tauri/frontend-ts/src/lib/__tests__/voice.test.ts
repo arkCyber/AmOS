@@ -12,6 +12,7 @@
  */
 
 import { describe, test, expect } from "bun:test";
+import { fastest, PERF_ATTEMPTS } from "../../__tests__/perfBudget";
 import {
   voiceReducer,
   pcmToWavBytes,
@@ -582,50 +583,50 @@ describe("语音输入系统 - 性能测试", () => {
   test("WAV 生成应该在 10ms 内完成（小音频）", () => {
     const samples = new Float32Array(1000).fill(0.1);
     
-    const start = performance.now();
-    for (let i = 0; i < 100; i++) {
-      pcmToWavBytes(samples, 48000);
-    }
-    const duration = performance.now() - start;
-    
+    // REQ-A850 / F-DEV-106：单次 `performance.now()` 差值 = 干活 + 被抢占的时间。
+    const duration = fastest(PERF_ATTEMPTS, () => {
+      for (let i = 0; i < 100; i++) {
+        pcmToWavBytes(samples, 48000);
+      }
+    });
+
     expect(duration).toBeLessThan(100); // 100次 < 100ms
   });
 
   test("状态机转换应该是即时的（< 1ms）", () => {
-    const start = performance.now();
-    
-    let state: VoiceStatus = "idle";
-    for (let i = 0; i < 10000; i++) {
-      state = voiceReducer(state, { type: "start" });
-      state = voiceReducer(state, { type: "stop" });
-      state = voiceReducer(state, { type: "ok" });
-    }
-    
-    const duration = performance.now() - start;
+    const duration = fastest(PERF_ATTEMPTS, () => {
+      let state: VoiceStatus = "idle";
+      for (let i = 0; i < 10000; i++) {
+        state = voiceReducer(state, { type: "start" });
+        state = voiceReducer(state, { type: "stop" });
+        state = voiceReducer(state, { type: "ok" });
+      }
+    });
+
     expect(duration).toBeLessThan(10); // 30000次转换 < 10ms
   });
 
   test("解析器应该在 1ms 内完成（单次）", () => {
     const payload = { text: "Hello, world!", recognized: true };
     
-    const start = performance.now();
-    for (let i = 0; i < 1000; i++) {
-      parseTranscribe(payload);
-    }
-    const duration = performance.now() - start;
-    
+    const duration = fastest(PERF_ATTEMPTS, () => {
+      for (let i = 0; i < 1000; i++) {
+        parseTranscribe(payload);
+      }
+    });
+
     expect(duration).toBeLessThan(10); // 1000次 < 10ms
   });
 
   test("信号检测应该在 1ms 内完成（1000采样）", () => {
     const samples = new Float32Array(1000).fill(0.1);
     
-    const start = performance.now();
-    for (let i = 0; i < 1000; i++) {
-      hasSignal(samples);
-    }
-    const duration = performance.now() - start;
-    
+    const duration = fastest(PERF_ATTEMPTS, () => {
+      for (let i = 0; i < 1000; i++) {
+        hasSignal(samples);
+      }
+    });
+
     expect(duration).toBeLessThan(10); // 1000次 < 10ms
   });
 });

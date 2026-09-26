@@ -5,6 +5,7 @@
   // "Frequent / Recent" call chips are derived from the shared call log via
   // createStoreValue (lib/calllog.ts) — never reimplemented.
   import {
+    AVATAR_THEME_KEY,
     CONTACTS_KEY,
     addContact,
     avatarEmoji,
@@ -19,6 +20,7 @@
     getContactAvatarSrc,
     groupContacts,
     hasCustomAvatar,
+    normalizeAvatarTheme,
     normalizeContacts,
     primaryPhone,
     processAvatarUpload,
@@ -30,10 +32,13 @@
     sortContacts,
   } from "../lib/contacts";
   import type { AvatarTheme, Contact } from "../lib/contacts";
-  import { readStoreValue, writeStoreValue, writeStoreValueChecked } from "../lib/amosStore";
+  import { readStoreValue, writeStoreValueChecked } from "../lib/amosStore";
   import StoreErrorBar from "./StoreErrorBar.svelte";
   import { iconSvg } from "../lib/sysIcons";
-  import { bridged, telephonyDial } from "../lib/backend";
+  import { bridged, realDial, realDialStatus, telephonyBackendKind, telephonyDefaultDialerStatus, telephonyDial } from "../lib/backend";
+  import { placeOutgoingCall } from "../lib/phone";
+  import { wmOpenReported } from "../lib/wm";
+  import { isEmergencyNumber } from "../lib/emergency";
   import {
     CALLLOG_KEY,
     frequentNumbers,
@@ -42,21 +47,45 @@
     recordCall,
   } from "../lib/calllog";
   import type { CallRecord } from "../lib/calllog";
-  import { NOTIF_KEY, addNotif, newNotifId } from "../lib/settings";
+  import { NOTIF_KEY, addNotif, newNotifId, normalizeNotifs } from "../lib/settings";
   import type { Notif } from "../lib/settings";
-  import { zh } from "../i18n/locales/zh";
+  import { bgT } from "./bgText";
   import { t } from "./locale.svelte";
   import { createStoreValue } from "./store";
   import { contactsChannel } from "./appLinks";
+  import { dragGesture } from "./dragGesture";
+  import { makePhonePayload } from "../lib/dragDrop";
   import { buildVcf, countVCards, MAX_IMPORT_BYTES, mergeImported, parseVcf } from "../lib/contactTransfer";
   import type { ParseVcfResult } from "../lib/contactTransfer";
   import { copySelection } from "../lib/clipboard";
   import { calculateVirtualRange } from "../lib/virtualScroll";
+  import { grantCapability } from "./osPermissions";
 
-  // Contacts list: seeded from the shared store; every mutation persists.
-  // NOTE: $state does NOT lazily invoke a function initializer — compute first.
-  const initialContacts = normalizeContacts(readStoreValue<unknown>(CONTACTS_KEY, []));
-  let contacts = $state<Contact[]>(initialContacts);
+  // Default-on contacts: this screen is the app whose headline function *is* the
+  // `contacts` resource, exactly as `camera` is the Camera screen's
+  // (`osCapabilities.DEFAULT_CAPABILITIES`). Per the repo's owning-screen doctrine —
+  // CameraApp re-seeds at mount, VoiceMemosApp re-asserts at the point of use, neither
+  // prompts — this screen re-asserts the grant through the one seam. The boot seed
+  // writes it once; this is what makes an explicit Privacy revoke come back on the next
+  // open of the screen that owns the resource, and what puts a "use" in the daemon audit
+  // trail for a capability the OS declares for this app (audit P1-C1). Idempotent: a
+  // ledger that already holds it costs no store write and no daemon mirror.
+  grantCapability("contacts", "contacts");
+
+  // Contacts list: seeded from the shared store and kept in sync with it.
+  //
+  // The key is written by more than one surface — `PhoneApp` subscribes to it (so a contact
+  // added here names the typed number in the recents), and a **split pane** mounts this screen
+  // beside another one. Reading it once at init would both miss an external write and, because
+  // every mutation persists *this* component's list, erase it. Same primitive as the sibling
+  // `PhoneApp` / `IncomingCall`, which already subscribe (`REQ-A1126`).
+  const contactsStore = createStoreValue<unknown>(CONTACTS_KEY, []);
+  let contacts = $state<Contact[]>(normalizeContacts(readStoreValue<unknown>(CONTACTS_KEY, [])));
+  $effect(() => {
+    return contactsStore.subscribe((v) => {
+      contacts = normalizeContacts(v);
+    });
+  });
   // The store refused a write (full/unavailable): say so and keep showing the truth.
   let storeErr = $state("");
   const persist = (next: Contact[]): boolean => {
@@ -81,6 +110,10 @@
   let confirmId = $state<string | null>(null);
 
   // ---- avatar theme & animation state ----
+  // The theme is a durable preference, so the store — not module memory — is the
+  // source of truth for what the screen starts on. Seeding the pure module here keeps
+  // `avatarEmoji`'s own default and this component from ever disagreeing.
+  setAvatarTheme(normalizeAvatarTheme(readStoreValue<unknown>(AVATAR_THEME_KEY, undefined)));
   let avatarTheme = $state<AvatarTheme>(getAvatarTheme());
   let avatarThemeMenuOpen = $state(false);
   let animatingAvatarId = $state<string | null>(null);
@@ -113,7 +146,10 @@
       document.body.appendChild(a);
       a.click();
       a.remove();
-      URL.revokeObjectURL(url);
+      // Release the object URL on a later task, **not** synchronously: the browser reads
+      // the blob *after* `click()` returns, and revoking in the same task can cancel the
+      // download — the export would then announce 「已导出 N 个联系人」 with no file.
+      setTimeout(() => URL.revokeObjectURL(url), 0);
       return true;
     } catch {
       return false;
@@ -242,6 +278,10 @@
   let scrollTop = $state(0);
   let containerHeight = $state(600);
   const ITEM_HEIGHT = 64; // Contact row height in px
+  // The scroll container itself, so the alphabet index can move it. It is NOT only a
+  // styling hook: the virtual window derives from `scrollTop`, so a jump must move the
+  // *element* too — otherwise the next `onscroll` reads the old position back.
+  let listEl = $state<HTMLDivElement | null>(null);
 
   // Flatten groups into a single array with metadata for virtual scrolling
   interface FlatItem {
@@ -252,26 +292,83 @@
     itemIndex: number;
   }
 
-  const flatItems = $derived((): FlatItem[] => {
+  /** The one owner of the flat layout: any consumer that needs to know *where* a row
+   *  sits (the render window, a jump, a reveal) counts through this, so an index can
+   *  never be computed against a different layout than the one being rendered. */
+  function flattenGroups(gs: { letter: string; items: Contact[] }[]): FlatItem[] {
     const result: FlatItem[] = [];
-    groups.forEach((grp, groupIndex) => {
+    gs.forEach((grp, groupIndex) => {
       result.push({ type: "header", letter: grp.letter, groupIndex, itemIndex: result.length });
       grp.items.forEach((contact) => {
         result.push({ type: "contact", contact, groupIndex, itemIndex: result.length });
       });
     });
     return result;
-  });
+  }
 
-  const totalHeight = $derived(flatItems().length * ITEM_HEIGHT);
+  const flatItems = $derived(flattenGroups(groups));
+
+  const totalHeight = $derived(flatItems.length * ITEM_HEIGHT);
+
+  /**
+   * Move the virtual list's window: state **and** element together.
+   *
+   * The rendered rows are *derived* from `scrollTop` (`visibleRange` below), and the
+   * element's own offset is only ever read back to that state by an `onscroll` event.
+   * So a positional change has to write both: writing only the state leaves the element
+   * showing the old rows until the next scroll event arrives, and writing only the
+   * element leaves the derived window computing from the old offset. Every jump/reveal
+   * in this screen goes through here.
+   */
+  function scrollListTo(top: number): void {
+    const clamped = Math.max(0, top);
+    scrollTop = clamped;
+    if (listEl) listEl.scrollTop = clamped;
+  }
+
+  /**
+   * Jump to a letter's section — the whole point of the index, and the one gesture
+   * that must reach a section *far* from the current position.
+   *
+   * It cannot be a `getElementById("section-" + letter).scrollIntoView()`: this list is
+   * virtualized, so only the rows around the current `scrollTop` exist in the DOM, and
+   * the header element for any other letter does not exist at all. The lookup therefore
+   * returned `null` and the tap did nothing — for exactly the far letters the index
+   * exists to reach (a rendered letter is one you can already see).
+   *
+   * The scroll position is the virtual window's input, so the jump sets *that*: the
+   * header's index times the row height.
+   */
+  function jumpToLetter(letter: string): void {
+    const idx = flatItems.findIndex((it) => it.type === "header" && it.letter === letter);
+    if (idx < 0) return;
+    scrollListTo(idx * ITEM_HEIGHT);
+  }
+
+  /**
+   * Bring one contact's row into the render window.
+   *
+   * Same family as {@link jumpToLetter}: a row outside the window is not in the DOM at
+   * all, so "mark this contact" is a request addressed to the window's **input** and has
+   * to move it. Without this the Spotlight deep link marked a row that, for any contact
+   * below the current window, did not exist — the screen showed nothing at all while
+   * claiming to have revealed the contact. Measured against the **unfiltered** list,
+   * because the deep-link path is the one that clears `q` (the list it will render).
+   */
+  function revealContact(id: string): void {
+    const idx = flattenGroups(groupContacts(sortContacts(contacts))).findIndex(
+      (it) => it.type === "contact" && it.contact?.id === id,
+    );
+    if (idx >= 0) scrollListTo(idx * ITEM_HEIGHT);
+  }
 
   const visibleRange = $derived(
-    calculateVirtualRange(scrollTop, containerHeight, flatItems().length, ITEM_HEIGHT, 5)
+    calculateVirtualRange(scrollTop, containerHeight, flatItems.length, ITEM_HEIGHT, 5)
   );
 
   const visibleItems = $derived(
     visibleRange.items.map((vItem) => {
-      const item = flatItems()[vItem.index];
+      const item = flatItems[vItem.index];
       return item ? { ...item, vStart: vItem.start } : null;
     }).filter((item): item is FlatItem & { vStart: number } => item !== null)
   );
@@ -291,6 +388,9 @@
       if (target) {
         q = ""; // a filtered list would hide the very contact we were asked to show
         spotId = target.id;
+        // …and a row outside the render window is not in the DOM either, so "mark it"
+        // also has to move the window onto it.
+        revealContact(target.id);
       }
       contactsChannel().set({ id: "", nonce: linkNonce });
     });
@@ -302,14 +402,20 @@
       .map((x) => x.trim())
       .filter(Boolean);
     const input = { name, phones: ph, note: note || undefined };
-    if (ph.length > 0) {
-      const dup = editing
-        ? contactsWithPhoneExcept(contacts, ph[0]!, editing.id)
-        : contactsWithPhone(contacts, ph[0]!);
-      if (dup.length > 0) {
-        status = t("contacts.dup");
-        return;
-      }
+    // Every number in the field, not just the first. The field is a comma/newline-separated
+    // *list*, so a duplicate in the second slot used to slip past the guard and be saved —
+    // and the reverse lookup (`contactNameFor`) then names whichever contact sorts first.
+    // Same shape as `mergeImported`'s own guard, whose comment says it mirrors this one.
+    const dup = ph.some(
+      (p) =>
+        (editing
+          ? contactsWithPhoneExcept(contacts, p, editing.id)
+          : contactsWithPhone(contacts, p)
+        ).length > 0,
+    );
+    if (dup) {
+      status = t("contacts.dup");
+      return;
     }
     const next = editing ? editContact(contacts, editing.id, input) : addContact(contacts, input);
     if (next === contacts) {
@@ -331,7 +437,10 @@
     editing = c;
     adding = false;
     name = c.name;
-    phones = c.phones.join("\n");
+    // Join with the separator the field itself advertises (it is a single-line `<input>`, and
+    // the text-input value sanitisation strips CR/LF — a `"\n"` join showed two numbers as one
+    // concatenated number and made one keystroke save that concatenation over the real numbers).
+    phones = c.phones.join(", ");
     note = c.note ?? "";
     status = "";
   }
@@ -348,8 +457,18 @@
     avatarThemeMenuOpen = !avatarThemeMenuOpen;
   }
 
-  /** Change avatar theme and refresh UI. */
+  /** Change avatar theme and refresh UI. A refused write is reported, never claimed. */
   function changeAvatarTheme(theme: AvatarTheme): void {
+    // Verify the durable write BEFORE the screen says 「已切换到 … 主题」: the picker used
+    // to repaint every avatar and announce the switch for a choice that lived only in
+    // module memory and was gone on the next launch. A store that refused it must read
+    // as a refused change, not as a switch that quietly un-happened.
+    if (!writeStoreValueChecked(AVATAR_THEME_KEY, theme)) {
+      storeErr = t("common.storeWriteFailed");
+      avatarThemeMenuOpen = false;
+      return;
+    }
+    storeErr = "";
     setAvatarTheme(theme);
     avatarTheme = theme;
     avatarThemeMenuOpen = false;
@@ -426,6 +545,28 @@
     longPressTarget = null;
   }
 
+  // Cross-app drag (REQ-A683): hold a contact row, then drag — the payload is its
+  // first phone number, and releasing over Messages/Phone hands the number over.
+  // The avatar button and the row's own action buttons keep their long-press/tap, so
+  // a press that starts on a button is left to the button (see `startContactDrag`).
+  let dragContactId = $state<string | null>(null);
+  const contactDrag = dragGesture({
+    payload: () => {
+      const c = contacts.find((x) => x.id === dragContactId);
+      if (!c) return null;
+      const n = c.phones.find((p) => p.trim() !== "");
+      return n ? makePhonePayload(n, c.name) : null;
+    },
+    sourceApp: () => "contacts",
+  });
+
+  /** Arm the drag only when the press landed on the row, not on one of its buttons. */
+  function startContactDrag(e: PointerEvent, contactId: string): void {
+    if ((e.target as HTMLElement | null)?.closest("button")) return;
+    dragContactId = contactId;
+    contactDrag.onpointerdown(e);
+  }
+
   /** Open file picker for avatar upload. */
   function openAvatarUpload(contactId: string): void {
     uploadingAvatarFor = contactId;
@@ -494,18 +635,74 @@
       status = t("contacts.offline");
       return;
     }
-    try {
-      await telephonyDial(num);
-      recordOutgoing(num, nameHint, t("contacts.dialed"));
-      status = t("contacts.dialing");
-    } catch {
-      status = t("contacts.offline");
+    // The call goes through the **same** decision owner as the dialer
+    // (`lib/phone.ts::placeOutgoingCall`), so the two screens cannot drift apart: the
+    // real platform path (`ACTION_CALL`) first, then a daemon backed by a genuinely real
+    // stack, and only a host with no telephony stack at all falls back to the daemon's
+    // simulation. Calling `telephonyDial` alone left this screen the one place a device
+    // with a live bridge but a dead daemon could only ever say "offline", even though
+    // the platform could place the call (REQ-A1232).
+    const outcome = await placeOutgoingCall(num, isEmergencyNumber(num), {
+      system: (n) => realDial(n),
+      daemonReal: async () => (await telephonyBackendKind())?.real === true,
+      hostStatus: () => realDialStatus(),
+      daemon: (n, e) => telephonyDial(n, e),
+    });
+    // A refusal is the outcome, not an exception: `invoke` catches every bridge
+    // rejection and answers `null` (REQ-A296), so a `catch` here could never run.
+    if (outcome.kind === "failed") {
+      // The host's own words when it gave any — "connect the phone daemon" would be the
+      // wrong remedy for a device that simply refused to place the call.
+      status = outcome.reason !== "" ? t("phone.dialFailedDetail", { detail: outcome.reason }) : t("contacts.offline");
+      return;
     }
+    // A simulated call (the daemon's mock on a host with no telephony stack) is recorded
+    // and reported as one: "已拨出电话" alone would claim a call the device never placed.
+    const simulated = outcome.kind === "managed" && outcome.simulated;
+    recordOutgoing(num, nameHint, simulated ? t("phone.dialedSimulated") : t("contacts.dialed"));
+    if (outcome.kind === "handed-off") {
+      // `ACTION_CALL` went to Android Telecom. **Which dialer owns the call now** is the
+      // ROLE_DIALER role, not a guess — the same question `PhoneApp.startCall` asks after
+      // its own hand-off (REQ-A1222), one surface over:
+      //   * AmOS holds the role ⇒ Telecom resolves the call straight back into *this
+      //     app's own* `AmosInCallService` (fixed id `real`). "The system dialer owns it"
+      //     is then false, there is no other dialer to hang up on, and this list has no
+      //     in-call UI — a live call the user cannot end. Bring up the Phone app, whose
+      //     mount-adoption renders the real in-call surface (hang-up / timer / toggles).
+      //   * AmOS does not hold the role ⇒ another dialer owns the call and draws its own
+      //     in-call UI; opening Phone would put our keypad under *their* call.
+      const role = await telephonyDefaultDialerStatus();
+      // A probe that fails answers `null` — no verdict — and `null` is 「我没问到」, not
+      // the second case: nothing established who owns the live call, and reading the
+      // refusal as "another dialer took it" is a guess that can hide a call AmOS itself
+      // owns behind a line with no hang-up anywhere. Ask Phone (whose mount adoption asks
+      // the same question and draws the matching surface) and say the status was unread.
+      if (role === null) {
+        status = (await wmOpenReported("phone", "contacts"))
+          ? t("contacts.dialRoleUnanswered")
+          : t("contacts.callUiFailed");
+        return;
+      }
+      if (role.role_held) {
+        // A refused `wm_open` is not the call failing: the call is live either way, so
+        // say which half went wrong instead of 「正在拨号…」 over a call with no control.
+        status = (await wmOpenReported("phone", "contacts"))
+          ? t("contacts.dialing")
+          : t("contacts.callUiFailed");
+        return;
+      }
+      status = t("phone.handedToSystem");
+      return;
+    }
+    status = simulated ? t("phone.dialedSimulated") : t("contacts.dialing");
   }
   const call = (c: Contact) => void callNumber(primaryPhone(c) ?? "", c.name);
 
   function recordOutgoing(num: string, name?: string, body?: string): void {
-    const next = recordCall(callLog, num, name);
+    // `"outgoing"`, exactly as the dialer's own `PhoneApp.recordOutgoing` writes it: the row
+    // is shared, and a direction-less record reads as 「通话」 with the neutral bullet and is
+    // hidden by the history page's 「去电」 filter — a call the user placed, unfindable as one.
+    const next = recordCall(callLog, num, name, Date.now(), "outgoing");
     // The entry may not reach the log — reuse the page's own error line rather than
     // losing the call silently.
     if (!callLogStore.save(next)) {
@@ -516,13 +713,24 @@
     const label = name && name.trim() !== "" ? name.trim() : num;
     const entry: Notif = {
       id: newNotifId(),
-      app: zh["app.phone"],
+      app: bgT("app.phone"),
       title: label,
       body,
       icon: "📞",
       time: Date.now(),
     };
-    writeStoreValue(NOTIF_KEY, addNotif(readStoreValue<Notif[]>(NOTIF_KEY, []), entry));
+    // The same rule as the call-log write above: a rejected notification write must be
+    // visible, not swallowed. The sibling above checked; this one used the unchecked
+    // `writeStoreValue`, so a full/unavailable store silently ate the notification while
+    // the page still reported the dial.
+    if (
+      !writeStoreValueChecked(
+        NOTIF_KEY,
+        addNotif(normalizeNotifs(readStoreValue<unknown>(NOTIF_KEY, [])), entry),
+      )
+    ) {
+      storeErr = t("common.storeWriteFailed");
+    }
   }
 </script>
 
@@ -531,16 +739,22 @@
   <div class="flex items-center gap-2">
     <input
       bind:value={q}
+      oninput={() => scrollListTo(0)}
       placeholder={t("contacts.search")}
       aria-label={t("contacts.search")}
       class="min-w-0 flex-1 rounded-ios-input bg-neutral-100 px-4 py-2 text-ios-body outline-none placeholder:text-neutral-400 dark:bg-white/10 dark:placeholder:text-neutral-500"
     />
+    <!-- The binding is the **region's** open state, not just the flag this click flips:
+         tapping a row's pencil opens the same composer with `adding` still false, so
+         `aria-expanded={adding}` alone would announce "collapsed" over a region that is
+         plainly on screen. -->
     <button
       onclick={() => {
         editing = null;
         adding = !adding;
       }}
       aria-label={t("contacts.add")}
+      aria-expanded={adding || editing !== null}
       class="rounded-full bg-accent px-4 py-2 text-ios-body font-medium text-white shadow-sm active:scale-95"
     >
       {t("contacts.add")}
@@ -562,7 +776,12 @@
     </button>
     <!-- Avatar Theme Selector -->
     <div class="relative">
-      <button onclick={toggleAvatarThemeMenu} aria-label={t("contacts.avatarTheme")} title={t("contacts.avatarTheme")}
+      <!-- A disclosure, not a toggle: the click reveals/hides the theme menu and the
+           accessible name (「头像主题」 + the current theme) is identical in both states,
+           so the open/closed state has to ride on `aria-expanded` (the repo idiom for a
+           region — `Dock.svelte`, `CalculatorApp`, `WebManApp`; `aria-pressed` is for
+           on/off switches instead). -->
+      <button onclick={toggleAvatarThemeMenu} aria-label={t("contacts.avatarTheme")} aria-expanded={avatarThemeMenuOpen} title={t("contacts.avatarTheme")}
         class="rounded-full bg-neutral-200/80 px-3 py-1 text-xs text-neutral-700 active:scale-95 dark:bg-white/10 dark:text-neutral-200">
         🎨 {t(`contacts.theme.${avatarTheme}`)}
       </button>
@@ -665,7 +884,8 @@
   {/if}
 
   <div class="mt-3 flex gap-3">
-    <div 
+    <div
+      bind:this={listEl}
       class="flex-1 space-y-1.5 overflow-y-auto"
       onscroll={(e) => {
         const target = e.currentTarget;
@@ -684,12 +904,19 @@
           {#each visibleItems as item (item.itemIndex)}
             <div style="position: absolute; top: {item.vStart}px; left: 0; right: 0;">
               {#if item.type === "header" && item.letter}
-                <div id={`section-${item.letter}`} class="sticky top-0 z-10 bg-neutral-100/90 px-1 py-0.5 text-xs font-bold uppercase tracking-widest text-neutral-400 backdrop-blur-sm dark:bg-black/60">
+                <div id={`section-${item.letter}`} class="sticky top-0 z-10 bg-neutral-100/90 px-1 py-0.5 text-xs font-bold uppercase tracking-widest text-neutral-600 backdrop-blur-sm dark:bg-black/60 dark:text-neutral-400">
                   {item.letter}
                 </div>
               {:else if item.type === "contact" && item.contact}
                 {@const c = item.contact}
-              <div class="flex items-center gap-3 rounded-ios-card px-3 py-3 ring-1 transition {spotId === c.id ? 'bg-accent/15 ring-accent dark:bg-accent/20' : 'bg-white/80 ring-black/5 dark:bg-white/[0.06] dark:ring-white/10'}" data-spotlight={spotId === c.id ? "hit" : undefined}>
+              <div class="flex items-center gap-3 rounded-ios-card px-3 py-3 ring-1 transition {spotId === c.id ? 'bg-accent/15 ring-accent dark:bg-accent/20' : 'bg-white/80 ring-black/5 dark:bg-white/[0.06] dark:ring-white/10'}" data-spotlight={spotId === c.id ? "hit" : undefined}
+                role="group"
+                aria-label={c.name}
+                data-drag-source="contact"
+                onpointerdown={(e) => startContactDrag(e, c.id)}
+                onpointermove={contactDrag.onpointermove}
+                onpointerup={contactDrag.onpointerup}
+                onpointercancel={contactDrag.onpointercancel}>
                 <!-- Avatar with custom upload support or fallback to emoji -->
                 <div class="group/avatar relative shrink-0">
                   <button
@@ -746,13 +973,23 @@
                 </span>
                 <button onclick={() => openEdit(c)} aria-label={t("contacts.edit")} title={t("contacts.edit")}
                   class="grid h-9 w-9 place-items-center rounded-full text-neutral-500 opacity-80 transition active:scale-90 dark:text-neutral-300">{@html iconSvg("pencil", "h-4 w-4")}</button>
-                <button onclick={() => persist(setContactFav(contacts, c.id, !c.fav))} aria-label={t("contacts.fav")} title={t("contacts.fav")}
+                <!-- The ⭐/☆ glyph is the whole state signal, and a static `aria-label` OVERRIDES
+                     element content for the accessible name — so without `aria-pressed` this toggle
+                     reads as an unchanging "收藏" to AT (REQ-A962's shape; the ♥ chip in PhotosApp and
+                     the 24+ `aria-pressed` sites in this repo are the same idiom). REQ-A1001 / F-SH-322. -->
+                <button onclick={() => persist(setContactFav(contacts, c.id, !c.fav))} aria-label={t("contacts.fav")} aria-pressed={c.fav} title={t("contacts.fav")}
                   class="text-lg opacity-70 transition active:scale-90">{c.fav ? "⭐" : "☆"}</button>
                 <button onclick={() => void call(c)} aria-label={t("contacts.call")} title={t("contacts.call")}
                   class="grid h-9 w-9 place-items-center rounded-full bg-ios-green text-white shadow-sm transition active:scale-90">{@html iconSvg("phone", "h-4 w-4")}</button>
+                <!-- Two-step delete: the first press only *arms*, and the whole "armed" state is the
+                     ✓ glyph. The name stays 删除 in both states, so AT reported the same control twice
+                     and a second press that really deletes the contact was indistinguishable from the
+                     first. `aria-pressed` is the repo's idiom for a control whose state is not in its
+                     name (REQ-A1001 / F-SH-322). -->
                 <button
                   onclick={() => (confirmId === c.id ? persist(removeContact(contacts, c.id)) : (confirmId = c.id))}
                   aria-label={t("contacts.delete")}
+                  aria-pressed={confirmId === c.id}
                   title={t("contacts.delete")}
                   data-icon={confirmId === c.id ? "check" : "trash"}
                   class="grid h-9 w-9 place-items-center text-danger/80 transition active:scale-90">{@html iconSvg(confirmId === c.id ? "check" : "trash", "h-4 w-4")}</button>
@@ -769,9 +1006,7 @@
       <div class="sticky top-1/2 flex -translate-y-1/2 flex-col items-center gap-0.5 py-2">
         {#each groups as grp (grp.letter)}
           <button
-            onclick={() => {
-              document.getElementById(`section-${grp.letter}`)?.scrollIntoView({ behavior: "smooth", block: "start" });
-            }}
+            onclick={() => jumpToLetter(grp.letter)}
             aria-label={`${t("contacts.jumpTo")} ${grp.letter}`}
             class="grid h-4 w-4 place-items-center text-[9px] font-bold text-accent/70 transition hover:scale-150 active:text-accent dark:text-accent/60"
           >

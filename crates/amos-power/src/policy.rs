@@ -9,6 +9,14 @@
 //! does) and the battery-low band only *enters* below `power_save_on_level_pct` and
 //! only *exits* above `power_save_off_level_pct`; the thermal tiers carry an
 //! analogous exit cushion.
+//!
+//! **A protective throttle is latched on evidence and released only by evidence.**
+//! Every entry test needs a finite reading (an absent one never *starts* a
+//! throttle), and every hold test is written as "hold *unless* a finite reading
+//! proves recovery" — so a reading that disappears mid-event cannot be mistaken for
+//! one that recovered. Equally, an absent reading never fabricates a low/critical
+//! one. This is the mechanism behind [`BatteryState`](crate::types::BatteryState)'s
+//! "unknown" contract. (REQ-A525 / FMEA F-SH-060.)
 
 use amos_sensor::SensorManager;
 use amos_sensor::SensorMode;
@@ -281,6 +289,9 @@ pub fn decide(policy: &Policy, t: &Telemetry, current: Option<&Decision>) -> Dec
 
     // 1. Critical heat — force full save, keep it held until we cool below the
     //    exit cushion (so a temperature hovering at the critical line is stable).
+    //    The hold is released only by a *finite* reading at/below the cushion: an
+    //    absent reading is not a recovery, so a sensor dropout mid-event keeps the
+    //    throttle (REQ-A525).
     if at_least(battery.temperature_c, p.critical_temp_c) {
         return Decision {
             sensor_mode: SensorMode::PowerSave,
@@ -289,7 +300,7 @@ pub fn decide(policy: &Policy, t: &Telemetry, current: Option<&Decision>) -> Dec
             reason: Reason::ThermalCritical,
         };
     }
-    if was_thermal_critical_save(current) && at_least(battery.temperature_c, thermal_save_exit) {
+    if was_thermal_critical_save(current) && !at_most(battery.temperature_c, thermal_save_exit) {
         return Decision {
             sensor_mode: SensorMode::PowerSave,
             cap_inference: true,
@@ -329,7 +340,9 @@ pub fn decide(policy: &Policy, t: &Telemetry, current: Option<&Decision>) -> Dec
     }
 
     // 4. Non-critical heat — at most Balanced (never Performance). Held while the
-    //    die stays above the high-exit cushion once we already throttled for heat.
+    //    die stays above the high-exit cushion once we already throttled for heat;
+    //    like the critical tier, only a finite reading at/below the cushion lifts it
+    //    (an absent reading is not a recovery — REQ-A525).
     if at_least(battery.temperature_c, p.high_temp_c) {
         return Decision {
             sensor_mode: SensorMode::Balanced,
@@ -338,7 +351,7 @@ pub fn decide(policy: &Policy, t: &Telemetry, current: Option<&Decision>) -> Dec
             reason: Reason::ThermalHigh,
         };
     }
-    if was_thermal_high(current) && at_least(battery.temperature_c, thermal_high_exit) {
+    if was_thermal_high(current) && !at_most(battery.temperature_c, thermal_high_exit) {
         return Decision {
             sensor_mode: SensorMode::Balanced,
             cap_inference: usage.inference_active,
@@ -488,6 +501,71 @@ mod tests {
         let restored = decide(&p, &healthy_telemetry(hot), Some(&entered));
         assert_eq!(restored.sensor_mode, SensorMode::Balanced);
         assert_ne!(restored.reason, Reason::ThermalCritical);
+        // At exactly the cushion (43) the recovery is inclusive: the throttle lifts.
+        hot.temperature_c = Some(43.0);
+        let at_exit = decide(&p, &healthy_telemetry(hot), Some(&entered));
+        assert_eq!(at_exit.sensor_mode, SensorMode::Balanced);
+    }
+
+    #[test]
+    fn thermal_critical_dropout_keeps_the_throttle() {
+        let p = Policy::default();
+        let mut hot = BatteryState::on_battery(70.0);
+        hot.temperature_c = Some(46.0);
+        let entered = decide(&p, &healthy_telemetry(hot), None);
+        assert_eq!(entered.reason, Reason::ThermalCritical);
+        for absent in [None, Some(f64::NAN), Some(f64::INFINITY)] {
+            // A reading that vanishes (or goes non-finite) is *not* a recovery:
+            // the throttle entered on evidence stays until evidence lifts it.
+            hot.temperature_c = absent;
+            let held = decide(&p, &healthy_telemetry(hot), Some(&entered));
+            assert_eq!(
+                held.sensor_mode,
+                SensorMode::PowerSave,
+                "{absent:?}: an absent reading must not release a critical-thermal save"
+            );
+            assert_eq!(held.reason, Reason::ThermalCritical, "{absent:?}");
+            assert!(held.cap_inference && held.throttle_background, "{absent:?}");
+        }
+    }
+
+    #[test]
+    fn thermal_high_dropout_keeps_balanced_never_performance() {
+        let p = Policy::default();
+        // Charging makes the dropout dangerous: without the latch, a lost sensor
+        // would fall through to the charging branch and restore Performance.
+        let mut hot = BatteryState::charging(90.0);
+        hot.temperature_c = Some(40.0);
+        let entered = decide(&p, &healthy_telemetry(hot), None);
+        assert_eq!(entered.reason, Reason::ThermalHigh);
+        hot.temperature_c = None;
+        let held = decide(&p, &healthy_telemetry(hot), Some(&entered));
+        assert_eq!(held.sensor_mode, SensorMode::Balanced, "not Performance");
+        assert_eq!(held.reason, Reason::ThermalHigh);
+        assert!(held.throttle_background);
+    }
+
+    #[test]
+    fn battery_dropout_holds_the_save() {
+        let p = Policy::default();
+        let mut low = BatteryState::on_battery(5.0);
+        let entered = decide(&p, &healthy_telemetry(low), None);
+        assert_eq!(entered.reason, Reason::BatteryCritical);
+        // The level reading vanishes while the save is active → hold, not restore.
+        low.level_pct = None;
+        let held = decide(&p, &healthy_telemetry(low), Some(&entered));
+        assert_eq!(held.sensor_mode, SensorMode::PowerSave);
+        assert_eq!(held.reason, Reason::BatteryLowHold);
+    }
+
+    #[test]
+    fn cold_start_unknown_enters_no_tier_and_never_performance() {
+        // All-unknown telemetry: the policy must neither fabricate a fault
+        // (no PowerSave on a reading it never had) nor claim headroom it cannot
+        // see (never Performance). It sits in the middle tier. (REQ-A525.)
+        let d = decide(&Policy::default(), &Telemetry::default(), None);
+        assert_eq!(d.sensor_mode, SensorMode::Balanced);
+        assert!(!d.cap_inference);
     }
 
     #[test]

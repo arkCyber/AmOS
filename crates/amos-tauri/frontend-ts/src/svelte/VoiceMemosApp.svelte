@@ -145,26 +145,36 @@ const stop = async (): Promise<void> => {
       error = t("vm.errNoSpace");
       return;
     }
-    persist(
-      prependMemo(
-        memos,
-        memoForRecording({
-          id,
-          title: defaultRecordingTitle(now),
-          createdAt: now,
-          durationMs: Math.max(0, now - startAt),
-          sizeBytes: res.blob.size,
-          mime: res.mime,
-        }),
-      ),
+    const next = prependMemo(
+      memos,
+      memoForRecording({
+        id,
+        title: defaultRecordingTitle(now),
+        createdAt: now,
+        durationMs: Math.max(0, now - startAt),
+        sizeBytes: res.blob.size,
+        mime: res.mime,
+      }),
     );
+    // The bytes went in first (above), so a refused index write would leave the recording's
+    // audio in the store with no row naming it — unplayable, unlisted, and undeletable from
+    // any screen, yet still the user's voice at rest. `persist` has already reported the
+    // refusal; take the bytes back out, the same way `persistVideoCapture`
+    // (lib/cameraCapture.ts) does for a refused capture and `saveTrim` below does for a
+    // refused trim. REQ-A1264 / F-SH-542.
+    if (!persist(next)) await defaultMediaStore().del(id);
   } catch {
     error = t("vm.errMic");
   }
 };
 
 const deleteMemo = (m: VoiceMemo): void => {
-  persist(removeMemo(memos, m.id));
+  // The bytes are only removed once the index no longer lists the memo — the same
+  // ordering `removeVideoCapture` (lib/cameraCapture.ts) applies. A refused index
+  // write that still deleted the bytes would leave a listed-but-unplayable memo:
+  // the row survives (correctly) on the next boot, but tapping it plays nothing,
+  // and the recording is unrecoverable. REQ-A1263 / F-SH-541.
+  if (!persist(removeMemo(memos, m.id))) return;
   if (m.audio.kind === "recorded") void defaultMediaStore().del(m.id);
 };
 
@@ -298,7 +308,13 @@ const exportMemo = async (m: VoiceMemo): Promise<void> => {
   try {
     const bytes = await exportBytesFor(m);
     if (!bytes || bytes.length === 0) {
-      exportOutcome = { id: m.id, outcome: "offline" };
+      // Nothing to write is NOT "no host" (REQ-A1493). The host was never asked — the memo's
+      // audio simply is not in the MediaStore (an evicted blob, or the refused-index-write
+      // orphan REQ-A1264 catches). 「没有系统宿主」 asserted a cause this path never
+      // established; `mediaExport` already names this outcome (`invalid`: "we refused to send
+      // it — there were no bytes to write") and `exportLabel` already has the sentence for it,
+      // which no path could reach while this read `offline`.
+      exportOutcome = { id: m.id, outcome: "invalid" };
       return;
     }
     const outcome = await exportToSharedCollection(
@@ -320,7 +336,7 @@ const exportLabel = (outcome: string): string => {
   if (outcome === "saved") return t("vm.exportSaved");
   if (outcome === "refused") return t("vm.exportRefused");
   if (outcome === "offline") return t("vm.exportOffline");
-  if (outcome === "empty") return t("vm.exportEmpty");
+  if (outcome === "invalid") return t("vm.exportEmpty");
   return outcome;
 };
 
@@ -468,15 +484,25 @@ const startTranscribe = async (): Promise<void> => {
       if (blob) bytes = await blobBytes(blob);
     }
     if (!bytes || bytes.length === 0) {
-      asrState = { kind: "error", message: "offline" };
+      // The same fact as the export path above, on the other verb that consumes these bytes
+      // (REQ-A1493): `transcribe_audio` was never called, so 「没有系统宿主」 would blame a
+      // host that was never asked. `saveTrim` states this one correctly — 「音频数据不可用」.
+      asrState = { kind: "error", message: "audio" };
       return;
     }
     const raw = await transcribeAudio(bytes, { format: "wav" });
     const now = Date.now();
     asrState = classifyTranscribe(raw, now);
     if (asrState.kind === "done") {
-      const updated = attachTranscript(m, asrState.transcript);
-      persist(memos.map((x) => (x.id === m.id ? updated : x)));
+      const tx = asrState.transcript;
+      const updated = attachTranscript(m, tx);
+      // The verdict decides the panel's face (REQ-A1464). The panel drew `asrState` while the row
+      // drew `m.transcript` — the thing the store actually holds — so a refused attach used to
+      // leave the two faces of one fact contradicting each other: a full transcript in the panel,
+      // no 「已转写」 badge on the row, and a 「清除」 button acting on something never stored.
+      // On refusal the transcription is kept (it happened) but marked unsaved.
+      const saved = persist(memos.map((x) => (x.id === m.id ? updated : x)));
+      asrState = saved ? { kind: "done", transcript: tx } : { kind: "done", transcript: tx, unsaved: true };
     }
   } catch (e) {
     asrState = classifyTranscribeError(e);
@@ -486,8 +512,14 @@ const startTranscribe = async (): Promise<void> => {
 const clearTranscript = (): void => {
   const m = selectedMemo;
   if (!m) return;
+  // Same rule as the attach above, the other way: a refused clear leaves the memo holding its
+  // transcript, so the panel must keep drawing it rather than fall back to 「转写」 (REQ-A1464).
+  const tx = m.transcript;
+  if (!persist(memos.map((x) => (x.id === m.id ? attachTranscript(x, null) : x)))) {
+    if (tx) asrState = { kind: "done", transcript: tx };
+    return;
+  }
   asrState = { kind: "idle" };
-  persist(memos.map((x) => (x.id === m.id ? attachTranscript(x, null) : x)));
 };
 
 /* ---- detail panel ---- */
@@ -728,8 +760,9 @@ const trimStartPct = $derived(
               {t("vm.trimRange")}: <span class="tabular-nums text-neutral-700 dark:text-neutral-200">{trimDurDisplay}</span>
             </p>
             <div class="mb-1 flex items-center gap-2">
-              <label class="w-12 shrink-0 text-xs text-neutral-500">{t("vm.trimStart")}</label>
+              <label for="vm-trim-start" class="w-12 shrink-0 text-xs text-neutral-500">{t("vm.trimStart")}</label>
               <input
+                id="vm-trim-start"
                 type="range"
                 min="0"
                 max={detailMemo.durationMs}
@@ -750,8 +783,9 @@ const trimStartPct = $derived(
               </span>
             </div>
             <div class="mb-2 flex items-center gap-2">
-              <label class="w-12 shrink-0 text-xs text-neutral-500">{t("vm.trimEnd")}</label>
+              <label for="vm-trim-end" class="w-12 shrink-0 text-xs text-neutral-500">{t("vm.trimEnd")}</label>
               <input
+                id="vm-trim-end"
                 type="range"
                 min="0"
                 max={detailMemo.durationMs}
@@ -841,6 +875,15 @@ const trimStartPct = $derived(
             </p>
           {:else}
             <p class="text-sm italic text-neutral-400">{t("vm.transcriptEmpty")}</p>
+          {/if}
+          {#if asrState.unsaved}
+            <p
+              class="mt-1.5 flex items-center gap-1 text-xs text-danger"
+              data-testid="vm-transcript-unsaved"
+            >
+              {@html iconSvg("alertCircle", "h-3 w-3 shrink-0")}
+              <span>{t("vm.transcriptUnsaved")}</span>
+            </p>
           {/if}
         </div>
       {:else if asrState.kind === "empty"}

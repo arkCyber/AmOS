@@ -58,37 +58,55 @@ export type AirPlayResult =
   | { kind: 'unavailable'; reason: string }
   | { kind: 'permission_denied'; reason: string }
   | { kind: 'device_not_found' }
-  | { kind: 'failed'; reason: string };
+  | { kind: 'failed'; reason: string }
+  // The surface exists but the host has no implementation for it (REQ-A467). Distinct from
+  // `unavailable`, which means "this platform has no AirPlay at all" — the two need different
+  // sentences in front of the user. Pinned on the Rust side by
+  // `airplay_tests.rs::test_airplay_result_wire_form`, because the wire strings are this contract.
+  | { kind: 'not_implemented'; reason: string };
 
 /**
- * Check if AirPlay is available on this platform
+ * Check if AirPlay is available on this platform, or `null` when the host did not answer.
+ *
+ * `null` is unambiguous: `airplay_available` answers a **boolean**, and `invoke` resolves
+ * `null` only when the command was refused or there is no host at all. The old `?? false`
+ * made a refused read into 「此平台不支持 AirPlay」 — a claim about the *platform* derived
+ * from a question nobody answered — and, because `AirPlayPanel` early-returns on `false`,
+ * it also killed the panel for the whole session with no retry (REQ-A1336 / F-SH-602).
  */
-export async function isAirPlayAvailable(): Promise<boolean> {
-  const result = await invoke<boolean>('airplay_available');
-  return result ?? false;
+export async function isAirPlayAvailable(): Promise<boolean | null> {
+  return await invoke<boolean>('airplay_available');
 }
 
 /**
- * Start device discovery
+ * Start device discovery, or `null` when the host did not answer.
+ *
+ * The old fallback synthesised `{ kind: 'failed', reason: 'Not in Tauri environment' }` —
+ * a **cause** the wrapper cannot know (the host may be right there and have refused).
  */
-export async function discoverDevices(): Promise<AirPlayResult> {
-  const result = await invoke<AirPlayResult>('airplay_discover');
-  return result ?? { kind: 'failed', reason: 'Not in Tauri environment' };
+export async function discoverDevices(): Promise<AirPlayResult | null> {
+  return await invoke<AirPlayResult>('airplay_discover');
 }
 
 /**
- * Stop device discovery
+ * Stop device discovery.
+ *
+ * Signed `void`: the verdict is deliberately dropped by the only caller (`AirPlayPanel`'s
+ * `onDestroy`, where there is no surface left to report on and nothing to retry with).
+ * It is in `scripts/void-cmd-allowlist.json`.
  */
 export async function stopDiscovery(): Promise<void> {
   await invoke('airplay_stop_discovery');
 }
 
 /**
- * Get list of discovered devices
+ * Get the list of discovered devices, or `null` when the host did not answer.
+ *
+ * `[]` is the host saying 「设备列表是空的」 (`airplay.noDevices`); `null` is this reader
+ * saying 「我问不到」. The old `?? []` rendered the second as the first (REQ-A1336).
  */
-export async function getDevices(): Promise<AirPlayDevice[]> {
-  const result = await invoke<AirPlayDevice[]>('airplay_get_devices');
-  return result ?? [];
+export async function getDevices(): Promise<AirPlayDevice[] | null> {
+  return await invoke<AirPlayDevice[]>('airplay_get_devices');
 }
 
 /**
@@ -101,17 +119,15 @@ export async function getStatus(): Promise<AirPlayStatus | null> {
 /**
  * Connect to an AirPlay device
  */
-export async function connect(deviceId: string): Promise<AirPlayResult> {
-  const result = await invoke<AirPlayResult>('airplay_connect', { deviceId });
-  return result ?? { kind: 'failed', reason: 'Not in Tauri environment' };
+export async function connect(deviceId: string): Promise<AirPlayResult | null> {
+  return await invoke<AirPlayResult>('airplay_connect', { deviceId });
 }
 
 /**
  * Disconnect from current AirPlay device
  */
-export async function disconnect(): Promise<AirPlayResult> {
-  const result = await invoke<AirPlayResult>('airplay_disconnect');
-  return result ?? { kind: 'failed', reason: 'Not in Tauri environment' };
+export async function disconnect(): Promise<AirPlayResult | null> {
+  return await invoke<AirPlayResult>('airplay_disconnect');
 }
 
 /**
@@ -120,23 +136,20 @@ export async function disconnect(): Promise<AirPlayResult> {
 export async function startStream(
   kind: StreamKind,
   url?: string
-): Promise<AirPlayResult> {
-  const result = await invoke<AirPlayResult>('airplay_start_stream', { kind, url });
-  return result ?? { kind: 'failed', reason: 'Not in Tauri environment' };
+): Promise<AirPlayResult | null> {
+  return await invoke<AirPlayResult>('airplay_start_stream', { kind, url });
 }
 
 /**
  * Stop current stream
  */
-export async function stopStream(): Promise<AirPlayResult> {
-  const result = await invoke<AirPlayResult>('airplay_stop_stream');
-  return result ?? { kind: 'failed', reason: 'Not in Tauri environment' };
+export async function stopStream(): Promise<AirPlayResult | null> {
+  return await invoke<AirPlayResult>('airplay_stop_stream');
 }
 
 /**
  * Set playback volume (0.0-1.0)
  */
-export async function setVolume(volume: number): Promise<AirPlayResult> {
-  const result = await invoke<AirPlayResult>('airplay_set_volume', { volume });
-  return result ?? { kind: 'failed', reason: 'Not in Tauri environment' };
+export async function setVolume(volume: number): Promise<AirPlayResult | null> {
+  return await invoke<AirPlayResult>('airplay_set_volume', { volume });
 }

@@ -12,7 +12,11 @@
  */
 import { describe, expect, test } from "vitest";
 import { render } from "@testing-library/svelte";
+import { fireEvent } from "@testing-library/svelte";
+import { tick } from "svelte";
 import KeyboardPage from "../src/svelte/settings/KeyboardPage.svelte";
+import { KEYBOARD_CONFIG_KEY } from "../src/lib/keyboardConfigHook.svelte";
+import { readKeyboardConfig } from "../src/lib/keyboardConfig";
 import { SHELL_MODULES } from "../src/svelte/shellModules";
 import { formatShortcut, modulesFor } from "../src/lib/shellModule";
 import {
@@ -21,7 +25,103 @@ import {
   TOUCH_DEFAULTS,
 } from "../src/lib/keyboardConfigHook.svelte";
 
+/**
+ * Swap in a storage whose writes of `key` throw the way a full quota does (the pattern
+ * `settings-pages.svelte.test.ts` uses), and return a restore function.
+ */
+function failWritesFor(key: string): () => void {
+  const real = window.localStorage;
+  const fake = {
+    get length() {
+      return real.length;
+    },
+    clear: () => real.clear(),
+    key: (i: number) => real.key(i),
+    getItem: (k: string) => real.getItem(k),
+    removeItem: (k: string) => real.removeItem(k),
+    setItem: (k: string, v: string) => {
+      if (k === key) throw new Error("QuotaExceededError");
+      real.setItem(k, v);
+    },
+  } as unknown as Storage;
+  Object.defineProperty(window, "localStorage", { value: fake, configurable: true, writable: true });
+  return () =>
+    Object.defineProperty(window, "localStorage", { value: real, configurable: true, writable: true });
+}
+
 describe("KeyboardPage", () => {
+  /**
+   * F-SH-043 — the page's own claim about the write. `writeKeyboardConfig` answers whether the value
+   * landed (`writeStoreValueChecked`), and this page used to discard that answer and always show
+   * 「已保存」: with a refusing store the user was told their rebind was saved while the rows
+   * re-read the *old* config, so the chords silently stayed as they were. (The repo's `write-scan`
+   * exempts config keys as "carrying no claim" — a claim is exactly what this toast is.)
+   */
+  test("a refused write is reported as such, never as 已保存 (F-SH-043)", async () => {
+    const restore = failWritesFor(KEYBOARD_CONFIG_KEY);
+    try {
+      const { container } = render(KeyboardPage);
+      // Edit → capture a new chord → 存储: the path that used to claim success.
+      const badge = container.querySelector<HTMLButtonElement>(
+        '[aria-label^="编辑"]',
+      );
+      expect(badge, "a row's edit badge").toBeTruthy();
+      await fireEvent.click(badge as HTMLButtonElement);
+      await tick();
+      await fireEvent.keyDown(document, { key: "j", metaKey: true, shiftKey: true });
+      await tick();
+      const save = [...container.querySelectorAll("button")].find(
+        (b) => b.textContent?.trim() === "存储",
+      );
+      expect(save, "the save button of the capture row").toBeTruthy();
+      await fireEvent.click(save as HTMLButtonElement);
+      await tick();
+
+      const text = container.textContent ?? "";
+      expect(text, "the failure is stated").toContain("保存失败");
+      expect(text, "and success is NOT claimed").not.toContain("已保存");
+      // …and the store really was untouched, which is why the claim would have been false.
+      expect(readKeyboardConfig().system.newWindow, "no rebind was stored").toBeUndefined();
+    } finally {
+      restore();
+    }
+    // The config key is still readable through the hook (the failing storage did not corrupt it).
+    expect(readKeyboardConfig().version).toBeGreaterThan(0);
+  });
+
+  /**
+   * F-SH-044 — the conflict warning's **reason**. The page warns that a chord is already taken
+   * ("冲突的绑定将被警告但仍可保存") and the reason used to live only in a `title` tooltip: on the page
+   * whose whole audience is keyboard users, and unreadable by a screen reader (a bare ⚠️ with no name).
+   * The warning must therefore be text with an accessible name, and the save must still go through —
+   * the page's own promise is "warned, not blocked".
+   */
+  test("a conflicting chord says which binding it clashes with, and still saves (F-SH-044)", async () => {
+    const { container } = render(KeyboardPage);
+    const badge = container.querySelector<HTMLButtonElement>('[aria-label^="编辑"]');
+    expect(badge, "a row's edit badge").toBeTruthy();
+    await fireEvent.click(badge as HTMLButtonElement);
+    await tick();
+    // ⌘W belongs to 关闭窗口, so capturing it on any other row is a conflict.
+    await fireEvent.keyDown(document, { key: "w", metaKey: true });
+    await tick();
+
+    const warning = container.querySelector<HTMLElement>('[role="status"]');
+    expect(warning, "the warning is a named status, not a tooltip-only emoji").toBeTruthy();
+    const said = `${warning?.textContent ?? ""} ${warning?.getAttribute("aria-label") ?? ""}`;
+    expect(said, "the reason names the other binding").toContain("关闭窗口");
+    expect(said, "…and the tooltip still carries it").toContain("冲突");
+
+    // Warned, not blocked: the save applies and the page says so.
+    const save = [...container.querySelectorAll("button")].find(
+      (b) => b.textContent?.trim() === "存储",
+    );
+    await fireEvent.click(save as HTMLButtonElement);
+    await tick();
+    expect(container.textContent ?? "").toContain("已保存");
+    expect(readKeyboardConfig().system.newWindow ?? readKeyboardConfig().overlays.launchpad).toBeTruthy();
+  });
+
   test("shows the engine's defaults — one source, not a second copy", () => {
     // 这个页面曾经把三张默认表逐字再抄一遍（同一个键、同一个修饰符，只是包成数组）。
     // 现在它读 `keyboardConfigHook` 导出的那一份；这条断言把"显示的就是引擎的默认值"

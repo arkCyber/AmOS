@@ -13,8 +13,9 @@
  * - Silent Notifications: Background content updates without alerts
  * - Priority Handling: Critical alerts and time-sensitive notifications
  */
-import { invoke } from "./backend";
+import { bridgeDiag, invoke } from "./backend";
 import { localId } from "./localId";
+import type { Notif } from "./settings";
 
 /** Device token for remote push notifications (64 hex chars in production). */
 export type DeviceToken = string;
@@ -490,11 +491,24 @@ export function shouldPresentNotification(
 // when the host is not bridged or the command fails, and records *why* in the
 // bridge diagnostics ledger instead of throwing.
 
+/** The `kind` tags of Rust `PushResult` (`#[serde(tag = "kind", rename_all = "lowercase")]`).
+ * The array is the one declaration; {@link PushResultKind} derives from it. A rename on
+ * either side is a wire break — `vocabMirror.test.ts` reads `push_notifications.rs` and
+ * requires the two to agree, rather than trusting this copy (REQ-A668). */
+export const PUSH_RESULT_KINDS = [
+  "ok",
+  "unavailable",
+  "permissiondenied",
+  "invalidtoken",
+  "failed",
+] as const;
+export type PushResultKind = (typeof PUSH_RESULT_KINDS)[number];
+
 /** Rust PushResult type — every `push_*` command answers with one of these kinds
  * instead of throwing, so "the platform said no" stays distinguishable from
  * "the call failed". Mirrors `push_notifications.rs`' published `kind` strings. */
 export interface PushResult {
-  kind: "ok" | "unavailable" | "permissiondenied" | "invalidtoken" | "failed";
+  kind: PushResultKind;
   reason?: string;
 }
 
@@ -524,12 +538,52 @@ export interface RustPushStatistics {
   last_received: string | null;
 }
 
+/** The variants of Rust `PermissionStatus` (`#[serde(rename_all = "lowercase")]`). The array is
+ * the one declaration; {@link RustPermissionStatus} derives from it. Bound to
+ * `push_notifications.rs` by `vocabMirror.test.ts` (REQ-A668). */
+export const PERMISSION_STATUSES = [
+  "notdetermined",
+  "denied",
+  "authorized",
+  "provisional",
+] as const;
 /** Rust PermissionStatus type. */
-export type RustPermissionStatus = "notdetermined" | "denied" | "authorized" | "provisional";
+export type RustPermissionStatus = (typeof PERMISSION_STATUSES)[number];
+
+/**
+ * The field names of Rust `PushStatus`, bound to `push_notifications.rs` by
+ * `vocabMirror.test.ts` (REQ-A865).
+ *
+ * The interface below cannot be derived from an array (its fields have six different
+ * types), so this is the census the mirror compares — added in the same round as
+ * `permission_backend` because a **new wire field with no mirror is exactly how the panel
+ * would go back to reading `undefined`**: `undefined` is falsy, so a rename would silently
+ * hide the request button everywhere instead of failing loudly.
+ */
+export const PUSH_STATUS_FIELDS = [
+  "available",
+  "permission_backend",
+  "device_token",
+  "permission",
+  "badge_count",
+  "statistics",
+] as const;
 
 /** Rust PushStatus type. */
 export interface RustPushStatus {
   available: boolean;
+  /**
+   * The OS API the host would ask for a push permission, or `null` when no target binds
+   * one (REQ-A865 / F-DEV-116).
+   *
+   * **Not a second spelling of `available`.** `available` means "this device has a push
+   * subsystem" — true, the host really does hold a token and a history — while this field
+   * answers the button's question, "can the OS be asked". They were one `bool`, which is
+   * how the panel came to draw 「允许通知」 and then print 「你现在可以接收推送通知了」 for a
+   * grant nothing had issued. `null` is the honest value on every target this build can
+   * produce; the panel reads it to decide whether the button may exist at all.
+   */
+  permission_backend: string | null;
   device_token: RustDeviceToken | null;
   permission: RustPermissionStatus;
   badge_count: number;
@@ -538,9 +592,17 @@ export interface RustPushStatus {
 
 /**
  * Register device token for push notifications.
+ *
+ * `null` = the host did not answer (no bridge, or the command was refused). It is its own
+ * fact and must not be folded into a `PushResult`: the old `?? noBridge()` synthesized
+ * `{ kind: "failed", reason: "push backend unreachable (no host bridge)" }` — an English
+ * **cause** this module made up — and `PushSettings.askPermission` renders `reason`
+ * verbatim, so a Chinese screen read 「无法申请通知权限：push backend unreachable (no host
+ * bridge)」 about a request nobody ever carried out (REQ-A1352). `null` is unambiguous
+ * because the Rust command answers a `PushResult` variant, never JSON `null`.
  */
-export async function registerDeviceToken(token: string, environment: string = "production"): Promise<PushResult> {
-  return (await invoke<PushResult>("push_register_token", { token, environment })) ?? noBridge();
+export async function registerDeviceToken(token: string, environment: string = "production"): Promise<PushResult | null> {
+  return await invoke<PushResult>("push_register_token", { token, environment });
 }
 
 /** Get current device token. */
@@ -548,14 +610,30 @@ export async function getDeviceToken(): Promise<RustDeviceToken | null> {
   return await invoke<RustDeviceToken>("push_get_token");
 }
 
-/** Request push notification permission. */
-export async function requestPushPermission(): Promise<PushResult> {
-  return (await invoke<PushResult>("push_request_permission")) ?? noBridge();
+/**
+ * Request push notification permission.
+ *
+ * `null` = the host did not answer (REQ-A1352). This is the sharper of the two: the panel
+ * only draws its 「允许通知」 button inside `{#if pushStatus?.available}`, which is on screen
+ * only because the host *did* answer with a push subsystem present — so the old
+ * `?? noBridge()`'s 「no host bridge」 was a cause contradicting a fact already rendered
+ * beside it. A host that really refuses answers `PushResult::Unavailable` in its own words,
+ * and those words still reach the screen unchanged.
+ */
+export async function requestPushPermission(): Promise<PushResult | null> {
+  return await invoke<PushResult>("push_request_permission");
 }
 
-/** Get current permission status. */
-export async function getPushPermission(): Promise<RustPermissionStatus> {
-  return (await invoke<RustPermissionStatus>("push_get_permission")) ?? "notdetermined";
+/**
+ * Get current permission status, or `null` when the host did not answer.
+ *
+ * `null` is unambiguous because `push_get_permission` answers a status *string*, never
+ * JSON `null`. The old `?? "notdetermined"` folded "I could not ask" into the same value a
+ * host uses for "you have not been asked yet", so a refused read drew a device state
+ * (REQ-A1335 / F-SH-601 — the family `project_one_null_two_facts`).
+ */
+export async function getPushPermission(): Promise<RustPermissionStatus | null> {
+  return await invoke<RustPermissionStatus>("push_get_permission");
 }
 
 /**
@@ -568,19 +646,15 @@ export async function simulateReceivePush(payload: PushPayload): Promise<string 
   return await invoke<string>("push_simulate_receive", { payload });
 }
 
-/** The honest answer when there is no host to ask. */
-function noBridge(): PushResult {
-  return { kind: "failed", reason: "push backend unreachable (no host bridge)" };
-}
 
-/** One push _statistics snapshot with every counter at zero. */
-function emptyPushStatistics(): RustPushStatistics {
-  return { total_received: 0, with_badge: 0, with_sound: 0, silent: 0, last_received: null };
-}
-
-/** Get badge count. */
-export async function getBadgeCount(): Promise<number> {
-  return (await invoke<number>("push_get_badge")) ?? 0;
+/**
+ * Get badge count, or `null` when the host did not answer.
+ *
+ * A zero badge is a *fact the host states* ("nothing is pending"); it must not be the
+ * answer this reader invents when it could not ask (REQ-A1335 / F-SH-601).
+ */
+export async function getBadgeCount(): Promise<number | null> {
+  return await invoke<number>("push_get_badge");
 }
 
 /** Set badge count. */
@@ -589,39 +663,106 @@ export async function setBadgeCount(count: number): Promise<void> {
 }
 
 /**
- * Get notification history (newest first, as the Rust manager returns it).
+ * Get notification history (newest first, as the Rust manager returns it), or `null` when
+ * the host did not answer.
  *
- * An unreachable host answers `[]` — "I could not ask", which every caller must
- * treat as *no news*, never as *nothing exists* (see `mergePushHistory`).
+ * The empty list and the refusal used to be one value, and they are not: `[]` is the host
+ * saying "there is nothing", `null` is this reader saying "I could not ask". Callers treat
+ * both as *no news* today (`svelte/osPushWatcher`), but only the second means the fetch
+ * failed — and the old `?? []` made that undecidable (REQ-A1335 / F-SH-601).
  */
-export async function getNotificationHistory(limit?: number): Promise<RustNotificationRecord[]> {
-  return (await invoke<RustNotificationRecord[]>("push_get_history", { limit: limit ?? null })) ?? [];
+export async function getNotificationHistory(limit?: number): Promise<RustNotificationRecord[] | null> {
+  return await invoke<RustNotificationRecord[]>("push_get_history", { limit: limit ?? null });
 }
 
-/** Mark notification as read. */
-export async function markNotificationRead(id: string): Promise<boolean> {
-  return (await invoke<boolean>("push_mark_read", { id })) ?? false;
+/**
+ * Mark notification as read.
+ *
+ * `null` = the host did not answer (REQ-A1352). `false` is a real answer — "the device did
+ * not mark it" — and folding the two made a command that was never carried out look like a
+ * device that declined. The callers are best-effort (`void markNotificationRead(id)`), so
+ * nothing renders the wrong thing today; that is a property of the callers, not of the value.
+ */
+export async function markNotificationRead(id: string): Promise<boolean | null> {
+  return await invoke<boolean>("push_mark_read", { id });
 }
 
-/** Clear notification history. */
-export async function clearNotificationHistory(): Promise<void> {
+/**
+ * Delete one delivery from the device's push history.
+ *
+ * The shell's list is a *projection* of that history — `push_get_history` is asked again on
+ * every poll (`svelte/osPushWatcher`) — so removing a row from the store without this leaves
+ * the device still holding it, and the next poll writes it straight back.
+ *
+ * `false` is the device answering "I never held that id" and it is a **success** — removing
+ * the row locally is right. `null` (REQ-A1352) is the other thing entirely: a command that
+ * never reached the device, over which nothing about the device was established. The old
+ * `?? false` merged them, and the callers then had to recover the distinction from the
+ * *global* `bridgeDiag("push_delete_notification").ok` slot — a per-command ledger entry, so
+ * two dismissals in flight at once could each read the other's outcome. The value is now the
+ * answer, and the ledger is only the explanation.
+ */
+export async function deleteNotification(id: string): Promise<boolean | null> {
+  return await invoke<boolean>("push_delete_notification", { id });
+}
+
+/**
+ * Relay a **local** removal to the device, for every push delivery among `rows` (REQ-A1260).
+ *
+ * The shell's list is a projection of the device's push history, so every control that removes
+ * a row has to delete it on the device too, or the next `osPushWatcher` poll writes it straight
+ * back. `NotificationCenter` / `DesktopNotificationCenter` state that for `dismiss`, and the
+ * settings pages for 「清空」; the three **acknowledge-on-tap** paths — the two arrival banners
+ * (`NotificationBanner` / `DesktopNotificationBanner`) and the desktop panel's
+ * open-the-source-app — wrote only the local store. The consequence there is worse than a row
+ * returning: the reappearing id is a *new* id set for the banner's arrival detector, so the
+ * delivery is announced a second time (chime + haptic) for something that never arrived twice.
+ *
+ * `rows` is the set about to be dropped, read **before** the local write. Fire-and-forget by
+ * the same reasoning as `dismiss`: these surfaces hold a transient toast / a panel that is
+ * closing, neither has a place to draw a refusal, and the failure is visible as the row coming
+ * back. No host bridge ⇒ no device history and no poll to write one back, so the call is a
+ * no-op exactly when it should be.
+ */
+export function deleteDeliveriesOnDevice(rows: readonly Notif[]): void {
+  for (const row of rows) if (row.source === "push") void deleteNotification(row.id);
+}
+
+/**
+ * Clear the device's push-notification history.
+ *
+ * `push_clear_history` answers unit (JSON `null`), which is also what the bridge produces for a
+ * refusal — so the reply cannot carry the verdict and the diagnostic ledger has to (the same
+ * rule `lib/dockBadge.ts` / `lib/spaces.ts` use for their unit-reply mutations). `true` only
+ * when the command actually succeeded; `false` means the device **still has** the history, and a
+ * caller must not report it as cleared (REQ-A845 / F-SH-270).
+ */
+export async function clearNotificationHistory(): Promise<boolean> {
   await invoke("push_clear_history");
+  return bridgeDiag("push_clear_history").ok;
 }
 
-/** Get push statistics. */
-export async function getPushStatistics(): Promise<RustPushStatistics> {
-  return (await invoke<RustPushStatistics>("push_get_statistics")) ?? emptyPushStatistics();
+/**
+ * Get push statistics, or `null` when the host did not answer.
+ *
+ * An all-zero snapshot is a *measurement* ("this device has received nothing"); inventing
+ * one for a refused read reports an unasked question as a measured zero (REQ-A1335 / F-SH-601).
+ */
+export async function getPushStatistics(): Promise<RustPushStatistics | null> {
+  return await invoke<RustPushStatistics>("push_get_statistics");
 }
 
-/** Get push notification status. */
-export async function getPushStatus(): Promise<RustPushStatus> {
-  return (
-    (await invoke<RustPushStatus>("push_get_status")) ?? {
-      available: false,
-      device_token: null,
-      permission: "notdetermined",
-      badge_count: 0,
-      statistics: emptyPushStatistics(),
-    }
-  );
+/**
+ * Get push notification status, or `null` when the host did not answer.
+ *
+ * **This is the whole point of the round (REQ-A1335 / F-SH-601).** The old fallback
+ * synthesised a complete status with `available: false` for a *reachable but refusing* host,
+ * and the panel renders `available: false` as 「此设备上没有可用的推送后端」 — a claim about the
+ * device, drawn from a question nobody answered — while the same branch dropped the retry
+ * (only the no-bridge path offered one). Its own comment said the two loss modes "must not
+ * be merged back"; `null` is what keeps them apart. `push_get_status` answers a struct, never
+ * JSON `null`, so a `null` here can only mean "not answered".
+ */
+export async function getPushStatus(): Promise<RustPushStatus | null> {
+  return await invoke<RustPushStatus>("push_get_status");
 }

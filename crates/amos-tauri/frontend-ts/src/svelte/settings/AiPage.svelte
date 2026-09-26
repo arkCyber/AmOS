@@ -3,7 +3,7 @@
   // relocated). Lets the user pick local Ollama vs a cloud OpenAI-compatible
   // provider (OpenAI / DeepSeek / custom endpoint) and configure the
   // model/endpoint/API key; shows the live engine state via lib/aiEngine.
-  import { readStoreValue, writeStoreValue } from "../../lib/amosStore";
+  import { readStoreValue, writeStoreValueChecked } from "../../lib/amosStore";
   import { SETTINGS_KEY } from "../../lib/settings";
   import {
     cloudDefaultEndpoint,
@@ -19,6 +19,7 @@
   import { bridged, getAiStatus, switchAiBackend } from "../../lib/backend";
   import {
     clearDiag,
+    clockOf,
     diagStats,
     recentDiag,
     setDiagMinLevel,
@@ -27,6 +28,7 @@
     type DiagLevel,
   } from "../../lib/debugLog";
   import { t } from "../locale.svelte";
+  import StoreErrorBar from "../StoreErrorBar.svelte";
   import { GROUP, LABEL, FIELD, nextFieldId } from "./kit";
 
   // The three cloud fields are a *stacked* form (caption above the input), not a label/control
@@ -77,6 +79,8 @@
     apiKey: initialCfg.apiKey ?? "",
   });
   let aiMsg = $state("");
+  /** The store refused the settings write — the save did not happen (REQ-A1379). */
+  let storeErr = $state("");
   let aiLive = $state<string | null>(null);
   let aiView = $state<EngineView>(describeEngine(null));
 
@@ -189,7 +193,20 @@
       apiKey: aiEdits.apiKey,
     };
     const cur = readStoreValue<Record<string, unknown>>(SETTINGS_KEY, {});
-    writeStoreValue(SETTINGS_KEY, setAiConfig(cur, cfg));
+    // `writeStoreValue` is `void`: a refused `setItem` dispatches no `STORE_CHANGED_EVENT`
+    // and returns `false` to nobody. The same blob is what `readAiConfig` reads back at
+    // mount and what the daemon's restart env is derived from, so a refused write means
+    // the whole save did not happen — yet this page went on to print 「已保存」 in the
+    // success colour *and* to switch the live backend. A success sentence on a write that
+    // never landed is the one thing this page must not say, so the refusal aborts the
+    // save: no success line, no backend switch (a live engine that disagrees with the
+    // persisted provider silently reverts on the next launch).
+    if (!writeStoreValueChecked(SETTINGS_KEY, setAiConfig(cur, cfg))) {
+      aiMsg = "";
+      storeErr = t("common.storeWriteFailed");
+      return;
+    }
+    storeErr = "";
     if (bridged()) {
       void switchAiBackend(cfg.provider, {
         model: cfg.model,
@@ -263,6 +280,7 @@
       {t("settings.aiSave")}
     </button>
   </div>
+  <StoreErrorBar message={storeErr} />
   {#if aiMsg}
     <p role="status" class="mt-2 text-[11px] text-accent">{aiMsg}</p>
   {/if}
@@ -415,9 +433,22 @@
     {#if diagEntries.length === 0}
       <p data-testid="ai-diag-empty" class="mt-1 opacity-60">{t("settings.aiClientDiagEmpty")}</p>
     {:else}
+      <!-- Every field of an entry is rendered, not just its name: the *reason* (`detail`)
+           and *when* (`ts`) used to be recorded and then dropped here, so a row said
+           "backend failed" and stopped — the two facts a diagnosis is actually made of are
+           now on the row. `detail` is empty for entries logged without one, so the row
+           stays one line for those. A long detail truncates like the rest of the panel; the
+           full text is still in `recentDiag()`. -->
       <ul data-testid="ai-diag" class="mt-1 space-y-0.5 font-mono text-[10px]">
         {#each diagEntries as e (e.seq)}
-          <li data-testid="ai-diag-item" class="truncate">{e.level} · {e.area} · {e.msg}</li>
+          <li class="truncate">
+            <span data-testid="ai-diag-item"
+              >{clockOf(e.ts)} · {e.level} · {e.area} · {e.msg}</span
+            >
+            {#if e.detail !== ""}
+              <span data-testid="ai-diag-detail" class="opacity-60"> — {e.detail}</span>
+            {/if}
+          </li>
         {/each}
       </ul>
     {/if}

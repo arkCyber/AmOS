@@ -21,11 +21,15 @@ import DesktopNotificationBanner from "../src/svelte/DesktopNotificationBanner.s
 import DesktopShell from "../src/svelte/DesktopShell.svelte";
 import { writeStoreValue } from "../src/lib/amosStore";
 import {
+  NOTIF_CAP,
   NOTIF_KEY,
   SETTINGS_KEY,
   addNotif,
 } from "../src/lib/settings";
 import { SOUND_KEY } from "../src/lib/sound";
+import { setLocale } from "../src/svelte/locale.svelte";
+import { en } from "../src/i18n/locales/en";
+import { zh } from "../src/i18n/locales/zh";
 import {
   TOPBAR_HEIGHT,
   NOTIF_BANNER_TOP_OFFSET,
@@ -50,6 +54,7 @@ beforeEach(() => {
 afterEach(() => {
   window.localStorage.clear();
   tone.play.mockClear();
+  setLocale("zh");
 });
 
 // ─── §4.1 几何（5 条） ───────────────────────────────────────────────────────
@@ -142,6 +147,22 @@ describe("G-γ — 通知到达 / 消失 / 位置 / 新到一条 / ack", () => {
     await tick();
     expect(bannerEl(container)).toBeTruthy();
     expect(container.textContent ?? "").toContain("信息");
+  });
+
+  // REQ-A1181 / F-SH-473: the twin of the phone banner's English fallback — a row with
+  // neither `app` nor `title` must read the dictionary, not the literal "Notification".
+  test("topBanner_falls_back_to_localized_copy_when_no_app_or_title", async () => {
+    const { container } = render(DesktopNotificationBanner);
+    await tick();
+    writeStoreValue(NOTIF_KEY, [{ id: "n1", body: "仅正文", time: Date.now() }]);
+    await tick();
+    expect(bannerEl(container)).toBeTruthy();
+    expect(container.textContent ?? "").toContain(zh["nc.untitled"]);
+    expect(container.textContent ?? "").not.toContain("Notification");
+
+    setLocale("en");
+    await tick();
+    expect(container.textContent ?? "").toContain(en["nc.untitled"]);
   });
 
   test("topBanner_dismisses_after_NOTIF_BANNER_SHOW_MS", async () => {
@@ -274,6 +295,31 @@ describe("G-γ — DND / 静音 / 不抢焦点", () => {
     expect(tone.play).not.toHaveBeenCalled();
   });
 
+  // REQ-A1636 / F-SH-831：桌面横幅与手机横幅共用一个提示音门。`amos.notifications` 有
+  // 上限，满表时一次真投递把最老的一行挤掉、表长度不变；旧的 `prev.length` ∕
+  // `notifs.length` 把这读成「没有到达」而**再也不响**。门的据是这次到达（id 集合），不是
+  // 长度差 —— 与 `osPushWatcher.ts` 记下的同一处折叠同源（REQ-A589）。
+  test("topBanner_rings_for_a_capped_arrival（满表时的到达仍然响）", async () => {
+    const full = Array.from({ length: NOTIF_CAP }, (_, i) => ({
+      id: `n${i}`,
+      app: "信息",
+      title: `row ${i}`,
+      time: i + 1,
+    }));
+    writeStoreValue(NOTIF_KEY, full);
+    const { container } = render(DesktopNotificationBanner);
+    await tick();
+    expect(tone.play).not.toHaveBeenCalled(); // 挂载时读到现存表不是一次到达
+
+    const capped = [{ id: "n-new", app: "信息", title: "new", time: 9_999 }, ...full.slice(1)];
+    expect(capped.length).toBe(NOTIF_CAP);
+    writeStoreValue(NOTIF_KEY, capped);
+    await tick();
+
+    expect(bannerEl(container)).toBeTruthy();
+    expect(tone.play).toHaveBeenCalledTimes(1);
+  });
+
   // **负控 #5**：banner 出现时**不**把键盘焦点抓到自身 —— macOS 上通知 banner
   // 不抢焦点，否则用户正在打字会被打断。
   test("topBanner_does_not_steal_focus_from_active_window", async () => {
@@ -304,6 +350,29 @@ describe("G-γ — 挂载 / 与 NotificationCenter 同源", () => {
     // 仅 1 行 mount —— 多挂一次会触发重复渲染与重复出现 banner
     const mounts = body.match(/<DesktopNotificationBanner\b[^/]*\/?>/g) ?? [];
     expect(mounts.length).toBe(1);
+  });
+
+  // REQ-A983 / F-SH-310: the desktop banner's ack control carried the hard-coded
+  // English literal `notification: acknowledge`, so a zh-UI screen-reader user heard
+  // English. The `:` after the first word defeated `i18n-scan`'s English-copy check
+  // (MULTIWORD_EN only accepts word characters). The name must now follow the locale.
+  test("the desktop ack name is localized and follows the locale", async () => {
+    const { container } = render(DesktopNotificationBanner);
+    await tick();
+    writeStoreValue(NOTIF_KEY, [
+      { id: "n1", app: "信息", title: "小安", time: Date.now() },
+    ]);
+    await tick();
+    const ack = container.querySelector(
+      '[data-testid="desktop-notif-ack"]',
+    ) as HTMLButtonElement | null;
+    expect(ack).toBeTruthy();
+    expect(ack!.getAttribute("aria-label")).toBe(zh["a11y.acknowledgeNotification"]);
+    expect(ack!.getAttribute("aria-label")).not.toBe("notification: acknowledge");
+
+    setLocale("en");
+    await tick();
+    expect(ack!.getAttribute("aria-label")).toBe(en["a11y.acknowledgeNotification"]);
   });
 
   test("topBanner_uses_the_same_store_as_DesktopNotificationCenter", async () => {

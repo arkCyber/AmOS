@@ -14,9 +14,11 @@ and the `SensorManager` that applies the energy policy to sensors. Part of
   camera frame *bytes* deliberately do **not** travel over gRPC (`proto/sensor.proto` says
   so); high-rate payloads belong to a data plane such as
   [`crates/amos-link`](../amos-link/README.md).
-- `sensor.stream` (`FrameLatest`, `ImuLatest`, `LiveSensorProvider`, `StreamChange`) keeps
-  the **newest** sample per stream, which is what a UI needs and what stops a slow consumer
-  from growing a queue.
+- `sensor.stream` (`FrameLatest`, `ImuLatest`, `VitalsLatest`, `LiveSensorProvider`,
+  `StreamChange`) keeps the **newest** sample per stream, which is what a UI needs and what
+  stops a slow consumer from growing a queue. A `VitalsSample` field is `Option`: `None` is
+  "no reading" (a device without that sensor, or a sensor that lost contact), never `0` — and
+  losing a reading is a *retraction* that must reach the store, not a no-op.
 - `SensorManager` owns the on/off + rate decisions, driven by `crates/amos-power`'s
   `SensorMode` — so "the governor lowered the rate" is one code path, not per-sensor logic.
 - `service.rs` (`SensorService`, `server`, `mock_server`) exposes the typed surface over the
@@ -29,11 +31,12 @@ It is **not** a camera driver or an ALSA/HAL: the actual capture is the platform
 
 | file | what |
 |---|---|
-| `src/spec.rs` | camera / GNSS / IMU spec types |
+| `src/spec.rs` | camera / GNSS / IMU / vitals spec types |
 | `src/provider.rs` | `SensorProvider` seam + `MockSensorProvider` |
-| `src/stream.rs` | `FrameLatest`, `ImuLatest`, `LiveSensorProvider`, `StreamChange` |
+| `src/stream.rs` | `FrameLatest`, `ImuLatest`, `VitalsLatest`, `LiveSensorProvider`, `StreamChange` |
 | `src/manager.rs` | `SensorManager`: energy-policy-driven enable/rate |
 | `src/service.rs` | `SensorService`, `server`, `mock_server` (the tonic surface) |
+| `src/sim.rs` | `SimHarness` + `checkerboard`/`deterministic_motion`: a host-side driver that exercises the whole live stream (IMU / camera / vitals, incl. a retraction) without a device |
 | `src/android.rs` | *(feature `android`)* the Android provider |
 
 ## Build & test

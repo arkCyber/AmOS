@@ -23,6 +23,8 @@
   import { createKeyboardBindings } from "../../lib/keyboardConfigHook.svelte";
   import { isDesktopFeatureEnabled } from "../../lib/desktopFeatures";
   import { deadChordMessage, refusedChordMessage, runSystemIntent, systemIntentFor } from "../desktopSystemKeys";
+  import { snapRefusal, snapZoneFor } from "../../lib/snapZones";
+  import { wmSnapWithDiag } from "../../lib/wm";
   import { handOverSystemKeys } from "../../lib/earlySystemKeys";
   import { isSelectAllChord, selectAllInFocus } from "../../lib/editKeys";
   import { amosWarn } from "../../lib/debugLog";
@@ -74,6 +76,30 @@
           );
         });
         return;
+      }
+
+      // 窗口吸附（⌃⌥ 一族，表在 `lib/snapZones.ts`）——**放在系统域之后**，因为系统域
+      // 是用户可改的（键盘设置）：他把某一行绑到 ⌃⌥← 时，显式配置必须赢过这张壳自有的
+      // 固定表（否则他的绑定在这个窗口里静默失效，正是 REQ-A394 修掉的形状）。两族默认
+      // 值本来就不相交（`shortcutMatches` 精确比修饰符）。吸附正是**应用窗口**上发生的事，
+      // 而 ⌘W 那套理由在这里更强：本组件活在被吸附的那扇窗里，`label` 就是它的宿主标签，
+      // 所以不需要轮询、也不会吸到邻居（REQ-A419）。宿主拒绝要说出来（非桌面形态、窗口
+      // 已关闭、或它正在分屏里），不能静默。
+      const snapZone = snapZoneFor(e);
+      if (snapZone) {
+        e.preventDefault();
+        e.stopPropagation();
+        void wmSnapWithDiag(label, snapZone).then((outcome) => {
+          if (outcome.ok) return;
+          const diag = outcome.diag;
+          // `WmReplyDiag` also carries an `{ ok: true }` member, so narrow before reading
+          // `kind` (the wrapper fills one of the three failure kinds itself).
+          if (diag.ok) return;
+          amosWarn("shell", snapRefusal(snapZone, "host-refused"), {
+            label,
+            reason: diag.kind,
+          });
+        });
       }
     };
     window.addEventListener("keydown", onKeyDown, OPTIONS);

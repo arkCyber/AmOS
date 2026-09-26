@@ -10,6 +10,7 @@
 //! the `android` seam in a later phase (`docs/android-storage-unify.md` §6 C).
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Mutex;
 
 use crate::error::{MediaError, Result};
@@ -96,6 +97,44 @@ pub trait MediaProvider: Send + Sync {
     /// The provider enforces [`MAX_SAVE_BYTES`]; the manager enforces policy.
     fn save(&self, dir: StandardDir, kind: MediaKind, name: &str, data: &[u8])
         -> Result<MediaItem>;
+
+    /// Persist the file already at `src` as `name` in `dir` — the **streaming**
+    /// twin of [`save`](MediaProvider::save).
+    ///
+    /// `save` takes the payload as one `&[u8]`, which caps it at
+    /// [`MAX_SAVE_BYTES`]. A WebMan download may be up to the pipeline's 4 GiB
+    /// ceiling, so a finished transfer is handed over as a *path* and the backend
+    /// streams it (the Android glue copies in 64 KiB chunks into MediaStore, so the
+    /// bytes never exist as one buffer in either address space).
+    ///
+    /// The default is correct but **materialises** the file, so it keeps the same
+    /// [`MAX_SAVE_BYTES`] ceiling [`save`](MediaProvider::save) enforces. A backend
+    /// that streams overrides it and is bounded by the source file instead — the
+    /// cap exists to stop an unbounded *allocation*, not to bound the destination.
+    ///
+    /// Overrides must run [`validate_save_name`] themselves; it is the single name
+    /// guard and this default is the reference for what "same answer" means.
+    fn save_from_path(
+        &self,
+        dir: StandardDir,
+        kind: MediaKind,
+        name: &str,
+        src: &Path,
+    ) -> Result<MediaItem> {
+        let name = validate_save_name(name)?;
+        let len = std::fs::metadata(src)
+            .map_err(|e| MediaError::Provider(format!("cannot stat {}: {e}", src.display())))?
+            .len();
+        if len > MAX_SAVE_BYTES {
+            return Err(MediaError::TooLarge {
+                bytes: len,
+                max: MAX_SAVE_BYTES,
+            });
+        }
+        let data = std::fs::read(src)
+            .map_err(|e| MediaError::Provider(format!("cannot read {}: {e}", src.display())))?;
+        self.save(dir, kind, &name, &data)
+    }
 
     /// Read back the bytes of a previously-saved `item` (identified by its opaque
     /// `uri`). Backends return bytes only for payloads they actually hold; an item
@@ -493,6 +532,65 @@ mod tests {
         // Past the byte cap.
         let huge = "x".repeat(MAX_SAVE_NAME_BYTES + 1);
         assert!(validate_save_name(&huge).is_err());
+    }
+
+    /// The Mock backend must run the same path-traversal guard — it is the test
+    /// surface for the trait and would otherwise let a unit test exercise a
+    /// "successful" save that the production backend refuses.
+    #[test]
+    fn save_from_path_streams_the_file_through_the_name_guard() {
+        let tmp = std::env::temp_dir().join(format!("amos-media-sfp-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap_or_else(|e| panic!("tmpdir: {e}"));
+        let src = tmp.join("payload.bin");
+        std::fs::write(&src, b"streamed-bytes").unwrap_or_else(|e| panic!("write: {e}"));
+
+        let p = MockMediaProvider::empty();
+        let it = p
+            .save_from_path(StandardDir::Download, MediaKind::File, "payload.bin", &src)
+            .unwrap_or_else(|e| panic!("save_from_path: {e}"));
+        assert_eq!(it.name, "payload.bin");
+        assert_eq!(it.size_bytes, Some(14));
+        // The bytes really arrived: the mock holds them for a later `load`.
+        assert_eq!(p.load(&it).unwrap_or_default(), b"streamed-bytes");
+
+        // Same trait-level name guard as `save` — a traversal name never reaches
+        // the (streaming) write, whichever entry point was used.
+        assert!(p
+            .save_from_path(StandardDir::Download, MediaKind::File, "../escape", &src)
+            .is_err());
+
+        // An unreadable source is an honest provider error, not a zero-byte save.
+        assert!(p
+            .save_from_path(
+                StandardDir::Download,
+                MediaKind::File,
+                "missing.bin",
+                &tmp.join("nope.bin")
+            )
+            .is_err());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn save_from_path_refuses_a_source_over_the_cap() {
+        // The default materialises the file, so it keeps `save`'s in-memory cap.
+        // A sparse file keeps this O(1) on disk instead of writing 64 MiB.
+        let tmp = std::env::temp_dir().join(format!("amos-media-cap-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap_or_else(|e| panic!("tmpdir: {e}"));
+        let big = tmp.join("big.bin");
+        let f = std::fs::File::create(&big).unwrap_or_else(|e| panic!("create: {e}"));
+        f.set_len(MAX_SAVE_BYTES + 1)
+            .unwrap_or_else(|e| panic!("set_len: {e}"));
+        drop(f);
+
+        let p = MockMediaProvider::empty();
+        assert!(matches!(
+            p.save_from_path(StandardDir::Download, MediaKind::File, "big.bin", &big),
+            Err(MediaError::TooLarge { max, .. }) if max == MAX_SAVE_BYTES
+        ));
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// The Mock backend must run the same path-traversal guard — it is the test

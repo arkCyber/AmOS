@@ -121,6 +121,21 @@ impl AndroidFlashlightProvider {
         amos_jni::attached(&self.vm).map_err(jerr)
     }
 
+    /// Issue one torch request on the calling thread and fold the accepted value
+    /// into the mirror. This is the whole of [`FlashlightProvider::set_on`] minus the
+    /// `async`; it is separate because the System UI has to drive it **between** two
+    /// other synchronous JNI calls (releasing AmOS's own camera preview, then giving
+    /// it back — `amos-tauri/src/flashlight.rs`), and an `async` fn cannot be
+    /// sequenced with them without a nested executor.
+    pub fn set_on_blocking(&self, on: bool) -> Result<()> {
+        let mut env = self.env()?;
+        self.set_torch_mode(&mut env, on)?;
+        // Only reflect the state once the OS accepted the request, so the mirror
+        // never lies about the light being on.
+        self.on.store(on, Ordering::Relaxed);
+        Ok(())
+    }
+
     /// Drive `CameraManager#setTorchMode(cameraId, on)`. Throws (→ Provider
     /// error) when the camera is owned by another client, or the device is too
     /// hot / the battery too low.
@@ -149,12 +164,7 @@ impl FlashlightProvider for AndroidFlashlightProvider {
     }
 
     async fn set_on(&self, on: bool) -> Result<()> {
-        let mut env = self.env()?;
-        self.set_torch_mode(&mut env, on)?;
-        // Only reflect the state once the OS accepted the request, so the mirror
-        // never lies about the light being on.
-        self.on.store(on, Ordering::Relaxed);
-        Ok(())
+        self.set_on_blocking(on)
     }
 
     fn note_external_state(&self, on: bool) {

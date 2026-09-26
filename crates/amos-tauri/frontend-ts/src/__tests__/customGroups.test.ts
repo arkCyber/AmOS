@@ -159,7 +159,7 @@ describe("addCustomGroup / setGroupApps / renameCustomGroup / setGroupIcon / rem
   test("setGroupApps：只改目标分组，并把数组复制一份", () => {
     const groups = [g("a", "A"), g("b", "B")];
     const input = ["notes"];
-    const next = setGroupApps(groups, "a", input);
+    const { groups: next } = setGroupApps(groups, "a", input);
     expect(next.map((x) => x.apps)).toEqual([["notes"], []]);
     // 复制：调用方之后改自己的数组，不应改变已保存的分组。
     input.push("reminders");
@@ -169,39 +169,47 @@ describe("addCustomGroup / setGroupApps / renameCustomGroup / setGroupIcon / rem
 
   test("setGroupApps：未知 id ⇒ 内容不变（不是「清空成员」）", () => {
     const groups = [g("a", "A", ["notes"])];
-    expect(setGroupApps(groups, "nope", [])).toEqual(groups);
+    expect(setGroupApps(groups, "nope", []).groups).toEqual(groups);
   });
 
   test("renameCustomGroup：trim 后改名；空名 ⇒ 原样返回且**不落盘**", () => {
     memory.set(CUSTOM_GROUPS_KEY, JSON.stringify([g("a", "旧名")]));
-    const renamed = renameCustomGroup([g("a", "旧名")], "a", "  新名 ");
+    const renamed = renameCustomGroup([g("a", "旧名")], "a", "  新名 ").groups;
     expect(renamed[0]!.name).toBe("新名");
     expect(stored()).toEqual(renamed);
 
     memory.set(CUSTOM_GROUPS_KEY, JSON.stringify([g("a", "旧名")]));
     const untouched = [g("a", "旧名")];
-    expect(renameCustomGroup(untouched, "a", "   ")).toEqual(untouched);
+    expect(renameCustomGroup(untouched, "a", "   ").groups).toEqual(untouched);
     expect(stored()).toEqual([g("a", "旧名")]); // 没有写盘
   });
 
   test("setGroupIcon：空字符串清除图标，未知 id 不动", () => {
     const groups = [g("a", "A", [], "📁"), g("b", "B")];
-    expect(setGroupIcon(groups, "a", "").map((x) => x.icon)).toEqual([undefined, undefined]);
-    expect(setGroupIcon(groups, "a", "⭐").map((x) => x.icon)).toEqual(["⭐", undefined]);
-    expect(setGroupIcon(groups, "nope", "⭐")).toEqual(groups);
+    expect(setGroupIcon(groups, "a", "").groups.map((x) => x.icon)).toEqual([undefined, undefined]);
+    expect(setGroupIcon(groups, "a", "⭐").groups.map((x) => x.icon)).toEqual(["⭐", undefined]);
+    expect(setGroupIcon(groups, "nope", "⭐").groups).toEqual(groups);
   });
 
   test("removeCustomGroup：删掉目标、其余保持顺序；未知 id 内容不变", () => {
     const groups = [g("a", "A"), g("b", "B"), g("c", "C")];
-    expect(removeCustomGroup(groups, "b").map((x) => x.id)).toEqual(["a", "c"]);
-    expect(removeCustomGroup(groups, "zzz")).toEqual(groups);
+    expect(removeCustomGroup(groups, "b").groups.map((x) => x.id)).toEqual(["a", "c"]);
+    expect(removeCustomGroup(groups, "zzz").groups).toEqual(groups);
   });
 
-  test("写入被存储拒绝时不会假装成功（读回来还是旧内容）", () => {
+  test("写入被存储拒绝时不会假装成功（读回来还是旧内容，且裁决为 ok:false）", () => {
     const groups = addCustomGroup([], "先存一个").groups;
     failWrites = true;
-    addCustomGroup(groups, "存不进去");
+    // 裁决是本次修复的核心：拒写必须**说出来**，而不是只让读回的内容碰巧没变。
+    expect(addCustomGroup(groups, "存不进去").ok).toBe(false);
+    expect(setGroupApps(groups, groups[0]!.id, ["notes"]).ok).toBe(false);
+    expect(renameCustomGroup(groups, groups[0]!.id, "改名").ok).toBe(false);
+    expect(setGroupIcon(groups, groups[0]!.id, "⭐").ok).toBe(false);
+    expect(removeCustomGroup(groups, groups[0]!.id).ok).toBe(false);
     expect(getCustomGroups().map((x) => x.name)).toEqual(["先存一个"]);
+    // 对照：写回去（failWrites 关掉）时裁决为 ok:true —— 上面五条不能靠「永远 false」通过。
+    failWrites = false;
+    expect(renameCustomGroup(groups, groups[0]!.id, "改名").ok).toBe(true);
   });
 });
 

@@ -27,8 +27,9 @@
 //!    [`JunkKind`] shapes above and never enumerates user media — a `.jpg`/`.mp4`
 //!    under the root is *not junk* and is never returned.
 //!
-//! A scan additionally reports how many directories it could not read
-//! ([`HostScan::unreadable_dirs`]) so a partial scan is never presented as a
+//! A scan additionally reports how many directories it did not enter
+//! ([`HostScan::unreadable_dirs`] — one it could not list, or one the walk
+//! reached [`MAX_SCAN_DEPTH`] before) so a partial scan is never presented as a
 //! complete one.
 
 use std::fs;
@@ -40,6 +41,10 @@ use crate::spec::{JunkItem, JunkKind, MAX_JUNK_ITEMS};
 
 /// Maximum directory depth a scan descends (a bounded walk: no unbounded
 /// recursion, no way to traverse a pathological tree).
+///
+/// A walk that stops at this bound records the directory it did not enter in
+/// [`HostScan::unreadable_dirs`], so the truncated result is **reported as
+/// partial** rather than returned as if it were complete.
 pub const MAX_SCAN_DEPTH: usize = 12;
 
 /// Directory names whose whole subtree is treated as rebuildable cache.
@@ -82,8 +87,11 @@ pub fn is_safe_root(root: &Path) -> bool {
 pub struct HostScan {
     /// The junk found, in the walk's deterministic depth-first order.
     pub items: Vec<JunkItem>,
-    /// Directories skipped because they could not be listed (permissions, races).
-    /// Non-zero means the scan is **partial**, and a caller should say so.
+    /// Directories the walk did not enter — because they could not be listed
+    /// (permissions, races) **or** because `depth` exceeded [`MAX_SCAN_DEPTH`] at
+    /// that level. Non-zero means the scan is **partial**, and a caller should say
+    /// so: both causes leave un-enumerated subtrees behind, and a partial scan must
+    /// never be shown as complete.
     pub unreadable_dirs: usize,
 }
 
@@ -222,6 +230,12 @@ impl Frame {
         out: &mut HostScan,
     ) -> Result<Option<Frame>> {
         if depth > MAX_SCAN_DEPTH {
+            // The walk stops here deliberately, but a subtree it never entered is a
+            // **partial** scan the caller must be able to see. Counting it is what makes
+            // `HostScan::unreadable_dirs`'s promise ("a partial scan is never presented as a
+            // complete one") true for the depth bound too — returning `None` silently
+            // reported a depth-truncated walk as complete. (REQ-A591 / F-SH-079)
+            out.unreadable_dirs += 1;
             return Ok(None);
         }
         let children = match fs::read_dir(dir) {
@@ -546,6 +560,41 @@ mod tests {
             scan.items.iter().all(|i| !i.uri.ends_with("buried.log")),
             "the bounded walk must not reach beyond MAX_SCAN_DEPTH"
         );
+        assert!(
+            scan.unreadable_dirs >= 1,
+            "a walk cut short by the depth bound is PARTIAL and must say so"
+        );
+    }
+
+    #[test]
+    fn scan_reports_a_depth_truncated_walk_as_partial() {
+        // The depth bound must not turn a partial scan into a silently complete one:
+        // a subtree the walk never entered (because `depth > MAX_SCAN_DEPTH`) is junk
+        // it did not enumerate, so `unreadable_dirs` must be non-zero. Without the
+        // count, `scan()` returns a result whose zero counters claim "nothing was
+        // missed" while a whole subtree went unvisited.
+        let t = TempRoot::new();
+        // A directory chain one level past the bound, with a junk file in the deepest
+        // reachable leaf AND beyond it — either way the scan is incomplete.
+        let mut deep = t.path().to_path_buf();
+        for i in 0..MAX_SCAN_DEPTH + 2 {
+            deep = deep.join(format!("d{i}"));
+        }
+        fs::create_dir_all(&deep).expect("mkdir deep");
+        fs::write(deep.join("tail.tmp"), b"x").expect("write deep temp");
+
+        let scan = HostFsScanner::new(t.path()).scan().expect("scan ok");
+        assert!(
+            scan.unreadable_dirs >= 1,
+            "the depth-truncated subtree must be reported, not hidden"
+        );
+
+        // A shallow scan that reaches everything reports zero — the counter is not
+        // spuriously non-zero.
+        let shallow = TempRoot::new();
+        shallow.file("app.log", 1);
+        let clean = HostFsScanner::new(shallow.path()).scan().expect("scan ok");
+        assert_eq!(clean.unreadable_dirs, 0);
     }
 
     #[test]

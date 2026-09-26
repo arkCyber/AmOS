@@ -122,7 +122,7 @@ describe("MDM 未启用时一切放行（策略不该拦没有 MDM 的设备）"
   test("无配置：所有判定都允许，且不抛", () => {
     expect(mdmManager.checkActionAllowed("apps", "any")).toEqual({ allowed: true });
     expect(mdmManager.checkPermission("delete")).toEqual({ allowed: true });
-    expect(mdmManager.checkCanCreate()).toEqual({ allowed: true });
+    expect(mdmManager.checkCanCreate(0)).toEqual({ allowed: true });
     expect(mdmManager.checkCanModify("s-1")).toEqual({ allowed: true });
     expect(mdmManager.checkCanDelete("s-1")).toEqual({ allowed: true });
     expect(mdmManager.checkCanExecute("s-1", 999)).toEqual({ allowed: true });
@@ -209,12 +209,18 @@ describe("MDM 执行限制", () => {
     expect(denied.reason).toContain("10");
   });
 
-  test("操作数：checkActionCount 与 checkCanExecute 用同一上限但措辞不同", () => {
+  /**
+   * 这条原题为「用同一上限但**措辞不同**」，断言两份实现各说各话 —— 那正是缺陷本身：
+   * 同一个上限有两份代码，一份带 NaN 折叠（命名的那份）一份不带（内联的那份），
+   * 于是 `undefined` 上限下内联的那份恒放行（REQ-A899）。现在两者是同一份实现，
+   * 所以这里改成断言**同一个结果对象**（措辞当然也必须一样）。
+   */
+  test("操作数：checkActionCount 与 checkCanExecute 是同一份实现、同一句话", () => {
     mdmManager.setConfigForTest(config({ maxActionsPerShortcut: 3 }));
     expect(mdmManager.checkActionCount(3)).toEqual({ allowed: true });
     expect(mdmManager.checkActionCount(4).reason).toContain("操作数超过");
-    expect(mdmManager.checkCanExecute("s-1", 4).reason).toContain("快捷指令操作数超过限制");
     expect(mdmManager.checkCanExecute("s-1", 3)).toEqual({ allowed: true });
+    expect(mdmManager.checkCanExecute("s-1", 4)).toEqual(mdmManager.checkActionCount(4));
   });
 
   test("每日次数：recordExecution 累计到上限后拒绝，且计数按「日期-指令」落盘", () => {
@@ -225,7 +231,9 @@ describe("MDM 执行限制", () => {
     mdmManager.recordExecution("s-1");
     const denied = mdmManager.checkDailyExecutionLimit("s-1");
     expect(denied.allowed).toBe(false);
-    expect(denied.reason).toContain("每日执行次数限制");
+    // 措辞统一到**用户已经看到过的那一句**（`checkCanExecute()` 内联时代的文案，
+    // 它经 `shortcuts.ts` 的 `error` 字段显示给用户）。统一成哪一句都可以，但不能有两句。
+    expect(denied.reason).toContain("已达到每日最大执行次数");
     expect(mdmManager.checkCanExecute("s-1", 1).reason).toContain("已达到每日最大执行次数");
 
     expect(mdmManager.checkDailyExecutionLimit("s-2")).toEqual({ allowed: true });
@@ -320,7 +328,7 @@ describe("MDM 每日执行配额跨重载（读写的形状必须是一份契约
     restarted.setConfigForTest(config({ maxExecutionsPerDay: 2 }));
 
     expect(restarted.checkDailyExecutionLimit("s-1").allowed).toBe(false);
-    expect(restarted.checkDailyExecutionLimit("s-1").reason).toContain("每日执行次数限制");
+    expect(restarted.checkDailyExecutionLimit("s-1").reason).toContain("已达到每日最大执行次数");
     // 没到上限的另一条指令不受影响
     expect(restarted.checkDailyExecutionLimit("s-2").allowed).toBe(true);
   });
@@ -686,7 +694,16 @@ describe("MDM configure() 字段合并（必填字段不丢、可选字段不被
     expect(m.getConfig()?.deviceName).toBe("");
   });
 
-  test("policies / restrictions / enforcedShortcuts 全集合替换", async () => {
+  /**
+   * 数组字段是**原子**的：给一份新的 `enforcedShortcuts` 就是整份替换（合并一个列表
+   * 没有意义 —— 谁也不知道该往哪一端并）。
+   *
+   * `restrictions` 原先也按「全集合替换」写，这是**错的一侧**：它的类型是
+   * `Partial<MDMRestrictions>`，语义是「我只说这几项」。整块替换会把没提到的限制全变成
+   * `undefined` ⇒ 判据恒放行（`currentCount >= undefined` 为假），且落盘之后重启依然如此
+   * （REQ-A899）。所以这里顺带钉住它现在是**一层深合并**。
+   */
+  test("policies / enforcedShortcuts 全集合替换；restrictions 是一层深合并", async () => {
     const m = new MDMManager();
     m.setConfigForTest(config({}, { enforcedShortcuts: ["old-a", "old-b"] }));
 
@@ -708,6 +725,12 @@ describe("MDM configure() 字段合并（必填字段不丢、可选字段不被
     expect(m.getConfig()?.policies.length).toBe(1);
     expect(m.getConfig()?.policies[0]?.id).toBe("p-1");
     expect(m.getConfig()?.enforcedShortcuts).toEqual(["new-x"]);
+
+    // 只给一项 restrictions：没提到的两项保持原值（`config()` 里它们是 1000 / 100）
+    await m.configure({ restrictions: { maxExecutionTime: 60 } as MDMRestrictions });
+    expect(m.getRestrictions().maxExecutionTime).toBe(60);
+    expect(m.getRestrictions().maxExecutionsPerDay).toBe(1000);
+    expect(m.getRestrictions().maxActionsPerShortcut).toBe(100);
   });
 
   test("configure 后必须落盘（防止'已配置'的假象，重启后字段清零）", async () => {

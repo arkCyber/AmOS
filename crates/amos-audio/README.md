@@ -22,6 +22,10 @@ features. Part of **[Amos](../../README.md)**. Design record:
 - `android/` (features `aaudio` / `tinyalsa`): the FFI seams. The AAudio path uses the
   **data-callback (push)** form by default (`AAudioCallbackCapture`), with a blocking pull
   reader kept as an explicit alternative.
+- `tinyalsa_layout.rs`: the AOSP `pcm.h` FFI-layout facts the TinyALSA seam depends on
+  (`PcmConfig` field order, `pcm_format` / `pcm_flags` values, period sizing), kept in a
+  host-compiled module so a **host** test pins them instead of a device build being the only
+  thing that would notice a transcription slip.
 - `mock.rs`: the offline sources (`SineMic`) every consumer test uses.
 
 It is **not** a mixer, a codec or a policy manager (routing, focus, ducking are platform
@@ -37,6 +41,7 @@ concerns) and it does not implement AOSP's `audio_policy` service.
 | `src/resample.rs` | `resample_linear`, `LinearDownsampler` |
 | `src/ring.rs` | the bounded, real-time-safe sample ring |
 | `src/mock.rs` | deterministic offline sources (`SineMic`) |
+| `src/tinyalsa_layout.rs` | the `pcm.h` FFI-layout facts, host-testable |
 | `src/android/` | *(features `aaudio`/`tinyalsa`)* the real HAL seams |
 
 ## Build & test

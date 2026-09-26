@@ -27,6 +27,31 @@ const PAIRS = ["z_zh", "c_ch", "s_sh", "n_l", "f_h", "r_l", "in_ing", "en_eng", 
 
 const settle = () => new Promise<void>((r) => setTimeout(r, 0));
 
+/**
+ * Swap in a storage whose writes of `key` throw the way a full quota does, and return
+ * a restore function (the same helper `messages.svelte.test.ts` uses — `window.localStorage`
+ * is a per-access proxy, so the window property itself is replaced).
+ */
+function failWritesFor(key: string): () => void {
+  const real = window.localStorage;
+  const fake = {
+    get length() {
+      return real.length;
+    },
+    clear: () => real.clear(),
+    key: (i: number) => real.key(i),
+    getItem: (k: string) => real.getItem(k),
+    removeItem: (k: string) => real.removeItem(k),
+    setItem: (k: string, v: string) => {
+      if (k === key) throw new Error("QuotaExceededError");
+      real.setItem(k, v);
+    },
+  } as unknown as Storage;
+  Object.defineProperty(window, "localStorage", { value: fake, configurable: true, writable: true });
+  return () =>
+    Object.defineProperty(window, "localStorage", { value: real, configurable: true, writable: true });
+}
+
 /** A minimal `ime_*` engine: enough state to drive the page's controls. */
 function installFakeEngine(): string[] {
   const calls: string[] = [];
@@ -148,6 +173,33 @@ describe("Settings → Input Method", () => {
 
     await fireEvent.click(button()!);
     expect(calls).toContain("ime_learning_clear");
+  });
+
+  test("a refused write leaves the switch where the store still is, and says so (REQ-A1432)", async () => {
+    window.localStorage.setItem(IME_ENABLED_KEY, "false");
+    const host = render(ImePage);
+    await tick();
+    const sw = () => host.container.querySelector('[role="switch"]');
+    expect(sw()?.getAttribute("aria-checked")).toBe("false");
+
+    const restore = failWritesFor(IME_ENABLED_KEY);
+    try {
+      await fireEvent.click(sw()!);
+      await tick();
+      // 开关本身就是「已保存」这条断言：写没落盘，它就不能亮。
+      expect(sw()?.getAttribute("aria-checked")).toBe("false");
+      expect(window.localStorage.getItem(IME_ENABLED_KEY)).toBe("false");
+      expect(q(host, "settings-ime-store-error")?.textContent).toContain("未保存");
+    } finally {
+      restore();
+    }
+
+    // 存储回来可写：这一次真的落盘，开关动，拒绝句消失。
+    await fireEvent.click(sw()!);
+    await tick();
+    expect(sw()?.getAttribute("aria-checked")).toBe("true");
+    expect(window.localStorage.getItem(IME_ENABLED_KEY)).toBe("true");
+    expect(q(host, "settings-ime-store-error")).toBeNull();
   });
 
   test("with no engine it says so instead of showing inert controls", async () => {

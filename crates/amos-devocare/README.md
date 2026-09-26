@@ -12,7 +12,10 @@ Design record: [`docs/devcare.md`](../../docs/devcare.md).
 ## What it is
 
 - **scan → analyse → plan → execute**, with the plan carrying *why* each item is reclaimable
-  (`reclaim_rank`, `is_reclaimable`, `RECLAIMABLE_STATES`) — never "trust me, it's junk".
+  (`JunkKind::is_auto_cleanable` / `needs_review`) — never "trust me, it's junk".
+- **A memory boost names only reclaimable lifecycle tiers** (`RECLAIMABLE_STATES`,
+  `is_reclaimable`, `reclaim_rank`): `cached` before `background`, and the foreground /
+  visible / foreground-service tiers are never selected.
 - **`UninstallGuard` + `CRITICAL_PACKAGES`** refuse system and pinned-critical removals; the
   refusal is a typed error, not a warning a caller can ignore.
 - **Review-only items need acknowledgement**: a plan that would delete something requiring
@@ -63,8 +66,11 @@ cargo run -p amos-devocare --example care_cycle
 
 ## Honest boundaries
 
-- **`SCAN_ITEM_CAP` bounds the scan**: a directory with more entries than the cap reports a
-  truncated result, and the report says so.
+- **`SCAN_ITEM_CAP` bounds the scan**: an over-cap scan is **refused**
+  (`DevCareError::TooManyItems`), never silently truncated — a destructive operation is
+  never handed an input that was quietly clipped. A walk that stops early (a directory it
+  could not list, or one past `MAX_SCAN_DEPTH`) is reported as **partial**
+  (`HostScan::unreadable_dirs`), so an incomplete scan is never shown as complete.
 - **No filesystem may be touched by the engine itself**: every read/delete goes through the
   `CleanProvider` seam, so the domain rules are pure and the hostfs backend is the only
   place that can be wrong about paths.

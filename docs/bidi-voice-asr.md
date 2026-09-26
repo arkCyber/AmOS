@@ -192,3 +192,19 @@ impl ChatAsr {
 - `amos-ai` 增 `amos-asr = { path = "../amos-asr", optional = true }`，feature `sherpa-asr = ["dep:amos-asr", "amos-asr/sherpa"]`（与 `amos-tauri` 的命名一致）。
 - 默认（无 feature）也内置 `MockStreamingRecognizer`（经 `amos-asr`），只是 `sherpa` 真模型需开 feature + `AMOS_SHERPA_MODEL_DIR`（同 `native-voice.md` 的同传参数）。
 
+---
+
+## 10. 诚实边界与 ASR 解析链（Gap 8，2026-09-20）
+
+`chat_asr.rs` 的 `ChatAsr::default_asr` 按一条**模型目录解析链**决定用哪个识别器：
+
+1. **`AMOS_SHERPA_MODEL_DIR`**（operator 覆盖）——可用则优先（`resolve_sherpa_model_dir` 也校验非空白、不超 `MAX_MODEL_DIR_BYTES`）；
+2. **内嵌资产目录**——AOSP 镜像 stage 的 `sherpa/`（`AMOS_BUNDLE_RES_DIR` / `AMOS_BUNDLE_MODELS_DIR` 之下）；没带模型的设备镜像**从不**服务 mock；
+3. 前两级都解析不出时才落到**确定性 mock**，且**必定**带一条 `tracing::error!`，点名这是 dev/CI-only 回退。
+
+边界：
+
+* **mock 只在 feature 与目录都不可用时返回**：`asr-sherpa` 是 `amos-ai` 的 **default-on** feature（`cargo build -p amos-ai --no-default-features` 才关）；feature 在**且**目录可解析 ⇒ 真 sherpa。**显式** `AMOS_ASR_BACKEND=sherpa` 在缺 feature 或缺目录时返回**诚实的 `None`，绝不降级成 mock**。
+* **mock 被显式标注、且必被记录**：识别器带标签（`"sherpa"` / `"mock"` / …），`get_status` / 日志 / 测试据此区分真假；任何 mock 回退**永远**伴随 `error!` 日志（env 条目不可用则 `warn!`），读日志的运维不会把它当成真识别（F-ASR-001）。
+* **未接与未验**：`AMOS_ASR_BACKEND=off` 关语音；无目录时 `None` 退回 §5 的"诚实提示"。整条链的判定由主机单测覆盖（含负控：把 `AMOS_SHERPA_MODEL_DIR` 指向不存在的目录 ⇒ 观察 `None` 而非 panic）；**真机采集 + 真模型的 16 kHz mono f32 端到端**（经文 bidi `Chat`）**未验证**。
+

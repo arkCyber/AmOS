@@ -86,9 +86,13 @@ pub use model::{
 };
 pub use provider::{MockStoreProvider, StoreProvider};
 pub use pwa::{
-    builtin_index, bundle_csp, csp_connect_sources, index_base_url, index_base_url_for, index_csp,
-    index_document_url, protocol_base_url, protocol_base_url_for, protocol_url, serve_index,
-    DisplayMode, Orientation, PwaIndex, PwaManifest, ToolAction, INDEX_SCHEMA,
+    builtin_index, bundle_csp, csp_connect_sources, host_allowed, index_base_url,
+    index_base_url_for, index_csp, index_dir_from_env, index_document_url, install_local_pwa,
+    install_pwa, open_remote_pwa, open_remote_pwa_with, parse_remote_allow_list, persist_manifest,
+    protocol_base_url, protocol_base_url_for, protocol_url, remote_allow_list_from_env,
+    serve_index, DisplayMode, ManifestFetcher, Orientation, PwaIndex, PwaInstallRequest,
+    PwaInstallSource, PwaManifest, ToolAction, INDEX_SCHEMA, MAX_ALLOWED_DOMAINS,
+    MAX_MANIFEST_BYTES, MAX_MANIFEST_URL_BYTES, PWA_REMOTE_ALLOW_ENV, REMOTE_FETCH_TIMEOUT_SECS,
 };
 pub use serve::{content_type_for, resolve_request, ServedFile};
 pub use sign::{sign_manifest, verify_manifest_signature, DeveloperKey};

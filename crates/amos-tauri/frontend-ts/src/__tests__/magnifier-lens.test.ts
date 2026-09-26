@@ -4,14 +4,15 @@ import {
   DEFAULT_ZOOM,
   MAX_ZOOM,
   MAX_TONE,
+  MIN_TONE,
   LENS_R,
   clamp,
-  clamp01,
   clampCenter,
   centredLens,
   defaultMagnifierSettings,
   lensSourceRadius,
   normalizeMagnifierSettings,
+  toneFactor,
   toneFilter,
 } from "../lib/magnifier";
 
@@ -21,14 +22,6 @@ describe("magnifier lens geometry", () => {
     expect(clamp(5, 0, 10)).toBe(5);
     expect(clamp(-1, 0, 10)).toBe(0);
     expect(clamp(20, 0, 10)).toBe(10);
-  });
-
-  test("clamp01 never fully off or blown out", () => {
-    expect(clamp01(0.5)).toBe(0.5);
-    expect(clamp01(1)).toBe(1);
-    expect(clamp01(1.5)).toBe(1);
-    expect(clamp01(0)).toBe(0.05); // lower bound, never true black
-    expect(clamp01(-3)).toBe(0.05);
   });
 
   test("clampCenter keeps an in-bounds centre as-is", () => {
@@ -94,10 +87,34 @@ describe("magnifier lens sampling + tone", () => {
     expect(lensSourceRadius(2, 200)).toBe(100);
   });
 
-  test("toneFilter clamps and renders brightness/contrast", () => {
-    expect(toneFilter(1, 1)).toBe("brightness(1) contrast(1)");
-    expect(toneFilter(1.5, 0.2)).toBe("brightness(1) contrast(0.2)");
-    expect(toneFilter(0, 2)).toBe("brightness(0.05) contrast(1)");
+  test("toneFactor maps the declared percent range onto the declared factor range", () => {
+    // The docs on MIN_TONE/MAX_TONE/DEFAULT_TONE promise 0–200% → factor 0–2 with
+    // 100 = 1.0 (neutral); the floor keeps the lens from going fully black.
+    expect(toneFactor(DEFAULT_TONE)).toBe(1);
+    expect(toneFactor(MAX_TONE)).toBe(2);
+    expect(toneFactor(MIN_TONE)).toBe(0.05);
+    expect(toneFactor(150)).toBe(1.5);
+    expect(toneFactor(50)).toBe(0.5);
+    expect(toneFactor(-10)).toBe(0.05); // floored
+    expect(toneFactor(9999)).toBe(2); // capped at the declared max
+  });
+
+  test("toneFilter renders the brightness/contrast percentages as factors", () => {
+    expect(toneFilter(100, 100)).toBe("brightness(1) contrast(1)");
+    expect(toneFilter(150, 20)).toBe("brightness(1.5) contrast(0.2)");
+    expect(toneFilter(0, 200)).toBe("brightness(0.05) contrast(2)");
+  });
+
+  test("the tone sliders are not inert: the whole 0–200% travel changes the filter", () => {
+    // Before REQ-A729 the component handed raw percentages to a factor-domain clamp,
+    // so every position from 1% to 200% produced the identical `brightness(1)
+    // contrast(1)`: the sliders moved a number nothing read. The travel must now
+    // produce distinct filters (only 0 and 1 both floor to 0.05, so ≥9 of 10 distinct).
+    const travel = [0, 20, 40, 60, 80, 100, 120, 140, 160, 200];
+    const seen = new Set(travel.map((v) => toneFilter(v, v)));
+    expect(seen.size).toBeGreaterThanOrEqual(9);
+    // The neutral default is the one value that must read as "no change".
+    expect(toneFilter(DEFAULT_TONE, DEFAULT_TONE)).toBe("brightness(1) contrast(1)");
   });
 });
 

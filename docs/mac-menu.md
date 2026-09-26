@@ -25,7 +25,7 @@ macOS 用户进入桌面形态时,顶部必须看到**真实的 Aqua 全局菜�
 **窗口类条目的可用性(CREQ-A433)**:`Close Window` / `Minimize` / `Zoom` / `Enter Full Screen` 只作用于**被聚焦的应用窗口**。没有这样的窗口时(只有启动器 / 空桌面)它们**会被置灰** —— 实测(2026-09-18,AX 逐项点击)此前它们是**可用的却什么都不做**(壳有意跳过启动器 F-SH-008,而启动器本身已是屏幕大小、Zoom 无处可 zoom),这正是 F-SH-001 那类"看起来能用"的缺陷长在操作系统自己的菜单里。同步由 `menu::sync_window_items` 负责,触发点是**平台自己的焦点事件**(`WindowEvent::Focused`)与安装完成:判据先问平台 key 窗口、再回落到窗口管理器(F-PLATFORM 的一致性,见 REQ-A431)。
 
 **已知不符/未做(如实记录)**:
-- `File ▸ New Window` ✅ **已收口为「New Files Window」(REQ-A434)**:它开的就是**「文件」应用**的窗口(`wm_open("files")`,与 Finder 的 "New Finder Window" 同形),此前标签说"New Window"却 **没有**说出是哪个应用 —— 实测(2026-09-18)在 Notes 窗口聚焦时点它,用户拿到一个「文件」窗口且无从预知;真正的"给当前应用再开一个窗口"需要"标签 ⇄ 应用"之外的第二身份(宿主一个 label 只有一个窗口),所以当下的诚实做法是**让标签说出会发生什么**。
+- `File ▸ New Window` ✅ **标签又说真话了（REQ-A473 收口 REQ-A434）**：REQ-A434 曾把它改名为「New Files Window」，因为该条目**只能**开「文件」应用的窗口（`wm_open("files")`）—— 真正的 per-app 新窗口需要"标签 ⇄ 应用"之外的第二身份。身份模型落地后（`crates/amos-wm/src/identity.rs`），该分支改为向壳要 **`wm_new_window(被聚焦的应用)`**（`DesktopShell` 的 `menu.new-window` → `desktopSystemKeys::newWindowTarget`，只有在**没有**应用窗口被聚焦时才落回「文件」—— Finder 自己的规则），于是标签重新叫 `New Window` / 「新建窗口」，与 in-app 菜单那一行同词。**落回文件是"一处"规则**（菜单行、⌘N、原生条目共用 `newWindowTarget`），不是三处各写一遍。
 - 菜单标签**随 UI 语言**：✅ **已做（REQ-A437）**——`MenuLocale` + `MenuLabels`（zh/en 两张表，中文措辞照 Apple 菜单词汇），启动时宿主读共享存储的 `amos-ui.locale`，切语言时前端调 `menu_set_locale` 重画；菜单栏此前是**整屏唯一说英文的地方**（壳默认 zh）。**门禁**：`scripts/menu-i18n-scan.mjs`（`make lint`，`--selftest` 6 断言）钉住"标签只能来自 `MenuLabels`"（`build_menu` 里出现字符串字面量即红，加速键 `Some("CmdOrCtrl+N")` 不算标签）与"每个字段都真的被画出来"（没有死译文）。仍未做：**系统语言变更**不追（AppKit 自己的事）、Windows/Linux 菜单、`Services` 仍是占位。
 - `Services` 是占位(系统级服务子菜单未接入)。
 - **Edit 菜单的行文案随 UI 语言** ✅ **已做(REQ-A439)**:预定义项的行文本此前由 AppKit 按**系统语言**生成 —— 在一台系统语言英文、UI 语言中文的 Mac 上,`编辑` 里读到的却是 `Undo / Redo / Cut / Copy / Paste / Select All`(实测)。现在六行(window 菜单的 `最小化 / 缩放` 同理)都通过 `*_with_text(l.<字段>)` 给我们自己的文案(Apple 中文词汇:**拷贝**不是「复制」);**选择器与 ⌘ 加速键仍是平台自己的**,行为不变。门禁 `scripts/menu-i18n-scan.mjs` 已扩展到 `*_with_text("字面量")` 这一形状。**仍由系统注入的三行未动**:`AutoFill` / `Start Dictation…` / `Emoji & Symbols`(AppKit 自动加进 Edit 菜单,不在我们的树里)。
@@ -84,13 +84,68 @@ menu::on_menu_event(app, event)
   (宿主没有该命令)、`Help ▸ 搜索 / 应用帮助`(没有 per-app 帮助内容)、`Edit ▸ 撤销`
   (见下)。
 
-### 5.2 明确**不是**缺口的:`⌘` + 反引号（同应用窗口循环）
+### 5.1.1 菜单里的键帽（keycap）说的是**哪一个**键（REQ-A484）
+
+**已做（REQ-A484）**：菜单行右边那个 `⌘W` / `⌘N` **不再读默认表**，而是读**用户合并后的绑定**
+（默认 + 覆盖 + 禁用，即 `DesktopShell` 派发时用的同一份 `keyboardBindings.bindings.system`）——
+`lib/desktopKeys.ts::desktopShortcutLabel(kind, bindings?)`，`DESKTOP_SYSTEM_KEYS` 每行带**配置 id**
+（`intentIdFor`）。**禁用**的绑定在合并后的 map 里**不存在**，于是菜单**什么都不画**：菜单不得广告
+壳没有的绑定（REQ-A342 的那条规则）。**Dock 右键菜单**这一轮第一次画上键帽，且**只给动作与和弦一致的
+两行**画：`新建窗口 ⌘N`、`隐藏 ⌘H`；`打开`/`显示` 没有对应和弦，`退出` 不画（macOS 那里是 ⌘Q，本壳
+未绑定；最近的 ⌘W 关的是**焦点**窗口，是另一个动作），`选项…` 是灰占位。
+
+**已做（REQ-A485）：原生菜单栏的 accelerator 跟着用户的键位走**。这一格此前是 `menu.rs` 里的**编译期字面量**
+（`DEFAULT_ACCELERATORS` 的七行：⌘, / ⌘H / ⌥⌘H / ⌘Q / ⌘N / ⌘W / ⌘M），界面上**读不出来**（标题里没有键帽），
+于是改绑/禁用之后菜单栏会一直广告旧键。现在：壳在**挂载与配置变化**时把合并后的绑定推给宿主
+（`menu_set_shortcuts`，与语言同步 `menu_set_locale` 同一条先例），宿主用 muda 的 `set_accelerator` 就地更新，
+`null` = 该绑定被禁用 ⇒ **清掉那一格的键帽**；找不到行或设置失败会按 id `warn!`。**真机读数**：宿主日志
+`menu accelerators synced with the shell's bindings applied=5 sent=5`，AX 读到 `新建窗口 → Cmd+N`、
+`关闭窗口 → Cmd+W`、`最小化 → Cmd+M`（读法：`AXMenuItemCmdChar` + `AXMenuItemCmdModifiers`）。
+**边界**：真机只走了默认绑定（改绑要写 WebView 的 localStorage）；⌘Q / ⌥⌘H 等行也同步了，但其中一部分 AppKit
+另有约定；**⌘\`** 没有原生行，因此不在同步集里。
+
+**已修（REQ-A487）：那次读数的两个 5 是巧合 —— 告警自己的计数错了**。上面的真机读数是在**全部绑定都没被禁用**的
+状态下取的（`sent=5 applied=5`），于是掩盖了一件事：壳用来和宿主比对的 `sent` 是 payload 里**非 null** 的条数，
+而宿主数的 `applied` 是**碰过的行数**——包括它**清掉**的那一行（`null` = 用户禁用了该绑定，清掉键帽同样是"干了活"，
+`apply_accelerators` 把它计入，它自己那句短警告也是拿 `updates.len()` 比）。两者在"有一个绑定被禁用"的配置下
+必然不等：读者可见的后果是**挂载即告警**`the host synced fewer menu accelerators than the shell sent
+{"sent":4,"applied":5}` —— 一边说"同步得比发的少"，一边 `applied`(5) 比 `sent`(4) **大**。**一个在没坏时也会响的
+告警，就是真的坏了时被忽略的那个**（这一格修的就是告警本身，不是同步）。修法：`sent` 改成**问过的行数**
+（`Object.keys(payload).length`），并在两侧都钉住：壳侧
+`svelte-tests/desktop-shell.svelte.test.ts`（禁用一行 ⇒ 宿主答 5 ⇒ **不得**告警；宿主答 4 ⇒ 必须告警且
+`sent:5 / applied:4`），宿主侧 `menu.rs::tests::accelerator_updates_read_the_shell_payload`（`null` 也产出一条
+update ⇒ `updates.len()` 就是 payload 长度）。**复现证据**：把两条测试里宿主答 5/答 4 分别喂进去，修前第一条
+红（`{"sent":4,"applied":5}` 打进日志），修后 4 条全绿。
+
+### 5.2 ~~明确**不是**缺口的:`⌘` + 反引号（同应用窗口循环）~~ → **已做（REQ-A473）**
 
 审计里一度把"`⌘` + 反引号（同应用窗口循环）"记成缺口 —— 检索后**撤回**:宿主**一个 label 只有一个窗口**
 (`wm.rs` 的 `label ⇄ app` 映射,REQ-A434 的注释也写明"per-app 'new window' 需要标签之外的第二身份"),
-所以"在同一个 app 的窗口之间循环"当前**没有可循环的对象**。加一个只会得到死键 —— 本仓对死键的
-立场是"宁可不加,也不加一个按下去什么都不发生的键"。真正的缺口是**多窗口身份模型**本身
-(per-app 菜单模型、per-app 多窗口),它记在 G6 那一族里。
+所以"在同一个 app 的窗口之间循环"当时**没有可循环的对象**；当时登记的真正缺口是**多窗口身份模型**本身。
+
+**该模型已落地**（`crates/amos-wm/src/identity.rs`：`files` / `files_2` / `files_3`；一个身份一种拼写；
+序数有上界；分配取最小空闲序数；循环顺序由序数决定），于是：
+
+- `⌘\``（`SYSTEM_DEFAULTS.cycleWindows`）→ `wm_cycle_app(app_id, forward)`：只走**焦点窗口所属应用**的
+  环，按序数、可回绕；带 Shift 时反向（`SystemIntentOptions.forward`）。**不足两扇窗时具名拒绝**
+  （"there is nothing to cycle"）而不是"成功但没动" —— 死弦是本仓的缺陷形状。
+- `⌘N`（`SYSTEM_DEFAULTS.newWindow`）→ `wm_new_window(app_id)`：宿主自己分配实例 label，调用方只说应用。
+  与 `File ▸ New Window`、原生菜单项共用 `newWindowTarget` 这一条规则。
+
+**仍未做**（如实登记，别把这一节读成"窗口那族做完了"）：**per-app 菜单模型**（每个应用自己的主菜单）仍是
+F-SH-001 那一族；Dock 右键菜单已有「新建窗口」（REQ-A474）。
+
+**锚在指针上的菜单怎么放**（REQ-A481 的真机缺陷 F-SH-037，已修）：它们用 `left:x; top:y` 直画，而 Dock 在窗口
+**最底边** —— 1496×880 的窗口里右键 访达 图标（指针 y=839、面板 200×223）时面板画到 y=1091，被窗口下边缘（909）
+截断，除第一行外的每一行**存在但够不着**（像素实测：菜单本该在的地方是桌面壁纸）。现在四个锚在指针上的浮层
+（Dock 图标菜单 / Dock 全局菜单 / Dock 溢出菜单 / 桌面右键菜单）共用 `lib/menuPlacement.ts::placeMenu`：
+**先翻转、后夹取**（下面放不下就画到指针上方；两边都不够则保住前几行、允许下溢；margin 永远不能把面板挤出窗口；
+**没有测量到尺寸的菜单不动**）。真机复核：同一个菜单的 AX frame 从 `(793,868) 200×223`（底 1091，被裁）变成
+`(793,677) 200×183`（底 860 ≤ 880 ✓），而且点击「新建窗口」**真的开出了窗口**。
+**App Exposé 已做**（REQ-A476）：`⌃↓` 铺开**焦点应用**的窗口（`svelte/AppExpose.svelte` + `lib/wm.ts` 的
+`windowsOfApp`/`focusedAppOf` + `desktopLayout.shouldShowAppExpose`）；焦点应用不足两扇窗时**什么都不开**
+（macOS 同样）并把原因写进诊断账本（`desktopSystemKeys.appExposeRefusal`）。它的边界：**没有缩略图**
+（瓷砖是应用图标 + 名字）、**没有方向键网格导航**、顺序就是宿主给的顺序。
 
 ### 5.3 仍未做的:`Edit ▸ 撤销`(诚实登记)
 

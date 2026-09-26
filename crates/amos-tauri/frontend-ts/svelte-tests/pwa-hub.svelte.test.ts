@@ -10,9 +10,9 @@
  * render the picker without going through the Tauri bridge.
  */
 import { afterEach, describe, expect, test, vi } from "vitest";
-import { cleanup, render } from "@testing-library/svelte";
+import { cleanup, fireEvent, render } from "@testing-library/svelte";
 import PwaHubApp from "../src/svelte/PwaHubApp.svelte";
-import { setFormFactor } from "../src/lib/desktopApps";
+import { setFormFactor } from "../src/lib/formAuthority.svelte";
 import { DESKTOP_MAX_COLS } from "../src/lib/formLayout";
 import * as pwaIndex from "../src/lib/pwaIndex";
 
@@ -109,3 +109,48 @@ describe("PwaHubApp — grid column count adapts to the device class (REQ-A293)"
     expect(colCount(grid as HTMLElement)).toBe(4);
   });
 });
+
+describe("PwaHubApp — 「从网址添加」把 pwa_open_remote 接进屏幕（REQ-A560）", () => {
+  test("提交网址：调用宿主、显示宿主回报的名字，并重读索引（新磁贴才算证据）", async () => {
+    const fetchSpy = vi.spyOn(pwaIndex, "fetchPwaIndex").mockResolvedValue(okDoc);
+    const openSpy = vi
+      .spyOn(pwaIndex, "openRemotePwa")
+      .mockResolvedValue({ kind: "ok", app: { id: "org.amos.remote", name: "Remote", version: "2.0" } });
+
+    const { findByTestId, getByTestId } = renderHub();
+    // The form is present before any index load resolves — an *empty* index is exactly when it
+    // matters, so it is not nested inside the "there are apps" branch.
+    const input = (await findByTestId("pwa-remote-url")) as HTMLInputElement;
+    await fireEvent.input(input, { target: { value: "https://apps.example.org/manifest.toml" } });
+    await fireEvent.click(getByTestId("pwa-remote-add"));
+
+    expect(openSpy).toHaveBeenCalledWith("https://apps.example.org/manifest.toml");
+    const added = await findByTestId("pwa-remote-added");
+    expect(added.textContent).toContain("Remote");
+    // The initial load + the reload after the successful add.
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    // The field is cleared so the next paste is not appended to the previous URL.
+    expect(input.value).toBe("");
+  });
+
+  test("宿主拒绝：显示宿主自己的那句话，并保留用户输入以便修正", async () => {
+    vi.spyOn(pwaIndex, "fetchPwaIndex").mockResolvedValue(okDoc);
+    vi.spyOn(pwaIndex, "openRemotePwa").mockResolvedValue({
+      kind: "failed",
+      reason: "refused",
+      detail: "no remote PWA host is allow-listed: set AMOS_PWA_REMOTE_ALLOW",
+    });
+
+    const { findByTestId, getByTestId } = renderHub();
+    const input = (await findByTestId("pwa-remote-url")) as HTMLInputElement;
+    await fireEvent.input(input, { target: { value: "https://evil.example/m.toml" } });
+    await fireEvent.click(getByTestId("pwa-remote-add"));
+
+    const error = await findByTestId("pwa-remote-error");
+    const detail = await findByTestId("pwa-remote-detail");
+    expect(error.textContent).not.toBe(""); // a translated reason, never blank
+    expect(detail.textContent).toContain("AMOS_PWA_REMOTE_ALLOW");
+    expect(input.value).toBe("https://evil.example/m.toml");
+  });
+});
+

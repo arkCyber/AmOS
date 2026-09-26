@@ -9,13 +9,17 @@
 //! [`ProfileReport`](crate::report::ProfileReport) turns into `est_energy_j`
 //! tracks the actual battery under a heavy LLM load instead of a fixed 3700 mV.
 //!
-//! * The **current** read is real (`BATTERY_PROPERTY_CURRENT_NOW = 2`).
+//! * The **current** read is real (`BATTERY_PROPERTY_CURRENT_NOW = 2`). Its sign is
+//!   platform-signed (negative while *discharging*), so the magnitude is taken and the
+//!   unsupported-property sentinel (`Long.MIN_VALUE`) maps to "unavailable"
+//!   (`power::current_ua_from_property`).
 //! * The **voltage** is refreshed each read from the sticky battery broadcast
 //!   `EXTRA_VOLTAGE` (no permission needed for that extra); it only falls back to
 //!   the constructor's nominal voltage when the broadcast is absent.
-//! * When either half cannot be read / reports `<= 0`, the sample is invalid and
-//!   [`BatterySample::power_mw`] returns `0.0` — honest "unavailable", never a
-//!   fabricated draw.
+//! * When either half is genuinely unavailable (a `Long.MIN_VALUE` current, an absent
+//!   voltage, or a true zero), the sample is invalid and [`BatterySample::power_mw`]
+//!   returns `0.0` — honest "unavailable", never a fabricated draw. A *negative*
+//!   current is **not** unavailable: it is the normal discharging draw (REQ-A1449).
 //!
 //! `cargo check -p amos-profiling --features android` keeps it compiling; not
 //! runnable on the desktop host (needs a real Android VM + `Context`).
@@ -165,7 +169,10 @@ impl AndroidBatteryPowerSource {
             .ok()?
             .j()
             .ok()?;
-        (v > 0).then_some(v)
+        // The sentinel/sign policy (unsupported ⇒ `None`; discharging is negative and is a
+        // real draw) lives in `power::current_ua_from_property` so it is host-testable —
+        // the old inline `v > 0` discarded every discharging sample (REQ-A1449/F-PWR-001).
+        crate::power::current_ua_from_property(v)
     }
 
     /// One instantaneous battery sample: live `CURRENT_NOW` (µA) × live
@@ -187,10 +194,15 @@ impl AndroidBatteryPowerSource {
             Some(c) => c,
             None => return BatterySample::new(0, 0),
         };
-        // Live voltage when available; nominal fallback otherwise. A broken live
-        // read still leaves us with the fallback (better than dropping the sample).
-        let voltage_mv = sticky_voltage_mv(&mut env, ctx).unwrap_or(self.fallback_voltage_mv);
-        BatterySample::new(current_ua, voltage_mv)
+        // Live voltage when available; nominal fallback otherwise. A broken live read still
+        // leaves us with the fallback (better than dropping the sample) — but the sample
+        // records *which* it was: the fallback is an assumed input, and the estimate built on
+        // it must not enter the mean that a `ProfileReport` publishes as `est_energy_j`
+        // (REQ-A1449 / F-PWR-001).
+        match sticky_voltage_mv(&mut env, ctx) {
+            Some(voltage_mv) => BatterySample::new(current_ua, voltage_mv),
+            None => BatterySample::with_nominal_voltage(current_ua, self.fallback_voltage_mv),
+        }
     }
 
     /// Instantaneous board power in milliwatts, or `0.0` for "unavailable".

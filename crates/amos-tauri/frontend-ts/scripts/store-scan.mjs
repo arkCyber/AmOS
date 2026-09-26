@@ -32,6 +32,11 @@
 import { readFileSync, readdirSync, existsSync } from "node:fs";
 import { join, dirname, relative } from "node:path";
 import { fileURLToPath } from "node:url";
+// `buildScopes` reads a name→key table **scoped to the importing file**, out of the module
+// that declares each binding. A flat corpus table (this file's own `keyConstants`) answers
+// a colliding name with whichever file the walk reached last, which for `SYNC_STORES`
+// means a back-up list that depends on directory order — see REQ-A812.
+import { buildScopes } from "./write-scan.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const SRC = join(root, "src");
@@ -86,6 +91,54 @@ export function inlineKeys(sources) {
 }
 
 /**
+ * Store keys read from the **store API call sites** — the authoritative notion of "a store
+ * key", independent of any naming convention.
+ *
+ * REQ-A1890 / F-DEV-160. The two extractors above define the corpus by a **prefix**
+ * (`amos.` / `amos-ui.`). That is a convention, not an invariant, and a store key that
+ * does not follow it is invisible to the gate rather than flagged: `DOCK_PREFS_KEY =
+ * "dock.prefs.v1"` (`lib/dockPrefs.ts`) is written through `createStoreValue` /
+ * `writeStoreValueChecked` / `readStoreValue` in `Dock.svelte` and
+ * `settings/DockPage.svelte`, yet matched neither regex — so the gate that exists to force
+ * every key to be classified reported **0 unclassified** while this one sat in neither
+ * `SYNC_STORES` nor the allow-list (measured: `node scripts/store-scan.mjs` exited 0).
+ *
+ * The durable corpus is where a key is **used**: the first argument of the store API. A
+ * constant is resolved through a *relaxed* table (any `*KEY*` const, whatever its value),
+ * so the resolution is driven by the call site, never by the key's spelling. A constant
+ * that is never handed to the store API (e.g. `photos.ts`'s `UNKNOWN_DAY_KEY`) never
+ * enters — which is why this does not simply relax the two extractors above.
+ */
+export function storeApiKeys(sources) {
+  const out = new Map(); // key -> Set(files)
+  const add = (key, file) => {
+    if (!key) return;
+    if (!out.has(key)) out.set(key, new Set());
+    out.get(key).add(file);
+  };
+  // Any `*KEY*` const, **any** value: the call site decides whether it is a store key.
+  const consts = new Map();
+  for (const { file, src } of sources) {
+    for (const m of stripComments(src).matchAll(
+      /(?:export\s+)?const ([A-Za-z0-9_$]*KEY[A-Za-z0-9_$]*)\s*=\s*"([^"]*)"/g,
+    )) {
+      consts.set(m[1], m[2]);
+    }
+  }
+  // A generic parameter list never contains `(`, so `[^(\n]*` skips one safely.
+  const CALL =
+    /\b(?:createStoreValue|readStoreValue|writeStoreValue|writeStoreValueChecked|removeStoreValue)\b\s*(?:<[^(\n]*>)?\s*\(\s*(?:"([^"]*)"|'([^']*)'|([A-Za-z0-9_$]+))/g;
+  for (const { file, src } of sources) {
+    for (const m of stripComments(src).matchAll(CALL)) {
+      if (m[1] !== undefined) add(m[1], file);
+      else if (m[2] !== undefined) add(m[2], file);
+      else if (consts.has(m[3])) add(consts.get(m[3]), file);
+    }
+  }
+  return out;
+}
+
+/**
  * The keys `SYNC_STORES` actually lists, resolved through the constant table — the
  * gate reads the real list, never a copy of it.
  */
@@ -95,13 +148,34 @@ export function syncStores(cloudSrc, consts) {
   const open = clean.indexOf("[", start);
   const close = clean.indexOf("]", open);
   if (start < 0 || open < 0 || close < 0) return [];
-  const byName = new Map(consts.map((c) => [c.name, c.key]));
+  const byName = consts instanceof Map ? consts : new Map(consts.map((c) => [c.name, c.key]));
   return clean
     .slice(open + 1, close)
     .split(",")
     .map((e) => e.trim())
     .filter((e) => e !== "")
     .map((e) => (byName.has(e) ? byName.get(e) : e.startsWith('"') ? e.slice(1, -1) : `<unresolved:${e}>`));
+}
+
+/**
+ * Kinds no entry references, minus the ones that declare themselves (REQ-A1492).
+ *
+ * A stale *key* is reported; a `kind` whose last key left was not, because `kinds` is
+ * only ever read as a lookup for the keys. Accepted declarations: a non-empty `note`
+ * (object-shaped kinds) or a reason beginning `RETIRED` ∕ `UNUSED` ∕ `KEPT`.
+ */
+export function memberlessKinds(kinds, referenced) {
+  const refs = new Set(referenced);
+  return Object.keys(kinds ?? {})
+    .filter((k) => !refs.has(k) && !declaresMemberless(kinds[k]))
+    .sort();
+}
+
+function declaresMemberless(spec) {
+  if (spec && typeof spec === "object") {
+    return typeof spec.note === "string" && spec.note.trim() !== "";
+  }
+  return /^(RETIRED|UNUSED|KEPT)\b/.test(String(spec ?? "").trim());
 }
 
 // --- selftest ---------------------------------------------------------------
@@ -119,12 +193,52 @@ export function runSelftest() {
   const inline = inlineKeys(sources);
   ok("finds inline keys too", inline.has("amos.inline.key") && inline.get("amos.alpha").has("lib/a.ts"));
 
+  // REQ-A1890: the corpus is where the store API is **called**, not how the key is spelled,
+  // so a key outside the `amos.` convention is still seen (and then has to be classified).
+  const viaConst = storeApiKeys([
+    {
+      file: "lib/dock.ts",
+      src: 'export const DOCK_PREFS_KEY = "dock.prefs.v1";\nconst p = createStoreValue<DockPrefs>(DOCK_PREFS_KEY, {});\n',
+    },
+  ]);
+  ok("a store key with no `amos.` prefix is seen, through its constant", viaConst.has("dock.prefs.v1"));
+  ok("a literal handed to the store API is seen", storeApiKeys([{ file: "lib/x.ts", src: 'readStoreValue("some.key", 0);' }]).has("some.key"));
+  ok(
+    "the `*KEY*` const check is not the 3-arg overload of a fn that never reaches the store",
+    !storeApiKeys([{ file: "lib/p.ts", src: 'export const UNKNOWN_DAY_KEY = "unknown";\nconst k = { key: UNKNOWN_DAY_KEY };' }]).has("unknown"),
+  );
+  ok("a call with a bare identifier that is not a key constant invents nothing", storeApiKeys([{ file: "lib/y.ts", src: "readStoreValue(key, 0);" }]).size === 0);
+
   const cloud = 'export const SYNC_STORES = [A_KEY, "amos.literal",] as const;';
   const resolved = syncStores(cloud, consts);
   ok("resolves a constant entry to its key", resolved.includes("amos.alpha"));
   ok("accepts a literal entry", resolved.includes("amos.literal"));
   ok("a non-constant entry is flagged unresolved", syncStores("const SYNC_STORES = [MYSTERY];", consts)[0].startsWith("<"));
   ok("missing SYNC_STORES → empty", syncStores("export const x = 1;", consts).length === 0);
+
+  // The kinds map is the allow-list's second dimension: a kind no key references is a
+  // permission nobody asked for, and the scan never looked at it (REQ-A1492).
+  ok("a referenced kind is covered", memberlessKinds({ "demo-seed": "why" }, ["demo-seed"]).length === 0);
+  ok(
+    "a memberless kind that explains nothing is reported",
+    memberlessKinds({ configuration: "why" }, []).length === 1,
+  );
+  ok(
+    "a RETIRED memberless kind is accepted",
+    memberlessKinds({ x: "RETIRED (REQ-A1, round N). …" }, []).length === 0,
+  );
+  ok(
+    "an UNUSED memberless kind is accepted",
+    memberlessKinds({ x: "UNUSED — never had a key." }, []).length === 0,
+  );
+  ok(
+    "an object kind with a note is accepted",
+    memberlessKinds({ x: { reason: "why", note: "kept deliberately" } }, []).length === 0,
+  );
+  ok(
+    "a `RETIREDLY` prefix is not the RETIRED marker",
+    memberlessKinds({ x: "RETIREDLY…" }, []).length === 1,
+  );
 
   const invoked = "file:///x/store-scan.mjs";
   ok(
@@ -152,13 +266,20 @@ function runScan() {
     .filter((f) => !/\/i18n\/locales\//.test(f))
     .map((f) => ({ file: relative(root, f), src: readFileSync(f, "utf8") }));
 
-  const consts = keyConstants(sources);
-  const cloudSrc = sources.find((s) => s.file.endsWith("lib/cloud.ts"))?.src ?? "";
-  const listed = syncStores(cloudSrc, consts);
+  const scopes = buildScopes(sources);
+  const cloudFile = sources.find((s) => s.file.endsWith("lib/cloud.ts"))?.file ?? "";
+  const cloudSrc = sources.find((s) => s.file === cloudFile)?.src ?? "";
+  const listed = syncStores(cloudSrc, scopes.get(cloudFile) ?? new Map());
   const synced = new Set(listed.filter((k) => !k.startsWith("<")));
   const unresolvedSync = listed.filter((k) => k.startsWith("<"));
 
   const all = inlineKeys(sources);
+  // Union in the usage-based corpus (REQ-A1890): the prefix extractors above miss any key
+  // whose spelling is outside the `amos.` convention.
+  for (const [k, files] of storeApiKeys(sources)) {
+    if (!all.has(k)) all.set(k, new Set());
+    for (const f of files) all.get(k).add(f);
+  }
   const keys = [...all.keys()].sort();
 
   let allow;
@@ -176,6 +297,11 @@ function runScan() {
     }
   }
   const byKey = new Map((allow.keys ?? []).map((e) => [e.key, e.kind]));
+  // A kind no key references is a classification nobody leans on: the scan reads `kinds`
+  // *for* the keys, never the other way, so a reason can outlive every key it described
+  // with nothing saying so (REQ-A1492 — `write-allowlist.json`'s `derived-tick` rotted
+  // exactly that way). A memberless kind must declare itself.
+  const memberless = memberlessKinds(kinds, [...byKey.values()]);
 
   const unclassified = [];
   for (const key of keys) {
@@ -195,7 +321,8 @@ function runScan() {
     .sort();
   const syncMissing = [...synced].filter((k) => !all.has(k));
 
-  const failures = unclassified.length + stale.length + syncMissing.length + unresolvedSync.length;
+  const failures =
+    unclassified.length + stale.length + syncMissing.length + unresolvedSync.length + memberless.length;
 
   if (process.argv.includes("--json")) {
     console.log(
@@ -207,6 +334,7 @@ function runScan() {
           stale,
           syncMissing,
           unresolvedSync,
+          memberlessKinds: memberless,
           kinds,
         },
         null,
@@ -230,6 +358,12 @@ function runScan() {
     }
     for (const k of stale) {
       console.log(`[store-scan] allow-list: stale entry (no such store key) — shrink with a reason: ${k}`);
+    }
+    for (const k of memberless) {
+      console.error(
+        `[store-scan] FAIL — allow-list kind \`${k}\` is referenced by no key and does not say why it is ` +
+          "kept. Retire it (reason begins `RETIRED`), declare it unused (`UNUSED` ∕ `KEPT`), or drop it",
+      );
     }
     if (failures === 0) {
       console.log("[store-scan] OK — every store key is either backed up or classified with a reason.");

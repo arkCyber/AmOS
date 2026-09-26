@@ -146,7 +146,7 @@ if (problems.length > 0) {
   console.error(`[react-free-scan] FAIL — ${problems.length} trace(s) of React coming back:`);
   for (const p of problems) console.error(`  ${p}`);
   console.error(
-    "\nThe shell is Svelte-only (see docs/SVELTE_MIGRATION_AUDIT.md §\"状态校正\").\n" +
+    "\nThe shell is Svelte-only (see SVELTE_MIGRATION_AUDIT.md §\"状态校正\").\n" +
       "If a React screen is genuinely being added back, say so in that document and this\n" +
       "gate's rules — do not let it return silently.",
   );

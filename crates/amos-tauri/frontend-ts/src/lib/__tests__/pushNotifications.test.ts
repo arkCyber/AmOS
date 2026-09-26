@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { fastest, PERF_ATTEMPTS } from "../../__tests__/perfBudget";
 import {
   isValidDeviceToken,
   generateMockDeviceToken,
@@ -672,26 +673,28 @@ describe("推送通知服务 - 航空航天级审计", () => {
 
     test("大量通知处理不导致性能降级", () => {
       let history: PushNotification[] = [];
-      const start = Date.now();
-      
-      for (let i = 0; i < 1000; i++) {
-        history = addNotificationToHistory(
-          history,
-          {
-            payload: { aps: { alert: `msg${i}` } },
-            metadata: {
-              id: `n${i}`,
-              timestamp: i,
-              priority: "normal",
-              foreground: false,
-              expiry: null,
+      // REQ-A850 / F-DEV-106：把「重置」放进闭包内，这样第 K 次尝试与第 1 次测的是同一件事
+      // （都是往一条空历史上追加），最后留下的 `history` 仍是第 K 次的那一份，供下面的断言用。
+      const elapsed = fastest(PERF_ATTEMPTS, () => {
+        history = [];
+        for (let i = 0; i < 1000; i++) {
+          history = addNotificationToHistory(
+            history,
+            {
+              payload: { aps: { alert: `msg${i}` } },
+              metadata: {
+                id: `n${i}`,
+                timestamp: i,
+                priority: "normal",
+                foreground: false,
+                expiry: null,
+              },
             },
-          },
-          MAX_NOTIFICATION_HISTORY,
-        );
-      }
-      
-      const elapsed = Date.now() - start;
+            MAX_NOTIFICATION_HISTORY,
+          );
+        }
+      });
+
       expect(elapsed).toBeLessThan(1000); // 1000次操作应在1秒内完成
       expect(history.length).toBe(MAX_NOTIFICATION_HISTORY);
     });

@@ -1,0 +1,9 @@
+{
+  "_why": [
+    "Sites where a nullable read's failure value (`null`) is deliberately coerced into a default, and that is the right thing to do *there*.",
+    "Every site must name a `kind`, and every `kind` must carry a `reason` that says why losing the failure value is acceptable at that site — not why it is convenient. `read-fold-scan.mjs` fails on a site without a kind, a kind without a reason, or an entry that no longer matches a fold site (the list may not rot).",
+    "This list is deliberately empty. Every fold the scan found was fixed instead: the empty-state and error sentences in the repo already say the difference (`native.offlineHint`: 「既不显示应用，也不假装成「本机没有应用」」; `MailApp.refresh`; `LmkDebugPanel`), so the correct repair was to reach them, not to excuse the fold."
+  ],
+  "kinds": {},
+  "sites": []
+}

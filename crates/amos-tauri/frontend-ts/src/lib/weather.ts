@@ -1,4 +1,4 @@
-import type { Locale } from "../i18n/types";
+import { intlTag, type Locale } from "../i18n/types";
 // DST-safe day stepping (same helper the alarm path uses): "N days from now" is a calendar step,
 // not `N × 86400000` — a fixed-millisecond step names the wrong weekday across a DST night.
 import { addLocalDays } from "./time";
@@ -24,11 +24,6 @@ export function forecast(): DayForecast[] {
     { daysFromNow: 3, icon: "☁️", temp: 23, range: "19°–26°", humidity: 71, wind: "3" },
     { daysFromNow: 4, icon: "☀️", temp: 27, range: "22°–31°", humidity: 45, wind: "2" },
   ];
-}
-
-/** Map our Locale to an Intl tag used for day names. */
-export function intlTag(locale: Locale): string {
-  return locale === "zh" ? "zh-CN" : "en-US";
 }
 
 /** Short weekday name for a day N days from `base`. */

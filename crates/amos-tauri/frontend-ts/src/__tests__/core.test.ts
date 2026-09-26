@@ -7,6 +7,8 @@ import {
   pushRecent,
   restoreToHome,
   moveBefore,
+  moveWithinHome,
+  canMoveWithinHome,
   type HomeLayout,
 } from "../lib/amosStore";
 import { APP_META as APPS, appIcon, appTitleKey } from "../lib/appMeta";
@@ -83,6 +85,54 @@ describe("core shell", () => {
     l = moveBefore(l, "c", "d"); // cross-list into dock before d
     expect(l.page).toEqual(["a", "b"]);
     expect(l.dock).toEqual(["c", "d"]);
+  });
+
+  // REQ-A462: the home editor's ‹ › buttons. The direction-sensitive slot rule is the
+  // reason this is not `moveBefore` (which inserts *before* the neighbour in both
+  // directions, i.e. moves the icon the wrong way half the time) — the same lesson the
+  // dock's reorder learned in REQ-A456.
+  test("moveWithinHome moves one slot, and the direction is real", () => {
+    const l: HomeLayout = { page: ["a", "b", "c"], dock: ["d"], hidden: [] };
+    expect(moveWithinHome(l, "b", -1).page).toEqual(["b", "a", "c"]);
+    expect(moveWithinHome(l, "b", 1).page).toEqual(["a", "c", "b"]);
+    // …and inside the dock, the same rule
+    expect(moveWithinHome({ page: [], dock: ["x", "d"], hidden: [] }, "d", -1).dock).toEqual([
+      "d",
+      "x",
+    ]);
+  });
+
+  test("moveWithinHome never changes which list an app belongs to", () => {
+    const l: HomeLayout = { page: ["a", "c"], dock: ["d"], hidden: [] };
+    // "c" is the last page app. Its "later" neighbour *on screen* would be the dock's
+    // "d" — moving there would pin it to the dock, which a reorder button must not do.
+    const moved = moveWithinHome(l, "c", 1);
+    expect(moved).toBe(l); // same reference: there is nowhere to go
+    expect(moved.dock).toEqual(["d"]);
+    expect(canMoveWithinHome(l, "c", 1)).toBe(false);
+    expect(canMoveWithinHome(l, "c", -1)).toBe(true);
+    // the ends of the dock behave the same way
+    expect(canMoveWithinHome(l, "d", -1)).toBe(false);
+    expect(canMoveWithinHome(l, "d", 1)).toBe(false);
+  });
+
+  test("canMoveWithinHome is the UI's disabled state, from the same rule", () => {
+    const l: HomeLayout = { page: ["a", "b"], dock: [], hidden: [] };
+    expect(canMoveWithinHome(l, "a", -1)).toBe(false);
+    expect(canMoveWithinHome(l, "a", 1)).toBe(true);
+    expect(canMoveWithinHome(l, "b", 1)).toBe(false);
+    // an app the layout does not hold cannot move anywhere
+    expect(canMoveWithinHome(l, "zz", 1)).toBe(false);
+    expect(moveWithinHome(l, "zz", 1)).toBe(l);
+  });
+
+  test("moveWithinHome skips the ids a surface does not show", () => {
+    const l: HomeLayout = { page: ["a", "junk", "b"], dock: [], hidden: [] };
+    const isShown = (x: string) => x !== "junk";
+    // "b" steps past the neighbour the *user can point at* (a), and `junk` keeps its slot
+    expect(moveWithinHome(l, "b", -1, isShown).page).toEqual(["b", "junk", "a"]);
+    // a hidden-in-this-surface id itself cannot be moved
+    expect(moveWithinHome(l, "junk", -1, isShown)).toBe(l);
   });
 
   test("hiding a dock icon moves it back to the page (never hidden)", () => {

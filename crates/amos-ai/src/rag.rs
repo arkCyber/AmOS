@@ -20,7 +20,7 @@
 //! `tokio::task::spawn_blocking`, exactly as the existing inference layer does
 //! for its blocking Ollama calls.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use amos_vector_db::{Embedder, FlatIndex, Metric, ScoredHit, Vector, VectorDbError};
@@ -275,7 +275,6 @@ impl Embedder for ApiEmbedder {
 pub struct RagStore<E: Embedder> {
     embedder: E,
     idx: Option<FlatIndex>,
-    path: Option<PathBuf>,
 }
 
 impl<E: Embedder> RagStore<E> {
@@ -284,13 +283,7 @@ impl<E: Embedder> RagStore<E> {
         RagStore {
             embedder,
             idx: None,
-            path: None,
         }
-    }
-
-    /// Remember a snapshot path for later [`persist`](Self::persist).
-    pub fn set_snapshot_path(&mut self, path: PathBuf) {
-        self.path = Some(path);
     }
 
     /// Embed `text` and index it under `id` (insert, or replace if present).
@@ -356,14 +349,6 @@ impl<E: Embedder> RagStore<E> {
         idx.save_to(path)
     }
 
-    /// Persist to the path set with [`set_snapshot_path`](Self::set_snapshot_path).
-    pub fn persist(&self) -> amos_vector_db::Result<()> {
-        let path = self.path.as_ref().ok_or_else(|| {
-            VectorDbError::Invalid("no snapshot path set (use set_snapshot_path)".into())
-        })?;
-        self.persist_to(path)
-    }
-
     /// Rebuild a store from a snapshot file, reusing `embedder` for future
     /// queries. The snapshot's dimension is authoritative.
     pub fn load(embedder: E, path: impl AsRef<Path>) -> amos_vector_db::Result<Self> {
@@ -371,7 +356,6 @@ impl<E: Embedder> RagStore<E> {
         Ok(RagStore {
             embedder,
             idx: Some(idx),
-            path: None,
         })
     }
 }

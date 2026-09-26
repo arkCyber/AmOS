@@ -2,9 +2,11 @@ import { describe, expect, test } from "bun:test";
 import {
   appIsRunning,
   normalizeTaskSnapshot,
+  taskmgrAppAction,
   taskmgrSnapshot,
   type TaskSnapshot,
 } from "../lib/taskmgr";
+import { bridgeDiag } from "../lib/backend";
 
 const full: TaskSnapshot = {
   apps: [
@@ -67,6 +69,47 @@ describe("taskmgrSnapshot() guarded bridge", () => {
     g.window = {};
     try {
       expect(await taskmgrSnapshot()).toBeNull();
+    } finally {
+      if (prev === undefined) delete g.window;
+      else g.window = prev;
+    }
+  });
+});
+
+describe("a refused lifecycle action is a recorded verdict, not a silent null", () => {
+  /**
+   * The daemon is **up** and answers a refused action with its own words
+   * (`taskmgr.rs::taskmgr_app_action` — `unregister_app '…' failed`, or
+   * `"unknown task-manager action '…'"`). The private `call<T>` this module used to carry
+   * folded that rejection into `null` **before** anything wrote it down, so the caller's
+   * `.catch("daemon offline")` was unreachable and the button simply did nothing. Routing
+   * through `backend.invoke` makes the reason recoverable — which is what lets the panel
+   * say it (the reader is `TaskManager.svelte::reportRefusal`).
+   */
+  test("a rejected taskmgr_app_action resolves null AND records command-failed + the reason", async () => {
+    const g = globalThis as Record<string, unknown>;
+    const prev = g.window;
+    g.window = {
+      __TAURI_INTERNALS__: {
+        invoke: async (cmd: string) => {
+          if (cmd === "taskmgr_app_action") {
+            throw new Error("unregister_app 'com.x' failed: not registered");
+          }
+          return null;
+        },
+      },
+    };
+    try {
+      expect(await taskmgrAppAction("com.x", "kill")).toBeNull();
+      const diag = bridgeDiag("taskmgr_app_action");
+      expect(diag.ok).toBe(false);
+      if (!diag.ok && diag.kind === "command-failed") {
+        expect(String(diag.detail)).toContain("unregister_app");
+      } else {
+        throw new Error(`expected command-failed, got ${JSON.stringify(diag)}`);
+      }
+      // A *different* command's slot is not polluted by this failure.
+      expect(bridgeDiag("taskmgr_job_action").ok).toBe(true);
     } finally {
       if (prev === undefined) delete g.window;
       else g.window = prev;

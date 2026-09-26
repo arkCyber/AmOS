@@ -202,7 +202,7 @@ describe("MDM 管理", () => {
     await mdmManager.configure({ enabled: true });
     await mdmManager.addPolicy("allowUserCreate", false);
 
-    const check = mdmManager.checkCanCreate();
+    const check = mdmManager.checkCanCreate(0);
     expect(check.allowed).toBe(false);
     expect(check.reason).toBeTruthy();
   });
@@ -227,6 +227,11 @@ describe("MDM 管理", () => {
 
 describe("企业模板", () => {
   beforeEach(async () => {
+    // 上一段 describe 把 `allowUserCreate: false` 留在 MDM 上（模块级单例，没人收拾）。
+    // REQ-A1326 之后这条策略**会**管到模板安装：`installTemplate` 走的
+    // `shortcuts.ts::createShortcut` 里有 `checkCanCreate`。所以这里要先把那份残留清掉，
+    // 否则「应该能够安装模板」测的是「管理员禁了创建」，而不是安装本身。
+    mdmManager.clearConfigForTest();
     await templateManager.initialize();
   });
 

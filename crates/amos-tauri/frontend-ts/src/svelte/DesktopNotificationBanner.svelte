@@ -33,12 +33,15 @@
   // 挂载点：`DesktopShell.svelte` 的浮层 `<div>` 之前 —— z 序
   // z = `100 + index`（overlay） > banner（见 mount 处写在 stage 之后，
   // 但**不放在** `{#each openOverlays}` 内）。
-  import { writeStoreValue } from "../lib/amosStore";
+  import { writeStoreValueChecked } from "../lib/amosStore";
+  import { deleteDeliveriesOnDevice } from "../lib/pushNotifications";
   import {
     NOTIF_KEY,
     SETTINGS_KEY,
     dndActive,
+    droppedAppNotifs,
     newestAddedNotif,
+    normalizeNotifs,
     normalizeQuick,
     removeAppNotifs,
     type Notif,
@@ -58,9 +61,11 @@
     TOPBAR_HEIGHT,
   } from "../lib/desktopLayout";
   import { createStoreValue } from "./store";
+  import StoreErrorBar from "./StoreErrorBar.svelte";
+  import { t } from "./locale.svelte";
 
   // ─── store 订阅（与 phone banner 同源）────────────────────────────────────
-  const notifStore = createStoreValue<Notif[]>(NOTIF_KEY, []);
+  const notifStore = createStoreValue<unknown>(NOTIF_KEY, []);
   const settingsStore = createStoreValue<unknown>(SETTINGS_KEY, {});
   const soundStore = createStoreValue<unknown>(SOUND_KEY, {});
 
@@ -68,6 +73,8 @@
   let settingsRaw = $state<unknown>({});
   let soundRaw = $state<unknown>({});
   let banner = $state<Notif | null>(null);
+  // 上一次 ack 被存储拒绝时的那句话（REQ-A1408 ∕ F-SH-666）。
+  let storeErr = $state("");
 
   // Transient mirrors —— 不参与响应式（避免每次渲染重建）。
   let prev: Notif[] = [];
@@ -77,11 +84,12 @@
 
   $effect(() => {
     const un = notifStore.subscribe((v) => {
+      const list = normalizeNotifs(v);
       if (!seeded) {
         seeded = true;
-        prev = v;
+        prev = list;
       }
-      notifs = v;
+      notifs = list;
     });
     return un;
   });
@@ -119,25 +127,49 @@
     const added = newestAddedNotif(prev, notifs);
     if (added) {
       banner = added;
+      storeErr = ""; // 新到达换掉旧 toast，旧拒写的那句话随之作废
       timer = setTimeout(() => {
         banner = null;
         timer = null;
       }, NOTIF_BANNER_SHOW_MS);
-      // 提示音门：沿用 phone banner 的真源（shouldRingOnArrival）—— 桌面无 haptic。
-      if (shouldRingOnArrival(prev.length, notifs.length, policy)) {
-        playNotifyTone({ volume: policy.volume });
-      }
+    }
+    // 提示音门：沿用 phone banner 的真源（shouldRingOnArrival）—— 桌面无 haptic。
+    // 门据是**这一次到达**（`added`：`prev` 里没有的 id），不是表长了多少 ——
+    // `amos.notifications` 有上限，满表时一次真投递让长度不变，旧的 `prev.length` ∕
+    // `notifs.length` 把它读成「没有到达」而彻底不响（REQ-A1636，与 `osPushWatcher.ts`
+    // 记下的同一处长度差折叠同源，REQ-A589）。只收缩或原样重读的表依旧不是到达：
+    // `newestAddedNotif` 回 `null`，门保持关着。
+    if (shouldRingOnArrival(added !== null, policy)) {
+      playNotifyTone({ volume: policy.volume });
     }
     prev = notifs;
   });
 
-  // 单击 ack：清空该 app 所有通知（不是单条 —— 钉住 `removeAppNotifs` 真源）
+  // 单击 ack：清空该 app 所有通知（不是单条 —— 钉住 `removeAppNotifs` 真源）。
+  //
+  // ack 是一次**删除**，而 `amos.notifications` 是设备推送历史的投影：`osPushWatcher` 每几秒
+  // 重问一次 `push_get_history`，把存储里已经没有的记录写回。所以被丢掉的那些**推送**行必须
+  // 同时从设备删掉 —— 只删本地的话，id 会在下一次轮询后原样回来，而横幅的「新到达」检测比的是
+  // id 集合，于是同一次投递被第二次播报（toast + 提示音 + 本应在另一形态的震动）。两块面板的
+  // `dismiss` 从 REQ-A1202 起就已经这么做，这里是同一个删除、同一份义务（REQ-A1260）。
   const ack = () => {
     const b = banner;
     if (!b) return;
     if (b.app) {
-      writeStoreValue(NOTIF_KEY, removeAppNotifs(notifs, b.app));
+      // 先取快照：写成功会同步派发 `STORE_CHANGED_EVENT`，其监听把 `notifs` 换成新表 ——
+      // 写之后再读，读到的会是留下来的行，而不是要删掉的那些。
+      const dropped = droppedAppNotifs(notifs, b.app);
+      // 本地那一半是能读到判决的那一半，也是 ✓ 所声称的那一半：拒写时每一行都还在，
+      // 横幅**不能**装作确认成功而消失 —— 说出口并留在原地，用户可再按一次。设备那一半
+      // 放在后面：拒绝时绝不把盘上仍然持有的行从设备删掉（REQ-A1408 ∕ F-SH-666）。
+      if (!writeStoreValueChecked(NOTIF_KEY, removeAppNotifs(notifs, b.app))) {
+        storeErr = t("common.storeWriteFailed");
+        clearTimer(); // 否则自动消失会把这句话吞掉
+        return;
+      }
+      deleteDeliveriesOnDevice(dropped);
     }
+    storeErr = "";
     banner = null;
     clearTimer();
   };
@@ -163,13 +195,14 @@
   >
     <button
       onclick={ack}
-      aria-label="notification: acknowledge"
+      aria-label={t("a11y.acknowledgeNotification")}
+      data-testid="desktop-notif-ack"
       class="flex w-full cursor-pointer items-start gap-3 text-left"
     >
       <span class="text-xl leading-none" aria-hidden="true">{banner.icon ?? "🔔"}</span>
       <span class="min-w-0 flex-1">
         <span class="block truncate text-[13px] font-semibold text-neutral-900 dark:text-white">
-          {banner.app ?? banner.title ?? "Notification"}
+          {banner.app ?? banner.title ?? t("nc.untitled")}
         </span>
         {#if banner.title}
           <span class="block truncate text-[12px] text-neutral-700 dark:text-neutral-300">
@@ -184,5 +217,6 @@
       </span>
       <span aria-hidden="true" class="opacity-50">✓</span>
     </button>
+    <StoreErrorBar message={storeErr} />
   </div>
 {/if}

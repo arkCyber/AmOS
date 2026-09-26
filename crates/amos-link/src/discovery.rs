@@ -207,7 +207,9 @@ impl Default for PeerId {
 /// What a peer *is* — the role half of the topology.
 ///
 /// The `serde` names are the same stable keys as [`NodeKind::key`], so a status JSON a
-/// script parses and the protobuf the daemon serves cannot disagree about "robot".
+/// script parses and the protobuf the daemon serves cannot disagree about "robot" — bound
+/// by `a_node_kinds_serde_name_is_its_key`, which serializes every variant (the derive's
+/// `rename_all` is a *second* spelling of the vocabulary, next to `key()`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum NodeKind {
@@ -222,6 +224,16 @@ pub enum NodeKind {
     /// Tooling: the CLI, a laptop, a test harness.
     Tool,
 }
+
+/// The token a consumer folds a **kind this build does not know** to.
+///
+/// `proto.Peer.kind` is an open string: a newer daemon may send a role this build has never
+/// heard of. Every consumer that shows it — the CLI's peer row, the System UI's peer table —
+/// must fold an unfamiliar role to this one token rather than displaying the raw word, because
+/// two readers of the same fact disagreeing about one peer is exactly the class of defect the
+/// wire vocabulary exists to prevent. [`NodeKind::wire_token`] is the single place that rule
+/// lives.
+pub const UNKNOWN_KIND: &str = "unknown";
 
 impl NodeKind {
     /// Every kind, in documentation order.
@@ -247,6 +259,25 @@ impl NodeKind {
     /// Parse a key; `None` for an unknown string.
     pub fn from_key(s: &str) -> Option<NodeKind> {
         NodeKind::ALL.into_iter().find(|k| k.key() == s)
+    }
+
+    /// The token for a **wire** kind string: a recognized key is normalized to its
+    /// [`NodeKind::key`], and anything this build does not know folds to [`UNKNOWN_KIND`].
+    ///
+    /// The one implementation of that fold — shared by every consumer of `proto.Peer.kind`
+    /// (the CLI's `PeerRow::from_proto`, the System UI bridge's `peer_out`) so they cannot
+    /// disagree about the same peer when a newer daemon sends an unfamiliar role.
+    ///
+    /// ```
+    /// use amos_link::discovery::{NodeKind, UNKNOWN_KIND};
+    ///
+    /// assert_eq!(NodeKind::wire_token("robot"), "robot");
+    /// assert_eq!(NodeKind::wire_token("quadruped"), UNKNOWN_KIND);
+    /// ```
+    pub fn wire_token(s: &str) -> &'static str {
+        NodeKind::from_key(s)
+            .map(NodeKind::key)
+            .unwrap_or(UNKNOWN_KIND)
     }
 }
 
@@ -535,6 +566,19 @@ impl PeerView {
     }
 }
 
+/// The beacon cadence that keeps a peer fresh on every other table: **a third of the
+/// peer TTL**, the bound [`spawn_federation_advertising`] enforces.
+///
+/// This is the one implementation of the rule (`docs/amos-link.md` §3; **REQ-A643**). The
+/// default — `ttl == PeerRegistry::DEFAULT_TTL` — is [`LinkNode::FEDERATION_PERIOD`], and a
+/// kernel test ties the two so the constant can never drift from the TTL that establishes it.
+/// Announcing *faster* than this is legal (a caller may want a snappier table) but is wire
+/// noise; a caller with a sub-second TTL who needs a floor (the CLI's LAN sweep) applies
+/// it on top — the floor is a property of *that* caller, not of the rule.
+pub fn federation_period(ttl: Duration) -> Duration {
+    ttl / 3
+}
+
 /// The live peer table: upsert on beacon, evict on TTL.
 ///
 /// Deliberately *pure*: every method that depends on time takes `now` as an argument,
@@ -561,7 +605,8 @@ pub struct PeerRegistry {
 }
 
 impl PeerRegistry {
-    /// The default beacon TTL: three missed beacons at the default 1 Hz cadence.
+    /// The default beacon TTL: three missed beacons at the default cadence
+    /// ([`federation_period`] of this value = 1 Hz = [`LinkNode::FEDERATION_PERIOD`]).
     pub const DEFAULT_TTL: Duration = Duration::from_secs(3);
 
     /// A registry that forgets a peer after `ttl` without a beacon, and **without an
@@ -1569,6 +1614,48 @@ mod tests {
             assert_eq!(NodeKind::from_key(k.key()), Some(k));
         }
         assert_eq!(NodeKind::from_key("nope"), None);
+    }
+
+    /// The [`NodeKind`] doc's one claim, on a real document rather than in prose: the
+    /// **`serde` names are the same keys as [`NodeKind::key`]**.
+    ///
+    /// The claim is load-bearing because one JSON carries the vocabulary twice: the CLI's
+    /// `status` renders `NodeStatus { kind: NodeKind, peers: Vec<PeerView> }` (`to_json`), where
+    /// the node's own role goes through the *derived* `Serialize` (`#[serde(rename_all =
+    /// "lowercase")]`) and every `peers[].kind` goes through `PeerView`'s hand-written
+    /// `serialize_field("kind", …key())`. Two spellings, one document. If the derive's
+    /// `rename_all` or a variant's `key()` arm drifts, a script that reads `status --json`
+    /// matches the node's role and its peers' roles against two different words — and every
+    /// other test stays green, because they all pin the `key()` side only.
+    #[test]
+    fn a_node_kinds_serde_name_is_its_key() {
+        for k in NodeKind::ALL {
+            let json = serde_json::to_value(k).expect("json");
+            assert_eq!(
+                json,
+                serde_json::Value::String(k.key().to_string()),
+                "{k:?}: the serde name and `key()` must be one vocabulary"
+            );
+            // …in both directions: a one-way equality would let `Deserialize` drift from
+            // `from_key`, so a document this build wrote would no longer read back.
+            let back: NodeKind = serde_json::from_value(json).expect("the key reads back");
+            assert_eq!(back, k, "{k:?} round-trips through its own name");
+        }
+    }
+
+    /// The wire fold the CLI and the bridge both apply: a known key is normalized, an
+    /// unfamiliar role is `unknown` — never the raw word it arrived as.
+    #[test]
+    fn an_unfamiliar_role_folds_to_unknown() {
+        for k in NodeKind::ALL {
+            assert_eq!(NodeKind::wire_token(k.key()), k.key(), "{k:?} round-trips");
+        }
+        // A role a *newer* daemon might send: this build names the peer, it does not echo a
+        // vocabulary it does not have.
+        assert_eq!(NodeKind::wire_token("quadruped"), UNKNOWN_KIND);
+        assert_eq!(NodeKind::wire_token(""), UNKNOWN_KIND);
+        // The two consumers really do share one rule, not two copies of it.
+        assert_eq!(NodeKind::wire_token("nope"), "unknown");
     }
 
     #[tokio::test]

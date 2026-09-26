@@ -16,6 +16,7 @@
     IME_FUZZY_PAIRS,
     IME_LETTER_ROWS,
     IME_SYMBOL_ROWS,
+    IME_ZH_SYMBOL_ROWS,
     candidatePageCount,
     pageCandidates,
     type ImeState,
@@ -76,7 +77,12 @@
   // "Forget all learned words" destroys data and cannot be undone, so it asks once
   // before doing it (and lets go of the question when the panel closes).
   let confirmClear = $state(false);
-  const rows = $derived(symbols ? IME_SYMBOL_ROWS : IME_LETTER_ROWS);
+  // The symbol page is mode-dependent: Chinese mode shows the Chinese
+  // punctuation page (digits + ，。？！), English mode the ASCII one. Same
+  // `?123` key toggles either, so the user always sees the glyph they will get.
+  const rows = $derived(
+    symbols ? (mode === "zh" ? IME_ZH_SYMBOL_ROWS : IME_SYMBOL_ROWS) : IME_LETTER_ROWS,
+  );
   const upper = $derived(mode === "en" && shift && !symbols);
   const candidates = $derived(session?.candidates ?? []);
   const pages = $derived(candidatePageCount(candidates.length));
@@ -92,6 +98,11 @@
   // source has something to offer.
   const suggesting = $derived(candidates.some((c) => c.kind === "predict"));
   const learned = $derived((session?.learned_pins ?? 0) + (session?.learned_pending ?? 0));
+  // REQ-A1472：`session === null` 是「引擎从没回答」（浏览器预览 ∕ 没有守护进程 —— 见文件头与
+  // `ImeOverlay::degrade`），不是「词典空的、全都关着」。设置面板已有一串引擎读数与引擎开关，
+  // 它必须把「没答」画成「—」∕禁用，而不是把 `?? 0` 折成「词典 0 码」「已学习 0 个词」「自定义」，
+  // 再把九枚开关全画成 off —— 那是替一台没答话的引擎陈述它的状态。
+  const hasEngine = $derived(session !== null);
 
   // A one-shot modifier must not outlive the mode it belongs to: leaving English
   // mode drops the arm, so a stale ⇧ can never uppercase the first letter after the
@@ -137,23 +148,29 @@
           class="rounded-full bg-white/70 px-2 py-0.5 text-[11px] dark:bg-white/10"
           data-testid="ime-mode-summary"
         >
-          {session?.strict ? t("ime.presetStrict") : t("ime.fuzzyCustom")}
+          {session ? (session.strict ? t("ime.presetStrict") : t("ime.fuzzyCustom")) : "—"}
         </span>
       </div>
+      <!-- The panel replaces the offline banner below (`{:else}` branch), so it must carry
+           the reason itself; otherwise an offline panel states engine facts with no hint. -->
+      {#if !hasEngine}
+        <p class="text-[11px] opacity-70" data-testid="ime-settings-offline">{t("ime.offline")}</p>
+      {/if}
       <div class="flex items-center justify-between gap-2 text-[11px] opacity-60">
         <span data-testid="ime-dict-entries">
-          {t("ime.dictEntries", { n: session?.dict_entries ?? 0 })}
+          {session ? t("ime.dictEntries", { n: session.dict_entries }) : "—"}
         </span>
-        <span>{t("ime.learned", { n: learned })}</span>
+        <span>{session ? t("ime.learned", { n: learned }) : "—"}</span>
       </div>
       <div class="flex flex-wrap gap-1.5">
         {#each IME_FUZZY_PAIRS as pair (pair)}
           <button
             type="button"
+            disabled={!hasEngine}
             aria-pressed={!!session?.fuzzy[pair]}
             data-testid="ime-fuzzy-{pair}"
             onclick={() => onfuzztoggle(pair)}
-            class={"rounded-full px-2.5 py-1 text-xs " +
+            class={"rounded-full px-2.5 py-1 text-xs disabled:opacity-30 " +
               (session?.fuzzy[pair]
                 ? "bg-accent text-white"
                 : "bg-white/70 text-neutral-700 dark:bg-white/10 dark:text-neutral-200")}
@@ -165,26 +182,29 @@
       <div class="flex items-center gap-1.5">
         <button
           type="button"
+          disabled={!hasEngine}
           data-testid="ime-preset-strict"
           onclick={() => onpreset("strict")}
-          class="rounded-full bg-white/70 px-2.5 py-1 text-xs dark:bg-white/10"
+          class="rounded-full bg-white/70 px-2.5 py-1 text-xs disabled:opacity-30 dark:bg-white/10"
         >
           {t("ime.presetStrict")}
         </button>
         <button
           type="button"
+          disabled={!hasEngine}
           data-testid="ime-preset-permissive"
           onclick={() => onpreset("permissive")}
-          class="rounded-full bg-white/70 px-2.5 py-1 text-xs dark:bg-white/10"
+          class="rounded-full bg-white/70 px-2.5 py-1 text-xs disabled:opacity-30 dark:bg-white/10"
         >
           {t("ime.presetPermissive")}
         </button>
         <button
           type="button"
+          disabled={!hasEngine}
           data-testid="ime-learn-clear"
           aria-pressed={confirmClear}
           onclick={askClearLearning}
-          class={"ml-auto rounded-full px-2.5 py-1 text-xs " +
+          class={"ml-auto rounded-full px-2.5 py-1 text-xs disabled:opacity-30 " +
             (confirmClear ? "bg-red-600 text-white" : "bg-white/70 dark:bg-white/10")}
         >
           {confirmClear ? t("ime.clearLearningConfirm") : t("ime.clearLearning")}

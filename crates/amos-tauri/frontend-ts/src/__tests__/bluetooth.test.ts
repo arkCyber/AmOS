@@ -7,6 +7,7 @@
  *     a device the platform never named.
  */
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import {
   BOND_BONDED,
   BOND_BONDING,
@@ -277,5 +278,25 @@ describe("bluetooth scan rows (REQ-A200/A201)", () => {
     // A transition back to "not paired" (the peer declined) is reported as such, not as
     // a success and not as still pairing.
     expect(pairingProgress([{ address: "AA:BB", state: BOND_NONE }], "AA:BB", rows)).toBe("none");
+  });
+});
+
+// ─── REQ-A651: the cap is a cross-language contract, not a shell-local number ───
+
+describe("MAX_SCAN_ROWS mirrors the device-side cap in BluetoothGlue.kt", () => {
+  test("equals the Kotlin `MAX_DEVICES`", () => {
+    // `MAX_SCAN_ROWS`'s doc claims it mirrors the Kotlin cap. Before this test nothing
+    // read the device source: the mirror was a comment and the number a local literal,
+    // so either side could drift and both suites would stay green.
+    const kt = readFileSync(
+      new URL("../../../../amos-tauri/android-glue/com/amos/ai/glue/BluetoothGlue.kt", import.meta.url),
+      "utf8",
+    );
+    const m = /private const val MAX_DEVICES = (\d+)/.exec(kt);
+    expect(m, "MAX_DEVICES not found in BluetoothGlue.kt").not.toBeNull();
+    const cap = Number(m?.[1]);
+    // Non-vacuity: a parsed 0/NaN would satisfy a `toBe` only by accident.
+    expect(cap).toBeGreaterThan(0);
+    expect(MAX_SCAN_ROWS).toBe(cap);
   });
 });

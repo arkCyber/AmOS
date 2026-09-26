@@ -5,25 +5,55 @@
  * so the UI shows a "daemon not connected" state instead of throwing.
  *
  * Wire shapes: crates/amos-tauri/src/taskmgr.rs `TaskSnapshot`/`TaskApp`/`TaskJob`/
- * `TaskDecision`.
+ * `TaskDecision`. The **values** are a cross-language contract too (REQ-A669): the
+ * lifecycle keys are `taskmgr.rs::app_state_key`'s arms and the job kinds
+ * `job_kind_key`'s, which `declaredMirrors.test.ts` reads from the Rust source and
+ * requires to survive {@link normalizeTaskSnapshot} unchanged; the action tokens the UI
+ * can send are the ones `taskmgr.rs::parse_action` accepts.
  */
-export type TaskStateKey =
-  | "foreground"
-  | "visible"
-  | "foreground_service"
-  | "background"
-  | "cached"
-  | "stopped"
-  | "unknown";
+import { invoke } from "./backend";
 
 export interface TaskApp {
   id: string;
   state: TaskStateKey;
 }
 
+/**
+ * The lifecycle keys the UI recognises — **the one declaration** (REQ-A669).
+ *
+ * {@link TaskStateKey} is *derived* from this array, so an add/rename is one edit and the
+ * membership check in `stateKey` can no longer silently disagree with the type. It used to be
+ * two hand-written spellings joined by an unchecked `as TaskStateKey` cast — the shape
+ * `lib/permissions.ts` documents as a defect (a string present in one spelling only still
+ * compiled).
+ *
+ * `visible` is the **container** tier (`amos_applife::AppState::key()`), which travels on the
+ * *LMK* snapshot (`lib/android.ts::runTierForPackage`), not on `TaskSnapshot`: the proto has no
+ * `AppState` value for it (`amos_ai::governor_service::proto_app_state` maps it to
+ * `APP_STATE_UNSPECIFIED`), so a visible app arrives on this wire as `unknown`. Accepted here
+ * because the key is real and the two vocabularies share the other five.
+ */
+export const TASK_STATE_KEYS = [
+  "foreground",
+  "visible",
+  "foreground_service",
+  "background",
+  "cached",
+  "stopped",
+] as const;
+
+/** A lifecycle key the UI recognises, or `unknown` (absent / unrecognised). */
+export type TaskStateKey = (typeof TASK_STATE_KEYS)[number] | "unknown";
+
+/** The job kinds `taskmgr.rs::job_kind_key` can emit (`unknown` = absent / unrecognised). */
+export const TASK_JOB_KINDS = ["exact", "deferred"] as const;
+
+/** A job kind the UI recognises, or `unknown`. */
+export type TaskJobKind = (typeof TASK_JOB_KINDS)[number] | "unknown";
+
 export interface TaskJob {
   id: string;
-  kind: "exact" | "deferred" | "unknown";
+  kind: TaskJobKind;
   earliest: number;
   latest: number;
 }
@@ -43,12 +73,19 @@ export interface TaskSnapshot {
   decision: TaskDecision | null;
 }
 
-/** App actions a Task-Manager can drive into the governor. */
-export type AppAction = "foreground" | "background" | "freeze" | "stop" | "kill";
+/**
+ * App actions a Task-Manager can drive into the governor — **the one declaration** of the
+ * tokens the UI may send, each of which must be one `taskmgr.rs::parse_action` accepts (the
+ * bridge answers "unknown task-manager action '…'" for anything else, so a rename on either
+ * side would make a button a no-op the user cannot diagnose).
+ */
+export const APP_ACTIONS = ["foreground", "background", "freeze", "stop", "kill"] as const;
+
+/** An action a Task-Manager can drive into the governor. */
+export type AppAction = (typeof APP_ACTIONS)[number];
 
 const stateKey = (v: unknown): TaskStateKey =>
-  typeof v === "string" &&
-  ["foreground", "visible", "foreground_service", "background", "cached", "stopped"].includes(v)
+  typeof v === "string" && (TASK_STATE_KEYS as readonly string[]).includes(v)
     ? (v as TaskStateKey)
     : "unknown";
 
@@ -87,7 +124,10 @@ function normalizeJobs(raw: unknown): TaskJob[] {
   for (const j of raw) {
     const it = (j ?? {}) as Partial<TaskJob>;
     if (typeof it.id === "string" && it.id.length > 0) {
-      const kind = it.kind === "exact" || it.kind === "deferred" ? it.kind : "unknown";
+      const kind: TaskJobKind =
+        typeof it.kind === "string" && (TASK_JOB_KINDS as readonly string[]).includes(it.kind)
+          ? (it.kind as TaskJobKind)
+          : "unknown";
       out.push({
         id: it.id,
         kind,
@@ -118,38 +158,32 @@ export function appIsRunning(app: TaskApp): boolean {
   return app.state === "foreground" || app.state === "visible" || app.state === "foreground_service" || app.state === "background";
 }
 
-interface Bridge {
-  invoke(command: string, args?: Record<string, unknown>): Promise<unknown>;
-}
-function bridge(): Bridge | null {
-  const w = window as unknown as { __TAURI_INTERNALS__?: Bridge };
-  return w && typeof w.__TAURI_INTERNALS__ === "object" ? (w.__TAURI_INTERNALS__ as Bridge) : null;
-}
+/**
+ * All three wrappers route through `backend.invoke`, so a failure is not only `null` — it
+ * is recorded in the per-command diagnostic ledger (`bridgeDiag("taskmgr_app_action")` and
+ * friends answer `{kind:"not-bridged"}` vs `{kind:"command-failed", detail}`) and leaves a
+ * breadcrumb (REQ-A220). The private `bridge()`/`call<T>` that used to sit here swallowed
+ * the rejection with a bare `catch { return null }`: the daemon's actual answer — the
+ * `move_app`/`unregister_app` failure, or `"unknown task-manager action"` — was discarded
+ * before anything wrote it down, which is why a *refused* action was indistinguishable from
+ * an offline daemon (the caller's `.catch` — commented "daemon offline" — was unreachable,
+ * and the action simply did nothing).
+ */
 
-async function call<T>(command: string, args?: Record<string, unknown>): Promise<T | null> {
-  const b = bridge();
-  if (!b) return null;
-  try {
-    return (await b.invoke(command, args)) as T;
-  } catch {
-    return null;
-  }
-}
-
-/** Read the governor's app/job snapshot (null offline). */
+/** Read the governor's app/job snapshot (null offline or refused — see the ledger). */
 export function taskmgrSnapshot(): Promise<TaskSnapshot | null> {
-  return call<TaskSnapshot>("taskmgr_snapshot");
+  return invoke<TaskSnapshot>("taskmgr_snapshot");
 }
 
-/** Drive a per-app lifecycle action; returns the fresh snapshot (null offline). */
+/** Drive a per-app lifecycle action; returns the fresh snapshot (null offline or refused). */
 export function taskmgrAppAction(
   appId: string,
   action: AppAction,
 ): Promise<TaskSnapshot | null> {
-  return call<TaskSnapshot>("taskmgr_app_action", { appId, action });
+  return invoke<TaskSnapshot>("taskmgr_app_action", { appId, action });
 }
 
 /** Drive a job action (currently only `cancel`); returns the fresh snapshot. */
 export function taskmgrJobAction(jobId: string, action: "cancel"): Promise<TaskSnapshot | null> {
-  return call<TaskSnapshot>("taskmgr_job_action", { jobId, action });
+  return invoke<TaskSnapshot>("taskmgr_job_action", { jobId, action });
 }

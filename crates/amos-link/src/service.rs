@@ -129,15 +129,24 @@ pub struct LinkService {
 }
 
 impl LinkService {
-    /// Wrap a node. The caller owns liveness: if the node should beat, either spawn
+    /// Wrap a node and start the **return path** — the watcher that folds robots'
+    /// `state/actuation` reports into `ListActuations`.
+    ///
+    /// The watcher is not optional, so no constructor leaves it out. A control plane
+    /// without it answers `ListActuations` with an empty list, i.e. 「没有机器人上报过」,
+    /// which is indistinguishable from a fleet that is merely quiet — and the table is
+    /// private, so a caller has no way to add the watcher afterwards. Only **liveness**
+    /// is a caller's choice: if the node should beat, either spawn
     /// [`LinkNode::spawn_heartbeat`] itself or use [`LinkService::with_heartbeat`].
     pub fn new(node: Arc<LinkNode>) -> Self {
+        let actuations = Arc::new(Mutex::new(ActuationTable::default()));
+        let _actuation_watch = start_actuation_watch(&node, Arc::clone(&actuations));
         Self {
             node,
             publish_seq: AtomicU64::new(0),
             _heartbeat: None,
-            actuations: Arc::new(Mutex::new(ActuationTable::default())),
-            _actuation_watch: None,
+            actuations,
+            _actuation_watch,
         }
     }
 
@@ -151,15 +160,9 @@ impl LinkService {
     /// so the beat belongs to the service rather than to a caller that does not exist.
     pub fn with_heartbeat(node: Arc<LinkNode>) -> Self {
         let _heartbeat = start_heartbeat(&node);
-        let actuations = Arc::new(Mutex::new(ActuationTable::default()));
-        let _actuation_watch = start_actuation_watch(&node, Arc::clone(&actuations));
-        Self {
-            node,
-            publish_seq: AtomicU64::new(0),
-            _heartbeat,
-            actuations,
-            _actuation_watch,
-        }
+        let mut service = Self::new(node);
+        service._heartbeat = _heartbeat;
+        service
     }
 
     /// The node this service reports on.
@@ -270,7 +273,8 @@ fn start_actuation_watch(
 /// and **its own heartbeat running** (see [`LinkService::with_heartbeat`]) — so the
 /// mounted control plane really reports a live node. This is what `amos-ai` mounts; an
 /// operator/deployment that wants calibrated timestamps or the Zenoh transport builds its
-/// own node and calls [`server`] (which leaves liveness to that caller).
+/// own node and calls [`server`] (which leaves liveness — and only liveness — to that
+/// caller).
 pub fn mock_server() -> RobotLinkServer<LinkService> {
     let peer = crate::discovery::PeerId::new("amos-daemon").unwrap_or_default();
     RobotLinkServer::new(LinkService::with_heartbeat(LinkNode::in_process(
@@ -280,6 +284,12 @@ pub fn mock_server() -> RobotLinkServer<LinkService> {
 }
 
 /// A ready-to-mount [`RobotLinkServer`] around a caller-provided node.
+///
+/// Only **liveness** is left to the caller: the node does not beat unless the caller
+/// spawns its heartbeat ([`LinkNode::spawn_heartbeat`]). The **return path** is started
+/// here — by [`LinkService::new`], through which every constructor goes — because a
+/// control plane cannot answer `ListActuations` without it, and the caller has no way to
+/// add it afterwards.
 pub fn server(node: Arc<LinkNode>) -> RobotLinkServer<LinkService> {
     RobotLinkServer::new(LinkService::new(node))
 }
@@ -405,7 +415,7 @@ impl RobotLink for LinkService {
     /// The forwarding task ends with the client (its receiver is dropped) or with the
     /// node's transport closing — no orphaned task.
     ///
-    /// Beats are read with [`Subscriber::recv_beat`], so one whose payload names a peer other
+    /// Beats are read with [`Subscriber::recv_beat`](crate::pubsub::Subscriber::recv_beat), so one whose payload names a peer other
     /// than the frame's own publisher never reaches a client: this stream *is* the answer to
     /// "which robots are alive", and a frame carrying two identities would put the payload's
     /// claim in front of every operator while the framing says something else.

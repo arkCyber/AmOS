@@ -11,7 +11,7 @@
  * the UI shows "notes search offline" instead of guessing.
  */
 
-import { invoke } from "./backend";
+import { bridgeDiag, invoke } from "./backend";
 
 export interface RagHit {
   id: string;
@@ -26,7 +26,13 @@ export interface RagQueryResult {
 
 export interface RagStatus {
   indexed: number;
-  dimension: number;
+  /**
+   * Vector width of the index, `null` until something has been ingested. `null` is
+   * the honest answer for an empty index: `0` is not a dimension an embedder can
+   * have (`amos-vector-db` refuses `ZeroDimension`), so it must never reach a
+   * surface as the measurement 「0 维」.
+   */
+  dimension: number | null;
   embedder: string; // "mock" | "ollama" (honest backend label)
 }
 
@@ -85,14 +91,28 @@ export function parseRagQuery(raw: unknown): RagQueryResult | null {
   return { hits, count: count === null ? hits.length : Math.trunc(count) };
 }
 
+/**
+ * Decode the `dimension` slot of a `rag_status` reply.
+ *
+ * The daemon sends the field **absent** while nothing has been ingested. It used to
+ * be a bare `uint32` whose `0` meant "unknown" (`RagStore::dim() == None`), so `0`
+ * from an older daemon is decoded the same way. Both mean *unknown*, never a width:
+ * a zero-width vector cannot exist (`amos-vector-db` refuses `ZeroDimension`).
+ */
+function parseDimension(raw: unknown): number | null {
+  const d = num(raw);
+  if (d === null) return null;
+  const n = Math.trunc(d);
+  return n > 0 ? n : null;
+}
+
 /** Defensive parse of a `rag_status` reply. */
 export function parseRagStatus(raw: unknown): RagStatus | null {
   if (!isObj(raw)) return null;
   const indexed = num(raw.indexed);
-  const dimension = num(raw.dimension);
   const embedder = str(raw.embedder);
-  if (indexed === null || dimension === null || embedder === null) return null;
-  return { indexed: Math.trunc(indexed), dimension: Math.trunc(dimension), embedder };
+  if (indexed === null || embedder === null) return null;
+  return { indexed: Math.trunc(indexed), dimension: parseDimension(raw.dimension), embedder };
 }
 
 /** Defensive parse of a `rag_index` reply. */
@@ -125,6 +145,27 @@ export async function ragQuery(query: string, topK = RAG_DEFAULT_TOP_K): Promise
   // offline") while the UI, the unit tests (they only saw the command name) and
   // every gate stayed green. Pinned by scripts/tauri-args-scan.mjs + rag.test.ts.
   return parseRagQuery(await invoke("rag_query", { query, topK: normalizeTopK(topK) }));
+}
+
+/** The host's own code for "the caller is not the window the user is looking at". */
+export const RAG_FOREGROUND_REQUIRED = "amos.rag.foreground_required";
+
+/**
+ * Was the last {@link ragQuery}'s `null` a **foreground refusal** rather than the index being
+ * unreachable? Two situations answer the same `null`, and a surface that draws both as "notes
+ * search offline" makes a claim about the *index* when the index had just answered — it refused
+ * *this window* (F-AI-019). `bridgeDiag` is per-command, so the retrieval's own diagnostic is the
+ * thing to ask; there is no other signal on the wire.
+ */
+export function ragQueryRefusedForForeground(): boolean {
+  const diag = bridgeDiag("rag_query");
+  if (diag.ok !== false || diag.kind !== "command-failed") return false;
+  const detail = diag.detail;
+  const code =
+    typeof detail === "object" && detail !== null
+      ? (detail as { code?: unknown }).code
+      : undefined;
+  return code === RAG_FOREGROUND_REQUIRED;
 }
 
 export async function ragIndex(id: string, text: string): Promise<RagIndexReply | null> {

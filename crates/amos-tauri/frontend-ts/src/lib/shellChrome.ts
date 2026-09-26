@@ -84,11 +84,15 @@ export const CHROME_TEXT_SHADOW = "0 1px 2px rgba(0,0,0,0.3)";
  * The magnification `transform` is deliberately **not** part of this token: the
  * container applies it to a wrapper around the widget (see `Dock.svelte`), which is
  * what keeps a scaled item out of the geometry the container measures.
- * 
+ *
+ * `relative` is here for the unread badge: the tile is the badge's positioning context
+ * (`DockTileButton`, `lib/dockBadge.ts`), so the badge hugs *the icon's* top-right corner
+ * rather than the container's.
+ *
  * macOS 实测：16px 圆角（约图标尺寸的 1/3），按下时 scale(0.85)。
  */
 export const DOCK_ITEM_TILE =
-  "group flex items-center justify-center rounded-[16px] shadow-xl transition-transform " +
+  "group relative flex items-center justify-center rounded-[16px] shadow-xl transition-transform " +
   "duration-100 active:scale-85 " +
   "bg-gradient-to-br from-neutral-700/90 to-neutral-900/90";
 

@@ -51,10 +51,21 @@
     getAndroidApps()
       .then((reply) => {
         if (!alive) return;
+        // REQ-A1360 / F-SH-624: `bridged()` above only says the Tauri internals object
+        // exists — the daemon is a separate process, and `invoke` answers `null` for a
+        // command it did not answer (and never rejects, so this reaches the `.then`, not
+        // the `.catch` below). Folding that `null` into `android.empty` with a genuinely
+        // empty listing rendered 「暂无安卓应用」 — a claim about this device's installed
+        // apps — for a question nobody answered. The sibling reads in this file already
+        // refuse that fold (`refreshTiers`, the `lmk-surface` subscribe).
+        if (reply === null) {
+          status = t("android.offline");
+          return;
+        }
         const { apps: list, runtime: rt, demo: isDemo } = normalizeAppsReply(reply);
         runtime = rt;
         demo = isDemo;
-        if (!reply || !list.length) {
+        if (!list.length) {
           status = t("android.empty");
           return;
         }
@@ -127,6 +138,10 @@
     void subscribe(LMK_SURFACE_EVENT, () => {
       void refreshTiers();
     }).then((un) => {
+      // REQ-A838: `null` = the listen was refused, so there is nothing to release. The verdict
+      // is on the ledger (`bridgeDiag(LMK_SURFACE_EVENT)`), and the badges below will simply
+      // not live-refresh — which must not be mistaken for "no container changed state".
+      if (un === null) return;
       if (disposed) un();
       else stop = un;
     });

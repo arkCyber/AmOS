@@ -143,7 +143,10 @@ export async function fetchBundleEntry(mid: string): Promise<BundleEntryResult> 
   if (id === null) {
     return { kind: "failed", reason: "blocked", detail: "empty app id" };
   }
-  const raw = await invoke<unknown>(BUNDLE_ENTRY_COMMAND, { id });
+  // REQ-A555: the generic names the host's reply (`Result<BundleEntry, String>`) so the wire
+  // audit can compare it; the reply is still *narrowed* below rather than trusted, because a
+  // declared type is a claim and `normalizeBundleEntry` is the check.
+  const raw = await invoke<BundleEntry>(BUNDLE_ENTRY_COMMAND, { id });
   if (raw === null) {
     // REQ-A407: 按本文件上面的约定，读**自己那条命令**的槽（导出 `BUNDLE_ENTRY_COMMAND`
     // 就是为了这个"键不会漂"）。诚实说明：这一处**今天不可能**读到过期的全局槽 ——

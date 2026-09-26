@@ -16,19 +16,36 @@
   import { GROUP, ROW, HINT } from "./kit";
   import Field from "./Field.svelte";
   import ToggleRow from "./ToggleRow.svelte";
+  import StoreErrorBar from "../StoreErrorBar.svelte";
 
   let prefs = $state<SoundPolicy>(loadSound());
-  const toggle = (key: "ring" | "vibrate") => {
-    const next = flipSound(prefs, key);
+  // 拒写时那一句，以及它属于哪一行 —— 渲染在**被按下的那个控件自己那一块**里。
+  let storeErr = $state("");
+  let errWhere = $state<"" | "ring" | "vibrate" | "volume">("");
+  /**
+   * `saveSound` 现在的返回值就是这一枚键的裁决，必须**先问再动屏幕**：这一位不止这一页读
+   * ——告示到达时的响铃 ∕ 触感（`shouldRingOnArrival` ∕ `shouldVibrateOnArrival`）与来电
+   * 路径（`lib/callTone`）都读它。拒写时若本地 `prefs` 已经动了，屏上说「振动」开着而来电
+   * 仍然不振动（F-SH-638）。成功时那句本地赋值本来就是多余的：派发是同步的。
+   */
+  const commit = (next: SoundPolicy, where: "ring" | "vibrate" | "volume") => {
+    if (!saveSound(next)) {
+      storeErr = t("common.storeWriteFailed");
+      errWhere = where;
+      return;
+    }
+    storeErr = "";
+    errWhere = "";
     prefs = next;
-    saveSound(next);
+  };
+  const toggle = (key: "ring" | "vibrate") => {
+    // `preview` 的隐式开启也走这条门 —— 同一个开关、同一条纪律。
+    commit(flipSound(prefs, key), key);
   };
   // 0..100 slider → 0..1 policy loudness. Persisted through the same lib/sound
   // write path as the switches (single owner of `amos.sound`).
   const setVolume = (pct: number) => {
-    const next = setSoundVolume(prefs, pct / 100);
-    prefs = next;
-    saveSound(next);
+    commit(setSoundVolume(prefs, pct / 100), "volume");
   };
   const preview = () => {
     playNotifyTone({ volume: prefs.volume });
@@ -43,6 +60,7 @@
       on={prefs.ring}
       ontoggle={() => toggle("ring")}
     />
+    {#if errWhere === "ring"}<StoreErrorBar message={storeErr} />{/if}
     <div class="px-4 pb-3">
       <p class={HINT}>{t("settings.notifySoundDesc")}</p>
     </div>
@@ -69,6 +87,7 @@
         </div>
       {/snippet}
     </Field>
+    {#if errWhere === "volume"}<StoreErrorBar message={storeErr} />{/if}
     <div class="px-4 pb-3">
       <p class={HINT}>{t("settings.notifyVolumeDesc")}</p>
     </div>
@@ -85,6 +104,7 @@
 
   <section class={GROUP}>
     <ToggleRow label={t("settings.haptics")} on={prefs.vibrate} ontoggle={() => toggle("vibrate")} />
+    {#if errWhere === "vibrate"}<StoreErrorBar message={storeErr} />{/if}
     <div class="px-4 pb-3">
       <p class={HINT}>{t("settings.hapticsDesc")}</p>
     </div>

@@ -99,8 +99,48 @@ describe("devcare — normalizers are total", () => {
     expect(r.groups[1]).toEqual({ kind: "future_kind", count: 1, bytes: 5 });
     expect(junkKindLabelKey("future_kind")).toBe("care.junk.unknown");
     expect(r.total_items).toBe(2);
-    expect(r.reclaimable_bytes).toBe(100);
     expect(normalizeJunkReport(undefined).groups).toEqual([]);
+  });
+
+  /**
+   * F-SH-662 ∕ REQ-A1405 — the scan's reclaimable/review sums live on the **reply
+   * root**, not inside `report`.
+   *
+   * `ScanOut.report` is the domain `JunkReport`, which serializes exactly three
+   * fields (`groups`/`total_items`/`total_bytes`); `reclaimable_bytes()` and
+   * `review_bytes()` are *methods*, and only `StorageOut` spells them as wire
+   * fields. Reading them off `report` therefore always yielded `0`, which the junk
+   * card's 「可回收」 header printed as a definite `0 B` — a fabricated zero beside
+   * a list of real groups. The fixtures that "passed" only did so because they
+   * hand-wrote the field the host never sends.
+   */
+  test("normalizeScan reads the reclaimable/review sums from the reply root", () => {
+    const v = normalizeScan({
+      status: { available: true, backend: "host-fs" },
+      // Exactly what `JunkReport` serializes — no sums here.
+      report: {
+        groups: [
+          { kind: "app_cache", count: 1, bytes: 1024 },
+          { kind: "stale_download", count: 1, bytes: 2048 },
+        ],
+        total_items: 2,
+        total_bytes: 3072,
+      },
+      auto_kinds: ["app_cache"],
+      review_kinds: ["stale_download"],
+      reclaimable_bytes: 1024,
+      review_bytes: 2048,
+    })!;
+    expect(v.reclaimable_bytes).toBe(1024);
+    expect(v.review_bytes).toBe(2048);
+
+    // A sum nested under `report` is *not* read: it is not where the host puts it,
+    // and honouring it is exactly the defect (a fixture-shaped field that the real
+    // command never sends).
+    const nested = normalizeScan({
+      report: { groups: [], total_items: 0, total_bytes: 0, reclaimable_bytes: 999 },
+    })!;
+    expect(nested.reclaimable_bytes).toBe(0);
   });
 
   test("normalizeScan returns null when the scan did not happen", () => {
@@ -225,22 +265,46 @@ describe("devcare — label key mapping", () => {
 
 describe("devcare — validateCleanRequest mirrors the Rust policy", () => {
   test("rejects an empty selection", () => {
-    expect(validateCleanRequest([], false)).toBe("care.err.noSelection");
+    expect(validateCleanRequest([], false, [])).toBe("care.err.noSelection");
   });
 
   test("rejects an unknown category tag", () => {
-    expect(validateCleanRequest(["app_cache", "nope"], false)).toBe("care.err.unknownKind");
+    expect(validateCleanRequest(["app_cache", "nope"], false, [])).toBe("care.err.unknownKind");
     // A path is not a category — the same hardening the Rust side enforces.
-    expect(validateCleanRequest(["/etc/passwd"], false)).toBe("care.err.unknownKind");
+    expect(validateCleanRequest(["/etc/passwd"], false, [])).toBe("care.err.unknownKind");
   });
 
   test("requires the acknowledgement for review-only categories", () => {
-    expect(validateCleanRequest(["stale_download"], false)).toBe("care.err.needsReview");
-    expect(validateCleanRequest(["stale_download"], true)).toBeNull();
+    expect(validateCleanRequest(["stale_download"], false, ["stale_download"])).toBe(
+      "care.err.needsReview",
+    );
+    expect(validateCleanRequest(["stale_download"], true, ["stale_download"])).toBeNull();
   });
 
   test("accepts a well-formed auto-cleanable request", () => {
-    expect(validateCleanRequest(["app_cache", "log_file"], false)).toBeNull();
+    expect(validateCleanRequest(["app_cache", "log_file"], false, [])).toBeNull();
+  });
+
+  // REQ-A1409 ∕ F-SH-667 — review-ness comes from the **host's** `review_kinds`,
+  // not from a literal kind. Both directions are pinned, because a guard that
+  // hardcodes one category is wrong in two ways: it misses a second review-only
+  // category, and it gates a category the host never called review-only.
+  test("gates a review-only category the host names (not only `stale_download`)", () => {
+    expect(validateCleanRequest(["crash_dump"], false, ["crash_dump"])).toBe(
+      "care.err.needsReview",
+    );
+    expect(validateCleanRequest(["crash_dump"], true, ["crash_dump"])).toBeNull();
+  });
+
+  test("does not gate a category the host did not name as review-only", () => {
+    // `stale_download` is review-only *today*; if the host stops naming it, the
+    // guard must follow the host rather than the literal.
+    expect(validateCleanRequest(["stale_download"], false, [])).toBeNull();
+    // …and only the named kinds are gated, not the whole selection.
+    expect(validateCleanRequest(["app_cache", "crash_dump"], false, ["crash_dump"])).toBe(
+      "care.err.needsReview",
+    );
+    expect(validateCleanRequest(["app_cache"], false, ["crash_dump"])).toBeNull();
   });
 });
 

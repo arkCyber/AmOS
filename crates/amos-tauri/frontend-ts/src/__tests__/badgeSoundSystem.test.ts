@@ -7,6 +7,7 @@
  */
 
 import { describe, test, expect } from "bun:test";
+import { fastest, PERF_ATTEMPTS } from "./perfBudget";
 import type { PushPayload } from "../lib/pushNotifications";
 import {
   isSilentPush,
@@ -338,11 +339,12 @@ describe("性能测试", () => {
   test("1000 次 extractBadge 调用应在 50ms 内完成", () => {
     const payload: PushPayload = { aps: { alert: { title: "Test" }, badge: 5 } };
 
-    const start = performance.now();
-    for (let i = 0; i < 1000; i++) {
-      extractBadge(payload);
-    }
-    const duration = performance.now() - start;
+    // REQ-A850 / F-DEV-106：取 K 次最小值（抢占只会给某一次**加**时间）。纯函数，重复安全。
+    const duration = fastest(PERF_ATTEMPTS, () => {
+      for (let i = 0; i < 1000; i++) {
+        extractBadge(payload);
+      }
+    });
 
     expect(duration).toBeLessThan(50);
   });
@@ -350,11 +352,11 @@ describe("性能测试", () => {
   test("1000 次 parsePushPayload 调用应在 50ms 内完成", () => {
     const json = '{"aps":{"alert":{"title":"Test"}}}';
 
-    const start = performance.now();
-    for (let i = 0; i < 1000; i++) {
-      parsePushPayload(json);
-    }
-    const duration = performance.now() - start;
+    const duration = fastest(PERF_ATTEMPTS, () => {
+      for (let i = 0; i < 1000; i++) {
+        parsePushPayload(json);
+      }
+    });
 
     expect(duration).toBeLessThan(50);
   });

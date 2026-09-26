@@ -8,7 +8,7 @@
  * shell's, and that every way of failing is *said* rather than shown as a blank
  * frame.
  */
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { cleanup, render } from "@testing-library/svelte";
 import ExtAppHost from "../src/svelte/ExtAppHost.svelte";
 import { fetchBundleEntry } from "../src/lib/bundleHost";
@@ -114,5 +114,27 @@ describe("ExtAppHost.svelte", () => {
     await settle();
     expect(frame(host)).toBeNull();
     expect(txt(host)).toContain("未在 AmOS 内运行");
+  });
+
+  test("installs the capability listener with the frame, and tears it down with the host (REQ-A721)", async () => {
+    installBridge({ url: "amos-app://org.amos.demo/index.html", start: "index.html" });
+    const add = vi.spyOn(window, "addEventListener");
+    const remove = vi.spyOn(window, "removeEventListener");
+    const host = render(ExtAppHost, { mid: "org.amos.demo", name: "Demo" });
+    await settle();
+    await settle();
+
+    const added = add.mock.calls.filter((c) => c[0] === "message").length;
+    // The frame is mounted ⇒ the host's capability listener is live (the half that used
+    // to be missing: nothing called `sandboxBridge`, so every frame was denied by absence).
+    expect(frame(host)).not.toBeNull();
+    expect(added).toBeGreaterThan(0);
+
+    cleanup(); // unmount the host
+    const removed = remove.mock.calls.filter((c) => c[0] === "message").length;
+    expect(removed).toBeGreaterThanOrEqual(added);
+
+    add.mockRestore();
+    remove.mockRestore();
   });
 });

@@ -36,6 +36,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::android::{CommitOutcome, InstallMode, InstallRequest, PackageInstallerBridge};
 use crate::error::{Result, StoreError};
+use crate::fdroid::version_code_from;
 use crate::model::{AppManifest, AppStatus, Checksum, InstalledApp, PackageFormat};
 use crate::StoreProvider;
 
@@ -529,7 +530,11 @@ impl<P: StoreProvider> AppStore<P> {
             package: manifest.id.clone(),
             apk_name: "base.apk".into(),
             mode,
-            version_code: 0, // versionCode isn't part of the catalog model today
+            // The catalog models the version as semver; the platform keys its
+            // upgrade bookkeeping on the integer `versionCode`, so encode it
+            // here rather than handing the bridge a constant 0 that makes every
+            // release look like the same build.
+            version_code: version_code_from(&manifest.version).max(0) as u64,
             expect_silent: true,
             label: Some(manifest.name.clone()),
         };
@@ -598,7 +603,7 @@ fn check_publisher(manifest: &AppManifest) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::android::{Posture, SideloadOnlyBridge};
+    use crate::android::{Posture, Session, SideloadOnlyBridge};
     use crate::model::{AppCategory, AppStatus, PackageFormat, PackageRef};
     use crate::provider::MockStoreProvider;
     use async_trait::async_trait;
@@ -1172,6 +1177,67 @@ mod tests {
         // Re-upgrading when already current is a clean no-op, not a reinstall.
         let noop = store.upgrade_apk("com.amos.mail").await.unwrap_err();
         assert!(matches!(noop, StoreError::NoUpdate { .. }), "{noop}");
+    }
+
+    /// A silent-capable bridge that records the `version_code` of every request
+    /// the engine hands it, so a test can see what actually reaches the platform.
+    struct RecordingBridge {
+        posture: Posture,
+        seen: Arc<Mutex<Vec<u64>>>,
+    }
+
+    impl PackageInstallerBridge for RecordingBridge {
+        fn posture(&self) -> Posture {
+            self.posture
+        }
+        fn open_session(&self, req: &InstallRequest) -> Result<Session> {
+            self.seen.lock().unwrap().push(req.version_code);
+            Ok(Session::new(1, req))
+        }
+        fn write_apk(&self, _session: &mut Session, _apk: &[u8]) -> Result<()> {
+            Ok(())
+        }
+        fn commit(&self, session: Session) -> Result<CommitOutcome> {
+            Ok(match session.mode {
+                InstallMode::Full => CommitOutcome::Installed,
+                InstallMode::InheritExisting => CommitOutcome::Updated,
+            })
+        }
+        fn abandon(&self, _session: Session) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn commits_carry_the_real_version_code_not_a_constant_zero() {
+        // `InstallRequest.version_code` is documented as the APK's `versionCode`
+        // "used for upgrade bookkeeping" — yet the engine used to hand the bridge
+        // a hardcoded 0, so every release looked like the same build and the
+        // platform could never tell a real upgrade from a no-op. The value is
+        // observable only at the bridge seam, so record it there.
+        let p = MockStoreProvider::new();
+        p.add(
+            apk_app("com.amos.mail", "Amos Mail", "1.0.0"),
+            b"PK\x03\x04v1".to_vec(),
+        )
+        .unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let store = AppStore::new(p.clone()).with_android_bridge(Arc::new(RecordingBridge {
+            posture: Posture::oem_platform(),
+            seen: seen.clone(),
+        }));
+
+        store.install_apk("com.amos.mail").await.unwrap();
+        p.add(
+            apk_app("com.amos.mail", "Amos Mail", "2.3.4"),
+            b"PK\x03\x04v2".to_vec(),
+        )
+        .unwrap();
+        store.upgrade_apk("com.amos.mail").await.unwrap();
+
+        // 1.0.0 → 1_000_000 and 2.3.4 → 2_003_004 under fdroid's base-1000 split;
+        // the fresh install and the upgrade must each carry their own version.
+        assert_eq!(*seen.lock().unwrap(), vec![1_000_000, 2_003_004]);
     }
 
     /// A catalog that cannot be read at all (offline backend / IO failure): "we could not

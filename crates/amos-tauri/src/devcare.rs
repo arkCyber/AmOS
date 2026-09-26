@@ -38,7 +38,7 @@ use std::sync::{Arc, Mutex};
 use amos_devocare::{
     audit, health, hostfs, junk, permissions, AppPackage, BatteryCare, CareInput, CareReport,
     CleanProvider, CleanRequest, DevCareError, HostScan, JunkGroup, JunkItem, JunkKind, JunkReport,
-    PermissionGrant, SensitiveResource, UninstallGuard,
+    PermissionGrant, SensitiveResource, UninstallGuard, UninstallVerdict,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
@@ -252,6 +252,17 @@ pub struct ScanOut {
     pub auto_kinds: Vec<String>,
     /// Category keys that require an explicit acknowledgement.
     pub review_kinds: Vec<String>,
+    /// Bytes cleanable without a second confirmation (the domain's
+    /// [`JunkReport::reclaimable_bytes`]).
+    ///
+    /// Sent on the **root**, not inside `report`: the domain `JunkReport`
+    /// serializes only `groups`/`total_items`/`total_bytes` — these two are
+    /// *methods*, and a shell reading them off `report` gets `None` for a field
+    /// the host never wrote, i.e. a fabricated `0 B` next to a list of real
+    /// groups. `StorageOut` already spells both as wire fields; this mirrors it.
+    pub reclaimable_bytes: u64,
+    /// Bytes that need an explicit user decision first ([`JunkReport::review_bytes`]).
+    pub review_bytes: u64,
 }
 
 /// The storage overview:「总 / 已用 / 可回收」plus the per-category breakdown.
@@ -466,6 +477,15 @@ struct Inner {
     scan: Vec<JunkItem>,
     unreadable_dirs: usize,
     root: Option<PathBuf>,
+    /// Whether `scan` is a snapshot this backend actually **observed**.
+    ///
+    /// A backend being attached is not the same as a scan having happened: the
+    /// device attach upcall deliberately does not scan (it arrives on the
+    /// Activity's main thread), and it drops the previous backend's snapshot. So
+    /// an attached-but-unscanned bridge holds an empty `scan` that no backend
+    /// ever produced — and `junk::analyze` of it is a real, zeroed `JunkReport`
+    /// that the storage area must not be scored from (P0-3: unobserved ≠ healthy).
+    scanned: bool,
     /// The scan/storage half of the backend (`None` ⇒ nothing was ever observed).
     scanner: Option<Box<dyn CareScanner + Send>>,
     provider: Option<Box<dyn CleanProvider + Send>>,
@@ -504,6 +524,7 @@ impl DevCareBridge {
                 scan: Vec::new(),
                 unreadable_dirs: 0,
                 root: None,
+                scanned: false,
                 scanner: None,
                 provider: None,
                 packages: None,
@@ -521,6 +542,7 @@ impl DevCareBridge {
             scan: Vec::new(),
             unreadable_dirs: 0,
             root: Some(root),
+            scanned: false,
             scanner: Some(scanner),
             provider: Some(provider),
             packages: None,
@@ -531,6 +553,7 @@ impl DevCareBridge {
                 Ok(scan) => {
                     inner.scan = scan.items;
                     inner.unreadable_dirs = scan.unreadable_dirs;
+                    inner.scanned = true;
                 }
                 Err(e) => inner.last_error = Some(e.to_string()),
             }
@@ -571,6 +594,9 @@ impl DevCareBridge {
         // backend has `scanned_items == 0` until the caller actually scans.
         inner.scan.clear();
         inner.unreadable_dirs = 0;
+        // …and it was never observed by this backend either: the snapshot is
+        // gone, so the storage area goes back to unassessed until a scan lands.
+        inner.scanned = false;
     }
 
     /// The backend-owned package source, when the attached backend has one.
@@ -647,6 +673,7 @@ impl DevCareBridge {
             Ok(scan) => {
                 inner.scan = scan.items;
                 inner.unreadable_dirs = scan.unreadable_dirs;
+                inner.scanned = true;
                 inner.last_error = None;
             }
             Err(e) => {
@@ -666,6 +693,8 @@ impl DevCareBridge {
             .filter(|g| g.kind.needs_review())
             .map(|g| g.kind.key().to_string())
             .collect();
+        let reclaimable_bytes = report.reclaimable_bytes();
+        let review_bytes = report.review_bytes();
         drop(inner);
 
         Ok(ScanOut {
@@ -673,6 +702,8 @@ impl DevCareBridge {
             report,
             auto_kinds,
             review_kinds,
+            reclaimable_bytes,
+            review_bytes,
         })
     }
 
@@ -726,6 +757,7 @@ impl DevCareBridge {
             if let Ok(scan) = scanner.scan() {
                 inner.scan = scan.items;
                 inner.unreadable_dirs = scan.unreadable_dirs;
+                inner.scanned = true;
             }
         }
         drop(inner);
@@ -799,9 +831,11 @@ impl DevCareBridge {
     ///
     /// Storage comes from the bridge's own scan; battery from the **attached
     /// backend's** reading (Android `BatteryManager`), falling back to the real host
-    /// battery reader on a desktop; the two counts come from the caller (permission
-    /// ledger / package inventory). Anything unavailable stays `None` and is
-    /// therefore **unassessed** rather than scored as healthy.
+    /// battery reader on a desktop; the sensitive-grant count is passed in from the
+    /// daemon-backed permission ledger and the reviewable-app count is derived by
+    /// the caller from the uninstall policy ([`reviewable_app_count`]). Anything
+    /// unavailable stays `None` and is therefore **unassessed** rather than scored
+    /// as healthy.
     pub fn report(
         &self,
         sensitive_grants: Option<usize>,
@@ -809,10 +843,13 @@ impl DevCareBridge {
     ) -> CareReport {
         let (reclaimable, device_battery) = {
             let mut inner = self.lock();
-            // No backend ⇒ *nothing* was observed. Leaving this `None` is what
+            // An attached backend is not an observation: the snapshot is cleared
+            // by `attach_device` (the device attach deliberately does not scan)
+            // and stays empty when a scan fails. Leaving this `None` is what
             // keeps an unobserved device unassessed instead of scoring its
-            // storage as a healthy zero (P0-3).
-            let reclaimable = if inner.provider.is_none() {
+            // storage as a healthy zero (P0-3) — the empty list would otherwise
+            // fold into a real, zeroed `JunkReport`.
+            let reclaimable = if !inner.scanned {
                 None
             } else {
                 junk::analyze(&inner.scan)
@@ -1099,6 +1136,28 @@ pub fn policy_preview(packages: &dyn PackageSource) -> Result<Vec<AppOut>, Strin
         .collect())
 }
 
+/// How many entries the manager would **actually offer to review** — the value
+/// [`CareInput::reviewable_apps`] is defined as
+/// (`UninstallGuard::selectable`: the `Allowed` verdict).
+///
+/// It is counted from the **bridge-owned inventory** through the same
+/// [`policy_preview`] the apps card is drawn from, so the care report and the
+/// list can never disagree about what is removable. A caller-supplied count
+/// cannot be checked against that authority — the shell only knows the rows it
+/// drew, and counting *every* installed entry would report system/protected apps
+/// as "available for review", i.e. a finding for an affordance that does not
+/// exist.
+///
+/// `None` when the inventory cannot be read: an unreadable registry is
+/// **unobserved**, not an observation of zero — the same rule the permission
+/// half follows when the daemon is unreachable.
+pub fn reviewable_app_count(packages: &dyn PackageSource) -> Option<usize> {
+    let allowed = UninstallVerdict::Allowed.key();
+    policy_preview(packages)
+        .ok()
+        .map(|rows| rows.iter().filter(|a| a.verdict == allowed).count())
+}
+
 /// Turn the **daemon's** grant rows into review rows, keeping the *review
 /// semantics* in the domain (dedup, ordering, bounded).
 ///
@@ -1383,16 +1442,25 @@ pub async fn devcare_permissions() -> Result<PermReviewOut, String> {
 /// Off the UI thread: the attached backend's battery read crosses JNI into
 /// `BatteryManager` (and the desktop fallback shells out to `pmset`), so a slow
 /// platform call must never freeze the screen (same rule as `devcare_storage`).
+///
+/// The reviewable-app count is **not** taken from the caller: it is the count of
+/// entries the uninstall policy would actually offer, derived here from the same
+/// authority `devcare_apps` draws its rows from (see [`reviewable_app_count`]).
+/// `sensitive_grants` still comes from the shell — the permission ledger's
+/// authority is the daemon, which this process queries over RPC, not from the
+/// package inventory.
 #[tauri::command]
 pub async fn devcare_report(
     app: AppHandle,
     sensitive_grants: Option<usize>,
-    reviewable_apps: Option<usize>,
 ) -> Result<CareReport, String> {
     offload(move || {
-        Ok(app
-            .state::<DevCareBridge>()
-            .report(sensitive_grants, reviewable_apps))
+        let bridge = app.state::<DevCareBridge>();
+        let reviewable_apps = match bridge.packages() {
+            Some(packages) => reviewable_app_count(packages.as_ref()),
+            None => reviewable_app_count(&*app.state::<StoreBridge>()),
+        };
+        Ok(bridge.report(sensitive_grants, reviewable_apps))
     })
     .await
 }
@@ -1489,6 +1557,10 @@ mod tests {
             "the host scanner finds no review-only kinds"
         );
         assert_eq!(scan.report.reclaimable_bytes(), 175);
+        // The same sum, on the reply **root** — the shell reads it there, because
+        // `report` serializes no such field (F-SH-662).
+        assert_eq!(scan.reclaimable_bytes, 175);
+        assert_eq!(scan.review_bytes, 0);
 
         let (out, events) = b.clean(&scan.auto_kinds, false).expect("clean ok");
         assert_eq!(out.planned_items, 3);
@@ -1641,6 +1713,78 @@ mod tests {
         assert!(policy_preview(&store)
             .expect("registry is readable")
             .is_empty());
+    }
+
+    /// REQ-A1410 ∕ F-SH-668 — the reviewable count is the *policy's* count, not the
+    /// inventory's length. Only the entries the manager would offer for uninstall
+    /// (`UninstallVerdict::Allowed`) may be reported as reviewable; a system or
+    /// protected entry is installed, but it is not a review affordance.
+    #[test]
+    fn the_reviewable_count_is_the_allowed_verdicts_not_the_inventory_length() {
+        let packages = FakePackages {
+            apps: vec![
+                InstalledEntry {
+                    id: "com.example.game".to_string(),
+                    name: "Game".to_string(),
+                    size_bytes: Some(10),
+                    system: false,
+                },
+                // Platform-flagged, not in the pinned critical set ⇒ `system_app`.
+                InstalledEntry {
+                    id: "com.vendor.weather".to_string(),
+                    name: "Weather".to_string(),
+                    size_bytes: Some(20),
+                    system: true,
+                },
+                // In the pinned critical set ⇒ `protected`.
+                InstalledEntry {
+                    id: "com.android.settings".to_string(),
+                    name: "Settings".to_string(),
+                    size_bytes: Some(30),
+                    system: false,
+                },
+            ],
+            launched: false,
+        };
+        assert_eq!(
+            reviewable_app_count(&packages),
+            Some(1),
+            "three installed entries, one removable"
+        );
+    }
+
+    /// A screen with only system/protected entries is **observed** and has nothing
+    /// to review: `Some(0)`, so the area is assessed. Reporting the inventory length
+    /// instead would light the apps area for affordances that do not exist.
+    #[test]
+    fn a_device_with_only_protected_entries_reviews_to_zero() {
+        let packages = FakePackages {
+            apps: vec![InstalledEntry {
+                id: "com.android.settings".to_string(),
+                name: "Settings".to_string(),
+                size_bytes: None,
+                system: true,
+            }],
+            launched: false,
+        };
+        assert_eq!(reviewable_app_count(&packages), Some(0));
+    }
+
+    /// An inventory that cannot be read is **unobserved**, not an observation of
+    /// zero — the same rule the permission half follows when the daemon is
+    /// unreachable. `None` leaves the apps area unassessed.
+    #[test]
+    fn an_unreadable_inventory_is_unassessed_not_zero() {
+        struct Unreadable;
+        impl PackageSource for Unreadable {
+            fn inventory(&self) -> Result<Vec<InstalledEntry>, String> {
+                Err("PackageManager unreachable".to_string())
+            }
+            fn uninstall(&self, _id: &str) -> Result<Removal, String> {
+                Err("PackageManager unreachable".to_string())
+            }
+        }
+        assert_eq!(reviewable_app_count(&Unreadable), None);
     }
 
     #[test]
@@ -1824,6 +1968,68 @@ mod tests {
         assert_eq!(r.score as u32, 100 - penalty);
     }
 
+    /// REQ-A1415 ∕ F-SH-673 — an attached backend is not an observation.
+    ///
+    /// `attach_device` deliberately does **not** scan (the upcall runs on the
+    /// Activity's main thread) and drops the previous backend's snapshot, so
+    /// between the attach and the first successful `devcare_scan` the bridge
+    /// holds an empty list **no backend ever produced**. Folding it scored the
+    /// storage area as assessed and certified a healthy zero — for a device whose
+    /// scan had just failed, on the same screen whose junk card says 「扫描失败」.
+    /// The area must stay unassessed until a snapshot is actually observed (P0-3).
+    #[test]
+    fn an_attached_but_unscanned_backend_leaves_storage_unassessed() {
+        let bridge = DevCareBridge::unavailable();
+        bridge.attach_device(
+            Box::new(FakeScan {
+                items: Vec::new(),
+                totals: StorageTotals::default(),
+                battery: BatteryReading::unknown(),
+            }),
+            Box::new(FakeCleaner),
+            Arc::new(FakePackages {
+                apps: Vec::new(),
+                launched: false,
+            }),
+        );
+        assert!(bridge.status().available, "the backend is attached");
+        let r = bridge.report(None, None);
+        assert!(
+            !r.assessed_area(CareArea::Storage),
+            "no scan landed ⇒ storage is unobserved, not a healthy zero"
+        );
+    }
+
+    /// The control for the rule above: once a scan **has** landed, an empty
+    /// snapshot is a real observation of zero and the area *is* assessed. Without
+    /// this, "never assess storage" would satisfy the fix.
+    #[test]
+    fn a_scanned_but_empty_backend_assesses_storage_as_zero() {
+        let bridge = DevCareBridge::unavailable();
+        bridge.attach_device(
+            Box::new(FakeScan {
+                items: Vec::new(),
+                totals: StorageTotals::default(),
+                battery: BatteryReading::unknown(),
+            }),
+            Box::new(FakeCleaner),
+            Arc::new(FakePackages {
+                apps: Vec::new(),
+                launched: false,
+            }),
+        );
+        bridge.scan().expect("the scan lands");
+        let r = bridge.report(None, None);
+        assert!(
+            r.assessed_area(CareArea::Storage),
+            "a landed scan is an observation, even an observation of nothing"
+        );
+        assert!(
+            r.findings.iter().all(|f| f.area != CareArea::Storage),
+            "nothing reclaimable ⇒ no storage finding"
+        );
+    }
+
     #[tokio::test]
     async fn record_audit_always_reports_attempted_and_a_reason_on_shortfall() {
         // Environment-independent invariant: whatever the daemon does, the caller
@@ -1994,6 +2200,48 @@ mod tests {
                 Removal::Removed
             })
         }
+    }
+
+    /// REQ-A1405 ∕ F-SH-662 — the scan's reclaimable/review sums ride the reply **root**.
+    ///
+    /// `ScanOut.report` is the domain `JunkReport`, which serializes exactly
+    /// `groups`/`total_items`/`total_bytes`; a shell reading
+    /// `report.reclaimable_bytes` gets a field the host never wrote, hence a
+    /// permanent `0` — printed as a fabricated `0 B` beside a list of real groups.
+    /// This pins the *wire*, which is what the shell actually parses.
+    #[test]
+    fn the_scan_reply_carries_its_sums_on_the_root_not_inside_report() {
+        let bridge = DevCareBridge::unavailable();
+        bridge.attach_device(
+            Box::new(FakeScan {
+                items: vec![
+                    JunkItem::new("content://cache/1", JunkKind::AppCache, 4096),
+                    JunkItem::new("content://dl/1", JunkKind::StaleDownload, 2048),
+                ],
+                totals: StorageTotals::default(),
+                battery: BatteryReading::unknown(),
+            }),
+            Box::new(FakeCleaner),
+            Arc::new(FakePackages {
+                apps: Vec::new(),
+                launched: false,
+            }),
+        );
+
+        let scan = bridge.scan().expect("scan ok");
+        // Only the auto-cleanable kind counts as reclaimable; the download needs a
+        // decision, so it lands in the review bucket instead.
+        assert_eq!(scan.reclaimable_bytes, 4096);
+        assert_eq!(scan.review_bytes, 2048);
+        assert_eq!(scan.reclaimable_bytes, scan.report.reclaimable_bytes());
+        assert_eq!(scan.review_bytes, scan.report.review_bytes());
+
+        let wire = serde_json::to_value(&scan).expect("serialize");
+        assert_eq!(wire["reclaimable_bytes"], 4096);
+        assert_eq!(wire["review_bytes"], 2048);
+        // …and `report` still carries neither, so nothing can read them there.
+        assert!(wire["report"].get("reclaimable_bytes").is_none());
+        assert!(wire["report"].get("review_bytes").is_none());
     }
 
     #[test]

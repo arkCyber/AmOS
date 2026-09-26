@@ -8,8 +8,8 @@
  * 注意：使用 bun:test 框架，不使用 vi.mock（Bun 不支持）
  */
 
-import { describe, test, expect } from "bun:test";
-import { fileableWindows, type Space } from "../spaces";
+import { describe, test, expect, afterEach } from "bun:test";
+import { fileableWindows, spacesFailure, type Space } from "../spaces";
 
 describe("Spaces API - 类型定义", () => {
   test("Space 接口结构完整", () => {
@@ -28,7 +28,9 @@ describe("Spaces API - 类型定义", () => {
     expect(Array.isArray(space.windows)).toBe(true);
   });
 
-  test("SpaceInfo 接口与 Space 兼容", () => {
+  // The cross-language shape binding (this interface == the Rust `Space`/`SpaceInfo` fields) lives
+  // in `src/__tests__/declaredMirrors.test.ts` (REQ-A710). This case only pins the TS-side literal.
+  test("a Space list carries the three documented fields", () => {
     const spaces: Space[] = [
       { id: "space-0", name: "桌面 1", windows: [] },
       { id: "space-1", name: "桌面 2", windows: ["settings"] },
@@ -50,10 +52,8 @@ describe("Spaces API - 函数导出", () => {
       deleteSpace,
       moveWindowToSpace,
       renameSpace,
-      isSpacesAvailable,
-      getSpacesStatus,
     } = await import("../spaces");
-    
+
     expect(typeof listSpaces).toBe("function");
     expect(typeof activeSpace).toBe("function");
     expect(typeof switchSpace).toBe("function");
@@ -61,8 +61,6 @@ describe("Spaces API - 函数导出", () => {
     expect(typeof deleteSpace).toBe("function");
     expect(typeof moveWindowToSpace).toBe("function");
     expect(typeof renameSpace).toBe("function");
-    expect(typeof isSpacesAvailable).toBe("function");
-    expect(typeof getSpacesStatus).toBe("function");
   });
 });
 
@@ -141,23 +139,174 @@ describe("Spaces API - 桥接契约(REQ-A296)", () => {
     expect(await createSpace("桌面试探") === null || typeof (await createSpace("桌面试探")) === "string").toBe(true);
   });
 
-  test("mutation 调用(switchSpace / deleteSpace / renameSpace)用 boolean 而不是 reject", async () => {
+  test("mutation 调用(switchSpace / deleteSpace / renameSpace)不抛异常", async () => {
     const { switchSpace, deleteSpace, renameSpace, moveWindowToSpace, unfileWindow } = await import("../spaces");
-    // 返回类型是 boolean(成功/失败),不是 throw — 这是 REQ-A296 把错误推回 data 后的副作用
-    expect(await switchSpace(0) === true || await switchSpace(0) === false).toBe(true);
-    expect(await deleteSpace("space-0") === true || await deleteSpace("space-0") === false).toBe(true);
-    expect(await renameSpace("space-0", "x") === true || await renameSpace("space-0", "x") === false).toBe(true);
-    expect(await moveWindowToSpace("settings", "space-0") === true ||
-           await moveWindowToSpace("settings", "space-0") === false).toBe(true);
-    expect(await unfileWindow("settings") === true || await unfileWindow("settings") === false).toBe(true);
-    // 关键:不会抛
+    // 没有桥的环境里,五个包装器都必须**优雅降级**而不是 reject(REQ-A296)
     let threw = false;
     try {
+      await switchSpace(0);
+      await deleteSpace("space-0");
+      await renameSpace("space-0", "x");
+      await moveWindowToSpace("settings", "space-0");
+      await unfileWindow("settings");
       await switchSpace(99);
     } catch {
       threw = true;
     }
     expect(threw).toBe(false);
+  });
+});
+
+/**
+ * REQ-A513 — 一次**真的**判据。
+ *
+ * 从前这条用例断言的是 `=== true || === false` —— 恒真,所以它掩盖了一个真缺陷:
+ * `spaces_switch` 返回 `()`,wire 上就是 `null`,而桥把**失败**也表达成 `null`
+ * (`lib/backend.invoke` 把错误吞进诊断台账),于是那 5 个包装器判 `result !== null`
+ * **在成功时也答 false**:`MissionControl` 切换后从不关闭浮层,`SpacesPanel` 把成功的
+ * 操作写成一行错误。这里给桥装上真值,两种结局必须得到**不同**的答案。
+ */
+describe("Spaces API - 单位返回的命令如何判成功 (REQ-A513)", () => {
+  type Handler = (command: string, args?: Record<string, unknown>) => Promise<unknown>;
+
+  /** 装一个只实现 `invoke` 的桥 —— 与 `window.__TAURI_INTERNALS__` 的最小形状一致。 */
+  function installBridge(handler: Handler): string[] {
+    const seen: string[] = [];
+    (globalThis as { window?: unknown }).window = {
+      __TAURI_INTERNALS__: {
+        invoke: (command: string, args?: Record<string, unknown>) => {
+          seen.push(command);
+          return handler(command, args);
+        },
+      },
+    };
+    return seen;
+  }
+
+  afterEach(() => {
+    delete (globalThis as { window?: unknown }).window;
+  });
+
+  /** 一个不抛的命令返回 `null`(Tauri 把 `()` 序列化成 `null`)—— 成功也是这个值。 */
+  const unitReply: Handler = async () => null;
+
+  test("四个单位返回的 mutation 在命令**成功**时答 true（而不是恒 false）", async () => {
+    const { deleteSpace, renameSpace, moveWindowToSpace, unfileWindow } = await import("../spaces");
+    installBridge(unitReply);
+    expect(await deleteSpace("space-0")).toBe(true);
+    expect(await renameSpace("space-0", "x")).toBe(true);
+    expect(await moveWindowToSpace("settings", "space-0")).toBe(true);
+    expect(await unfileWindow("settings")).toBe(true);
+  });
+
+  test("同一个判据在命令**失败**时答 false（成功/失败真的分得开）", async () => {
+    const { deleteSpace } = await import("../spaces");
+    installBridge(async () => {
+      throw new Error("amos.spaces.delete_last");
+    });
+    expect(await deleteSpace("space-0")).toBe(false);
+  });
+
+  test("switchSpace 把报告原样带回（hide_failed / show_failed 不再只进日志）", async () => {
+    const { switchSpace } = await import("../spaces");
+    const report = {
+      index: 1,
+      hide_failed: [{ label: "notes", reason: "window 'notes' is not registered" }],
+      show_failed: [],
+    };
+    const seen = installBridge(async () => report);
+    expect(await switchSpace(1)).toEqual(report);
+    expect(seen).toEqual(["spaces_switch"]);
+  });
+
+  test("switchSpace 被拒绝时是 null（不是\"空报告\"，两者必须分得开）", async () => {
+    const { switchSpace } = await import("../spaces");
+    installBridge(async () => {
+      throw new Error("amos.spaces.index_out_of_bounds");
+    });
+    expect(await switchSpace(99)).toBeNull();
+  });
+});
+
+/**
+ * F-SH-577 — the **one** rule that turns a typed `amos.spaces.*` code into the sentence a user
+ * reads.
+ *
+ * 这条映射从前只住在 `SpacesPanel.svelte` 里，于是 Mission Control 对**同一个** `spaces_switch`
+ * 拒绝什么都不说。搬到这里之后，它成了两个面共用的一枚措辞 —— 所以它自己要被钉住：每条已知
+ * code 走哪一句、未知 code 落回宿主自己的话，以及"台账里没有失败记录"时的那一支。
+ *
+ * 用真实的桥（`window.__TAURI_INTERNALS__.invoke`）驱动，因为 `spacesFailure` 读的是 `invoke`
+ * 写进台账的**最近一次**读数，而不是任何入参。
+ */
+describe("spacesFailure - 同一个拒绝只能有一份说法 (F-SH-577)", () => {
+  type Handler = (command: string, args?: Record<string, unknown>) => Promise<unknown>;
+
+  /** 装一个只实现 `invoke` 的桥；抛出的值就是 Rust 侧 `AmosError` 序列化后的样子。 */
+  function installBridge(handler: Handler): void {
+    (globalThis as { window?: unknown }).window = {
+      __TAURI_INTERNALS__: {
+        invoke: (command: string, args?: Record<string, unknown>) => handler(command, args),
+      },
+    };
+  }
+
+  afterEach(() => {
+    delete (globalThis as { window?: unknown }).window;
+  });
+
+  /** 跑一次真的 `spaces_switch`，让它把这次拒绝写进按命令名保留的台账。 */
+  async function refuseWith(detail: unknown): Promise<void> {
+    installBridge(async () => {
+      throw detail;
+    });
+    const { switchSpace } = await import("../spaces");
+    expect(await switchSpace(99)).toBeNull();
+  }
+
+  test("已知 code 映射到它自己那一句", async () => {
+    const cases: Array<[string, string]> = [
+      ["amos.spaces.lock_failed", "spaces.errorLockFailed"],
+      ["amos.spaces.serialization_failed", "spaces.errorSerialization"],
+      ["amos.spaces.not_found", "spaces.errorNotFound"],
+      ["amos.spaces.index_out_of_bounds", "spaces.errorOutOfBounds"],
+      ["amos.spaces.delete_last", "spaces.errorDeleteLast"],
+    ];
+    for (const [code, key] of cases) {
+      await refuseWith({ code, message: "宿主的话" });
+      // 有声明的 code ⇒ 用我们自己的措辞，宿主那句话不参与（否则两种说法会打架）。
+      expect(spacesFailure("spaces_switch")).toEqual({ key });
+    }
+  });
+
+  test("未知 code 落回宿主自己写下的那句话（没有已知 code 可映射）", async () => {
+    await refuseWith({ code: "amos.spaces.something_new", message: "宿主的话" });
+    expect(spacesFailure("spaces_switch")).toEqual({
+      key: "spaces.errorUnknown",
+      hostMessage: "宿主的话",
+    });
+  });
+
+  test("错误里连 code 都没有时，也给宿主那句话 —— 但 key 仍是未知", async () => {
+    await refuseWith({ message: "只有一句话" });
+    expect(spacesFailure("spaces_switch")).toEqual({
+      key: "spaces.errorUnknown",
+      hostMessage: "只有一句话",
+    });
+  });
+
+  test("台账里没有这次命令的失败记录 ⇒ 没有任何话可说（调用点的 null 判据才是权威）", () => {
+    installBridge(async () => null);
+    // 台账是**按命令名**保留最近一次读数、且跨用例存活（模块级 Map），所以这里用一个本进程
+    // 从没调用过的名字，测的才是"没有记录"那一支（`bridgeDiag` 的 `{ ok: true }` 默认）。
+    expect(spacesFailure("spaces_never_called")).toEqual({ key: "spaces.errorUnknown" });
+  });
+
+  test("读的是**指定的那条**命令，不是最近一次任何调用", async () => {
+    await refuseWith({ code: "amos.spaces.index_out_of_bounds" });
+    expect(spacesFailure("spaces_switch")).toEqual({ key: "spaces.errorOutOfBounds" });
+    // 另一个命令名没有记录 ⇒ 不会被上一条的读数串到。
+    expect(spacesFailure("spaces_list")).toEqual({ key: "spaces.errorUnknown" });
   });
 });
 
@@ -170,6 +319,10 @@ describe("fileableWindows - 可归档的窗口", () => {
   const win = (label: string, kind: string, external = false) => ({
     id: 1,
     label,
+    // REQ-A473: the identity the host reports (`""`/0 = the window shows no app). These
+    // cases are about `kind`, so the app is derived the way `normalizeWindows` does.
+    app: external ? "" : label,
+    instance: external ? 0 : 1,
     kind,
     state: "Shown",
     focused: false,

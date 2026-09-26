@@ -1,7 +1,7 @@
 //! `amos-vector-db` — the AmOS **offline local vector-retrieval core**.
 //!
 //! This is the index / retrieve half of the offline-RAG story (functional gap
-//! #7, `docs/FUNCTIONAL_GAP_ANALYSIS.md`): once `amos-pdf-parser` has turned a
+//! #7, `FUNCTIONAL_GAP_ANALYSIS.md`): once `amos-pdf-parser` has turned a
 //! PDF (or a Markdown note body) into [`crate::model`]-independent *chunks*, and
 //! an embedder (a seam, e.g. an Ollama `/api/embeddings` model served locally
 //! by the `amos-ai` daemon) has turned each chunk into a vector, this crate

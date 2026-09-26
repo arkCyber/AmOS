@@ -186,6 +186,11 @@ pub const fn npu_percent(mode: SensorMode) -> u16 {
 ///
 /// Never panics: a `0` hardware max (a degenerate / misconfigured cluster) short
 /// circuits before the `[1, max]` clamp, which is only safe for `max >= 1`.
+///
+/// The `0`-max short circuit returns `0` because there is no ceiling to compute —
+/// it is *not* a request to cap the domain to zero. A caller must therefore treat
+/// the result for a zero max as "no ceiling" (see [`plan`]), never wrap it back up
+/// as a `Some(0)` ceiling.
 pub fn cap_khz(max_khz: u32, percent: u16) -> u32 {
     if max_khz == 0 || percent >= 100 {
         return max_khz;
@@ -203,12 +208,18 @@ pub fn cap_khz(max_khz: u32, percent: u16) -> u32 {
 /// plan that lifts a previous PowerSave cap genuinely raises the ceiling again.
 /// The NPU is capped only when the plan's mode caps it and a hardware max was
 /// supplied.
+///
+/// A cluster / NPU reporting a **zero** hardware max is left uncapped (`None`)
+/// rather than capped to `0`: a zero max means "unknown / misconfigured", and a
+/// `0`-kHz ceiling would *halt* the domain — the most aggressive action derived
+/// from the least data (see [`cap_khz`]). Such a domain is one we cannot manage,
+/// not one we should stop. (REQ-A522 / FMEA F-SH-059.)
 pub fn plan(mode: SensorMode, clusters: &[Cluster], npu_max_khz: Option<u32>) -> FreqPlan {
     let cpu_caps = clusters
         .iter()
         .map(|c| {
             let percent = cpu_percent(c.kind, mode);
-            let max_khz = (percent < 100).then(|| cap_khz(c.max_khz, percent));
+            let max_khz = (percent < 100 && c.max_khz > 0).then(|| cap_khz(c.max_khz, percent));
             FreqCap {
                 cluster: c.id,
                 max_khz,
@@ -217,7 +228,7 @@ pub fn plan(mode: SensorMode, clusters: &[Cluster], npu_max_khz: Option<u32>) ->
         .collect();
     let npu_cap_khz = npu_max_khz.and_then(|hw| {
         let percent = npu_percent(mode);
-        (percent < 100).then(|| cap_khz(hw, percent))
+        (percent < 100 && hw > 0).then(|| cap_khz(hw, percent))
     });
     FreqPlan {
         cpu_caps,
@@ -508,7 +519,8 @@ mod tests {
         assert_eq!(cap_khz(0, 100), 0);
         assert_eq!(cap_khz(0, 150), 0);
 
-        // ...and planning over a zero-max cluster stays total (no panic).
+        // ...and planning over a zero-max cluster stays total (no panic), leaving
+        // the unmanageable domain *uncapped* rather than capping it to 0 kHz.
         let zero = vec![
             Cluster::new(0, ClusterKind::Little, 1_800_000),
             Cluster::new(1, ClusterKind::Big, 0), // degenerate
@@ -516,8 +528,32 @@ mod tests {
         let p = plan(SensorMode::PowerSave, &zero, Some(1_500_000));
         assert_eq!(p.cpu_caps.len(), 2);
         assert_eq!(p.cpu_caps[0].max_khz, Some(1_440_000)); // little 80% of 1.8 GHz
-        assert_eq!(p.cpu_caps[1].max_khz, Some(0)); // big has no valid max
+        assert_eq!(p.cpu_caps[1].max_khz, None); // zero max -> uncapped, never Some(0)
         assert_eq!(p.npu_cap_khz, Some(750_000));
+    }
+
+    #[test]
+    fn zero_max_domain_is_uncapped_never_a_zero_khz_ceiling() {
+        // A cluster / NPU whose hardware max reads 0 means "unknown / misconfigured",
+        // not "stop". Wrapping that into `Some(0)` would make the applier write a
+        // 0-kHz ceiling — halting the domain — i.e. the most aggressive action from
+        // the least data. It must plan as uncapped (`None`) so the applier leaves the
+        // hardware governor alone instead.
+        let zero = vec![Cluster::new(1, ClusterKind::Big, 0)];
+        for mode in SensorMode::ALL {
+            let p = plan(mode, &zero, Some(0));
+            assert_eq!(
+                p.cpu_caps[0].max_khz, None,
+                "{mode:?}: a 0 hw max must not become a 0-kHz ceiling"
+            );
+            assert_eq!(
+                p.npu_cap_khz, None,
+                "{mode:?}: a 0 NPU hw max must not become a 0-kHz ceiling"
+            );
+            // Belt and braces: nothing in the plan may ever request a 0 ceiling.
+            assert!(p.cpu_caps.iter().all(|c| c.max_khz != Some(0)));
+            assert_ne!(p.npu_cap_khz, Some(0));
+        }
     }
 
     #[test]

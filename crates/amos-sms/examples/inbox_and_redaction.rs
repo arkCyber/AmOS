@@ -3,6 +3,8 @@
 //! Reads the seeded mock (threads per folder, counts, one conversation), then shows the two
 //! rules that protect a user: a message too long for the protocol is **refused** rather than
 //! silently truncated, and a bank sender's balances are masked before they reach a UI surface.
+//! It ends on the send verdict — the mock answers `Unconfirmed` (no radio) and stores nothing,
+//! both asserted so this example cannot claim more than the mock does.
 //!
 //! Usage:
 //! ```text
@@ -11,7 +13,7 @@
 
 use amos_sms::redact::{is_bank_sender, redact_balances, redact_for};
 use amos_sms::validate::{segment_count, validate_text};
-use amos_sms::{MockSms, SmsFolder, SmsProvider};
+use amos_sms::{MockSms, SmsFolder, SmsProvider, SmsSendOutcome};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let provider = MockSms::seeded();
@@ -69,11 +71,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         redact_for("Ada", "balance is 12,345.67 CNY")
     );
 
-    // Sending on the mock is recorded, never a fake delivery claim.
-    provider.send("13800138000", "on my way")?;
-    println!(
-        "after send, sent threads: {}",
-        provider.snapshot(SmsFolder::Sent)?.len()
+    // Sending on the mock: a *verdict*, and no store. The mock has no radio, so
+    // it answers `Unconfirmed` — never `Sent` (see `SmsSendOutcome`). It also
+    // records nothing: it is a **fixed fixture**, so the Sent folder is the same
+    // before and after. Both halves are asserted, because the sentence this line
+    // replaced ("sending on the mock is recorded, never a fake delivery claim")
+    // was half false — nothing is recorded — and a comment is not a check.
+    let sent_before = provider.snapshot(SmsFolder::Sent)?.len();
+    let outcome = provider.send("13800138000", "on my way")?;
+    let sent_after = provider.snapshot(SmsFolder::Sent)?.len();
+    println!("send -> {outcome:?}");
+    println!("sent threads: {sent_before} before, {sent_after} after (the mock stores nothing)");
+    assert_eq!(
+        outcome,
+        SmsSendOutcome::Unconfirmed("mock provider: no radio to confirm the send".into()),
+        "the mock must never claim the radio took the message"
+    );
+    assert_eq!(
+        sent_before, sent_after,
+        "MockSms is a fixed fixture: `send` validates and answers, it does not store"
     );
     Ok(())
 }

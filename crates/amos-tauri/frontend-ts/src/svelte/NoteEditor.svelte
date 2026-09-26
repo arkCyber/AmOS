@@ -9,7 +9,9 @@
   // failed save rather than silently claimed as "saved".
   import { onDestroy } from "svelte";
   import type { Note } from "../lib/notes";
-  import { NOTES_KEY, editNote, fmtInline } from "../lib/notes";
+  import { NOTES_KEY, editNote, fmtInline, normalizeNotes } from "../lib/notes";
+  import { noteHasInk, type Ink, type InkTool } from "../lib/ink";
+  import InkCanvas from "./InkCanvas.svelte";
   import { readStoreValue, writeStoreValueChecked } from "../lib/amosStore";
   import {
     clockLabel,
@@ -26,14 +28,26 @@
   } from "../lib/noteEditing";
   import { t } from "./locale.svelte";
 
-  let { note, onClose }: { note: Note; onClose: () => void } = $props();
+  let {
+    note,
+    onClose,
+    palmRejection = true,
+  }: { note: Note; onClose: () => void; palmRejection?: boolean } = $props();
   // Read the (immutable-for-this-editor) identity once through a closure so svelte
   // treats it as an intentional initial capture, not a stray local reference.
-  const capture = () => ({ id: note.id, text: note.text, ts: note.ts });
+  const capture = () => ({ id: note.id, text: note.text, ts: note.ts, ink: note.ink });
   const initial = capture();
 
   let editVal = $state(initial.text);
   let previewOn = $state(false);
+  // The drawing surface is an **alternating view** of the same note, not an overlay: ink
+  // anchored to a scrolling text body would need character-offset anchoring, which is a
+  // much larger data model (docs/notes-ink.md §boundaries).
+  let drawOn = $state(false);
+  let tool = $state<InkTool>("pen");
+  // `undefined` means "leave the ink alone" — that is what keeps a pure-text edit from
+  // disturbing a drawing it never touched (see `editNote`).
+  let inkVal = $state<Ink | undefined>(initial.ink);
   let lastSaved = $state(initial.ts);
   let saveErr = $state("");
   // The dirty/saving/saved/error machine lives in the tested `lib/autoSave`
@@ -44,7 +58,7 @@
   let el = $state<HTMLTextAreaElement | null>(null);
 
   const commit = () => {
-    const cur = readStoreValue<Note[]>(NOTES_KEY, []);
+    const cur = normalizeNotes(readStoreValue<unknown>(NOTES_KEY, []));
     // The note may have been archived/removed (e.g. in another window). Never
     // silently claim a save we didn't make — surface it honestly.
     if (!cur.some((n) => n.id === initial.id)) {
@@ -53,7 +67,7 @@
       return;
     }
     const now = Date.now();
-    const next = editNote(cur, initial.id, editVal, now);
+    const next = editNote(cur, initial.id, editVal, now, inkVal);
     // The write is **verified**: reporting "保存于 HH:MM:SS" for a draft the store
     // rejected would claim a save that did not happen (the edits would be gone on
     // leaving). A rejected write is surfaced as a failed save instead.
@@ -77,6 +91,12 @@
     deb.schedule();
   };
   const onInput = () => {
+    markEdit();
+  };
+  /** A committed stroke (or eraser pass) — the canvas only fires this on commit, so the
+   *  600 ms debounce stays as cheap for a drawing as it is for a keystroke. */
+  const onInkChange = (next: Ink) => {
+    inkVal = next;
     markEdit();
   };
   const back = () => {
@@ -150,15 +170,30 @@
     </span>
   </div>
 
-  <textarea
-    bind:this={el}
-    bind:value={editVal}
-    oninput={onInput}
-    onkeydown={onKey}
-    data-testid="note-editor-textarea" aria-label={t("note.editorPlaceholder")}
-    placeholder={t("note.editorPlaceholder")}
-    class="w-full flex-1 resize-none bg-transparent p-3 text-sm leading-relaxed outline-none"
-  ></textarea>
+  {#if drawOn}
+    <div class="min-h-0 flex-1">
+      <InkCanvas ink={inkVal} {palmRejection} {tool} onChange={onInkChange} />
+    </div>
+  {:else}
+    <textarea
+      bind:this={el}
+      bind:value={editVal}
+      oninput={onInput}
+      onkeydown={onKey}
+      data-testid="note-editor-textarea" aria-label={t("note.editorPlaceholder")}
+      placeholder={t("note.editorPlaceholder")}
+      class="w-full flex-1 resize-none bg-transparent p-3 text-sm leading-relaxed outline-none"
+    ></textarea>
+  {/if}
+
+  <!-- An ink note opened in text mode would otherwise be an empty textarea with no
+       explanation of where the writing went. -->
+  {#if !drawOn && noteHasInk({ ink: inkVal })}
+    <div
+      data-testid="note-editor-ink-badge"
+      class="border-t border-black/5 px-3 py-1 text-xs opacity-60 dark:border-white/10"
+    >✎ {t("note.inkBadge")}</div>
+  {/if}
 
   <div class="flex items-center gap-1.5 border-t border-black/5 px-3 py-2 text-xs dark:border-white/10">
     <button
@@ -180,6 +215,22 @@
       title={t("note.editorPreviewHint")}
       class={"rounded-full px-2.5 py-1 " + (previewOn ? "bg-accent text-white" : "bg-black/5 dark:bg-white/10")}
     >{t("note.editorPreview")}</button>
+    <button
+      onclick={() => (drawOn = !drawOn)}
+      aria-pressed={drawOn}
+      data-testid="note-editor-draw"
+      title={t("note.editorDrawHint")}
+      class={"rounded-full px-2.5 py-1 " + (drawOn ? "bg-accent text-white" : "bg-black/5 dark:bg-white/10")}
+    >✎ {t("note.editorDraw")}</button>
+    {#if drawOn}
+      <button
+        onclick={() => (tool = tool === "eraser" ? "pen" : "eraser")}
+        aria-pressed={tool === "eraser"}
+        data-testid="note-editor-eraser"
+        title={t("note.editorEraserHint")}
+        class={"rounded-full px-2.5 py-1 " + (tool === "eraser" ? "bg-accent text-white" : "bg-black/5 dark:bg-white/10")}
+      >{t("note.editorEraser")}</button>
+    {/if}
   </div>
 
   {#if previewOn && editVal.trim()}

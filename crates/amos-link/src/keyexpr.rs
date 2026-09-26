@@ -186,7 +186,7 @@ impl Topic {
     /// Both sides are walked into **fixed stack arrays**, not `Vec`s: this is the
     /// *publish* path — once per matching subscription per frame, under the broker's
     /// registry lock — so "the matcher does not allocate" has to be true of the call
-    /// site too, not just of [`match_segments`]. (It used to `collect()` two vectors
+    /// site too, not just of `match_segments`. (It used to `collect()` two vectors
     /// per call: at 60 Hz with ten subscribers that is 1 200 heap allocations a second
     /// for a comparison of at most 32 short strings.)
     pub fn matches(&self, pattern: &Topic) -> bool {
@@ -319,6 +319,34 @@ impl AsRef<str> for Topic {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The **machine-independent** way to assert "this did not take long" (REQ-A854).
+    ///
+    /// `Instant::elapsed()` is the work *plus* whatever else the OS scheduled on this core, so a
+    /// bare `assert!(start.elapsed() < bound)` decides how busy the box is, not how the code
+    /// behaves — measured on this repo's frontend half under 40 spinners on 18 cores: 4 of 12
+    /// single-shot samples crossed a 50 ms bound (max 201.49 ms) while the minimum over K=5
+    /// attempts of the *same* work crossed it 0 times (max 40.90 ms). Contention only ever
+    /// **adds** time to an attempt and can never remove it, so the minimum approaches the cost of
+    /// the code, and the exponential blow-up this test guards against raises every attempt, and
+    /// the minimum with them. `min ≤ any single sample`, so binding an assertion through this can
+    /// only remove a false red; it cannot introduce one.
+    ///
+    /// The honest limit: this buys determinism, not sensitivity — the bound stays an absolute
+    /// number on one machine, and a regression below the noise floor is still invisible.
+    fn fastest_of<F: FnMut()>(attempts: usize, mut f: F) -> std::time::Duration {
+        let mut best: Option<std::time::Duration> = None;
+        for _ in 0..attempts.max(1) {
+            let start = std::time::Instant::now();
+            f();
+            let took = start.elapsed();
+            best = Some(match best {
+                Some(b) if b <= took => b,
+                _ => took,
+            });
+        }
+        best.expect("at least one attempt")
+    }
 
     #[test]
     fn concrete_topics_are_validated() {
@@ -520,26 +548,29 @@ mod tests {
         let pattern = Topic::pattern(format!("amos/{}/x", vec![WILDCARD_MANY; 15].join("/")))
             .expect("pattern");
 
-        let started = std::time::Instant::now();
-        assert!(
-            topic.matches(&pattern),
-            "15 `**` must be able to cover the middle segments"
-        );
-        let hit = started.elapsed();
+        // The claim is "does not blow up", so it is the *fastest* of K attempts that has to hold
+        // the bound: a backtracker hangs every attempt, while a loaded machine can slow one
+        // (REQ-A854; see `fastest_of`).
+        let hit = fastest_of(5, || {
+            assert!(
+                topic.matches(&pattern),
+                "15 `**` must be able to cover the middle segments"
+            );
+        });
         assert!(
             hit < std::time::Duration::from_secs(1),
-            "a hit must take bounded work, took {hit:?}"
+            "a hit must take bounded work, took {hit:?} (fastest of 5)"
         );
 
         // The negative case is the expensive one for a backtracker (it explores every
         // combination before giving up) — it must be just as quick.
         let miss = Topic::new(format!("amos/{}", vec!["y"; 31].join("/"))).expect("topic");
-        let started = std::time::Instant::now();
-        assert!(!miss.matches(&pattern), "the last segment is not `x`");
-        let miss_time = started.elapsed();
+        let miss_time = fastest_of(5, || {
+            assert!(!miss.matches(&pattern), "the last segment is not `x`");
+        });
         assert!(
             miss_time < std::time::Duration::from_secs(1),
-            "a miss must take bounded work, took {miss_time:?}"
+            "a miss must take bounded work, took {miss_time:?} (fastest of 5)"
         );
     }
 

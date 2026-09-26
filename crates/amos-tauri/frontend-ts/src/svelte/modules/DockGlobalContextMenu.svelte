@@ -18,6 +18,7 @@
    */
   import { t } from "../locale.svelte";
   import { installMenuKeyboard } from "../../lib/menuKeys";
+  import { placeMenuAt } from "../../lib/menuPlacement";
   import {
     CHROME_MENU_ITEM,
     CHROME_MENU_PANEL,
@@ -59,6 +60,13 @@
     if (!menuEl) return;
     return installMenuKeyboard(menuEl, { onClose: () => onclose?.() });
   });
+
+  /**
+   * The placement rule (REQ-A481) — see `lib/menuPlacement`'s header for the measured defect this
+   * closes. Same shape as `DockContextMenu`'s: the Dock is at the bottom of the window, so a
+   * pointer-anchored panel drawn straight down gets clipped by the window's own edge.
+   */
+  let placed = $derived.by(() => (menuEl ? placeMenuAt(menuEl, x, y) : { left: x, top: y, flipped: false }));
 
   function handlePositionChange(position: DockPosition) {
     onclose?.();
@@ -107,8 +115,8 @@
   bind:this={menuEl}
   class="fixed z-[200] {CHROME_MENU_PANEL}"
   style="
-    left:{x}px;
-    top:{y}px;
+    left:{placed.left}px;
+    top:{placed.top}px;
     {CHROME_MENU_PANEL_STYLE}
   "
   role="menu"

@@ -17,8 +17,15 @@ import PrivacyPage from "../src/svelte/settings/PrivacyPage.svelte";
 import TelemetrySpyPage from "../src/svelte/settings/TelemetrySpyPage.svelte";
 import { PERMISSIONS_KEY } from "../src/lib/permissions";
 import { readStoreValue } from "../src/lib/amosStore";
+import { spyWatch, startTelemetrySpyWatcher } from "../src/lib/telemetrySpy";
+import { zh } from "../src/i18n/locales/zh";
 
-beforeEach(() => window.localStorage.clear());
+beforeEach(() => {
+  window.localStorage.clear();
+  // `spyWatch` is a module-global seam: without this reset one case's answer leaks into
+  // every later one and the suite stops measuring the page at all.
+  spyWatch.set(null);
+});
 afterEach(() => {
   cleanup();
   delete (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
@@ -31,14 +38,16 @@ const settle = async () => {
   await tick();
 };
 
-const installBridge = (handler: (cmd: string) => unknown) => {
+const installBridge = (handler: (cmd: string) => unknown, listen: "ok" | "refused" = "ok") => {
   const calls: string[] = [];
   (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {
     invoke: async (cmd: string) => {
       calls.push(cmd);
       return handler(cmd);
     },
-    listen: async () => () => {},
+    // `"refused"` is the host rejecting the event registration — `backend.listenEvent`
+    // reports it as `listen-failed`, which is NOT the same fact as "no host".
+    listen: async () => (listen === "ok" ? () => {} : null),
   };
   return calls;
 };
@@ -77,6 +86,20 @@ describe("PrivacyPage (permission ledger + system media access)", () => {
     const holders = Object.entries(left).filter(([, caps]) => caps.includes("camera"));
     expect(holders).toHaveLength(1);
     expect(host.container.textContent ?? "").toContain("已授权: 1");
+  });
+
+  test("a default-on app shows its localized name, never its raw id", async () => {
+    // `vmemos` holds `microphone` by OS default (`osCapabilities.DEFAULT_CAPABILITIES`),
+    // so it is exactly the grant this page shows on a fresh boot. The page used to carry
+    // its own id→title table that lacked `vmemos`, so the chip read "vmemos" — the drift
+    // `PermissionsApp` was already fixed for by sourcing names from `lib/appMeta`.
+    window.localStorage.setItem(PERMISSIONS_KEY, JSON.stringify({ vmemos: ["microphone"] }));
+    const host = render(PrivacyPage);
+    await settle();
+    const text = host.container.textContent ?? "";
+    expect(text).toContain("麦克风"); // capability group renders
+    expect(text).toContain("语音备忘录"); // the app's own name (lib/appMeta)
+    expect(text).not.toContain("vmemos"); // not the raw id
   });
 
   test("an answered 'nothing granted' is not the same as 'could not read'", async () => {
@@ -156,15 +179,36 @@ describe("TelemetrySpyPage (informational, read-only)", () => {
     expect(host.container.querySelectorAll("button")).toHaveLength(0);
   });
 
-  test("a bridged host reports 'watching' but never claims capture is running", async () => {
+  test("an ATTACHED listener reports 'watching' but never claims capture is running", async () => {
     installBridge(() => null);
+    // The page reports the *subscription's* verdict, so the case must establish one —
+    // this is the shell's own `startTelemetrySpyWatcher` call, which in a real launch has
+    // long since run by the time the user opens this sub page.
+    expect(await startTelemetrySpyWatcher(() => {})).not.toBeNull();
     const host = render(TelemetrySpyPage);
     await settle();
     const text = host.container.textContent ?? "";
-    expect(text).toContain("已接入外发监听");
+    expect(text).toContain(zh["spy.statusWatching"]);
     // "Watching" is about the listener, not about captured traffic — the page must not
     // imply packets are being collected (the capture producer is a separate bring-up).
     expect(text).not.toContain("已捕获");
+    expect(text).not.toContain(zh["spy.statusListenRefused"]);
+  });
+
+  test("a REFUSED listen is not drawn as 'watching' (REQ-A1553)", async () => {
+    // `bridged()` is TRUE here — the Tauri internals object exists — and the pre-fix line
+    // read exactly that, so it drew 「审计中 · 已接入外发监听」 for an audit whose event
+    // registration the host had rejected. Nothing is listening and no hit can ever arrive;
+    // the shell's own REQ-A838 comment calls `bridgeDiag(SPY_HIT_EVENT)` the only place
+    // that tells "the audit is empty" from "the audit is not running", and this page is
+    // the surface that exists to report it.
+    installBridge(() => null, "refused");
+    expect(await startTelemetrySpyWatcher(() => {})).toBeNull();
+    const host = render(TelemetrySpyPage);
+    await settle();
+    const text = host.container.textContent ?? "";
+    expect(text).toContain(zh["spy.statusListenRefused"]);
+    expect(text).not.toContain(zh["spy.statusWatching"]);
   });
 });
 

@@ -252,6 +252,19 @@ export function shouldShowMissionControl(openWindowCount: number): boolean {
 }
 
 /**
+ * 是否应渲染 App Exposé（**焦点应用**的窗口数 ≥ 2，REQ-A476）。
+ *
+ * The count is the *application's* windows, not all windows: App Exposé tiles one app
+ * (`⌃↓` on macOS), while Mission Control tiles every window (`⌃↑`/F3). One window ⇒ nothing
+ * to choose between, so macOS shows nothing at all — and so does this (the shell then
+ * reports *why* the chord did nothing rather than opening an empty panel; see
+ * `desktopSystemKeys.appExposeRefusal`).
+ */
+export function shouldShowAppExpose(appWindowCount: number): boolean {
+  return Number.isFinite(appWindowCount) && appWindowCount >= 2;
+}
+
+/**
  * 计算鼠标在 Dock 中的"放大镜"效果 scale 因子。
  *
  * macOS 使用抛物线衰减（二次函数），不是线性插值。影响范围约 5 个图标宽度。

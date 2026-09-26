@@ -17,6 +17,14 @@
   import { t } from "./locale.svelte";
 
   const REFRESH_MS = 2500;
+  // While there is no data the card is hidden (`{#if hasAny}`), and its only retry button
+  // is rendered *inside* that branch — so if this component simply stopped polling here,
+  // the state that hides the panel would also switch off the one thing that could ever
+  // un-hide it, and a daemon that came up later would never be noticed (REQ-A1356). Hence
+  // the same two-cadence rule `MonitorApp` already states for its own read
+  // (`online ? REFRESH_MS : RECONNECT_MS`): probe more cheaply while the daemon is absent,
+  // but keep probing. Keep in step with `MonitorApp.svelte::RECONNECT_MS`.
+  const RECONNECT_MS = 5000;
   const GROUP =
     "overflow-hidden rounded-[11px] bg-white/70 ring-1 ring-black/5 dark:bg-white/[0.07] dark:ring-white/10";
   const ROW = "flex items-center justify-between gap-3 px-4 py-3";
@@ -67,8 +75,11 @@
     refresh();
   });
   $effect(() => {
-    if (!hasAny) return;
-    const id = window.setInterval(refresh, REFRESH_MS);
+    // Kept armed in **both** states, only the period changes (see `RECONNECT_MS`). The
+    // hidden panel therefore stays a reconnect probe rather than a snapshot with no
+    // retractor, and it re-arms at the live cadence the moment `hasAny` flips.
+    const ms = hasAny ? REFRESH_MS : RECONNECT_MS;
+    const id = window.setInterval(refresh, ms);
     return () => window.clearInterval(id);
   });
 

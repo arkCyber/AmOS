@@ -1,7 +1,10 @@
 /**
  * hotspot-page.svelte.test.ts — 「个人热点」is honest and cannot lie:
  *   • an un-provisionable config (blank name / a PSK under 8 chars) must NOT let the
- *     master switch claim a running AP (the toggle is refused);
+ *     master switch claim a running AP — the row is **disabled** (not merely inert on a
+ *     click) and the problem line beneath it names the blocker, the same shape airplane
+ *     mode already used (REQ-A1141); turning an already-**on** AP off stays possible no
+ *     matter how broken the stored config is;
  *   • a valid config toggles the shared radio bit (`onToggle("hotspot")`);
  *   • the config persists through lib/hotspot (durable amos.hotspot), including the
  *     "Suggest" PSK and the Open-network warning;
@@ -101,8 +104,25 @@ describe("HotspotPage — the switch never claims an un-provisionable hotspot", 
     expect(byTest(host.container, "hotspot-problems")?.textContent ?? "").toContain(
       zh["settings.hotspotProblemPw"],
     );
+    // The refusal is *drawn* (REQ-A1141): a switch that looks live but silently returns is
+    // the exact shape this page exists to avoid, and airplane mode already disables it.
+    expect(switchByLabel(host, zh["settings.hotspot"])?.disabled).toBe(true);
     await fireEvent.click(switchByLabel(host, zh["settings.hotspot"]) as HTMLButtonElement);
     expect(onToggle).not.toHaveBeenCalled();
+  });
+
+  test("an on AP stays switchable off even when the stored config is un-provisionable", async () => {
+    // The boundary that makes `ready` *alone* the wrong predicate: the readiness half must
+    // not trap the user in a hotspot they can no longer turn off. `on` is the AP bit, the
+    // stored config here is the default (no PSK) — so the row must be live. (REQ-A1141)
+    const onToggle = vi.fn();
+    const host = render(HotspotPage, {
+      props: { qs: qs({ hotspot: true }), onToggle },
+    });
+    await tick();
+    expect(switchByLabel(host, zh["settings.hotspot"])?.disabled).toBe(false);
+    await fireEvent.click(switchByLabel(host, zh["settings.hotspot"]) as HTMLButtonElement);
+    expect(onToggle).toHaveBeenCalledWith("hotspot");
   });
 
   test("a valid config toggles the shared radio bit", async () => {
@@ -115,6 +135,24 @@ describe("HotspotPage — the switch never claims an un-provisionable hotspot", 
     expect(onToggle).toHaveBeenCalledWith("hotspot");
   });
 
+  test("a passphrase with surrounding spaces is judged by the key, not a trimmed copy", async () => {
+    // A WPA2/WPA3 PSK is 8–63 characters and a space is a character, so a key that
+    // begins or ends with one is legal. The page already says so twice over:
+    // `setPassword` keeps the string exactly as typed ("not trimmed — spaces are
+    // legal") and the *maximum* bound is measured on that same string. The *minimum*
+    // was measured on `password.trim()`, so a legal 8-character key ending in a space
+    // was read as 7 and the switch was disabled with 「密码过短」 — the AP would have
+    // served it. The key the user is handing the AP is what must be measured (REQ-A1261).
+    writeStoreValue(HOTSPOT_KEY, { ...VALID, password: "abcdefg " });
+    const onToggle = vi.fn();
+    const host = render(HotspotPage, { props: { qs: qs(), onToggle } });
+    await tick();
+    expect(byTest(host.container, "hotspot-problems")).toBeNull();
+    expect(switchByLabel(host, zh["settings.hotspot"])?.disabled).toBe(false);
+    await fireEvent.click(switchByLabel(host, zh["settings.hotspot"]) as HTMLButtonElement);
+    expect(onToggle).toHaveBeenCalledWith("hotspot");
+  });
+
   test("a blank name is reported as a problem too", async () => {
     writeStoreValue(HOTSPOT_KEY, { ...VALID, ssid: "" });
     const onToggle = vi.fn();
@@ -123,6 +161,7 @@ describe("HotspotPage — the switch never claims an un-provisionable hotspot", 
     expect(byTest(host.container, "hotspot-problems")?.textContent ?? "").toContain(
       zh["settings.hotspotProblemSsid"],
     );
+    expect(switchByLabel(host, zh["settings.hotspot"])?.disabled).toBe(true);
     await fireEvent.click(switchByLabel(host, zh["settings.hotspot"]) as HTMLButtonElement);
     expect(onToggle).not.toHaveBeenCalled();
   });
@@ -151,6 +190,43 @@ describe("HotspotPage — the switch never claims an un-provisionable hotspot", 
     expect(byTest(host.container, "hotspot-refused")?.textContent).toContain(
       zh["radio.refused.device"],
     );
+    // No surface token ⇒ no button: an unexplained refusal must not offer an action
+    // the device never named.
+    expect(byTest(host.container, "hotspot-refused-open-settings")).toBeNull();
+  });
+
+  test("a refused AP attempt offers the system tethering settings (REQ-A1456)", async () => {
+    // The AP is the one switch a normal install can *attempt* and be refused (no
+    // TETHER_PRIVILEGED, no upstream, no public tethering API). The device's answer
+    // carries the surface where the user can still start it; the page must draw that
+    // route and report whether it opened — not leave the refusal a dead end.
+    const calls: string[] = [];
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string, args?: Record<string, unknown>) => {
+        calls.push(cmd === "radio_open_settings" ? `open:${String(args?.key)}` : cmd);
+        return cmd === "radio_open_settings" ? true : null;
+      },
+      listen: async () => () => {},
+    };
+    try {
+      const host = render(HotspotPage, {
+        props: {
+          qs: qs(),
+          onToggle: () => {},
+          refusal: { noteKey: "radio.refused.device", surface: "wireless_settings" },
+        },
+      });
+      await tick();
+      const btn = byTest(host.container, "hotspot-refused-open-settings") as HTMLButtonElement;
+      expect(btn).toBeTruthy();
+      await fireEvent.click(btn);
+      await tick();
+      expect(calls).toContain("open:hotspot");
+      // The open verdict is reported, never swallowed.
+      expect(byTest(host.container, "hotspot-surface-failed")).toBeNull();
+    } finally {
+      delete (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+    }
   });
 
   test("no refusal shows no refusal row", async () => {

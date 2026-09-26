@@ -4,14 +4,29 @@
   // (docs/telemetry-spy.md) and its honest boundaries. There is deliberately NO
   // toggle — the audit is always-on and read-only; this page is where a user can
   // understand what the "Outbound leak risk" notifications are about.
-  import { bridged } from "../../lib/backend";
+  import { spyWatch } from "../../lib/telemetrySpy";
   import { t } from "../locale.svelte";
   import { GROUP, ROW, LABEL, VALUE, H2, HINT } from "./kit";
 
-  // Watching = the System UI's Watch feed is bridged (listener attached); Quiet =
-  // not connected. Either way the default host build has no capture producer, so
-  // the honest boundary copy below makes clear the chain stays silent.
-  const status = $derived(bridged() ? t("spy.statusWatching") : t("spy.statusQuiet"));
+  // The status is the **subscription's own verdict**, read from the seam the shell
+  // publishes it on (`spyWatch`), not `bridged()`. `bridged()` only says the Tauri
+  // internals object exists (REQ-A1360) — and the event registration can still be
+  // refused, in which case no hit will ever arrive while the shell keeps running. The
+  // pre-fix line drew 「已接入外发监听」 whenever a host existed at all, so the one state
+  // this page exists to report — an audit that is **not** running — was the one it
+  // reported as running. Three states, so "not attached yet" and "the host refused"
+  // stop sharing a sentence that claimed neither.
+  //
+  // Note the remaining boundary, kept in the copy below: an *attached* listener is not
+  // a *producing* one — the default host build has no capture producer, so the chain
+  // is quiet, and 「审计中」 must not be read as "hits are being collected".
+  const status = $derived(
+    $spyWatch === "attached"
+      ? t("spy.statusWatching")
+      : $spyWatch === "refused"
+        ? t("spy.statusListenRefused")
+        : t("spy.statusQuiet"),
+  );
 </script>
 
 <div class="space-y-5">

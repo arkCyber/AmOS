@@ -366,8 +366,28 @@ const AVATAR_THEMES = {
   ],
 } as const;
 
+/** The theme used when nothing valid is stored. */
+export const DEFAULT_AVATAR_THEME: AvatarTheme = "animals";
+
+/**
+ * Store key for the user's chosen avatar theme.
+ *
+ * The theme is a **preference**, and preferences live in the shared store, not in
+ * module memory: `setAvatarTheme` used to assign this module's `currentTheme` and
+ * nothing else, so the picker said 「已切换到 … 主题」 and repainted every avatar for
+ * a choice that a cold start silently reset to {@link DEFAULT_AVATAR_THEME}. Every
+ * stored value is coerced through {@link normalizeAvatarTheme} so a corrupt or
+ * unknown theme falls back instead of blanking the avatar pools.
+ */
+export const AVATAR_THEME_KEY = "amos.contacts.avatarTheme";
+
+/** Coerce a stored value to a known theme; anything else falls back to the default. */
+export function normalizeAvatarTheme(value: unknown): AvatarTheme {
+  return typeof value === "string" && isAvatarTheme(value) ? value : DEFAULT_AVATAR_THEME;
+}
+
 /** Current active avatar theme (default: animals). */
-let currentTheme: AvatarTheme = "animals";
+let currentTheme: AvatarTheme = DEFAULT_AVATAR_THEME;
 
 /** Set the active avatar theme globally. */
 export function setAvatarTheme(theme: AvatarTheme): void {
@@ -430,21 +450,27 @@ export async function compressImage(
       const size = Math.min(img.width, img.height);
       const sx = (img.width - size) / 2;
       const sy = (img.height - size) / 2;
-      
+
+      // `maxWidth` is an upper bound, not a target size: a source smaller than it must
+      // keep its own edge. Drawing a 64px avatar onto a 512px canvas is not compression
+      // — it *grows* the blob, and this is how one contact's avatar came to occupy
+      // ~100KB of the `amos.contacts` store (audit PH-P2-13 / PH-P2-14).
+      const edge = Math.min(maxWidth, size);
+
       // Create canvas
       const canvas = document.createElement("canvas");
-      canvas.width = maxWidth;
-      canvas.height = maxWidth;
+      canvas.width = edge;
+      canvas.height = edge;
       const ctx = canvas.getContext("2d");
-      
+
       if (!ctx) {
         reject(new Error("Canvas context not available"));
         return;
       }
-      
+
       // Draw cropped and scaled image
-      ctx.drawImage(img, sx, sy, size, size, 0, 0, maxWidth, maxWidth);
-      
+      ctx.drawImage(img, sx, sy, size, size, 0, 0, edge, edge);
+
       // Convert to base64
       const compressed = canvas.toDataURL("image/jpeg", quality);
       resolve(compressed);

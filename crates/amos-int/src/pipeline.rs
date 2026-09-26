@@ -49,6 +49,21 @@ pub struct TtsAudio {
     pub samples: Vec<f32>,
 }
 
+/// Mono PCM sample rate every [`Pipeline::feed_audio`] chunk is specified in
+/// ("16 kHz f32" — the trait's own contract). The **audio clock** a pipeline
+/// keeps for [`AsrEvent::Final`]'s `start`/`end` is exactly the consumed sample
+/// count over this rate, so the constant lives here next to the contract rather
+/// than being re-declared by each provider.
+pub const AUDIO_SAMPLE_RATE_HZ: u32 = 16_000;
+
+/// Wall-clock audio duration of `samples` mono PCM samples at
+/// [`AUDIO_SAMPLE_RATE_HZ`]. The one conversion every pipeline's audio clock
+/// shares — so a downstream `Segment.start`/`end` means the same thing whether
+/// the final came from a local recognizer or the gRPC daemon.
+pub fn samples_to_duration(samples: usize) -> Duration {
+    Duration::from_secs_f64(samples as f64 / AUDIO_SAMPLE_RATE_HZ as f64)
+}
+
 /// Recognition events emitted by streaming ASR.
 #[derive(Clone, Debug)]
 pub enum AsrEvent {
@@ -69,9 +84,9 @@ pub trait Pipeline: Send + Sync {
     /// Static provider facts.
     fn info(&self) -> PipelineInfo;
 
-    /// Feed one chunk of mono PCM (16 kHz f32). Returns any recognition events
-    /// that completed (partials and, when the utterance ends, a final), or an
-    /// error if the provider is unreachable.
+    /// Feed one chunk of mono PCM (16 kHz f32 — [`AUDIO_SAMPLE_RATE_HZ`]). Returns
+    /// any recognition events that completed (partials and, when the utterance
+    /// ends, a final), or an error if the provider is unreachable.
     async fn feed_audio(&self, chunk: &[f32]) -> Result<Vec<AsrEvent>>;
 
     /// Optional: ask the pipeline to *flush* the current utterance — finalize any

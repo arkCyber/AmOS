@@ -30,6 +30,11 @@
  *      has none, and any future one is a real defect, not debt.
  *   4. **Hard-coded CJK copy in markup** — text nodes / translatable attributes /
  *      string literals containing Chinese (the dictionary's own language).
+ *      **Since REQ-A498 a text node is read *around* its `{…}` interpolations**
+ *      (`staticTextOf`): the two passes used to skip a node containing `{}` whole, so
+ *      `包含 {n} 个动作` — hard-coded Chinese — was invisible to this very check
+ *      (measured: 4 such nodes in 141 production `.svelte`, all now fixed; the old
+ *      predicate saw 0 of them, the new one sees 4 — see F-DEV-078).
  *   5. **Hard-coded English copy in markup** — the other half, added after audit:
  *      check 4 keys off the CJK character set, so English literals were invisible to
  *      it, and the always-on status bar had been rendering `aria-label="network
@@ -49,14 +54,19 @@
  *      control needs one. Hard gate.
  *   7. **A `t("…")` reference the dictionary cannot answer** (REQ-A183). Checks 1–3
  *      audit the *dictionary* side (parity, placeholders, dead keys); nothing audited
- *      the *reference* side. Two ways a call site lies to the user, both invisible to
+ *      the *reference* side. Three ways a call site lies to the user, all invisible to
  *      `tsc`/`svelte-check` because `t()` takes `key: string` (`./locale.svelte.ts`)
  *      and `translate()` falls back to `const base = raw ?? key`
  *      (`./i18n.ts`): a key that does not exist renders **the key itself** into the
- *      UI (`note.back`), and a call that omits a `{param}` the string needs renders
- *      **`{param}`** (`String(params[k] ?? \`{${k}}\`)`). Neither is a typo a user
- *      would report as a bug. 1 124 literal references and 125 param-carrying calls
- *      were clean when this check landed; the gate is what keeps them that way.
+ *      UI (`note.back`), a call that omits a `{param}` the string needs renders
+ *      **`{param}`** (`String(params[k] ?? \`{${k}}\`)`), and — **since REQ-A859** — a
+ *      call that passes a `{param}` the string never mentions renders **nothing at
+ *      all**: `translate()` replaces only the placeholders that *exist*, so the extra
+ *      param is dropped in silence (`{error}` against a bare 「执行失败」 hid every MDM
+ *      refusal reason — F-MDM-007). None of the three is a typo a user would report as
+ *      a bug. 1 124 literal references and 125 param-carrying calls were clean when
+ *      this check landed; 255 param-carrying calls and **0 excess** when the third
+ *      direction landed. The gate is what keeps them that way.
  *   8. **An interactive element with no usable accessible name** (REQ-A183) — the
  *      other half of check 6, and the mistake check 6's migration could make: moving
  *      a hook to `data-testid` and dropping the label from a control whose *content*
@@ -205,6 +215,16 @@ const SLUG_ID = /^[a-z0-9]+(?:[-_.][a-z0-9]+)+$/;
  * (`const CITIES = ["北京", …]`) is *not* matched — its elements are not assignments — because
  * place names, seeds and fixtures are data, not copy, and flagging them would bury the real
  * findings under a list nobody reads. Comments are skipped for the same reason.
+ *
+ * **REQ-A504 added the second shape: a returned template literal.** A whole fallback screen
+ * built as `return \`<div>应用出错…</div>\`` and rendered with `{@html …}` was invisible to
+ * both halves (check 4 reads markup only; an assignment never happened) — measured: exactly
+ * **one** production `.svelte` in the corpus, and it was real, user-visible copy in a zh+en UI.
+ * The new rule stays as narrow as the first: only a **returned** template literal is read.
+ * (An *assigned* CJK template was and is copy — the assignment rule already reads backtick
+ * literals; this round added the missing shape, it did not widen the old one.) The English half
+ * is **not** extended: the corpus measured **0** such sites, and widening a fuzzy rule with no
+ * reading behind it is how noise gets into a gate.
  */
 export function assignedCJKCopy(src) {
   const end = src.indexOf("</script>");
@@ -220,6 +240,52 @@ export function assignedCJKCopy(src) {
       if (CJK.test(literal)) out.push({ line: i + 1, literal, kind: "script" });
     }
   });
+  // REQ-A504: a **returned** template literal (may span lines, so scan the whole body).
+  for (const m of body.matchAll(/return\s+`((?:[^`\\]|\\.)*)`/g)) {
+    const literal = m[1] ?? "";
+    if (!CJK.test(literal)) continue;
+    const line = body.slice(0, m.index).split("\n").length;
+    out.push({ line, literal: literal.replace(/\s+/g, " ").trim(), kind: "script-return" });
+  }
+  return out;
+}
+
+/**
+ * The **static text** of a markup text node — the parts an interpolation does not hide.
+ *
+ * `<span>包含 {n} 个动作</span>` renders `包含 … 个动作`, so the copy is `包含` and
+ * `个动作`; the expression's own code is not copy (the same rule `templateStaticSegments`
+ * applies to a template literal's body).
+ *
+ * **Why this exists (REQ-A498, measured 2026-09-19).** Both text-node passes used
+ * `/>([^<>{}]+)</` — the `{}` in the character class made a node containing an
+ * interpolation be **skipped whole**. So copy sitting *next to* an interpolation was
+ * invisible to the very gate whose job it is: `包含 {n} 个动作` (hard-coded Chinese in a
+ * zh+en UI) passed the hard gate, and would have passed it forever — the exclusion is
+ * what made it invisible, not the absence of a rule. Measured before the fix, across
+ * 141 production `.svelte`: **4** such CJK nodes (every one real copy, all four fixed in
+ * the same round) and **6** English remainders (`mm`, `ms`, `px`, `B`, `x`, `v`) — i.e.
+ * **6/6 unit or version symbols, no copy at all**. Hence the split below: the CJK half
+ * masks and keeps its rules unchanged (any CJK left after masking is copy); the English
+ * half keeps only the **multi-word** rule for these nodes, because a *one-token*
+ * remainder beside an interpolation is a unit in this corpus, while the one-word rule
+ * exists for one-word **attributes** (`aria-label="lock"`).
+ *
+ * Braces are matched by the shared `balancedEnd` (string/template aware) rather than a
+ * regex, so `{list.map(x => ({ id: x }))}` cannot cut the node short.
+ */
+export function staticTextOf(node) {
+  let out = "";
+  let i = 0;
+  while (i < node.length) {
+    if (node[i] === "{") {
+      i = balancedEnd(node, i);
+      out += " ";
+      continue;
+    }
+    out += node[i];
+    i += 1;
+  }
   return out;
 }
 
@@ -231,7 +297,9 @@ export function hardcodedCopy(src) {
     if (t !== "" && CJK.test(t)) out.push({ literal: t, kind });
   };
   for (const m of html.matchAll(/(?:title|placeholder|alt|aria-label)="([^"]*)"/g)) push(m[1], "attr");
-  for (const m of html.matchAll(/>([^<>{}]+)</g)) push(m[1], "text");
+  for (const m of html.matchAll(/>([^<>]+)</g)) {
+    push(m[1].includes("{") ? staticTextOf(m[1]) : m[1], "text");
+  }
   // String literals anywhere in the markup (e.g. `{cond ? langLabel(x) : "源"}`).
   for (const m of html.matchAll(/"((?:[^"\\\n]|\\.)*)"/g)) push(m[1], "literal");
   return out;
@@ -263,7 +331,215 @@ export function englishCopy(src) {
     if (t !== "" && isEnglishCopy(t)) out.push({ literal: t, kind });
   };
   for (const m of html.matchAll(/(?:title|placeholder|alt|aria-label)="([^"]*)"/g)) push(m[1], "attr");
-  for (const m of html.matchAll(/>([^<>{}]+)</g)) push(m[1], "text");
+  for (const m of html.matchAll(/>([^<>]+)</g)) {
+    const node = m[1];
+    // REQ-A498: a node with an interpolation used to be skipped whole (`[^<>{}]`). It is
+    // read now, but the **one-word** rule is deliberately *not* applied here: measured,
+    // every one-token remainder beside an interpolation in this corpus is a unit or a
+    // version prefix (`mm` `ms` `px` `B` `x` `v` — 6/6), never copy. A node that is a
+    // single word *and nothing else* still goes through `push` above.
+    if (!node.includes("{")) {
+      push(node, "text");
+      continue;
+    }
+    const text = staticTextOf(node).trim();
+    if (text !== "" && MULTIWORD_EN.test(text)) out.push({ literal: text, kind: "text" });
+  }
+  return out;
+}
+
+/** The index just past the `}` matching the `{` at `open` (skips strings/templates). */
+function balancedEnd(s, open) {
+  let depth = 0;
+  for (let i = open; i < s.length; i += 1) {
+    const c = s[i];
+    if (c === '"' || c === "'") {
+      i += 1;
+      while (i < s.length && s[i] !== c) i += s[i] === "\\" ? 2 : 1;
+      continue;
+    }
+    if (c === "`") {
+      i += 1;
+      while (i < s.length && s[i] !== "`") i += s[i] === "\\" ? 2 : 1;
+      continue;
+    }
+    if (c === "{") depth += 1;
+    else if (c === "}") {
+      depth -= 1;
+      if (depth === 0) return i + 1;
+    }
+  }
+  return s.length;
+}
+
+/**
+ * The **static text** of a template literal's body — the parts outside `${…}`. An
+ * interpolation's content is code, not copy: `` `a ${t("x.y")} b` `` displays `a … b`,
+ * so only `"a "` and `" b"` are text (recursing into `${}` would report the dictionary
+ * key `x.y`).
+ */
+export function templateStaticSegments(inner) {
+  const out = [];
+  let i = 0;
+  let s = "";
+  while (i < inner.length) {
+    if (inner[i] === "\\") {
+      s += inner[i + 1] ?? "";
+      i += 2;
+      continue;
+    }
+    if (inner[i] === "$" && inner[i + 1] === "{") {
+      out.push(s);
+      s = "";
+      i = balancedEnd(inner, i + 1);
+      continue;
+    }
+    s += inner[i];
+    i += 1;
+  }
+  out.push(s);
+  return out.map((x) => x.trim()).filter((x) => x !== "");
+}
+
+/**
+ * The branches of a top-level `cond ? a : b` — the pieces a reader sees as "the values
+ * this expression can be". A body with no top-level `?` is one branch (itself).
+ */
+export function ternaryBranches(body) {
+  const out = [];
+  let depth = 0;
+  let cur = "";
+  for (let i = 0; i < body.length; i += 1) {
+    const c = body[i];
+    if (c === '"' || c === "'" || c === "`") {
+      const end = i + 1 + (c === "`" ? templateEnd(body, i) : stringEnd(body, i));
+      cur += body.slice(i, end);
+      i = end;
+      continue;
+    }
+    if ("([{".includes(c)) depth += 1;
+    else if (")]}".includes(c)) depth -= 1;
+    if (depth === 0 && (c === "?" || c === ":")) {
+      out.push(cur);
+      cur = "";
+      continue;
+    }
+    cur += c;
+  }
+  out.push(cur);
+  return out;
+}
+
+/** Index just past the string starting at `open` (which quotes). */
+function stringEnd(s, open) {
+  const q = s[open];
+  let i = open + 1;
+  while (i < s.length && s[i] !== q) i += s[i] === "\\" ? 2 : 1;
+  return i - open;
+}
+
+/** Index just past the template starting at `open` (a backtick), skipping `${…}`. */
+function templateEnd(s, open) {
+  let i = open + 1;
+  while (i < s.length && s[i] !== "`") {
+    if (s[i] === "\\") {
+      i += 2;
+      continue;
+    }
+    if (s[i] === "$" && s[i + 1] === "{") {
+      i = balancedEnd(s, i + 1);
+      continue;
+    }
+    i += 1;
+  }
+  return i - open;
+}
+
+/**
+ * The text a whole expression body would **display** — and nothing else.
+ *
+ * This is the discriminator that keeps the check honest (REQ-A461): a literal is copy
+ * only when the branch the reader sees **is** that literal. That single rule separates
+ * the two things a regex over "every string in the expression" cannot:
+ *
+ *   • copy    — `` `remove ${id}` ``, `"Do Not Disturb"`, `dnd ? "Do Not Disturb" : "alerts muted"`
+ *   • not copy — `prefs.position === "bottom" ? "✓" : "  "` (an enum comparison),
+ *                `iconSvg("x", "h-3 w-3")` (an icon name and a class list),
+ *                `{ id: "custom", labelKey: "settings.aiCustom" }` (an object literal)
+ *
+ * The first version of this function scanned *every* literal in the expression and
+ * produced **94** findings on the real tree — 93 of them enum tokens, icon names and
+ * Tailwind class lists. A false positive is worse than a miss (the same rule
+ * `rust-recursion-scan` applies to cycles), so the rule is stated as "the branch is the
+ * literal".
+ *
+ * A template is only read when it contains an interpolation: `` {`x`} `` is a string
+ * written with backticks (an identifier-shaped token in practice), not prose.
+ */
+export function wholeLiteralTexts(body) {
+  const out = [];
+  for (const raw of ternaryBranches(body)) {
+    const t = raw.trim();
+    const quoted = /^"((?:[^"\\]|\\.)*)"$/.exec(t) ?? /^'((?:[^'\\]|\\.)*)'$/.exec(t);
+    if (quoted) {
+      out.push(quoted[1].replace(/\\(.)/g, "$1"));
+      continue;
+    }
+    const tmpl = /^`([\s\S]*)`$/.exec(t);
+    if (tmpl && tmpl[1].includes("${")) {
+      for (const seg of templateStaticSegments(tmpl[1])) out.push(seg);
+    }
+  }
+  return out;
+}
+
+/**
+ * English copy that lives inside a Svelte **expression** in the markup — the half
+ * `englishCopy` cannot see, and the reason check 5 had a hole the size of a template
+ * literal.
+ *
+ * Why it exists (REQ-A461): `englishCopy` reads `aria-label="…"` / `title="…"` etc. as
+ * **double-quoted static attributes** and text nodes without braces. Two labels in this
+ * tree were written as expressions instead and were therefore invisible to it while
+ * being announced to every screen reader:
+ *
+ *   • `EditHome.svelte`  — `aria-label={\`remove ${id}\`}` (English *and* the raw id)
+ *   • `HomeDock.svelte`  — `aria-label={\`page ${i + 1} of ${gridPages.length}\`}`
+ *
+ * The rule is deliberately narrow so it cannot cry wolf: only the four translatable
+ * attributes in **expression form** and `{…}` text nodes are read, only **literal**
+ * segments are tested (an interpolation contributes nothing — `\`${a} ${b}\`` has no
+ * copy), and a literal that is the direct argument of `t(…)` is a **key**, not copy.
+ *
+ * A text node's `{…}` need not be adjacent to `>`: `{banner.app ?? "Notification"}`
+ * written as the element's own child on its own line is the same node, and the matcher
+ * used to be `/>\{/`, blind to that shape. Measured on this tree, widening it to
+ * `/>\s*\{/` adds **no** finding but the two it was hiding (REQ-A1181) — so the honest
+ * scope is "the text node", not "the text node that starts right after `>`".
+ *
+ * Out of scope, honestly: anything inside `<script>` (check 4's `scriptCopy` covers part
+ * of that), and copy assembled from variables alone (`label(id)`) — no static text exists
+ * to test.
+ */
+export function expressionCopy(src) {
+  const html = markupOf(src);
+  const out = [];
+  const push = (literal, kind) => {
+    if (literal !== "" && isEnglishCopy(literal)) out.push({ literal, kind });
+  };
+  const attrRe = /(?:title|placeholder|alt|aria-label)=\{/g;
+  for (const m of html.matchAll(attrRe)) {
+    const open = m.index + m[0].length - 1;
+    for (const text of wholeLiteralTexts(html.slice(open + 1, balancedEnd(html, open) - 1))) {
+      push(text, "attr-expr");
+    }
+  }
+  for (const m of html.matchAll(/>\s*\{/g)) {
+    const open = m.index + m[0].length - 1;
+    for (const text of wholeLiteralTexts(html.slice(open + 1, balancedEnd(html, open) - 1))) {
+      push(text, "text-expr");
+    }
+  }
   return out;
 }
 
@@ -289,7 +565,37 @@ export function slugLabel(src) {
     const value = m[2].trim();
     if (value !== "" && SLUG_ID.test(value)) out.push({ literal: value, kind: m[1] });
   }
+  // The **expression** half (REQ-A1080). The loop above reads `="…"` only, so a hook
+  // written as a template literal — `aria-label={`call-back-${n}`}` — was invisible to
+  // check 6 while a screen reader still announced it. Same blind spot REQ-A461 closed
+  // for English copy; this closes it for the hook rule. `wholeLiteralTexts` yields the
+  // static segments of the template, and `weldedSlug` recognises the one that carries
+  // the hook's trailing separator.
+  for (const m of html.matchAll(/(aria-label|title)=\{/g)) {
+    const open = m.index + m[0].length - 1;
+    const body = html.slice(open + 1, balancedEnd(html, open) - 1);
+    for (const seg of wholeLiteralTexts(body)) {
+      const lit = seg.trim();
+      if (lit === "") continue;
+      if (SLUG_ID.test(lit) || weldedSlug(lit)) out.push({ literal: lit, kind: "attr-expr" });
+    }
+  }
   return out;
+}
+
+/**
+ * Is this template-literal segment a test-hook id **welded to an interpolation**?
+ *
+ * `` `call-back-${n}` `` yields the segment `call-back-`: the separator that welds the
+ * id to `${n}` belongs to the hook, so [`SLUG_ID`] does not match it verbatim. Copy
+ * welded to an interpolation ends its segment in a **space** (`remove ${id}`,
+ * `page ${i} of ${n}`, ` · `), never a hook separator, so it does not reach here —
+ * which is what keeps this rule from crying wolf.
+ */
+export function weldedSlug(seg) {
+  const stripped = seg.replace(/^[-_.]+/, "").replace(/[-_.]+$/, "");
+  if (stripped === "" || stripped === seg) return false;
+  return SLUG_ID.test(stripped);
 }
 
 /**
@@ -326,6 +632,48 @@ export function callArgs(src, open) {
 }
 
 /**
+ * Comment-free source: line (`// …`) and block (`/* … *​/`) comments are replaced by a
+ * single space, while anything inside a string or template literal is left untouched —
+ * a `//` in `"https://x"` is data, not a comment.
+ *
+ * The param extractor below is a regex over the raw text, so a comment sitting between
+ * two properties broke it: in `` { n: v, // …\n dim: w } `` the property after the
+ * comment is preceded by the comment's last character (`.`, not `,`/`{`), so `dim` was
+ * never captured and the call read as **missing** a param it plainly passes — a false
+ * failure on correct code (a `//` comment inside `NotesApp.svelte`'s `ragStatus` call).
+ * Stripping first is the fix; `--selftest` pins both the comment case and the string
+ * case that must survive it.
+ */
+export function stripComments(src) {
+  let out = "";
+  let i = 0;
+  while (i < src.length) {
+    const c = src[i];
+    if (c === '"' || c === "'") {
+      const end = i + 1 + stringEnd(src, i);
+      out += src.slice(i, end);
+      i = end;
+    } else if (c === "`") {
+      const end = i + 1 + templateEnd(src, i);
+      out += src.slice(i, end);
+      i = end;
+    } else if (c === "/" && src[i + 1] === "/") {
+      while (i < src.length && src[i] !== "\n") i += 1;
+      out += " ";
+    } else if (c === "/" && src[i + 1] === "*") {
+      i += 2;
+      while (i < src.length && !(src[i] === "*" && src[i + 1] === "/")) i += 1;
+      i += 2;
+      out += " ";
+    } else {
+      out += c;
+      i += 1;
+    }
+  }
+  return out;
+}
+
+/**
  * Literal `t("key")` / `` t(`key`) `` references in a source, each with the params the
  * call supplies. `supplied` is the literal property-name list of a params **object
  * literal** (`{ addr }` shorthand included), `[]` when the call passes none, and
@@ -334,9 +682,10 @@ export function callArgs(src, open) {
  */
 export function keyRefs(src) {
   const out = [];
-  for (const m of src.matchAll(/\bt\(\s*(?:"((?:[^"\\]|\\.)*)"|`([^`$]*)`)/g)) {
+  const clean = stripComments(src);
+  for (const m of clean.matchAll(/\bt\(\s*(?:"((?:[^"\\]|\\.)*)"|`([^`$]*)`)/g)) {
     const key = (m[1] ?? m[2]).replace(/\\(.)/g, "$1");
-    const args = callArgs(src, src.indexOf("(", m.index));
+    const args = callArgs(clean, clean.indexOf("(", m.index));
     if (args === null) continue;
     const expr = args.length > 1 ? args[1] : null;
     let supplied = [];
@@ -354,10 +703,25 @@ export function keyRefs(src) {
 }
 
 /**
- * The two ways a call site can disagree with the dictionary: the key does not exist
- * (renders the key itself), or the value needs a `{param}` the call does not pass
- * (renders `{param}`). `dict` is the base (`zh`) dictionary — key parity makes the
- * other locale equivalent.
+ * The three ways a call site can disagree with the dictionary: the key does not exist
+ * (renders the key itself), the value needs a `{param}` the call does not pass
+ * (renders `{param}`), or the call passes a `{param}` the value never mentions
+ * (**renders nothing — the param is dropped in silence**). `dict` is the base (`zh`)
+ * dictionary — key parity makes the other locale equivalent.
+ *
+ * The third direction is REQ-A859. It is the mirror of the second, and it was a
+ * deliberate non-finding until then (the selftest asserted `an extra param is not a
+ * finding`): `translate()` is `base.replace(/\{(\w+)\}/g, (_, k) => String(params[k] ??
+ * `{${k}}`))`, which substitutes **only the placeholders that exist in the string**. So
+ * a param the template never mentions is not rendered as a stray `{param}` — it is
+ * silently discarded, and the call site looks correct to every reader and to `tsc`.
+ * That is how F-MDM-007 shipped: `t("shortcuts.executionFailed", { error })` against a
+ * bare `"执行失败"` showed the user a sentence with no reason in it. Measured before this
+ * check landed: 255 param-carrying calls, **0 excess** — it is a guard over a clean
+ * invariant, not a cleanup, exactly as check 7 was when it landed.
+ *
+ * Honest boundary: `keyRefs` only reads a params **object literal**; a variable, call or
+ * spread is `supplied: null` and is skipped on both directions (counted in `paramSites`).
  */
 export function keyRefProblems(refs, dict) {
   const out = [];
@@ -371,6 +735,8 @@ export function keyRefProblems(refs, dict) {
     const need = placeholders(value);
     const lack = need.filter((p) => !supplied.includes(p));
     if (lack.length) out.push({ key, kind: "params", lack });
+    const excess = supplied.filter((p) => !need.includes(p));
+    if (excess.length) out.push({ key, kind: "excess", excess });
   }
   return out;
 }
@@ -572,6 +938,22 @@ export function runSelftest() {
   ok("a <style> block is not copy", !lits.includes("样式"));
   ok("a t(...) key is not copy", !lits.includes("note.add"));
   ok("plain markup yields nothing", hardcodedCopy("<div>ok</div>").length === 0);
+  // REQ-A498 — copy **next to** an interpolation used to be invisible (the `[^<>{}]`
+  // class skipped the whole node). Both directions are pinned here: the copy is found,
+  // and the expression's own content still is not.
+  const interp = hardcodedCopy(
+    ['<span>包含 {actions.length} 个动作</span>', '<b>{t("note.add")} 保存</b>', "<i>{n}</i>"].join("\n"),
+  ).map((c) => c.literal);
+  ok("copy beside an interpolation is found", interp.some((l) => l.includes("包含")));
+  ok("the other half of that node is found too", interp.some((l) => l.includes("个动作")));
+  ok("copy after an interpolation is found", interp.some((l) => l.includes("保存")));
+  // One text node is **one** finding (`包含 … 个动作`), a half-empty node is none:
+  // `{n}` on its own masks to whitespace, so the two nodes that carry copy are all.
+  ok("a bare interpolation yields nothing", interp.length === 2);
+  ok(
+    "a nested object literal does not cut the node short",
+    hardcodedCopy('<span>{f(x => ({ id: 1 }))} 个</span>').some((c) => c.literal.includes("个")),
+  );
   // Script-block copy (REQ-A357) — the shape that hid F-SH-020's hard-coded Chinese.
   ok(
     "an assigned CJK literal is copy",
@@ -593,6 +975,26 @@ export function runSelftest() {
     "a t(...) call is not copy",
     assignedCJKCopy('<script>let m = t("note.exportCopyFailed");</script>').length === 0,
   );
+  // REQ-A504 — the shape that hid a whole fallback screen: copy **returned** as a template
+  // literal (rendered with `{@html …}`), which no assignment rule can see.
+  ok(
+    "a returned CJK template literal is copy",
+    assignedCJKCopy("<script>function F() { return `<div>应用出错</div>`; }</script>").length === 1,
+  );
+  ok(
+    "it is found across lines too",
+    assignedCJKCopy("<script>function F() {\n  return `\n  <div>重试</div>`;\n}</script>").length === 1,
+  );
+  ok(
+    "a returned template without CJK is not copy",
+    assignedCJKCopy("<script>function F(x) { return `#${x}`; }</script>").length === 0,
+  );
+  // The **pre-existing** assignment rule already reads backtick literals, so an assigned CJK
+  // template is copy — pinned here so the new rule cannot be "simplified" into changing it.
+  ok(
+    "an assigned CJK template is copy (unchanged by this round)",
+    assignedCJKCopy("<script>const T = `<div>北京</div>`;</script>").length === 1,
+  );
 
   const enMarkup = [
     '<button aria-label="Edit home screen"></button>',
@@ -609,6 +1011,21 @@ export function runSelftest() {
   ok("a single-token ASCII hook is NOT copy", !enLits.includes("block-add"));
   ok("a data-testid value is NOT scanned", !enLits.includes("spotlight-new-note"));
   ok("a t(...) key is not English copy", !enLits.some((l) => l.includes("a11y.")));
+  // REQ-A498 — the English half of the same blind spot, with the *measured* narrow rule:
+  // multi-word remainders are copy; one-token remainders beside an interpolation are units
+  // (`mm`/`ms`/`px`/`B`/`x`/`v` — 6/6 in this corpus), so they are not flagged.
+  const enInterp = englishCopy(
+    [
+      "<span>{n} items selected</span>",
+      "<span>{value.toFixed(0)} mm</span>",
+      "<span>v{AMOS_UI_VERSION}</span>",
+      "<span>{n}</span>",
+    ].join("\n"),
+  ).map((c) => c.literal);
+  ok("multi-word English beside an interpolation is flagged", enInterp.includes("items selected"));
+  ok("a unit beside an interpolation is NOT copy", !enInterp.includes("mm"));
+  ok("a version prefix is NOT copy", !enInterp.includes("v"));
+  ok("a bare interpolation is not English copy", enInterp.length === 1);
   ok("CJK copy is left to the CJK check", !enLits.includes("保存"));
 
   const oneWord = [
@@ -623,6 +1040,72 @@ export function runSelftest() {
   ok("a one-word text node IS copy", oneWordLits.includes("HDR"));
   ok("kebab/snake/slug hooks are NOT copy", !oneWordLits.includes("note-compose") && !oneWordLits.includes("quarantine-copy"));
 
+  // The expression-form half (REQ-A461): a template literal in a translatable
+  // attribute is copy — and it was invisible to `englishCopy` until this existed.
+  const exprMarkup = [
+    "<button aria-label={`remove ${id}`}></button>",
+    "<div aria-label={`page ${i + 1} of ${n}`}></div>",
+    "<span aria-label={`${canonicalPath(x)} ${access}`}></span>",
+    '<span aria-label={`${a} ${b}`}></span>',
+    '<button aria-label={t("desktop.search")}></button>',
+    '<span>{t("desktop.launchpad")}</span>',
+    '<span>{label(id)}</span>',
+    '<button title={cond ? "Network" : t("x")}></button>',
+    '<span>{`Total ${n}`}</span>',
+    '<button title={dnd ? "Do Not Disturb" : "alerts muted"}></button>',
+    '<span>{@html iconSvg("x", "h-3 w-3")}</span>',
+    '<div aria-checked={pos === "bottom"}></div>',
+    "<span>{`x`}</span>",
+    // Own-line text nodes: the `{…}` is a child of the element, not adjacent to `>`.
+    // The matcher used to be `/>\{/`, which is blind to this shape — so English copy
+    // written this way shipped unflagged (two notification banners, REQ-A1181).
+    '<span class="x">\n        {banner.app ?? "Own Line Copy"}\n      </span>',
+    '<p>\n  {t("desktop.ownLine")}\n</p>',
+  ].join("\n");
+  const exprLits = expressionCopy(exprMarkup).map((c) => c.literal);
+  ok("expr: a template's static text IS copy", exprLits.includes("remove") && exprLits.includes("page"));
+  ok("expr: every static segment counts", exprLits.includes("of"));
+  ok("expr: pure interpolation contributes nothing", !exprLits.includes(""));
+  ok(
+    "expr: t(...) arguments are keys, not copy",
+    !exprLits.includes("desktop.search") && !exprLits.includes("desktop.launchpad"),
+  );
+  ok("expr: a quoted literal branch IS copy", exprLits.includes("Network"));
+  ok(
+    "expr: every branch of a ternary is read",
+    exprLits.includes("Do Not Disturb") && exprLits.includes("alerts muted"),
+  );
+  ok("expr: an icon name / class list is NOT copy", !exprLits.includes("x") && !exprLits.includes("h-3 w-3"));
+  ok("expr: an enum comparison is NOT copy", !exprLits.includes("bottom"));
+  ok("expr: a backtick string without interpolation is NOT prose", !exprLits.includes("x"));
+  ok("expr: a text-node template is read too", exprLits.includes("Total"));
+  ok("expr: a call with no literal is silent", expressionCopy("<span>{label(id)}</span>").length === 0);
+  ok(
+    "expr: a text-node expression on its own line is read too",
+    exprLits.includes("Own Line Copy"),
+  );
+  ok(
+    "expr: an own-line t(...) argument is still a key, not copy",
+    !exprLits.includes("desktop.ownLine"),
+  );
+  ok(
+    "expr: ternaryBranches splits at top level only",
+    ternaryBranches('a === "b" ? c : d').length === 3 &&
+      ternaryBranches("f({ k: 1 ? 2 : 3 })").length === 1,
+  );
+  ok(
+    "expr: templateStaticSegments drops interpolations",
+    templateStaticSegments('a ${t("x.y")} b').join(",") === "a,b",
+  );
+  ok(
+    "expr: wholeLiteralTexts reads only whole branches",
+    wholeLiteralTexts("`p ${n}`").join(",") === "p" && wholeLiteralTexts('icon("x")').length === 0,
+  );
+  ok(
+    "expr: nested braces do not truncate the expression",
+    wholeLiteralTexts('cond ? `a ${f({ k: 1 })} b` : "c d"').join(",") === "a,b,c d",
+  );
+
   const slugSrc = [
     '<button aria-label="note-compose"></button>',
     '<button title="block-add"></button>',
@@ -636,6 +1119,28 @@ export function runSelftest() {
   ok("a slug title is flagged", slugs.includes("block-add"));
   ok("the same id as data-testid is not flagged", slugs.filter((s) => s === "note-compose").length === 1);
   ok("a localised label is not a slug", !slugs.includes("a11y.send") && !slugs.includes("Backspace"));
+  // REQ-A1080 — the expression half of the same check: a hook welded to an
+  // interpolation (`call-back-${n}`) was invisible to the static scan above, while a
+  // screen reader still announced it. Copy welded to an interpolation ends its segment
+  // in a space, so it must stay unflagged — that is the whole false-positive guard.
+  const slugExpr = [
+    "<button aria-label={`call-back-${n}`}></button>",
+    "<button title={`block-remove-${p}`}></button>",
+    "<button aria-label={`draft-edit-${d.address}`}></button>",
+    "<button aria-label={`remove ${id}`}></button>",
+    "<div aria-label={`page ${i + 1} of ${n}`}></div>",
+    "<span aria-label={`${a} · ${b}`}></span>",
+    '<button aria-label={`${x}`}></button>',
+  ].join("\n");
+  const slugExprs = slugLabel(slugExpr).map((s) => s.literal);
+  ok("expr: a welded hook head is flagged",
+    slugExprs.includes("call-back-") && slugExprs.includes("draft-edit-"));
+  ok("expr: a welded hook in a title is flagged", slugExprs.includes("block-remove-"));
+  ok("expr: copy welded to an interpolation is NOT a hook",
+    !slugExprs.includes("remove ") && !slugExprs.includes("page ") && !slugExprs.includes(" of "));
+  ok("expr: a bare interpolation is not a hook", !slugExprs.some((s) => s.includes("·")) && slugExprs.length === 3);
+  ok("weldedSlug strips only real hook separators",
+    weldedSlug("call-back-") && !weldedSlug("remove ") && !weldedSlug(" ") && !weldedSlug("-"));
 
   const args = callArgs('f(a, g(b, c), "d,e", { x: [1, 2] })', 1);
   ok("callArgs splits top-level args", args !== null && args.length === 4);
@@ -654,6 +1159,44 @@ export function runSelftest() {
   ok("keyRefs refuses to guess a variable", refs[4].supplied === null);
   ok("keyRefs ignores a dynamic key", refs.length === 5);
 
+  // A comment between two properties must not hide the second one. Before this, the
+  // regex saw the property after a `//` as preceded by the comment's own text (`.`,
+  // not `,`/`{`), so it dropped it and the call read as **missing** that param.
+  ok(
+    "keyRefs sees a param that follows a line comment",
+    keyRefs('t("a.b", { n: 1,\n  // why\n  dim: 2 })')[0].supplied.join() === "n,dim",
+  );
+  ok(
+    "keyRefs sees a param that follows a block comment",
+    keyRefs('t("a.b", { n: 1, /* why */ dim: 2 })')[0].supplied.join() === "n,dim",
+  );
+  // …and the param that *precedes* the comment must not be swallowed either.
+  ok(
+    "keyRefs keeps a param that precedes a comment",
+    keyRefs('t("a.b", {\n  n: 1,\n  // note\n  dim: 2,\n  e: 3,\n})')[0].supplied.join() === "n,dim,e",
+  );
+  // Negative control: a `//` inside a string is data, not a comment — a naive strip
+  // would eat the rest of the line and lose `b`.
+  ok(
+    "a `//` inside a string is not a comment",
+    keyRefs('t("a.b", { a: "https://x", b: 2 })')[0].supplied.join() === "a,b",
+  );
+  ok(
+    "stripComments leaves a string literal byte-identical",
+    stripComments('const u = "https://x"; // gone').includes('"https://x"'),
+  );
+  ok(
+    "stripComments removes a block comment",
+    !stripComments("a /* x, y */ b").includes("x") &&
+      !stripComments("a /* x, y */ b").includes(",") &&
+      stripComments("a /* x */ b").includes("a") &&
+      stripComments("a /* x */ b").includes("b"),
+  );
+  ok(
+    "a comment-held `t(…)` is not a reference",
+    keyRefs('// t("a.b", { n: 1 })\nconst x = 1;').length === 0,
+  );
+
   const dict2 = parseDict('export const zh = {\n  "a.b": "x {n}",\n  "c": "plain",\n};\n');
   const probs = keyRefProblems(
     keyRefs('t("gone") + t("a.b") + t("a.b", { n: 1 }) + t("c", { n: 1 }) + t("a.b", p)'),
@@ -662,7 +1205,29 @@ export function runSelftest() {
   ok("a key the dictionary lacks is a finding", probs.some((p) => p.key === "gone" && p.kind === "missing"));
   ok("an unfilled {param} is a finding", probs.some((p) => p.key === "a.b" && p.lack.join() === "n"));
   ok("a filled {param} is not a finding", probs.filter((p) => p.key === "a.b").length === 1);
-  ok("an extra param is not a finding", !probs.some((p) => p.key === "c"));
+  // REQ-A859 — this assertion used to read `an extra param is not a finding`, which
+  // pinned the unguarded direction. `translate()` drops a param the string never
+  // mentions, so it is exactly as silent as an unfilled one, and just as unseeable by
+  // `tsc`. The old shape is now the finding.
+  ok(
+    "an extra param IS a finding (the mirror of `lack`)",
+    probs.some((p) => p.key === "c" && p.kind === "excess" && p.excess.join() === "n"),
+  );
+  ok(
+    "a param the template never mentions is named",
+    keyRefProblems(keyRefs('t("a.b", { n: 1, typo: 2 })'), dict2).some(
+      (p) => p.kind === "excess" && p.excess.join() === "typo",
+    ),
+  );
+  ok(
+    "both directions can fire on one call",
+    keyRefProblems(keyRefs('t("a.b", { typo: 2 })'), dict2).map((p) => p.kind).sort().join() ===
+      "excess,params",
+  );
+  ok(
+    "a call that passes exactly what the template needs is clean",
+    keyRefProblems(keyRefs('t("a.b", { n: 1 })'), dict2).length === 0,
+  );
   ok("an unreadable params shape is not a finding", keyRefProblems(keyRefs('t("a.b", p)'), dict2).length === 0);
 
   const a11yNames = [
@@ -787,13 +1352,15 @@ for (const { file, src } of corpus.prodSources) {
   }
 }
 
-// Check 5 — English copy in markup (the other half of check 4; see englishCopy).
+// Check 5 — English copy in markup (the other half of check 4; see englishCopy and
+// expressionCopy: static attributes/text nodes **and** the expression forms — the
+// template-literal hole two real labels had been falling through).
 const english = [];
 const seenEnglish = new Set();
 for (const { file, src } of corpus.prodSources) {
   if (!file.endsWith(".svelte")) continue;
   const rel = file.slice(file.indexOf("/src/") + 1);
-  for (const { literal, kind } of englishCopy(src)) {
+  for (const { literal, kind } of [...englishCopy(src), ...expressionCopy(src)]) {
     if (allowedLiterals.has(literal)) continue;
     const key = `${rel}::${literal}`;
     if (seenEnglish.has(key)) continue;
@@ -1003,15 +1570,19 @@ if (process.argv.includes("--json")) {
     const why =
       u.kind === "missing"
         ? `no such key — t() would render ${JSON.stringify(u.key)} to the user`
-        : `missing {${u.lack.join("} {")}} — t() would render ${JSON.stringify(`{${u.lack[0]}}`)} to the user`;
+        : u.kind === "excess"
+          ? `the call passes {${u.excess.join("} {")}} but the string never mentions it — ` +
+            "t() substitutes only placeholders that EXIST, so the variable part is dropped and the user reads a sentence with a hole in it"
+          : `missing {${u.lack.join("} {")}} — t() would render ${JSON.stringify(`{${u.lack[0]}}`)} to the user`;
     console.error(
-      `[i18n-scan] FAIL — dictionary cannot answer a t(…) reference: ${u.file} t(${JSON.stringify(u.key)}) ${why} ` +
+      `[i18n-scan] FAIL — a t(…) call and its dictionary string disagree: ${u.file} t(${JSON.stringify(u.key)}) ${why} ` +
         "(tsc accepts it: t() takes `key: string`)",
     );
   }
   if (unresolved.length === 0) {
     console.log(
-      `[i18n-scan] OK — every t("…") reference resolves and passes the {param}s it needs` +
+      `[i18n-scan] OK — every t("…") reference resolves and passes exactly the {param}s its string needs` +
+        " (both directions: nothing missing, nothing the string would drop)" +
         (paramSites.length > 0
           ? ` (${paramSites.length} call site(s) pass params in a shape static analysis cannot read — counted, not judged).`
           : "."),

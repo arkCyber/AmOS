@@ -21,8 +21,10 @@
 )]
 
 pub mod provider;
+pub mod voice;
 
 pub use provider::{MockTtsProvider, TtsProvider};
+pub use voice::{resolve_voice, VOICE_STEMS};
 
 #[cfg(feature = "piper")]
 pub mod piper;

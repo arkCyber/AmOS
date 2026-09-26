@@ -57,11 +57,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let imu = device.imu_sample()?;
     println!(
-        "imu sample |accel|={:.3} m/s² |gyro|={:.3} rad/s temp={:.1}°C finite={}",
+        "imu sample |accel|={:.3} m/s² |gyro|={} rad/s temp={}°C",
         imu.accel_m_s2.magnitude(),
-        imu.gyro_rad_s.magnitude(),
-        imu.temperature_c,
-        imu.temperature_c.is_finite()
+        imu.gyro_rad_s
+            .map(|g| format!("{:.3}", g.magnitude()))
+            .unwrap_or_else(|| "—".to_string()),
+        imu.temperature_c
+            .map(|t| format!("{t:.1}"))
+            .unwrap_or_else(|| "—".to_string())
     );
 
     // The latest-value stores: recording many samples keeps exactly one.

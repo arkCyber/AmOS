@@ -65,6 +65,13 @@ fn is_high_s(s: &[u8; 32]) -> bool {
     cmp_be(s, &half) == Ordering::Greater
 }
 
+/// Whether `x` is a valid secp256k1 scalar, i.e. in `[1, n-1]`. `0` and any
+/// value `>= n` are not signatures at all (unlike a *high* `s`, which is a
+/// second, equally valid encoding — see [`RecoverableSignature::from_bytes`]).
+fn is_valid_scalar(x: &[u8; 32]) -> bool {
+    x.iter().any(|&b| b != 0) && cmp_be(x, &SECP256K1_ORDER) == Ordering::Less
+}
+
 /// A secp256k1 secret key. Construction is deterministic from a seed.
 #[derive(Clone)]
 pub struct SecretKey {
@@ -233,6 +240,20 @@ impl RecoverableSignature {
     }
 
     /// Parse from the 65-byte `r ‖ s ‖ v` form (`v` must be `27`/`28`).
+    ///
+    /// A signature has **two** byte encodings — `(r, s, v)` and its malleable
+    /// twin `(r, n-s, v⊕1)` — and Ethereum's `ecrecover` (hence every conformant
+    /// verifier) accepts both. This parse path therefore accepts a high-`s`
+    /// input by **normalising** it back to the canonical low-`s` form (negating
+    /// `s`, which negates the nonce and so flips `R.y`'s parity — the recovery
+    /// id). It must not reject it: refusing the twin would make
+    /// [`recover_from_prehash`](PublicKey::recover_from_prehash) report a
+    /// genuinely valid, externally produced signature as unsigned.
+    ///
+    /// Only encodings that are not signatures of *any* form are rejected: a
+    /// wrong length, `v` outside `{27, 28}`, or an `r`/`s` that is `0` or `>= n`
+    /// (REQ-A590 / F-SH-078 — refusing the high-`s` twin made verification report
+    /// a valid, externally produced signature as unsigned).
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         if bytes.len() != 65 || (bytes[64] != 27 && bytes[64] != 28) {
             return Err(Error::InvalidSignature);
@@ -241,10 +262,15 @@ impl RecoverableSignature {
         let mut s = [0u8; 32];
         r.copy_from_slice(&bytes[..32]);
         s.copy_from_slice(&bytes[32..64]);
-        if is_high_s(&s) {
+        if !is_valid_scalar(&r) || !is_valid_scalar(&s) {
             return Err(Error::InvalidSignature);
         }
-        Ok(Self { r, s, v: bytes[64] })
+        let mut v = bytes[64];
+        if is_high_s(&s) {
+            s = neg_mod_n(&s);
+            v = if v == 27 { 28 } else { 27 };
+        }
+        Ok(Self { r, s, v })
     }
 
     /// The `0x…` hex of the 65-byte form.
@@ -313,10 +339,55 @@ mod tests {
         let mut bad = [0u8; 65];
         bad[64] = 29; // invalid v
         assert!(RecoverableSignature::from_bytes(&bad).is_err());
-        let mut high = [0u8; 65];
-        high[64] = 27;
-        high[32..64].copy_from_slice(&[0xff; 32]); // high s -> non-canonical
-        assert!(RecoverableSignature::from_bytes(&high).is_err());
+        // This `s` is not merely "high" — it is `>= n`, so it is not a scalar at
+        // all and no normalisation can rescue it. (A *valid* high-s twin, s in
+        // (n/2, n), must be accepted: see the test below.)
+        let mut out_of_range = [0u8; 65];
+        out_of_range[64] = 27;
+        out_of_range[32..64].copy_from_slice(&[0xff; 32]);
+        assert!(RecoverableSignature::from_bytes(&out_of_range).is_err());
+        // s == 0 is not a signature either.
+        let mut zero_s = [0u8; 65];
+        zero_s[64] = 27;
+        assert!(RecoverableSignature::from_bytes(&zero_s).is_err());
+    }
+
+    /// A valid signature has **two** encodings — `(r, s, v)` and its malleable
+    /// twin `(r, n-s, v⊕1)` — and `ecrecover` (hence every Ethereum verifier)
+    /// accepts both. A verifier must therefore not report a *valid* signature as
+    /// invalid: this crate's `from_bytes` used to reject any high-s input, so a
+    /// signature produced by other tooling (which is free to emit the twin)
+    /// recovered as "unsigned". The parse path now normalises the twin to low-s
+    /// (negating `s` negates the nonce, which flips `R.y`'s parity, i.e. the
+    /// recovery id), and the normalised form recovers the same signer.
+    #[test]
+    fn high_s_twin_is_accepted_and_recovers_the_same_signer() {
+        let key = SecretKey::from_seed([42u8; 32]).unwrap();
+        let digest = keccak256(b"malleability");
+        let low = key.sign_prehash_recoverable(&digest).unwrap();
+        assert!(!is_high_s(&low.s), "our own signatures are low-s");
+
+        // The twin: `s' = n - s` (high), with the recovery parity flipped.
+        let high_s = neg_mod_n(&low.s);
+        assert!(is_high_s(&high_s), "n - s of a low s is high");
+        assert_eq!(neg_mod_n(&high_s), low.s, "negation is an involution");
+        let mut raw = [0u8; 65];
+        raw[..32].copy_from_slice(&low.r);
+        raw[32..64].copy_from_slice(&high_s);
+        raw[64] = if low.v == 27 { 28u8 } else { 27u8 };
+
+        // Before the fix this returned `Err` — a *valid* signature called
+        // malformed, so `verify_signer` reported "unsigned".
+        let parsed =
+            RecoverableSignature::from_bytes(&raw).expect("a high-s twin is a valid signature");
+        // It normalises to exactly the canonical low-s form…
+        assert_eq!(parsed, low, "normalised to the original low-s signature");
+        assert_eq!(
+            PublicKey::recover_from_prehash(&digest, &parsed)
+                .unwrap()
+                .address(),
+            key.public_key().address()
+        );
     }
 
     /// Out-of-range (≥ n) and zero seeds are not valid scalars and must be

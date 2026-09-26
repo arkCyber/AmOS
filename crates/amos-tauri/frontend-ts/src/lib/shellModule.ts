@@ -31,6 +31,12 @@
  * exist (`lib/shellChrome.ts` said "⌘Space/F4 are bound" while F4 was bound nowhere).
  */
 import type { Component } from "svelte";
+import type { DesktopSystemIntent } from "../svelte/desktopSystemKeys";
+// Type-only, so this edge is erased and does not close a runtime cycle with `snapZones.ts`
+// (which imports this module's `ShellShortcut` / `shortcutMatches`): the zone type has **one**
+// definition, in the table that owns the zones.
+import type { SnapZone } from "./snapZones";
+import type { StoreTile } from "./storeApps";
 
 /**
  * Where a widget can live. Exactly one container renders each slot:
@@ -124,8 +130,8 @@ export function shortcutMatches(e: ShortcutEvent, s: ShellShortcut): boolean {
   //   ┌─────────────────────────────────────────────────────────────────────┐
   //   │ s.meta=true / s.ctrl=undefined  → matches metaKey OR ctrlKey        │
   //   │   (legacy Apple-binding: ctrlKey is treated as ⌘)                    │
-  //   │ s.meta=true / s.ctrl=true       → matches metaKey only               │
-  //   │   (explicit "Ctrl AND ⌘", reserved for future use)                  │
+  //   │ s.meta=true / s.ctrl=true       → matches metaKey AND ctrlKey        │
+  //   │   (explicit "Ctrl AND ⌘" — both physical modifiers)                 │
   //   │ s.meta=undefined / s.ctrl=true  → matches ctrlKey only (Meta absent) │
   //   │   (Ctrl-only binding; matches our dormant `ctrl: true` branch)      │
   //   │ all other shapes                                                   → undef│
@@ -133,12 +139,17 @@ export function shortcutMatches(e: ShortcutEvent, s: ShellShortcut): boolean {
   // The shell-chrome registry declares none after REQ-A297 phase-2 §2, so
   // only row 1 is live today; the other rows exist as the explicit "I really
   // mean Ctrl, not ⌘" escape hatch for future rows that need it.
-  if (s.meta) {
-    // Meta required. Implicit-Ctrl-as-Meta is on unless the binding opted
-    // out by also setting `ctrl: true`.
-    const ctrlAsMeta = !s.ctrl;
-    const metaHits = Boolean(e.metaKey || (ctrlAsMeta && e.ctrlKey));
-    if (!metaHits) return false;
+  //
+  // Row 2 used to *name* itself "Ctrl AND ⌘" while matching `metaKey` alone (REQ-A1568):
+  // the name was the intent and the body was not it, so a `{ctrl, meta}` binding — the only
+  // shape that can reach a chord the ⌘ family does not already own — fired on the bare ⌘
+  // chord too. `lib/stageKeys.ts`'s ⌃⌘S is the first row to depend on it, and on the old body
+  // it would also have swallowed every app's ⌘S.
+  if (s.meta && s.ctrl) {
+    if (!e.metaKey || !e.ctrlKey) return false;
+  } else if (s.meta) {
+    // Meta required, with Ctrl accepted in its place (non-Apple keyboards).
+    if (!(e.metaKey || e.ctrlKey)) return false;
   } else if (s.ctrl) {
     // Pure Ctrl binding: requires ctrlKey, forbids metaKey.
     if (!e.ctrlKey || e.metaKey) return false;
@@ -195,6 +206,17 @@ export interface ShortcutHint {
  * placed in.
  */
 export interface ShellChromeApi {
+  /**
+   * The **installed store apps**, as the shell loaded them (REQ-A1179).
+   *
+   * Not a capability like the rest of this handle, but the same single-owner rule: only the
+   * shell starts `loadStoreTiles()` (it is the one component alive in every form factor), and
+   * the desktop chrome — Dock, Launchpad, stage, Spotlight — draws the *same* layout the
+   * touch shell draws. Reading the module cache directly would freeze each surface at
+   * whatever the cache held when it mounted, and the load is async — so the list is pushed
+   * down here the way the shell already pushes it to `HomeDock` / `RecentsPanel`.
+   */
+  storeTiles: readonly StoreTile[];
   /** Ask for the Launchpad overlay. */
   openLaunchpad: () => void;
   /** Ask for the Spotlight overlay. */
@@ -239,6 +261,78 @@ export interface ShellChromeApi {
    * (F-SH-008).
    */
   windowAction: (action: ShellWindowAction) => void;
+  /**
+   * Run a **focused-window** intent (close / hide) for the menu rows that act on "the
+   * window you are looking at" — File ▸ Close Window and Window ▸ Minimize.
+   *
+   * Same contract as [`ShellChromeApi.windowAction`]: the widget sends the **intent**, not a
+   * label, because the shell owns "which window is focused". These two rows used to send an
+   * empty label (`wm_close` / `wm_hide` with `""`) on the belief that `""` was the macOS
+   * "the front window" idiom — the host has no such idiom (`wm.rs::close_core` / `hide` look
+   * the label up in `by_label`), so the command was refused and the row did nothing while the
+   * matching ⌘W / ⌘M chord worked. Routing through the shell puts the rows on the chord's
+   * own path (REQ-A424's stale-poll fallback and REQ-A430's refusal report included).
+   */
+  focusedWindowIntent: (intent: DesktopSystemIntent) => void;
+  /**
+   * Ask the shell for **one more window of the focused application** (File ▸ New Window,
+   * and ⌘N — REQ-A473).
+   *
+   * A *request*, not a target: "which window is focused" is owned by the shell's single
+   * `wm_windows` poll, and a widget that resolved it itself would be a second focus model
+   * (the F-SH-005 shape). The shell resolves the app and reports a refusal, exactly as
+   * [`ShellChromeApi.windowAction`] does for Zoom / Enter Full Screen.
+   */
+  newWindow: () => void;
+  /**
+   * Snap the **focused app window** to a named screen region (REQ-A816 — the `Window` menu's
+   * zone rows).
+   *
+   * Same contract as [`ShellChromeApi.windowAction`]: a request, not a label, because the
+   * shell owns "which window is focused". The shell routes it to the *same* `snapFocused` the
+   * ⌃⌥ chords call, so the mouse path and the keyboard path are one implementation — including
+   * the stale-poll retry (REQ-A424), the launcher-is-never-a-target rule (F-SH-008) and the
+   * refusal report naming the zone (`snapRefusal`). It is deliberately **not** gated by
+   * `AMOS_DESKTOP_SHORTCUTS`, which switches off the shell *taking over keys*; a menu row is a
+   * click the user made on purpose, and the neighbouring Zoom / Minimize rows are not gated
+   * either.
+   *
+   * `zone` is `amos_wm::snap::SnapZone`'s wire key, taken from `lib/snapZones.ts`'s table by
+   * the caller — never a literal — so a menu row cannot name a region the host refuses.
+   */
+  snapWindow: (zone: SnapZone) => void;
+  /**
+   * Print the **focused app window** (REQ-A869 — File ▸ Print… / ⌘P).
+   *
+   * A request, not a target, for the reason every handle here states: the shell owns "which
+   * window is focused", and only the **host** can act on that answer for printing. `window.print()`
+   * is a call on the document that makes it, and the shell's only `menu-event` subscriber mounts
+   * in the **launcher** window — so a DOM-level print from either menu surface would print the
+   * desktop, not the app the user is looking at. The handle therefore routes to
+   * `print_document` (`lib/print.ts`), which is zero-argument for exactly this reason (D2).
+   *
+   * The refusal is reported through [`printRefusalMessage`] (`lib/print.ts`), which names the
+   * three `amos.print.*` codes rather than giving all of them one sentence.
+   */
+  printDocument: () => void;
+  /**
+   * Toggle **Stage Manager** (REQ-A1568 — the Window menu's row and the ⌃⌘S chord).
+   *
+   * A request with no argument, because the mode is the **host's** state: the shell reads it
+   * (`stage_snapshot`), flips it and reports a refusal. A widget that passed `enabled` would
+   * have to keep its own copy of the bit, and that copy goes stale the moment the rail's own
+   * toggle changes it (the second-ledger shape this feature was built without).
+   */
+  toggleStage: () => void;
+  /**
+   * Lay every on-stage window out in a grid (REQ-A1568 — Window ▸ Tidy).
+   *
+   * Also argument-free, and for a stronger reason than [`toggleStage`]: the **on-stage set**
+   * is derived by the host from the window model (`views_of`, the same rule the rail draws),
+   * so the shell has no list to send — one it computed itself could only disagree with the
+   * rail about which windows "Tidy" is about.
+   */
+  tidyStage: () => void;
 }
 
 /** The focused-window actions the in-app menu can request (see [`ShellChromeApi.windowAction`]). */

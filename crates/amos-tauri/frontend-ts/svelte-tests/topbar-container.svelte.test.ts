@@ -132,7 +132,7 @@ describe("TopBar as a chrome container", () => {
   });
 
   /**
-   * Which menus still carry an unavailable row — **and why View does not** (REQ-A457).
+   * Which menus still carry an unavailable row — **and which do not** (REQ-A457/A482).
    *
    * This case used to assert `disabledRows.length > 0` for **every** group, as a proxy for
    * "the F-SH-001 rendering path is exercised". That proxy turned into the defect's bodyguard:
@@ -142,10 +142,10 @@ describe("TopBar as a chrome container", () => {
    * honesty; a test that requires one to stay dead is.
    *
    * So the list is explicit now: the menus that still have rows the shell cannot do, and the
-   * reason each. `view` is asserted to have **none**, so a future edit that greys one there
-   * again is the thing that fails.
+   * reason each. The wired menus are asserted to have **none**, so a future edit that greys one
+   * there again is the thing that fails. file / help joined view as fully-wired in REQ-A482.
    */
-  test("the menus with an honest greyed row are exactly these (View is fully wired since REQ-A457)", async () => {
+  test("only Edit and Window still carry an honest greyed row (file/view/help fully wired)", async () => {
     const host = render(TopBar);
     await tick();
     const dead: Record<string, number> = {};
@@ -157,13 +157,14 @@ describe("TopBar as a chrome container", () => {
       await fireEvent.click(host.container.querySelector<HTMLElement>(`[data-testid="menu-${id}-trigger"]`)!);
       await tick();
     }
-    // file: 打印…（宿主没有打印管线）· edit: 撤销（唯一路径是 execCommand，未验证 ⇒ 不假装）
-    // window: 前置全部窗口（宿主没有该命令）· help: 搜索 / 应用帮助（没有 per-app 帮助内容）
-    expect(dead.file).toBeGreaterThan(0);
+    // edit: 撤销（唯一路径是 execCommand，未验证 ⇒ 不假装）· window: 前置全部窗口（宿主没有该命令）
     expect(dead.edit).toBeGreaterThan(0);
     expect(dead.window).toBeGreaterThan(0);
-    expect(dead.help).toBeGreaterThan(0);
-    // View had exactly one (`进入全屏幕`) and it is now live — see `docs/mac-menu.md` §5.1.
+    // file / view / help are fully wired since REQ-A457/A482 — 打印 goes through the WebView's
+    // print dialog, and both Help rows now act (Spotlight / Settings). A future edit that greys
+    // one there again is what fails here, the same reversal REQ-A457 made for View.
+    expect(dead.file).toBe(0);
     expect(dead.view).toBe(0);
+    expect(dead.help).toBe(0);
   });
 });

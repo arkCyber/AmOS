@@ -32,6 +32,17 @@ export function tauriBleAvailable(): boolean {
 
 /* ---- Kotlin BLE command surface (the real path on Android) ---- */
 
+/**
+ * Trim a UUID at the bridge boundary.
+ *
+ * The Kotlin glue calls `UUID.fromString` on this string and throws on anything malformed, and
+ * the screen keys its subscribe toggle by a **trimmed** `service/characteristic` pair while it
+ * used to send the raw field — so a stray space made the toggle's key disagree with the UUID the
+ * device was actually asked about (REQ-A1198). Normalising once, here, is what keeps the key and
+ * the wire call the same string; every UUID-bearing sender below goes through it.
+ */
+const normUuid = (uuid: string): string => uuid.trim();
+
 /** Outcome of a GATT read: the bytes or an error string. */
 export type BleReadResult =
   | { ok: true; bytes: number[] }
@@ -42,21 +53,30 @@ export type BleWriteResult =
   | { ok: true }
   | { ok: false; error: string };
 
-/** One discovered GATT service. */
+/** One discovered GATT service, with the characteristics the platform reported for it. */
 export interface BleService {
   uuid: string;
+  characteristics: BleCharacteristic[];
 }
+
+/**
+ * Outcome of a GATT service discovery.
+ *
+ * Distinct from an **empty** `services` list, which is a real answer ("the device advertises
+ * no services"): `ok: false` means the bridge could not get a list at all — no glue, a refused
+ * `discoverServices`, a stack that took the request and never answered, a discovery superseded
+ * by a newer one, or a service list the platform sent that could not be read. The screen says
+ * those apart (REQ-A1157, REQ-A1198).
+ */
+export type BleDiscoverResult =
+  | { ok: true; services: BleService[] }
+  | { ok: false; error: string };
 
 /** One discovered GATT characteristic. */
 export interface BleCharacteristic {
   uuid: string;
   /** Characteristic property flags (android.bluetooth.BluetoothGattCharacteristic). */
   properties: number;
-}
-
-/** One discovered GATT descriptor. */
-export interface BleDescriptor {
-  uuid: string;
 }
 
 /** State of a BLE GATT operation. */
@@ -74,71 +94,124 @@ export type BleGattState =
 /** Subscribe to BLE value-change events. Channel name emitted by the Kotlin glue. */
 export const BLE_VALUE_EVENT = "ble-value-changed";
 
+/** One value frame handed to a `bleOnValueChanged` callback. */
+export interface BleValue {
+  event: "notification" | "read";
+  /** The characteristic UUID the value came from (service UUID not available on the wire). */
+  characteristicUuid: string;
+  value: number[];
+}
+
 /**
- * Connect to a BLE device by `address`.
- * Returns `true` when the connection was initiated (Android: bonding flow starts).
+ * Connect to a BLE device by `address`, or `null` when the host did not answer.
+ *
+ * `false` means a GATT **client object** was not created and the request was never handed to the
+ * platform — no adapter, bad MAC, permission refused. That is a fact this runtime observed.
+ * `null` is its own fact (REQ-A1337 / F-SH-603): `invoke` resolves `null` for a refused command
+ * and never rejects, and the old `?? false` turned "the host did not answer" into the same `false`
+ * — which the screen words as 「连接失败：设备拒绝或超出了范围」, a claim about **the remote
+ * device** derived from a question nobody answered.
+ *
+ * Neither value says whether the device answered; that verdict arrives asynchronously on the
+ * `ble-value-changed` channel as `connected` (REQ-A1158 / F-SH-459).
  */
-export async function bleConnect(address: string): Promise<boolean> {
-  return (await invoke<boolean>("ble_connect", { address })) ?? false;
+export async function bleConnect(address: string): Promise<boolean | null> {
+  return await invoke<boolean>("ble_connect", { address });
 }
 
-/** Disconnect and release the GATT client. */
-export async function bleDisconnect(): Promise<boolean> {
-  return (await invoke<boolean>("ble_disconnect")) ?? false;
+/**
+ * Disconnect and release the GATT client, or `null` when the host did not answer.
+ *
+ * `false` = the host answered that it did not confirm the teardown; `null` = it did not answer
+ * at all. The screen must not word the second as 「系统没有确认」 — that sentence asserts the
+ * system spoke (REQ-A1337).
+ */
+export async function bleDisconnect(): Promise<boolean | null> {
+  return await invoke<boolean>("ble_disconnect");
 }
 
-/** Discover all services + characteristics on the connected device. */
-export async function bleDiscoverServices(): Promise<BleService[] | null> {
-  return invoke<BleService[]>("ble_discover_services");
+/**
+ * Discover all services on the connected device, or `null` when the host did not answer.
+ *
+ * `null` is the same "this runtime could not obtain a list" the unified client has always used
+ * for the Web Bluetooth path (`BleClient.discoverServices`). Synthesizing
+ * `{ ok: false, error: "not bridged" }` here instead made the screen print a **cause this side
+ * invented** — an English string the host never said (REQ-A1337).
+ */
+export async function bleDiscoverServices(): Promise<BleDiscoverResult | null> {
+  return await invoke<BleDiscoverResult>("ble_discover_services");
 }
 
-/** Read the value of a GATT characteristic.
- *  Returns the raw bytes (little-endian for standard GATT types). */
+/**
+ * Read the value of a GATT characteristic.
+ *
+ * Returns the raw bytes (little-endian for standard GATT types), or `null` when the host did not
+ * answer — `{ ok: false, error }` is the host's own report about the read, and only the host can
+ * say that (REQ-A1337).
+ */
 export async function bleRead(
   serviceUuid: string,
   characteristicUuid: string,
-): Promise<BleReadResult> {
-  const r = await invoke<BleReadResult>("ble_read", {
-    serviceUuid,
-    characteristicUuid,
+): Promise<BleReadResult | null> {
+  return await invoke<BleReadResult>("ble_read", {
+    serviceUuid: normUuid(serviceUuid),
+    characteristicUuid: normUuid(characteristicUuid),
   });
-  return r ?? { ok: false, error: "not bridged" };
 }
 
-/** Write a value to a GATT characteristic.
- *  `withResponse` = whether to wait for a write confirmation (Android WRITE_TYPE).
+/**
+ * Write a value to a GATT characteristic.
+ *
+ * `withResponse` = whether to wait for a write confirmation (Android WRITE_TYPE). `null` = the
+ * host did not answer (REQ-A1337).
  */
 export async function bleWrite(
   serviceUuid: string,
   characteristicUuid: string,
   value: number[],
   withResponse = false,
-): Promise<BleWriteResult> {
-  const r = await invoke<BleWriteResult>("ble_write", {
-    serviceUuid,
-    characteristicUuid,
+): Promise<BleWriteResult | null> {
+  return await invoke<BleWriteResult>("ble_write", {
+    serviceUuid: normUuid(serviceUuid),
+    characteristicUuid: normUuid(characteristicUuid),
     value,
     withResponse,
   });
-  return r ?? { ok: false, error: "not bridged" };
 }
 
-/** Start receiving notifications/indications for a characteristic.
- *  Values are emitted on the `ble-value-changed` event channel.
+/**
+ * Start receiving notifications/indications for a characteristic.
+ * Values are emitted on the `ble-value-changed` event channel.
+ *
+ * `null` = the host did not answer. The old `?? false` rendered that as 「订阅被设备拒绝。」
+ * — the screen naming **the device** as the refuser of a command the device was never asked
+ * (REQ-A1337 / F-SH-603).
  */
 export async function bleSubscribe(
   serviceUuid: string,
   characteristicUuid: string,
-): Promise<boolean> {
-  return (await invoke<boolean>("ble_subscribe", { serviceUuid, characteristicUuid })) ?? false;
+): Promise<boolean | null> {
+  return await invoke<boolean>("ble_subscribe", {
+    serviceUuid: normUuid(serviceUuid),
+    characteristicUuid: normUuid(characteristicUuid),
+  });
 }
 
-/** Stop receiving notifications/indications for a characteristic. */
+/**
+ * Stop receiving notifications/indications for a characteristic.
+ *
+ * `null` = the host did not answer. This one is the sharpest case: the folded value drove
+ * 「取消订阅被设备拒绝：设备仍在推送。」 — an assertion that the device is **still notifying**,
+ * made without ever having asked it (REQ-A1337).
+ */
 export async function bleUnsubscribe(
   serviceUuid: string,
   characteristicUuid: string,
-): Promise<boolean> {
-  return (await invoke<boolean>("ble_unsubscribe", { serviceUuid, characteristicUuid })) ?? false;
+): Promise<boolean | null> {
+  return await invoke<boolean>("ble_unsubscribe", {
+    serviceUuid: normUuid(serviceUuid),
+    characteristicUuid: normUuid(characteristicUuid),
+  });
 }
 
 /**
@@ -155,16 +228,25 @@ export async function bleUnsubscribe(
  * without a `uuid` are status frames (`connected`, `services_discovered`, `write_result`) and
  * are not value notifications, so they are ignored.
  *
- * Returns an unsubscribe function.
+ * Returns an unsubscribe function, or `null` when the subscription was not established
+ * (REQ-A838). **Bluetooth is out of scope for this round** — this site is widened only so the
+ * file compiles against the now-nullable `subscribe`; the callers were left as they were and
+ * are called out in the round report rather than silently reworked.
  */
 export async function bleOnValueChanged(
-  onValue: (payload: {
-    event: "notification" | "read";
-    /** The characteristic UUID the value came from (service UUID not available on the wire). */
-    characteristicUuid: string;
-    value: number[];
-  }) => void,
-): Promise<() => void> {
+  onValue: (payload: BleValue) => void,
+): Promise<(() => void) | null> {
+  // Off-device there is no Tauri event plugin to listen on, and the Web Bluetooth path
+  // delivers frames through its own listener instead (see `webSubscribe`). Returning `null`
+  // here — as this used to — left the screen with no value sink at all, so its
+  // 「特征值变化会出现在下方记录里。」 was a promise the runtime could not keep
+  // (REQ-A1189 / F-SH-478).
+  if (!bridged()) {
+    _webSinks.add(onValue);
+    return () => {
+      _webSinks.delete(onValue);
+    };
+  }
   // `bridged()` answers *whether* a bridge exists (a boolean); the old code called
   // `.listen` on that boolean, which threw and was swallowed by the `try/catch` below — so
   // the subscription silently never happened and no BLE value ever reached the UI
@@ -184,10 +266,163 @@ export async function bleOnValueChanged(
   });
 }
 
+/* ---- Characteristic property flags (what the device said it permits) ---- */
+
+/**
+ * `BluetoothGattCharacteristic#getProperties()` bits.
+ *
+ * The numbers are Android's (they cross the bridge raw); the **meaning** lives here so the
+ * screen and any test read the same table. A characteristic that does not advertise a property
+ * is one the device will refuse: the controls are disabled from this, rather than offering every
+ * action and letting the device say no (REQ-A1198 / F-SH-487).
+ */
+export const BLE_PROP_BROADCAST = 0x01;
+export const BLE_PROP_READ = 0x02;
+export const BLE_PROP_WRITE_NO_RESPONSE = 0x04;
+export const BLE_PROP_WRITE = 0x08;
+export const BLE_PROP_NOTIFY = 0x10;
+export const BLE_PROP_INDICATE = 0x20;
+export const BLE_PROP_SIGNED_WRITE = 0x40;
+export const BLE_PROP_EXTENDED_PROPS = 0x80;
+
+const hasProp = (props: number, bit: number): boolean => (props & bit) !== 0;
+
+/** The device advertises a readable value. */
+export function bleCanRead(props: number): boolean {
+  return hasProp(props, BLE_PROP_READ);
+}
+
+/**
+ * The device accepts a write.
+ *
+ * A **with-response** write needs `PROPERTY_WRITE` (a Write Request); a **without-response** one
+ * is accepted when *either* write bit is set, because a characteristic that only advertises
+ * `PROPERTY_WRITE` still takes a Write Command — refusing there would disable a control the
+ * device would have carried out.
+ */
+export function bleCanWrite(props: number, withResponse: boolean): boolean {
+  if (withResponse) return hasProp(props, BLE_PROP_WRITE);
+  return hasProp(props, BLE_PROP_WRITE) || hasProp(props, BLE_PROP_WRITE_NO_RESPONSE);
+}
+
+/**
+ * The device can push values — **notify or indicate**.
+ *
+ * Both are turned on through the same CCC descriptor write, so the toggle is offered for either;
+ * they differ in whether the device expects an acknowledgement, which does not change whether the
+ * user may subscribe.
+ */
+export function bleCanNotify(props: number): boolean {
+  return hasProp(props, BLE_PROP_NOTIFY) || hasProp(props, BLE_PROP_INDICATE);
+}
+
+/**
+ * The property names, in the spec's bit order, for showing what a characteristic permits.
+ *
+ * Each name is the **suffix of its `ble.prop.*` dictionary key**, so a caller renders it with
+ * ``t(`ble.prop.${name}`)`` and the spec's own vocabulary reaches the user in their language —
+ * the alternative (printing the raw bit names) puts English protocol words in a Chinese screen.
+ * Explicit and set-based rather than a bit-scan loop: the map is the whole contract, and a name
+ * that drifts from its key is a `t()` that renders the key itself.
+ */
+export function blePropertyNames(props: number): string[] {
+  return (
+    [
+      [BLE_PROP_BROADCAST, "broadcast"],
+      [BLE_PROP_READ, "read"],
+      [BLE_PROP_WRITE_NO_RESPONSE, "writeNoResponse"],
+      [BLE_PROP_WRITE, "write"],
+      [BLE_PROP_NOTIFY, "notify"],
+      [BLE_PROP_INDICATE, "indicate"],
+      [BLE_PROP_SIGNED_WRITE, "signedWrite"],
+      [BLE_PROP_EXTENDED_PROPS, "extended"],
+    ] as const
+  )
+    .filter(([bit]) => hasProp(props, bit))
+    .map(([, name]) => name);
+}
+
+/* ---- Pure value helpers (the screen's input/output formatting) ---- */
+
+/**
+ * Format raw GATT bytes as lowercase hex pairs (`[1, 171]` → `"01ab"`).
+ *
+ * The ByteArray crosses the bridge as a number array, and every surface that shows or
+ * accepts one has to agree on the spelling — hence one implementation here rather than
+ * a `map(toString(16))` in the screen (which is how the two would drift).
+ * A byte outside 0..255 is **not** silently truncated: it is the caller's contract
+ * violation, and the honest answer is to render what was received.
+ */
+export function bytesToHex(bytes: readonly number[]): string {
+  return bytes.map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/**
+ * Parse a hex string into bytes; `null` when the input is not hex or has an odd length.
+ *
+ * `null` (not `[]`, not a best-effort slice) because the caller is about to hand the
+ * bytes to a device write: a half-parsed payload would write something the user did
+ * not type.
+ */
+export function hexToBytes(hex: string): number[] | null {
+  const s = hex.replace(/[\s:_-]/g, "");
+  if (s.length === 0 || s.length % 2 !== 0) return null;
+  if (!/^[0-9a-fA-F]+$/.test(s)) return null;
+  const out: number[] = [];
+  for (let i = 0; i < s.length; i += 2) out.push(parseInt(s.slice(i, i + 2), 16));
+  return out;
+}
+
+/**
+ * Whether a string is a plausible GATT UUID (16-bit `180d`, 32-bit, or 128-bit with dashes).
+ *
+ * Deliberately *shape-only*: it does not claim the uuid exists on the connected device —
+ * only the device can answer that, and pretending otherwise here would turn a typo into
+ * "characteristic not found" noise. Its job is to keep an obviously malformed string from
+ * being sent (the glue would throw on `UUID.fromString`).
+ */
+export function isPlausibleBleUuid(uuid: string): boolean {
+  const s = uuid.trim();
+  if (s.length === 4 || s.length === 8) return /^[0-9a-fA-F]+$/.test(s);
+  if (s.length === 36) {
+    return /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(s);
+  }
+  return false;
+}
+
 /* ---- Web Bluetooth fallback (host / Chromium desktop) ---- */
 
 let _webDevice: BluetoothDevice | null = null;
 let _webServer: BluetoothRemoteGATTServer | null = null;
+
+/**
+ * Value sinks for the Web Bluetooth runtime.
+ *
+ * The device's frames come out of the platform as `characteristicvaluechanged` events on a
+ * `BluetoothRemoteGATTCharacteristic` — there is no event plugin to listen on off-device, so
+ * this registry is what carries them to `bleOnValueChanged`'s callers.
+ */
+const _webSinks = new Set<(v: BleValue) => void>();
+
+/** Live notification listeners, keyed by `service/characteristic`, so each is removed once. */
+const _webNotify = new Map<
+  string,
+  { chr: BluetoothRemoteGATTCharacteristic; handler: (ev: Event) => void }
+>();
+
+function webKey(serviceUuid: string, characteristicUuid: string): string {
+  return `${serviceUuid.trim()}/${characteristicUuid.trim()}`;
+}
+
+/** Turn one `characteristicvaluechanged` into the frame shape the screen already consumes. */
+function webFrame(characteristicUuid: string, dv: DataView | undefined): BleValue | null {
+  if (!dv) return null;
+  return {
+    event: "notification",
+    characteristicUuid,
+    value: Array.from(new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength)),
+  };
+}
 
 async function webConnect(address: string): Promise<boolean> {
   if (!BLE_AVAILABLE) return false;
@@ -212,6 +447,12 @@ async function webConnect(address: string): Promise<boolean> {
 }
 
 async function webDisconnect(): Promise<void> {
+  // The GATT client is going away: drop every listener with it, or a late notification on a
+  // characteristic nobody holds would still be routed to a screen that has moved on.
+  for (const { chr, handler } of _webNotify.values()) {
+    chr.removeEventListener("characteristicvaluechanged", handler);
+  }
+  _webNotify.clear();
   _webServer?.disconnect();
   _webDevice = null;
   _webServer = null;
@@ -266,7 +507,26 @@ async function webSubscribe(
   try {
     const svc = await _webServer.getPrimaryService(serviceUuid);
     const chr = await svc.getCharacteristic(characteristicUuid);
-    await chr.startNotifications();
+    const key = webKey(serviceUuid, characteristicUuid);
+    // Re-subscribing replaces this characteristic's listener rather than stacking a second
+    // one, which would deliver every notification twice.
+    const prev = _webNotify.get(key);
+    if (prev) prev.chr.removeEventListener("characteristicvaluechanged", prev.handler);
+    const handler = (ev: Event): void => {
+      const frame = webFrame(characteristicUuid, (ev.target as BluetoothRemoteGATTCharacteristic | null)?.value);
+      if (!frame) return;
+      for (const sink of _webSinks) sink(frame);
+    };
+    // Attach before `startNotifications()`: a device that notifies the instant it is enabled
+    // must not beat the listener. Detach again if enabling is refused.
+    chr.addEventListener("characteristicvaluechanged", handler);
+    try {
+      await chr.startNotifications();
+    } catch (e) {
+      chr.removeEventListener("characteristicvaluechanged", handler);
+      throw e;
+    }
+    _webNotify.set(key, { chr, handler });
     return true;
   } catch (e) {
     amosWarn("ble", "web bluetooth subscribe failed", e);
@@ -283,6 +543,14 @@ async function webUnsubscribe(
     const svc = await _webServer.getPrimaryService(serviceUuid);
     const chr = await svc.getCharacteristic(characteristicUuid);
     await chr.stopNotifications();
+    // Only a *confirmed* stop drops the listener — the same rule the screen applies to its own
+    // toggle: a refused unsubscribe leaves the stream live, so its values must keep arriving.
+    const key = webKey(serviceUuid, characteristicUuid);
+    const live = _webNotify.get(key);
+    if (live) {
+      live.chr.removeEventListener("characteristicvaluechanged", live.handler);
+      _webNotify.delete(key);
+    }
     return true;
   } catch (e) {
     amosWarn("ble", "web bluetooth unsubscribe failed", e);
@@ -295,18 +563,30 @@ async function webUnsubscribe(
  * falls back to Web Bluetooth API (host / Chromium desktop).
  */
 export interface BleClient {
-  connect(address: string): Promise<boolean>;
-  disconnect(): Promise<boolean>;
-  discoverServices(): Promise<BleService[] | null>;
-  read(serviceUuid: string, characteristicUuid: string): Promise<BleReadResult>;
+  /** `null` = the host did not answer (the Web Bluetooth path never returns it — it observed
+   *  the failure itself). */
+  connect(address: string): Promise<boolean | null>;
+  /** `null` = the host did not answer. */
+  disconnect(): Promise<boolean | null>;
+  /**
+   * `null` = **this runtime** cannot enumerate services at all — the Web Bluetooth path, or a
+   * host that did not answer; a `BleDiscoverResult` carries what the device answered (including
+   * its failures).
+   */
+  discoverServices(): Promise<BleDiscoverResult | null>;
+  /** `null` = the host did not answer; `{ ok: false, error }` is the host's own report. */
+  read(serviceUuid: string, characteristicUuid: string): Promise<BleReadResult | null>;
+  /** `null` = the host did not answer. */
   write(
     serviceUuid: string,
     characteristicUuid: string,
     value: number[],
     withResponse?: boolean,
-  ): Promise<BleWriteResult>;
-  subscribe(serviceUuid: string, characteristicUuid: string): Promise<boolean>;
-  unsubscribe(serviceUuid: string, characteristicUuid: string): Promise<boolean>;
+  ): Promise<BleWriteResult | null>;
+  /** `null` = the host did not answer. */
+  subscribe(serviceUuid: string, characteristicUuid: string): Promise<boolean | null>;
+  /** `null` = the host did not answer. */
+  unsubscribe(serviceUuid: string, characteristicUuid: string): Promise<boolean | null>;
 }
 
 /** Returns a BleClient that uses the Tauri bridge on device, Web Bluetooth on host. */
@@ -314,23 +594,23 @@ export function createBleClient(): BleClient {
   const useTauri = tauriBleAvailable();
 
   return {
-    async connect(address: string): Promise<boolean> {
+    async connect(address: string): Promise<boolean | null> {
       if (useTauri) return bleConnect(address);
       return webConnect(address);
     },
-    async disconnect(): Promise<boolean> {
+    async disconnect(): Promise<boolean | null> {
       if (useTauri) return bleDisconnect();
       await webDisconnect();
       return true;
     },
-    async discoverServices(): Promise<BleService[] | null> {
+    async discoverServices(): Promise<BleDiscoverResult | null> {
       if (useTauri) return bleDiscoverServices();
       return null;
     },
     async read(
       serviceUuid: string,
       characteristicUuid: string,
-    ): Promise<BleReadResult> {
+    ): Promise<BleReadResult | null> {
       if (useTauri) return bleRead(serviceUuid, characteristicUuid);
       return webRead(serviceUuid, characteristicUuid);
     },
@@ -339,23 +619,47 @@ export function createBleClient(): BleClient {
       characteristicUuid: string,
       value: number[],
       withResponse = false,
-    ): Promise<BleWriteResult> {
+    ): Promise<BleWriteResult | null> {
       if (useTauri) return bleWrite(serviceUuid, characteristicUuid, value, withResponse);
       return webWrite(serviceUuid, characteristicUuid, value, withResponse);
     },
     async subscribe(
       serviceUuid: string,
       characteristicUuid: string,
-    ): Promise<boolean> {
+    ): Promise<boolean | null> {
       if (useTauri) return bleSubscribe(serviceUuid, characteristicUuid);
       return webSubscribe(serviceUuid, characteristicUuid);
     },
     async unsubscribe(
       serviceUuid: string,
       characteristicUuid: string,
-    ): Promise<boolean> {
+    ): Promise<boolean | null> {
       if (useTauri) return bleUnsubscribe(serviceUuid, characteristicUuid);
       return webUnsubscribe(serviceUuid, characteristicUuid);
     },
   };
 }
+
+/**
+ * Turn characteristic notifications on or off through the unified client.
+ *
+ * One named call instead of `client.subscribe(…)` / `client.unsubscribe(…)` at the call
+ * site: which transport sits underneath (the Kotlin GATT bridge on device vs Web Bluetooth
+ * on host) is exactly what a screen should not have to re-decide, and the on/off pair is
+ * what must not drift apart — a UI that subscribes through one path and unsubscribes
+ * through another leaves a notification stream nobody owns.
+ *
+ * `null` = the host did not answer, and it is **not** "the device refused" — the screen words
+ * those two apart (REQ-A1337).
+ */
+export async function bleSetNotifications(
+  client: BleClient,
+  serviceUuid: string,
+  characteristicUuid: string,
+  on: boolean,
+): Promise<boolean | null> {
+  return on
+    ? client.subscribe(serviceUuid, characteristicUuid)
+    : client.unsubscribe(serviceUuid, characteristicUuid);
+}
+

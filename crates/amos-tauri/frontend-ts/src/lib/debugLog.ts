@@ -17,6 +17,13 @@
  *  - the level threshold defaults to `info`. Setting `amos.debug.log = "0"` (the
  *    pre-existing "quiet console" switch) silences the console AND raises the
  *    threshold to `warn`, so "off" cannot silently fill the ledger with info noise.
+ *  - a recorded failure carries its **reason**, not just its name: an exception used to
+ *    render as `{}` (`JSON.stringify` drops a non-enumerable `message`), so `safeDetail`
+ *    renders exceptions — top-level or nested — as `name: message · first frame`
+ *    (REQ-A839).
+ *  - every field of an entry is *read by the surface that renders it*: `detail` (the
+ *    reason) and `ts` (when) were both stored and dropped at the render point, which is
+ *    what `scripts/diag-render-scan.mjs` now asks.
  *
  * Usage:
  *   import { amosLog, amosWarn, amosError } from "../lib/debugLog";
@@ -77,12 +84,62 @@ function tag(area: string): string {
   return `${PREFIX}[${area}]`;
 }
 
+/**
+ * Is this an exception (this realm's, or another one's)?
+ *
+ * `instanceof Error` alone is not enough: a rejection that crossed a realm boundary (the
+ * Tauri host's `invoke` plumbing, an iframe) is an Error whose prototype is in a different
+ * realm, and `instanceof` answers `false` for it. The shape check is the fallback, so
+ * `name` + `message` + `stack` must all be strings to qualify — that keeps an ordinary
+ * data object (`BridgeDiag`'s `{ ok, kind, command }`) out.
+ */
+function isErrorLike(v: unknown): v is { name: string; message: string; stack?: string } {
+  if (typeof v !== "object" || v === null) return false;
+  if (v instanceof Error) return true;
+  const o = v as Record<string, unknown>;
+  return (
+    typeof o.name === "string" && typeof o.message === "string" && typeof o.stack === "string"
+  );
+}
+
+/**
+ * Render an exception as text the ledger can keep.
+ *
+ * `JSON.stringify(new Error("boom"))` is **`"{}"`** — `message` and `stack` are
+ * non-enumerable — so before this, an exception handed to a logger reached the ledger (and
+ * the device's logcat, which this module's header calls "the primary instrument for 'why is
+ * X not rendering on the device' questions") as `{}`: the failure was recorded, its **reason
+ * was not** (REQ-A839). The same hole swallowed a whole `BridgeDiag` whose nested `detail`
+ * was an Error — `{"ok":false,"kind":"command-failed","detail":{}}`.
+ *
+ * `name: message` plus the first stack frame is what a reader can act on; the rest of the
+ * stack stays in logcat, where it is unbounded.
+ */
+function errorText(e: { name?: unknown; message?: unknown; stack?: unknown }): string {
+  const name = typeof e.name === "string" && e.name !== "" ? e.name : "Error";
+  const message = typeof e.message === "string" ? e.message : "";
+  const head = message === "" ? name : `${name}: ${message}`;
+  const frame =
+    typeof e.stack === "string"
+      ? e.stack.split("\n").find((l) => /^\s+at\s/.test(l))?.trim()
+      : undefined;
+  return frame ? `${head} · ${frame}` : head;
+}
+
+/** `JSON.stringify` replacer: an exception nested anywhere in the value becomes its text. */
+function errReplacer(_key: string, value: unknown): unknown {
+  return isErrorLike(value) ? errorText(value) : value;
+}
+
 /** Render any value for the ledger without ever throwing or blowing up in size. */
 function safeDetail(v: unknown): string {
   if (v === undefined) return "";
   let s: string;
   try {
-    s = typeof v === "string" ? v : JSON.stringify(v) ?? String(v);
+    if (typeof v === "string") s = v;
+    else if (isErrorLike(v)) s = errorText(v);
+    // The replacer catches exceptions nested inside a plain object (`{detail: err}`).
+    else s = JSON.stringify(v, errReplacer) ?? String(v);
   } catch {
     // Circular / BigInt / a throwing getter: fall back to a plain coercion.
     try {
@@ -92,6 +149,21 @@ function safeDetail(v: unknown): string {
     }
   }
   return s.length > DETAIL_CAP ? `${s.slice(0, DETAIL_CAP)}…(+${s.length - DETAIL_CAP})` : s;
+}
+
+/**
+ * `HH:MM:SS` for one ledger row, on this device's clock (pure, unit-tested).
+ *
+ * A row without a time cannot answer "when did that happen", which is half of what a
+ * failures panel is asked. Not localizable on purpose: a diagnostic timestamp is read by
+ * whoever is diagnosing, and `toLocaleTimeString` would make two devices' logs disagree
+ * about the same moment's rendering.
+ */
+export function clockOf(ts: number): string {
+  if (!Number.isFinite(ts) || ts <= 0) return "--:--:--";
+  const d = new Date(ts);
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
 
 /**
@@ -149,7 +221,18 @@ export function amosError(area: string, msg: string, data?: unknown): void {
   diag("error", area, msg, data);
 }
 
-/** The recorded ledger, **newest first**, at most `n` entries (default: all). */
+/**
+ * The recorded ledger, **newest first**, at most `n` entries (default: all).
+ *
+ * Asking "what has been recorded since I last looked" is a **mark** question, not a length
+ * question (REQ-A853): the ring is bounded by [`RING_CAP`], so `recentDiag(-1).length` stops
+ * growing the moment it fills, and a `length - before` window becomes **empty exactly when
+ * the ledger is busiest** — an assertion built on it reports "never recorded" about an entry
+ * that is sitting in the ring. Take the mark from the newest entry's monotonic `seq`
+ * (`recentDiag(1)[0]?.seq ?? 0` — the counter survives eviction and `clearDiag`, so a mark taken
+ * before a clear still windows correctly afterwards) and select with
+ * `recentDiag(-1).find((e) => e.seq > mark)`.
+ */
 export function recentDiag(n = RING_CAP): DiagEntry[] {
   const out = ring.slice();
   out.reverse();

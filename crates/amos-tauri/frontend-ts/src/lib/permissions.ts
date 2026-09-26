@@ -13,10 +13,18 @@
  * actual camera/mic/location calls behind `capSet`) is the caller's job and
  * will be wired to a permission request/deny flow + a privacy dashboard next.
  */
-import { readStoreValue, writeStoreValue } from "./amosStore";
+import { readStoreValue, writeStoreValueChecked } from "./amosStore";
 
 /**
- * A sensitive capability an app may request.
+ * Every capability the OS knows about (drives dashboards / prompts).
+ *
+ * **This array is the one declaration.** {@link Capability} is *derived* from it
+ * (`(typeof CAPABILITIES)[number]`), so the vocabulary cannot be spelled twice and
+ * drift. It used to be two hand-written spellings of the same six strings — a union
+ * type plus this array — joined only by an `as readonly string[]` membership test
+ * that hid the split from the checker (a string in one but not the other still
+ * compiled). `permissions.test.ts` now freezes the values and cross-checks the five
+ * daemon-mirrored keys against `amos-ai::privacy::Resource` in Rust.
  *
  * The vocabulary mirrors the daemon's `amos-ai::privacy::Resource` wire keys for
  * the OS resources that the daemon gate-keeps (`camera` / `microphone` /
@@ -24,23 +32,22 @@ import { readStoreValue, writeStoreValue } from "./amosStore";
  * capability — it has no daemon resource and is not part of the OS permission
  * store (see `lib/privacyBackend.ts`).
  */
-export type Capability =
-  | "camera"
-  | "microphone"
-  | "location"
-  | "contacts"
-  | "storage"
-  | "notifications";
-
-/** Every capability the OS knows about (drives dashboards / prompts). */
-export const CAPABILITIES: readonly Capability[] = [
+export const CAPABILITIES = [
   "camera",
   "microphone",
   "location",
   "contacts",
   "storage",
   "notifications",
-];
+] as const;
+
+/**
+ * A sensitive capability an app may request — an element of {@link CAPABILITIES}.
+ *
+ * Derived, not hand-written: an add/rename is one edit, and the membership check
+ * in {@link normalizeLedger} can no longer silently disagree with the type.
+ */
+export type Capability = (typeof CAPABILITIES)[number];
 
 /** An app's display name key — a stable app id (built-in id or `store:<mid>`). */
 export type AppId = string;
@@ -111,7 +118,15 @@ export function loadLedger(): PermissionLedger {
   return normalizeLedger(readStoreValue<PermissionLedger>(PERMISSIONS_KEY, {}));
 }
 
-/** Persist the ledger to the (durable) shared store. */
-export function saveLedger(ledger: PermissionLedger): void {
-  writeStoreValue(PERMISSIONS_KEY, normalizeLedger(ledger));
+/**
+ * Persist the ledger to the (durable) shared store, and report whether it **landed**.
+ *
+ * The answer is not optional bookkeeping: `amos.permissions` is what every gate in the OS
+ * reads back (`loadLedger`), so a refused write means the change the user just made is not
+ * the change the next boot will enforce — a revoke that did not land leaves the capability
+ * granted. Callers that *show* the ledger must therefore adopt this verdict
+ * (`svelte/osPermissions`), not the value they attempted to write.
+ */
+export function saveLedger(ledger: PermissionLedger): boolean {
+  return writeStoreValueChecked(PERMISSIONS_KEY, normalizeLedger(ledger));
 }

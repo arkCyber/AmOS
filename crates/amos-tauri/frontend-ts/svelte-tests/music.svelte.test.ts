@@ -9,6 +9,7 @@ import { afterEach, describe, expect, test } from "vitest";
 import { cleanup, fireEvent, render } from "@testing-library/svelte";
 import MusicApp from "../src/svelte/MusicApp.svelte";
 import { readStoreValue } from "../src/lib/amosStore";
+import { zh } from "../src/i18n/locales/zh";
 
 afterEach(cleanup);
 
@@ -17,7 +18,8 @@ const bigTitle = (h: { container: HTMLElement }) =>
   h.container.querySelector("p.text-center.text-lg")?.textContent ?? "";
 const playBtn = (h: { container: HTMLElement }) =>
   [...h.container.querySelectorAll("button")].find((b) =>
-    b.getAttribute("aria-label") === "play" || b.getAttribute("aria-label") === "pause",
+    b.getAttribute("aria-label") === zh["player.play"] ||
+    b.getAttribute("aria-label") === zh["player.pause"],
   ) as HTMLButtonElement | undefined;
 const btnByIcon = (h: { container: HTMLElement }, name: string) =>
   [...h.container.querySelectorAll("button")].find((b) => b.getAttribute("data-icon") === name);
@@ -82,9 +84,9 @@ describe("MusicApp.svelte", () => {
 
   test("play button toggles to pause", async () => {
     const host = render(MusicApp);
-    expect(playBtn(host)?.getAttribute("aria-label")).toBe("play");
+    expect(playBtn(host)?.getAttribute("aria-label")).toBe(zh["player.play"]);
     await fireEvent.click(playBtn(host) as HTMLButtonElement);
-    expect(playBtn(host)?.getAttribute("aria-label")).toBe("pause");
+    expect(playBtn(host)?.getAttribute("aria-label")).toBe(zh["player.pause"]);
   });
 
   test("next changes the current track", async () => {
@@ -94,5 +96,32 @@ describe("MusicApp.svelte", () => {
     expect(next).toBeTruthy();
     await fireEvent.click(next as HTMLButtonElement);
     expect(bigTitle(host)).not.toBe(t0);
+  });
+
+  // REQ-A968: the lyrics button's accessible name is the constant `music.lyrics`; its
+  // open/closed state lived only in an opacity class, so AT read the same name in both
+  // states and a press meant to "open" could close. `aria-expanded` is the repo idiom
+  // for a disclosure (Dock.svelte:777).
+  test("lyrics button announces its expanded state", async () => {
+    const host = render(MusicApp);
+    expect(btnByIcon(host, "lyrics")?.getAttribute("aria-expanded")).toBe("false");
+    await fireEvent.click(btnByIcon(host, "lyrics") as HTMLButtonElement);
+    expect(btnByIcon(host, "lyrics")?.getAttribute("aria-expanded")).toBe("true");
+    await fireEvent.click(btnByIcon(host, "lyrics") as HTMLButtonElement);
+    expect(btnByIcon(host, "lyrics")?.getAttribute("aria-expanded")).toBe("false");
+  });
+
+  // REQ-A969: the repeat button is a three-state cycle (all→one→off) but its
+  // accessible name was the constant `music.repeat`; the mode was shown only by an
+  // opacity/colour class. `aria-pressed`/`aria-expanded` are two-state, so a cycle
+  // has no attribute to carry its state — the NAME must say which mode is on.
+  test("repeat button's accessible name names the current mode", async () => {
+    const host = render(MusicApp);
+    const repeatBtn = () => btnByIcon(host, "repeat");
+    expect(repeatBtn()?.getAttribute("aria-label")).toBe(zh["player.repeatAll"]);
+    await fireEvent.click(repeatBtn() as HTMLButtonElement);
+    expect(repeatBtn()?.getAttribute("aria-label")).toBe(zh["player.repeatOne"]);
+    await fireEvent.click(repeatBtn() as HTMLButtonElement);
+    expect(repeatBtn()?.getAttribute("aria-label")).toBe(zh["player.repeatOff"]);
   });
 });

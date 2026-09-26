@@ -291,3 +291,46 @@ describe("G-β-1 · Control Center 屏幕亮度滑杆（仅桌面 WebView 内容
     expect(Number(slider!.value)).toBe(30);
   });
 });
+
+/**
+ * Airplane mode owns the other radios — and the panel must **mark** that before the tap
+ * (REQ-A1082). `lib/quickRadio.tapRadio` answers `{ kind: "gated" }` for such a tap (the
+ * write is not even attempted), and ControlCenter's handler drops that verdict: no state
+ * change, no sentence. The settings page marks exactly this state (`RadioPage` disables its
+ * ToggleRow under `qs.airplane` and shows `settings.airplaneBlocks`), and this panel's own
+ * header claims "a switch that cannot work is marked **before** the user taps it" — so the
+ * live-looking, inert Wi-Fi tile is the defect, not the design.
+ */
+describe("ControlCenter — airplane mode marks the switches it owns (REQ-A1082)", () => {
+  test("the Wi-Fi and Bluetooth tiles are marked before the tap, with the reason on screen", async () => {
+    // The device holds airplane mode (the panel reads device truth on open — REQ-A185).
+    installHost({ status: { wifi: true, bluetooth: true, airplane: true, hotspot: false } });
+    const { container } = render(ControlCenter);
+    await tick();
+    await settle();
+    const tile = (id: string) => container.querySelector<HTMLButtonElement>(`[data-testid="${id}"]`)!;
+    expect(
+      tile("cc-radio-wifi").disabled,
+      "Wi-Fi cannot work under airplane mode — it must not look like a live control",
+    ).toBe(true);
+    expect(tile("cc-radio-bluetooth").disabled).toBe(true);
+    expect(
+      tile("cc-radio-airplane").disabled,
+      "the airplane switch itself is the one that can still be tapped",
+    ).toBe(false);
+    expect(container.querySelector('[data-testid="cc-airplane-blocks"]')?.textContent?.trim()).toBe(
+      zh["settings.airplaneBlocks"],
+    );
+  });
+
+  test("control: with airplane off the same tiles are live and nothing is explained away", async () => {
+    installHost({ status: { wifi: false, bluetooth: false, airplane: false, hotspot: false } });
+    const { container } = render(ControlCenter);
+    await tick();
+    await settle();
+    expect(
+      container.querySelector<HTMLButtonElement>('[data-testid="cc-radio-wifi"]')!.disabled,
+    ).toBe(false);
+    expect(container.querySelector('[data-testid="cc-airplane-blocks"]')).toBeNull();
+  });
+});

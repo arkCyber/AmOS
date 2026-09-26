@@ -16,7 +16,8 @@
 //! `subscriber::<T>`), so identity, clock and counters are wired once instead of at
 //! every call site. The control plane (`src/service.rs`) and the CLI are both thin
 //! shells over this type — which is why `amos-ai` mounts the middleware with a single
-//! `.add_service(amos_link::service::server(node))`.
+//! `.add_service(amos_link::service::mock_server())`, and a deployment that brings its
+//! own transport or clock calls `amos_link::service::server(node)` instead.
 //!
 //! Defaults are honest: [`LinkNode::in_process`] gets the in-process [`Broker`] and
 //! the **host** clock (`clock_synced == false` until the supervisor's timekeeper
@@ -367,6 +368,12 @@ impl LinkNode {
 
     /// The default federation period (1 Hz, like the heartbeat: cheap and fast enough
     /// that a [`PeerRegistry`] TTL of three periods notices a dead board in seconds).
+    ///
+    /// This is [`crate::discovery::federation_period`] at the default TTL — the one rule
+    /// ([`PeerRegistry::DEFAULT_TTL`] / 3), not a second number. A kernel test
+    /// (`default_federation_period_is_the_rule_at_the_default_ttl`) ties the two so a
+    /// change to the TTL cannot silently leave this "default" claiming a cadence the
+    /// rule no longer produces.
     pub const FEDERATION_PERIOD: Duration = Duration::from_secs(1);
 }
 
@@ -643,6 +650,20 @@ mod tests {
         assert!(
             n.status().await.metrics.published >= 1,
             "the heartbeat task published on the link"
+        );
+    }
+
+    /// `LinkNode::FEDERATION_PERIOD` is documented as "the default federation period … a
+    /// `PeerRegistry` TTL of three periods" — i.e. [`crate::discovery::federation_period`]
+    /// at [`PeerRegistry::DEFAULT_TTL`]. This test *establishes* that relationship instead
+    /// of leaving it as prose: change the TTL (or the rule) and the "default period" can
+    /// no longer claim a cadence the rule does not produce, without this failing first.
+    #[test]
+    fn default_federation_period_is_the_rule_at_the_default_ttl() {
+        assert_eq!(
+            LinkNode::FEDERATION_PERIOD,
+            crate::discovery::federation_period(PeerRegistry::DEFAULT_TTL),
+            "the default period must be the cadence rule at the default TTL, not a second number"
         );
     }
 }

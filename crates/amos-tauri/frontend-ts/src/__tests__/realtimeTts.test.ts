@@ -95,6 +95,27 @@ describe("realtimeTts playback (latest-segment wins)", () => {
     }
   });
 
+  test("playPcm answers `false` when nothing could be started (REQ-A1444)", () => {
+    const prevWindow = (globalThis as Record<string, unknown>).window as unknown;
+    try {
+      // A window with no AudioContext, and a payload with no samples: both are silent no-ops,
+      // and both must be readable as "not produced" rather than assumed to have played.
+      (globalThis as Record<string, unknown>).window = {};
+      expect(playPcm(pcm(1))).toBe(false);
+      const { restore } = fakeAudio();
+      try {
+        expect(playPcm({ samples: [], sample_rate: 16000, channels: 1 })).toBe(false);
+        expect(playPcm(pcm(1))).toBe(true); // and a real start is `true`
+      } finally {
+        restore();
+      }
+    } finally {
+      if (prevWindow === undefined) delete (globalThis as Record<string, unknown>).window;
+      else (globalThis as Record<string, unknown>).window = prevWindow;
+      resetPlayCtx();
+    }
+  });
+
   test("speakText is a no-op on empty text and still drives synth otherwise", async () => {
     const { restore } = fakeAudio();
     try {

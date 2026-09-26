@@ -37,16 +37,21 @@ pub const MAGIC: [u8; 4] = *b"AMLK";
 pub const VERSION: u8 = 1;
 /// Fixed part of the frame before the bincode header: magic + version + header length.
 const PREFIX_LEN: usize = 4 + 1 + 4;
-/// Largest accepted payload (and therefore frame), in bytes.
+/// Largest accepted **payload**, in bytes. The frame that carries it is larger by the header,
+/// the fixed prefix and the CRC (`MAX_PAYLOAD_BYTES + MAX_HEADER_BYTES + PREFIX_LEN + 4`), and
+/// the C ABI spells that frame bound as its own constant.
 ///
 /// A robot link carries large things — a 1280×720 stereo depth pair is ~1 MB — but
 /// "large" has to end somewhere: without a ceiling, one misbehaving publisher (or a
 /// hostile one) makes every subscriber allocate whatever the header claims. 16 MiB
 /// leaves room for a full-resolution depth frame or a point cloud with a wide margin,
-/// and is enforced on **both** sides: [`Envelope::encode`] refuses to build an
-/// oversized frame and [`Envelope::decode`] refuses to believe one (`payload_len` is
-/// checked *before* any allocation, so a forged header cannot make a receiver
-/// allocate 4 GiB).
+/// and it is enforced on **both** sides — [`Envelope::encode`] refuses to build a
+/// payload above it, and [`Envelope::decode`] refuses to believe one. On the receive
+/// path that is **two** checks, because the frame bound alone is not enough: the payload
+/// slice is measured against this ceiling (and the header's `payload_len` against the
+/// bytes actually present) *before* `decode` copies anything, so a forged header cannot
+/// make a receiver allocate 4 GiB — nor smuggle in a payload the sender's own ceiling
+/// would have refused to build.
 pub const MAX_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 /// Largest accepted header (a topic + a peer id + numbers; 4 KiB is generous).
 const MAX_HEADER_BYTES: usize = 4 * 1024;
@@ -408,8 +413,9 @@ impl Envelope {
     /// slice is a borrow, so a caller that discards it allocates only the header.
     ///
     /// This is the **one** parser: `decode` is written on top of it, so the magic/version/length
-    /// ceiling/CRC/header-validation checks cannot drift between the two paths — they are the
-    /// checks that keep a hostile frame out, and a second copy of them would be a second opinion.
+    /// ceilings (the frame's **and** the payload's)/CRC/header-validation checks cannot drift
+    /// between the two paths — they are the checks that keep a hostile frame out, and a second
+    /// copy of them would be a second opinion.
     pub fn decode_header(frame: &[u8]) -> Result<(Header, &[u8])> {
         if frame.len() < PREFIX_LEN + 4 {
             return Err(LinkError::Frame(format!(
@@ -456,6 +462,19 @@ impl Envelope {
         }
         let header_bytes = &frame[PREFIX_LEN..header_end];
         let payload = &frame[crc_end..];
+        // The *payload* ceiling, re-applied on receive. The frame bound above is
+        // `payload + header + prefix + crc`, so a frame whose header is smaller than the
+        // maximum admits a payload above `MAX_PAYLOAD_BYTES` and still fits; `encode` refuses
+        // to build one, so a frame that carries one was not made by a peer obeying the same
+        // contract. Refusing it here (before the CRC over a 16 MiB slice, and well before
+        // `decode` copies it) keeps the receive side from accepting what the send side cannot
+        // produce — the same both-sides rule the header's shape follows.
+        if payload.len() > MAX_PAYLOAD_BYTES {
+            return Err(LinkError::Frame(format!(
+                "payload of {} bytes exceeds the {MAX_PAYLOAD_BYTES}-byte limit",
+                payload.len()
+            )));
+        }
         let expect = u32::from_le_bytes([
             frame[header_end],
             frame[header_end + 1],
@@ -939,6 +958,63 @@ mod tests {
         // A frame larger than any legal frame is refused outright.
         let huge = vec![0u8; MAX_PAYLOAD_BYTES + MAX_HEADER_BYTES + 16];
         assert!(Envelope::decode(&huge).is_err());
+    }
+
+    /// The payload ceiling and the frame ceiling are two different bounds, and only the frame
+    /// one used to be applied on receive.
+    ///
+    /// `decode_header` refused a frame longer than `MAX_PAYLOAD_BYTES + MAX_HEADER_BYTES +
+    /// PREFIX_LEN + 4` — but that sum is *payload **plus** header*, so a frame whose header is
+    /// smaller than the maximum admits a payload **above** `MAX_PAYLOAD_BYTES` and still fits.
+    /// `encode` refuses to build one, so no legitimate peer can send one: a receiver that
+    /// accepts it accepts more than its own sender can produce, which is the asymmetry this
+    /// pins (and the reason the constant's doc claims the ceiling is "enforced on **both**
+    /// sides").
+    #[test]
+    fn a_payload_above_the_ceiling_is_refused_however_small_the_header_is() {
+        fn wire(payload_len: usize) -> (WireHeader, Vec<u8>) {
+            (
+                WireHeader {
+                    topic: topic().as_str().to_string(),
+                    publisher: peer().as_str().to_string(),
+                    seq: 1,
+                    stamp: Timestamp::new(1_700_000_000, 0).expect("valid stamp"),
+                    payload_len: u32::try_from(payload_len).unwrap_or(u32::MAX),
+                },
+                vec![0u8; payload_len],
+            )
+        }
+
+        // Positive control at the boundary: a payload of *exactly* the ceiling is legal — the
+        // fix must not refuse the largest frame the encoder can actually build.
+        let (h, p) = wire(MAX_PAYLOAD_BYTES);
+        let ok = frame_of_wire_header(&h, &p);
+        let decoded = Envelope::decode(&ok).expect("a payload at the ceiling is accepted");
+        assert_eq!(decoded.payload.len(), MAX_PAYLOAD_BYTES);
+        assert_eq!(
+            Envelope::decode_header(&ok)
+                .expect("header path agrees")
+                .1
+                .len(),
+            MAX_PAYLOAD_BYTES
+        );
+
+        // One byte over, in a frame that is *itself* within the frame ceiling (the header is
+        // tiny here, so the frame is ~4 KiB short of the frame bound).
+        let (h, p) = wire(MAX_PAYLOAD_BYTES + 1);
+        let over = frame_of_wire_header(&h, &p);
+        assert!(
+            over.len() <= MAX_PAYLOAD_BYTES + MAX_HEADER_BYTES + PREFIX_LEN + 4,
+            "the fixture must be a frame the *frame* ceiling lets through, or it proves nothing"
+        );
+        assert!(
+            Envelope::decode(&over).is_err(),
+            "a payload above the ceiling must be refused even when the frame fits"
+        );
+        assert!(
+            Envelope::decode_header(&over).is_err(),
+            "the one parser refuses it on both paths"
+        );
     }
 
     /// A deterministic "does it panic?" sweep: 2 000 pseudo-random byte strings (plus

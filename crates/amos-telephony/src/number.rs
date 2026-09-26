@@ -107,11 +107,32 @@ impl EmergencyMap {
         }
     }
 
-    /// A broad, commonly-shared emergency set (CN + EU + US + JP style codes).
-    /// Intended as the **fallback** when no jurisdiction is known; production
-    /// assembly should prefer [`EmergencyMap::for_region`].
+    /// The set used when **no jurisdiction is known**: the mock/demo assembly and
+    /// [`EmergencyMap::for_region`]'s `_` fallback. Production assembly should prefer
+    /// [`EmergencyMap::for_region`] where the region is actually known.
+    ///
+    /// It must be a **superset of every code the device recognizes** — the flat
+    /// `digits == "…" -> true` list in `AmosInCallService.is_emergency`, which the device
+    /// enforces locally rather than crossing the JNI seam. That is a safety requirement, not a
+    /// convenience: this map is consulted *exactly* when the region is unknown, and the
+    /// classification decides the dial path. [`NumberKind::Regular`] reaches the ordinary
+    /// provider, where **recording is legal**; an emergency number is refused there and forced
+    /// onto the emergency path, where it is forbidden (`crate::route::guard_regular`,
+    /// `MockTelephonyProvider::start_recording`). So a code the device calls an emergency and
+    /// this map does not is an **emergency call that gets recorded**.
+    ///
+    /// `000` (AU/NZ), `118` (JP coast guard) and `108` (India) were each recognized by the device
+    /// and missing here, so a caller on an unknown jurisdiction dialling one of them took the
+    /// ordinary path. `the_host_copy_recognizes_every_canonical_emergency_code` now reads both
+    /// directions and keeps this closed (REQ-A820 / F-TEL-006).
+    ///
+    /// Deliberately broad: on an unknown jurisdiction the cost of over-classifying is a regular
+    /// number forced onto the emergency path, while the cost of under-classifying is a **recorded
+    /// emergency** — see the module's own "the worst failure mode" note on [`Self::for_region`].
     pub fn common_global() -> Self {
-        Self::from_slice(&["110", "112", "119", "120", "122", "911", "999"])
+        Self::from_slice(&[
+            "110", "112", "119", "120", "122", "911", "999", "000", "118", "108",
+        ])
     }
 
     /// Jurisdiction-flavoured emergency set, self-maintained (see `docs/telephony.md`
@@ -156,10 +177,21 @@ impl EmergencyMap {
     /// The primary quick-dial code used by a one-key lock-screen emergency entry
     /// for `region` (the number a locked user reaches in one tap). Defaults to the
     /// universal **112** so the button is never tied to one country.
+    ///
+    /// Every returned code must appear in [`EmergencyMap::for_region`] for the
+    /// same region — the two tables are cross-checked by
+    /// `quick_dial_is_always_in_its_own_region_table`, because a one-tap number
+    /// that the jurisdiction does not recognize reaches nobody:
+    /// * KR dials **112** (police), not the CN/JP police code 110 — 110 is not
+    ///   an emergency number in Korea.
+    /// * AU/NZ dial **000**, their actual emergency number (112 also works from
+    ///   mobiles), never the US 911, which does not connect there.
     pub fn quick_dial(region: &str) -> &'static str {
         match region.trim().to_ascii_uppercase().as_str() {
-            "CN" | "CN-HK" | "CN-MO" | "JP" | "KR" => "110",
-            "US" | "CA" | "MX" | "AU" | "NZ" => "911",
+            "CN" | "CN-HK" | "CN-MO" | "JP" => "110",
+            "KR" => "112",
+            "US" | "CA" | "MX" => "911",
+            "AU" | "NZ" => "000",
             _ => "112",
         }
     }
@@ -304,6 +336,213 @@ mod tests {
         assert_eq!(EmergencyMap::quick_dial("GB"), "112"); // EU/UK default
         assert_eq!(EmergencyMap::quick_dial("XX"), "112"); // universal default
         assert_eq!(EmergencyMap::quick_dial(""), "112");
+    }
+
+    /// The two tables in this module must never disagree: the number a one-tap
+    /// lock-screen entry dials has to be one the *same* jurisdiction's
+    /// [`EmergencyMap`] recognizes. A quick-dial code outside its own region's
+    /// table is a locked user tapping a button that reaches nobody — the worst
+    /// failure mode this module exists to prevent.
+    #[test]
+    fn quick_dial_is_always_in_its_own_region_table() {
+        for region in [
+            "CN", "CN-HK", "CN-MO", "JP", "KR", "US", "CA", "MX", "AU", "NZ", "GB", "IE", "DE",
+            "FR", "IT", "ES", "PT", "NL", "BE", "AT", "CH", "SE", "NO", "DK", "FI", "PL", "RU",
+            "GR",
+        ] {
+            let code = EmergencyMap::quick_dial(region);
+            assert!(
+                EmergencyMap::for_region(region).is_emergency(code),
+                "{region}'s one-tap code {code} is not in its own emergency table {:?}",
+                EmergencyMap::for_region(region).codes()
+            );
+        }
+        // And the universal fallback is itself an emergency code.
+        for unknown in ["ZZ", "XX", "", "  "] {
+            assert!(
+                EmergencyMap::for_region(unknown).is_emergency(EmergencyMap::quick_dial(unknown))
+            );
+        }
+    }
+
+    /// The host keeps a **flat local copy** of the emergency codes
+    /// (`AmosInCallService.is_emergency`, Kotlin) because its own comment says it
+    /// must not cross the JNI seam on that hot path. A copy with no binding
+    /// drifts, and the cost of drift here is an emergency call that gets
+    /// *recorded*: this asserts the copy recognizes every code the canonical
+    /// table can produce, so widening a region's set without updating the host is
+    /// a test failure rather than a silently admissible recording.
+    ///
+    /// **Which direction that is, and which direction this test used to check
+    /// (REQ-A820 / F-TEL-006).** Those two sentences disagreed. `NumberKind::Emergency` is what
+    /// forbids recording — the emergency provider refuses it (`MockTelephonyProvider`) and
+    /// `route::guard_regular` **rejects** such a number from the ordinary path entirely — so the
+    /// harm is the host failing to recognize **a code the device recognizes**. The reverse (host
+    /// wider than the device) merely forces an ordinary number onto the emergency path.
+    ///
+    /// What was asserted was the reverse: `KOTLIN.contains("digits == \"{code}\"")` over the
+    /// codes the *Rust regions* can produce. **Measured**: with `911` deleted from
+    /// `common_global()` — the host then misses a device-recognized emergency on the
+    /// unknown-jurisdiction path, which is the recordable one — every assertion here was still
+    /// **green**. It also read the raw file, so a comment quoting an arm answered for the code.
+    ///
+    /// Both directions are read now, and both from the **arms** of comment-stripped source: the
+    /// device's set is its `digits == "…" -> true` list, the host must contain it *on the map used
+    /// when the jurisdiction is unknown*, and no host region may name a code the device lacks.
+    #[test]
+    fn the_host_copy_recognizes_every_canonical_emergency_code() {
+        const KOTLIN: &str =
+            include_str!("../../amos-tauri/android-glue/com/amos/ai/glue/AmosInCallService.kt");
+        let code = strip_kotlin_comments(KOTLIN);
+
+        // The **device's** set: the arms that answer `true`. Read from comment-stripped source, so
+        // a comment quoting an old arm can neither widen nor narrow it.
+        let mut device: Vec<String> = Vec::new();
+        for line in code.lines() {
+            let mut from = 0usize;
+            while let Some(rel) = line[from..].find("digits == \"") {
+                let start = from + rel + "digits == \"".len();
+                let Some(close) = line[start..].find('"') else {
+                    break;
+                };
+                // Only an arm answering `true` recognizes the code; `-> false` is an exclusion.
+                let after = &line[start + close + 1..];
+                if after.trim_start().starts_with("-> true") {
+                    device.push(line[start..start + close].to_string());
+                }
+                from = start + close + 1;
+            }
+        }
+        // Vacuity guard: an empty device set would satisfy both directions below.
+        assert!(
+            device.len() >= 8,
+            "expected the device's flat `digits == \"…\" -> true` list, parsed {device:?}"
+        );
+        device.sort();
+        device.dedup();
+
+        // Direction 1 — no host region may claim a code the device does not recognize. Failing
+        // here forces an ordinary number onto the emergency path (annoying, not dangerous), and it
+        // is the direction that was checked before.
+        let mut all: Vec<String> = Vec::new();
+        for region in [
+            "CN", "CN-HK", "CN-MO", "JP", "KR", "US", "CA", "MX", "AU", "NZ", "GB", "IE", "DE",
+            "FR", "IT", "ES", "PT", "NL", "BE", "AT", "CH", "SE", "NO", "DK", "FI", "PL", "RU",
+            "GR",
+        ] {
+            for c in EmergencyMap::for_region(region).codes() {
+                if !all.contains(c) {
+                    all.push(c.clone());
+                }
+            }
+        }
+        // Guard against a vacuous pass if the tables were ever emptied.
+        assert!(
+            all.len() >= 8,
+            "the canonical code set looks wrong: {all:?}"
+        );
+        for code in &all {
+            assert!(
+                device.contains(code),
+                "AmosInCallService.kt no longer recognizes {code}: the host copy has drifted \
+                 from EmergencyMap, so a call to {code} could be recorded"
+            );
+        }
+
+        // Direction 2 — **the recording direction.** The map consulted when the jurisdiction is
+        // unknown must recognize every code the device does. A miss here dials the ordinary path,
+        // where recording is legal, so this is the assertion that protects the thing the doc
+        // above describes.
+        let fallback = EmergencyMap::common_global();
+        for code in &device {
+            assert!(
+                fallback.is_emergency(code),
+                "the device treats {code} as an emergency but `common_global()` — the map used \
+                 when the jurisdiction is unknown — does not, so that call reaches the ordinary \
+                 path and can be recorded"
+            );
+        }
+    }
+
+    /// Strip Kotlin block and line comments, leaving string literals intact — so a comment that
+    /// *quotes* an arm cannot answer for the code. A `//` inside a string literal is not a
+    /// comment, which is what makes this a character machine rather than a `find("//")`.
+    fn strip_kotlin_comments(src: &str) -> String {
+        let chars: Vec<char> = src.chars().collect();
+        let mut out = String::with_capacity(src.len());
+        let mut i = 0usize;
+        let mut block_depth = 0usize;
+        while i < chars.len() {
+            let c = chars[i];
+            if block_depth > 0 {
+                if c == '/' && chars.get(i + 1) == Some(&'*') {
+                    block_depth += 1;
+                    i += 2;
+                } else if c == '*' && chars.get(i + 1) == Some(&'/') {
+                    block_depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+            if c == '/' && chars.get(i + 1) == Some(&'/') {
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            if c == '/' && chars.get(i + 1) == Some(&'*') {
+                block_depth = 1;
+                i += 2;
+                continue;
+            }
+            if c == '"' {
+                out.push(c);
+                i += 1;
+                while i < chars.len() && chars[i] != '"' {
+                    if chars[i] == '\\' && i + 1 < chars.len() {
+                        out.push(chars[i]);
+                        i += 1;
+                    }
+                    out.push(chars[i]);
+                    i += 1;
+                }
+                if i < chars.len() {
+                    out.push(chars[i]);
+                    i += 1;
+                }
+                continue;
+            }
+            out.push(c);
+            i += 1;
+        }
+        out
+    }
+
+    /// The stripper is itself two-sided: the arm must survive, a commented-out copy of it must
+    /// not, and a `//` inside a string literal must not be taken for a comment.
+    #[test]
+    fn strip_kotlin_comments_keeps_arms_and_drops_prose() {
+        let src = "\
+        // digits == \"108\" -> true was removed in the migration\n\
+        /** the old list had digits == \"999\" -> true */\n\
+        digits == \"108\" -> true\n\
+        val odd = \"a//b\"\n";
+        let code = strip_kotlin_comments(src);
+        assert_eq!(
+            code.matches("digits == \"108\"").count(),
+            1,
+            "only the real arm may survive; the commented-out one must be gone"
+        );
+        assert!(
+            !code.contains("digits == \"999\""),
+            "a comment quoting an old arm must not be read as one"
+        );
+        assert!(
+            code.contains("\"a//b\""),
+            "a // inside a string literal is not a comment"
+        );
     }
 
     #[test]

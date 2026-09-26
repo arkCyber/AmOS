@@ -17,6 +17,12 @@ use amos_proto::amos_telemetry_spy::{
     telemetry_spy_service_client::TelemetrySpyServiceClient, Confidence, EgressHit, Empty,
     IdentifierHit, IdentifierKind, Protocol,
 };
+// The domain core's `as_str()` keys are the *declared* wire spelling of these
+// vocabularies (each documented as "the stable machine key / a future wire
+// mapping"). The `*_str` mappers below derive from them — see REQ-A650 / F-SH-118.
+use amos_telemetry_spy::{
+    Confidence as DomainConfidence, IdentifierKind as DomainKind, Protocol as DomainProtocol,
+};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 use tokio::time::{sleep, Duration};
@@ -44,12 +50,13 @@ pub const MAX_PAYLOAD_BYTES: usize = 4 * 1024;
 /// Wire vocabulary for the telemetry-spy module. The UI i18n layer branches
 /// on these; renaming a variant is a wire break.
 pub mod codes {
+    use crate::error::ErrorCode;
     /// `TelemetrySpyService.Watch` could not be opened (daemon down / RPC error).
-    pub const WATCH_OPEN_FAILED: &str = "amos.telemetry_spy.watch_open_failed";
+    pub const WATCH_OPEN_FAILED: &str = ErrorCode::TelemetrySpyWatchOpenFailed.as_str();
     /// The watch stream returned an error mid-flight.
-    pub const STREAM_ERROR: &str = "amos.telemetry_spy.stream_error";
+    pub const STREAM_ERROR: &str = ErrorCode::TelemetrySpyStreamError.as_str();
     /// A spy hit could not be delivered to the UI.
-    pub const EMIT_FAILED: &str = "amos.telemetry_spy.emit_failed";
+    pub const EMIT_FAILED: &str = ErrorCode::TelemetrySpyEmitFailed.as_str();
 }
 
 /// One graded identifier hit, serializable for the WebView.
@@ -95,35 +102,56 @@ async fn build_spy_client(
     Ok(TelemetrySpyServiceClient::new(daemon::channel().await?))
 }
 
-fn protocol_str(p: i32) -> String {
+/// Map a proto `Protocol` bit to its domain kind; `None` for a bit this build
+/// does not know.
+fn domain_protocol(p: i32) -> Option<DomainProtocol> {
     match p {
-        p if p == Protocol::Tcp as i32 => "tcp",
-        p if p == Protocol::Udp as i32 => "udp",
-        p if p == Protocol::Icmp as i32 => "icmp",
-        p if p == Protocol::Other as i32 => "other",
-        _ => "unknown",
+        p if p == Protocol::Tcp as i32 => Some(DomainProtocol::Tcp),
+        p if p == Protocol::Udp as i32 => Some(DomainProtocol::Udp),
+        p if p == Protocol::Icmp as i32 => Some(DomainProtocol::Icmp),
+        p if p == Protocol::Other as i32 => Some(DomainProtocol::Other),
+        _ => None,
     }
-    .to_string()
+}
+
+/// Map a proto `Confidence` bit to its domain kind.
+fn domain_confidence(c: i32) -> Option<DomainConfidence> {
+    match c {
+        c if c == Confidence::Low as i32 => Some(DomainConfidence::Low),
+        c if c == Confidence::Medium as i32 => Some(DomainConfidence::Medium),
+        c if c == Confidence::High as i32 => Some(DomainConfidence::High),
+        _ => None,
+    }
+}
+
+/// Map a proto `IdentifierKind` bit to its domain kind.
+fn domain_kind(k: i32) -> Option<DomainKind> {
+    match k {
+        k if k == IdentifierKind::KindSerial as i32 => Some(DomainKind::Serial),
+        k if k == IdentifierKind::KindImei as i32 => Some(DomainKind::Imei),
+        k if k == IdentifierKind::KindCellId as i32 => Some(DomainKind::CellId),
+        _ => None,
+    }
+}
+
+/// The wire/UI spelling of a graded field: the domain enum's own `as_str()` key
+/// (the one declared authority), or `"unknown"` for a bit this build does not
+/// recognize. `"unknown"` has no domain variant, so it is the bridge's local
+/// sentinel and is deliberately *not* sourced from the domain crate.
+fn wire_key(key: Option<&'static str>) -> String {
+    key.unwrap_or("unknown").to_string()
+}
+
+fn protocol_str(p: i32) -> String {
+    wire_key(domain_protocol(p).map(DomainProtocol::as_str))
 }
 
 fn confidence_str(c: i32) -> String {
-    match c {
-        c if c == Confidence::Low as i32 => "low",
-        c if c == Confidence::Medium as i32 => "medium",
-        c if c == Confidence::High as i32 => "high",
-        _ => "unknown",
-    }
-    .to_string()
+    wire_key(domain_confidence(c).map(DomainConfidence::as_str))
 }
 
 fn kind_str(k: i32) -> String {
-    match k {
-        k if k == IdentifierKind::KindSerial as i32 => "serial",
-        k if k == IdentifierKind::KindImei as i32 => "imei",
-        k if k == IdentifierKind::KindCellId as i32 => "cell_id",
-        _ => "unknown",
-    }
-    .to_string()
+    wire_key(domain_kind(k).map(DomainKind::as_str))
 }
 
 fn identifier_payload(h: &IdentifierHit) -> SpyIdentifierHit {
@@ -359,5 +387,35 @@ mod tests {
         );
         assert_eq!(codes::STREAM_ERROR, "amos.telemetry_spy.stream_error");
         assert_eq!(codes::EMIT_FAILED, "amos.telemetry_spy.emit_failed");
+    }
+
+    /// The bridge's `*_str` mappers derive their spellings from the domain
+    /// crate's `as_str()` keys, which are each *declared* to be the wire mapping
+    /// (`amos-telemetry-spy`: "Stable machine key for logs / a future wire
+    /// mapping"). This pins that derivation to the literal vocabulary: a rename
+    /// on the domain side — or a wrong proto-bit → domain-kind arm — turns this
+    /// red instead of silently mislabelling a leaked identifier / transport /
+    /// evidence grade in the notification the System UI renders.
+    #[test]
+    fn the_wire_vocabularies_are_the_domain_as_str_keys() {
+        // Identifier kinds (`IdentifierKind::as_str`).
+        assert_eq!(kind_str(IdentifierKind::KindSerial as i32), "serial");
+        assert_eq!(kind_str(IdentifierKind::KindImei as i32), "imei");
+        assert_eq!(kind_str(IdentifierKind::KindCellId as i32), "cell_id");
+        assert_eq!(kind_str(999), "unknown", "an unknown bit is not guessed");
+        assert_eq!(domain_kind(999), None);
+
+        // Transport (`Protocol::as_str`).
+        assert_eq!(protocol_str(Protocol::Tcp as i32), "tcp");
+        assert_eq!(protocol_str(Protocol::Udp as i32), "udp");
+        assert_eq!(protocol_str(Protocol::Icmp as i32), "icmp");
+        assert_eq!(protocol_str(Protocol::Other as i32), "other");
+        assert_eq!(protocol_str(999), "unknown");
+
+        // Evidence grade (`Confidence::as_str`).
+        assert_eq!(confidence_str(Confidence::Low as i32), "low");
+        assert_eq!(confidence_str(Confidence::Medium as i32), "medium");
+        assert_eq!(confidence_str(Confidence::High as i32), "high");
+        assert_eq!(confidence_str(999), "unknown");
     }
 }

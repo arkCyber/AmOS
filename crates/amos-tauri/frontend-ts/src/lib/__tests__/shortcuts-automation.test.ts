@@ -32,6 +32,7 @@ import {
 } from "../shortcuts";
 import { NOTIF_KEY, type Notif } from "../settings";
 import { readStoreValue } from "../amosStore";
+import { LOCALE_KEY } from "../../svelte/i18n";
 
 const storageMap = new Map<string, string>();
 const mockStorage: Storage = {
@@ -79,7 +80,6 @@ function ctx(vars: Record<string, unknown> = {}, input?: unknown): ExecutionCont
     variables: new Map(Object.entries(vars)),
     input,
     output: input,
-    fromSiri: false,
     fromAutomation: false,
     startTime: Date.now(),
   };
@@ -390,6 +390,25 @@ describe("系统集成动作", () => {
     expect(list[0]?.icon).toBe("⚠️");
     expect(list[1]?.title).toBe("标题");
     expect(list[0]?.app).toBe("快捷指令");
+  });
+
+  it("通知的署名写的是推送当刻的语言，不冻结成中文（英文界面下不再是「快捷指令」）", async () => {
+    // `Notif.app` 是显示串、按下时解析一次，所以英文界面下这条行必须署名 "Shortcuts"。
+    // 这里写死过中文字面量：REQ-A1134 的清扫只找 `zh[...]` 查表，字面量被漏掉了。
+    mockStorage.setItem(LOCALE_KEY, "en");
+    try {
+      const sc = createShortcut(`notif-locale-${++seq}`, {
+        // 空标题同时钉住标题的兜底：它也必须跟着语言走，而不是回落到中文。
+        actions: [action("show_notification", { title: "", body: "hi" })],
+      })!;
+      const r = await executeShortcut(sc.id);
+      expect(r.success).toBe(true);
+      const list = readStoreValue<Notif[]>(NOTIF_KEY, []);
+      expect(list[0]?.app).toBe("Shortcuts");
+      expect(list[0]?.title).toBe("Shortcuts");
+    } finally {
+      mockStorage.removeItem(LOCALE_KEY);
+    }
   });
 
   it("open_app 在无桥（纯 bun）时如实降级、不假装打开、也不抛", async () => {

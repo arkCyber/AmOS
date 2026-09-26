@@ -185,6 +185,11 @@ impl<P: MailProvider> MailClient<P> {
         self.provider.set_flagged(mailbox, id, flagged).await
     }
 
+    /// Toggle a message's replied flag.
+    pub async fn set_answered(&self, mailbox: &str, id: &str, answered: bool) -> Result<()> {
+        self.provider.set_answered(mailbox, id, answered).await
+    }
+
     /// Delete a message from a mailbox (permanent removal from that mailbox).
     pub async fn delete(&self, mailbox: &str, id: &str) -> Result<()> {
         self.provider.delete(mailbox, id).await

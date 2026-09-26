@@ -11,6 +11,8 @@ This document is the **single source of truth** for all keyboard shortcuts in Am
 
 **Design Principle**: Shortcuts follow macOS conventions where applicable, with `Ctrl` on external (non-Apple) keyboards treated as equivalent to `⌘` for overlay launch bindings.
 
+**Where the user changes them**: 设置 (Settings) ▸ **「键盘快捷键」**. That page is the only surface that writes the keyboard config (rebind, **disable** a binding with `null`, reset, detect conflicts, import/export — `settings/KeyboardPage.svelte` → `writeKeyboardConfig`), and until REQ-A488 it had **no entrance**: the page carried a route, a title key and a render branch, but no index row — and the settings search only walks the index rows, while its 「键盘」 alias sat on the *输入法* page. Device reading before the fix: `make device-tool ARGS='press Amos 设置 --role AXMenuItem'` then `… ARGS='ax Amos 键盘'` ⇒ 259 nodes scanned, **0 printed**; after: the same two commands ⇒ `AXButton title="键盘快捷键" pos=(252,1171) size=(986x48) enabled`, and pressing it lands on the page (284 nodes, its own search field 「搜索快捷键或功能」, group 「窗口管理」, row 「新建窗口（当前应用）」 with its 编辑…快捷键 badge).
+
 ---
 
 ## 🚀 Overlay Launch Shortcuts
@@ -21,11 +23,14 @@ These shortcuts open system overlays from anywhere in the desktop shell:
 |----------|--------|-------------|
 | **⌘Space** | Spotlight | Universal search (apps, files, contacts, web) |
 | **F4** | Launchpad | App grid launcher (all installed apps) |
-| **F3** | Mission Control | Window switcher + Spaces bar |
+| **F3** | Mission Control | Window switcher + Spaces bar (every application's windows) |
 | **⌘Tab** | Mission Control | Same as F3 (macOS convention: app switcher) |
+| **⌃↓** | App Exposé | **The focused application's** windows, tiled (macOS "Application Windows") |
 | **Esc** | Close Overlay | Closes the topmost open overlay |
 
 **Note**: On external keyboards, `Ctrl+Space` / `Ctrl+Tab` work identically to `⌘Space` / `⌘Tab`.
+
+**Rebindable, unlike the four above**: `⌃↓` (App Exposé) is declared in the keyboard-config **`spaces`** domain (`SPACES_DEFAULTS.appExpose` in `lib/keyboardConfigHook.svelte.ts`), not in the overlay registry — because the registry's overlay-shortcut set (`F3 / F4 / ⌘Space / ⌘Tab`) is a documented, test-pinned invariant (`__tests__/shellModule.test.ts`). Setting it to `null` disables it. It opens nothing when the focused application has fewer than two windows — the same thing macOS does — and the shell reports the reason to the diagnostics ledger rather than leaving a chord that silently does nothing.
 
 ---
 
@@ -38,14 +43,18 @@ These shortcuts open system overlays from anywhere in the desktop shell:
 | **Ctrl+←** | Previous Space | Switch to the previous virtual desktop (wraps to last) |
 | **Ctrl+→** | Next Space | Switch to the next virtual desktop (wraps to first) |
 | **Ctrl+1** – **Ctrl+9** | Jump to Space | Switch directly to Space 1-9 by index |
-| **Ctrl+↑** | Create New Space | Create and switch to a new virtual desktop |
+| **Ctrl+↑** | Spaces Panel | Open/close the Spaces panel (the panel's "+" creates a new desktop) |
+| **Ctrl+↓** | App Exposé | The focused application's windows (see Overlay Launch Shortcuts) |
 
 **Usage Context**:
 - `Ctrl+←` / `Ctrl+→`: **Global shortcuts** with wrap-around navigation
   - From Space 1, `Ctrl+←` goes to the last Space
   - From the last Space, `Ctrl+→` goes to Space 1
 - `Ctrl+1-9`: Global shortcuts (work from anywhere)
-- `Ctrl+↑`: Global shortcut, creates "Space N+1" and switches to it immediately
+- `Ctrl+↑`: Global shortcut — it toggles the **panel**; creating a desktop is the panel's own action
+  ("+" / `createSpace`). *(Corrected 2026-09-19: this table used to say "Create New Space", which the
+  code never did — a documented promise nothing checked, F-DEV-065.)*
+- `Ctrl+↓`: Global shortcut — App Exposé (`⌃↓` is a member of the same Control-arrow family on macOS)
 
 ### Management
 
@@ -72,6 +81,36 @@ These shortcuts act on the **currently focused window**:
 | **⌘,** | Preferences | Open Settings app |
 
 **Note**: These shortcuts use **capture-phase** event handling to ensure they work even when a text field has focus.
+
+### Window Snapping (REQ-A616)
+
+Send the focused window to a named region instead of dragging it. The geometry rule is
+`amos_wm::snap::snap_bounds` (halves tile without a seam; the class minimum wins, then the frame is
+pulled back on-screen) and the host command is `wm_snap`; these chords are the front door.
+
+| Shortcut | Zone | Description |
+|----------|------|-------------|
+| **⌃⌥←** | Left half | Full-height left half of the work area |
+| **⌃⌥→** | Right half | Full-height right half |
+| **⌃⌥↑** | Top half | Full-width top half |
+| **⌃⌥↓** | Bottom half | Full-width bottom half |
+| **⌃⌥U** | Top-left | Top-left quarter |
+| **⌃⌥I** | Top-right | Top-right quarter |
+| **⌃⌥J** | Bottom-left | Bottom-left quarter |
+| **⌃⌥K** | Bottom-right | Bottom-right quarter |
+| **⌃⌥↩** | Fill | The whole work area (fills, does not toggle) |
+
+**Rectangle-compatible**: the chords mirror the macOS tiling vocabulary (Rectangle / Magnet), so muscle
+memory carries over. They are **shell-owned** and therefore **not** in the keyboard-config settings —
+the same choice the Spaces family made (`SPACES_DEFAULTS`): a fourth config domain is a separate change.
+Only windows of the **desktop** class allow free geometry; the host refuses `main`, a split pane and an
+external surface **by name**, and the shell reports the refusal to the diagnostics ledger rather than
+leaving a chord that silently does nothing.
+
+**Precedence matters** (F-WM-027): the snapping block is evaluated **last**, after the user-configurable
+system / Spaces / overlay domains, so a key the user has rebound to `⌃⌥…` in Settings still wins. The two
+families' **defaults** are disjoint (snapping is `⌃⌥`; system is `⌘…`; Spaces is `⌃`+arrows/digits; overlays
+are `F3/F4/⌘Space/⌘Tab`), because the matcher compares modifiers exactly.
 
 ---
 

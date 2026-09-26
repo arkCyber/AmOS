@@ -148,11 +148,12 @@ pub fn apply<R: tauri::Runtime>(app: &AppHandle<R>, label: Option<String>) -> Re
                 }
             }
             // Cross-platform count fallback (Windows taskbar / Linux Unity).
-            // We map an arbitrary label to a count: numeric strings become
-            // that number, everything else becomes `None` (clear).
+            // We map an arbitrary label to a count: the leading integer becomes
+            // that number (see `count_from_label` for why not a strict parse),
+            // and a label with no leading digit becomes `None` (clear).
             #[cfg(not(target_os = "macos"))]
             {
-                let count = label.as_ref().and_then(|s| s.parse::<i64>().ok());
+                let count = count_from_label(label.as_deref());
                 if let Err(e) = window.set_badge_count(count) {
                     tracing::warn!(
                         target: "amos::dock_badge",
@@ -261,6 +262,31 @@ pub fn sanitize_label(label: Option<String>) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// The integer a non-macOS badge surface (Windows taskbar / Linux Unity) can paint for a
+/// label, or `None` to clear.
+///
+/// macOS takes the label verbatim (`set_badge_label`), but those surfaces take a *count*,
+/// so a free-form label has to be reduced to one. The rule is the **leading integer**, not
+/// "the whole string must parse": the shell paints the same string on the Dock tile and on
+/// the OS icon, and past the cap that string is `"99+"` (`lib/dockBadge.ts::badgeText`). A
+/// strict `parse::<i64>()` answers `None` for `"99+"` and therefore **clears** the taskbar
+/// badge exactly when the unread count is highest — so the OS icon and the tile disagreed on
+/// Windows/Linux while this module's header claimed they could not. `"3 new"` → 3 by the
+/// same rule; a label with no leading digit at all (`"●"`) still clears.
+///
+/// `pub` for the same reason [`sanitize_label`] is: a caller that already has a label and
+/// wants the platform's count without going through [`apply`] can reuse the rule instead of
+/// re-deriving it. Kept **outside** the `#[cfg(not(target_os = "macos"))]` block that calls
+/// it, so it is unit-testable on every target (that block compiles only off macOS).
+pub fn count_from_label(label: Option<&str>) -> Option<i64> {
+    let digits: String = label?
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse::<i64>().ok()
+}
+
 #[tauri::command]
 pub fn dock_badge_set(app: AppHandle, label: Option<String>) -> Result<(), String> {
     // No `State<DockBadgeState>` parameter: this command only *applies* a label, and
@@ -308,6 +334,26 @@ mod tests {
             AttentionLevel::Critical.to_native(),
             UserAttentionType::Critical
         ));
+    }
+
+    #[test]
+    fn count_from_label_reads_the_leading_integer() {
+        // The shell's own capped label: `badgeText(1234)` is `"99+"` on macOS *and* on the
+        // tile, so the Windows/Linux count must not be "clear" for the very string the shell
+        // sends when the count is at its peak. This is the regression the header's
+        // "cannot disagree" claim missed.
+        assert_eq!(count_from_label(Some("99+")), Some(99));
+        // The plain counts the shell sends below the cap.
+        assert_eq!(count_from_label(Some("3")), Some(3));
+        // The free-form labels this module's header names as legitimate.
+        assert_eq!(count_from_label(Some("3 new")), Some(3));
+        // Truncation runs first in `apply`, but the rule is whitespace-tolerant on its own.
+        assert_eq!(count_from_label(Some("  7 ")), Some(7));
+        // No leading digit ⇒ no count ⇒ clear (the documented non-numeric case).
+        assert_eq!(count_from_label(Some("●")), None);
+        assert_eq!(count_from_label(Some("new")), None);
+        assert_eq!(count_from_label(Some("")), None);
+        assert_eq!(count_from_label(None), None);
     }
 
     #[test]

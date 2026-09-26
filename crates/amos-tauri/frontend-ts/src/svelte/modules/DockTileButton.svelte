@@ -31,6 +31,14 @@
     /** The key that does the same thing, when the item has one (`⌘Space` on the
      * Launchpad tile? — no: F4). `null` ⇒ no hint is rendered. */
     shortcut = null,
+    /** Unread badge text (`"3"`, `"99+"`), or `null`/absent for no badge. The text is
+     * computed by the caller (`lib/dockBadge.ts::badgeText`) so the tile never re-derives
+     * the cap and cannot disagree with the touch dock's badge. */
+    badge = null,
+    /** The badge spelled out for assistive tech (e.g. `"3 条未读"`), folded into the
+     * button's accessible name. The visual badge itself is `aria-hidden`: a bare number in
+     * its own element reads as noise out of context. */
+    badgeAria = null,
   }: {
     label: string;
     testId: string;
@@ -39,7 +47,13 @@
     onclick: () => void;
     disabled?: boolean;
     shortcut?: ShortcutHint | null;
+    badge?: string | null;
+    badgeAria?: string | null;
   } = $props();
+
+  /** The button's accessible name: the item, plus *what the badge means* when there is
+   * one (a screen reader gets "邮件, 3 条未读" — not "邮件" beside an unannounced number). */
+  const accessibleName = $derived(badgeAria ? `${label}, ${badgeAria}` : label);
 </script>
 
 <button
@@ -51,7 +65,7 @@
     font-size:32px;
     border: 1px solid rgba(255,255,255,0.1);
   "
-  aria-label={label}
+  aria-label={accessibleName}
   title={shortcut ? `${label} (${shortcut.label})` : label}
   aria-keyshortcuts={shortcut?.aria}
   data-testid={testId}
@@ -64,7 +78,9 @@
     <div class="w-full h-full p-1">
       <Icon />
     </div>
-  {:else if glyph}
-    {glyph}
-  {/if}
+  {:else if glyph}{glyph}{/if}{#if badge}<span
+      class="absolute -right-1 -top-1 grid min-w-[18px] place-items-center rounded-full bg-danger-solid px-1 text-[11px] font-bold text-white ring-2 ring-white dark:ring-neutral-900"
+      data-testid={`${testId}-badge`}
+      aria-hidden="true"
+    >{badge}</span>{/if}
 </button>

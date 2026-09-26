@@ -11,6 +11,8 @@
  *                 real engine was requested but degraded to mock.
  *   - "real"    : a real inference engine is serving.
  */
+import { describeEngine, isRealEngine } from "./aiEngine";
+
 export type AiAvailability = "offline" | "unknown" | "mock" | "real";
 
 export interface AiProbe {
@@ -32,7 +34,13 @@ export function classifyAiAvailability(p: AiProbe): AiAvailability {
   if (!s) return "unknown"; // bridged but not yet probed
   // A real engine was requested but the daemon is serving mock -> degraded.
   if (s.degraded) return "mock";
-  const engine = (s.engine ?? "").trim();
-  if (engine === "" || engine === "mock") return "mock";
-  return "real";
+  // REQ-A1775 / F-AI-022. The daemon reports its serving **path**, not a bare kind:
+  // `engine` is `mock+breaker` / `ollama+cache` (the decorators `crates/amos-ai`
+  // appends). So "is a real engine serving?" must be asked of the stripped kind —
+  // the one question `isRealEngine`/`describeEngine` already answer, and the rule
+  // `lib/netguard.ts::canEnforce` cites. Comparing the raw name against `"mock"`
+  // would call a decorated mock (`mock+breaker`, the daemon's own default) a real
+  // engine and hide the honest "mock" hint. An absent/empty `engine` means a
+  // pre-this-field daemon, which only ever served mock — so "mock", not "unknown".
+  return isRealEngine(describeEngine(s)) ? "real" : "mock";
 }

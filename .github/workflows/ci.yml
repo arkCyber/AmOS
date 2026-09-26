@@ -152,6 +152,16 @@ jobs:
   # target_os = "android", so this is the *only* place its signatures are ever
   # validated — without it, a host-green `make test` never touches the seam.
   #
+  # `make android-app-check` is the same instrument for the *whole desktop shell*:
+  # it cross-compiles amos-tauri (menu/wm/tray/print/airplay) for aarch64-android.
+  # Without it, every desktop-only API behind `#[cfg(desktop)]` — `tauri::menu`
+  # types, `WebviewWindow::{minimize,unminimize}` — is validated on the host only,
+  # where `desktop` is true, so an ungated call reaches the APK build with E0432/
+  # E0599 and no CI step is red (measured F-DEV-131 / REQ-A1000; the class recurred
+  # in F-DEV-117 and F-DEV-119). It was in `make verify` but in no workflow, so it
+  # had never run here at all — the same "run the chain, don't build a new gate"
+  # gap F-DEV-120 records.
+  #
   # Same container/host split as gated-native-backends (see vars.CI_ANDROID_IMAGE).
   # The host fallback provisions a PINNED NDK (26.1.10909125) via the shared
   # prep-android composite action — no floating NDK, no `cargo-ndk` at latest.
@@ -170,7 +180,7 @@ jobs:
             -v "$PWD:/workspace" -w /workspace \
             -e ANDROID_NDK_HOME=/opt/android-sdk/ndk/26.1.10909125 \
             "${{ vars.CI_ANDROID_IMAGE }}" \
-            bash -lc 'make android-audio-check && make android-ai-sherpa-check'
+            bash -lc 'make android-audio-check && make android-ai-sherpa-check && make android-app-check'
 
       - name: Prepare pinned NDK toolchain on host
         if: vars.CI_ANDROID_IMAGE == ''
@@ -188,3 +198,9 @@ jobs:
         env:
           ANDROID_NDK_HOME: ${{ steps.prep-android.outputs.ndk-home }}
         run: make android-ai-sherpa-check
+
+      - name: Cross-compile the desktop shell for Android (host)
+        if: vars.CI_ANDROID_IMAGE == ''
+        env:
+          ANDROID_NDK_HOME: ${{ steps.prep-android.outputs.ndk-home }}
+        run: make android-app-check

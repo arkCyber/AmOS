@@ -48,6 +48,17 @@ export interface KeyboardCallbacks {
   onDelete: () => void; // Delete/Backspace on focused item
   onToggle: () => void; // Space to toggle selection (if selecting mode)
   onSelectAll: () => void; // Cmd/Ctrl+A
+  /**
+   * Preview the focused file — **⌘Y**, not Space (REQ-A789).
+   *
+   * macOS binds Quick Look to both Space and ⌘Y. Space is unavailable here: this list is a
+   * `aria-multiselectable` listbox, and in the ARIA listbox contract Space *toggles selection*
+   * (the `onToggle` callback above) — that is what a screen-reader user is told to press. Taking
+   * Space for preview would either break selection or make one key mean two things depending on
+   * a mode the user cannot see. ⌘Y is macOS's own alternative binding for exactly this action,
+   * so the second binding is the one that survives.
+   */
+  onQuickLook: () => void; // Cmd/Ctrl+Y
 }
 
 export function createKeyboardHandler(
@@ -98,6 +109,16 @@ export function createKeyboardHandler(
         if (mod) {
           e.preventDefault();
           callbacks.onSelectAll();
+        }
+        break;
+      // ⌘Y — Quick Look. Only with the modifier: a bare `y` belongs to the search field / to
+      // nothing, and claiming it would swallow ordinary typing (the INPUT/TEXTAREA guard above
+      // covers the field itself, but a bare-letter binding is still a binding nobody asked for).
+      case "y":
+      case "Y":
+        if (mod) {
+          e.preventDefault();
+          callbacks.onQuickLook();
         }
         break;
     }

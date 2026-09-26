@@ -193,9 +193,9 @@ fn a_repeated_poll_of_the_same_alert_does_not_duplicate_pages() {
 }
 
 #[test]
-fn a_breaker_that_clears_fires_a_warn_id_ending_in_dot_cleared() {
+fn a_breaker_that_clears_fires_a_p0_id_ending_in_dot_cleared() {
     // The bridge's "transition OUT of the active set" path fires a
-    // dedicated `amos-ai.<id>.cleared` warning so an operator's paging
+    // dedicated `amos-ai.<id>.cleared` alert so an operator's paging
     // timeline shows the recovery, not just the silence.
     let (mut tracker, mut bridge, log) = rig();
     let obs_break = Observations {
@@ -219,13 +219,16 @@ fn a_breaker_that_clears_fires_a_warn_id_ending_in_dot_cleared() {
         ids.contains(&"amos-ai.breaker_open.cleared".to_string()),
         "clear fired: ids={ids:?}"
     );
-    // The cleared alert is a Warn/P1 — the bridge documents this as a
-    // contract and downstream automation depends on it.
+    // The cleared alert carries the **cleared alert's own** severity (rule 3,
+    // "severity is the alert's, not the bridge's"): `breaker_open` is an
+    // `Error`, so its resolution is a P0 — matching the clear-path comment's
+    // own wording, "any redundant `P0 cleared` from the same id". A P0
+    // incident resolved as a P1 never acknowledges the P0 page.
     let cleared = recorder_log
         .iter()
         .find(|a| a.id == "amos-ai.breaker_open.cleared")
         .unwrap();
-    assert_eq!(cleared.severity.label(), "P1");
+    assert_eq!(cleared.severity.label(), "P0");
 }
 
 /// Regression guard for REQ-A451 / F-AI-014 (a): the production

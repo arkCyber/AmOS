@@ -6,13 +6,16 @@
   // on mount. The live feed path is gated on navigator.mediaDevices?.getUserMedia
   // exactly like React, so headless runs take the demo viewfinder (🏔️) path.
   import { readStoreValue, writeStoreValueChecked } from "../lib/amosStore";
+  import { createStoreValue } from "./store";
   import {
+    CAPTURES_KEY,
     startVideoRecording,
     persistVideoCapture,
     removeVideoCapture,
     captureBlob,
     listCaptures,
     newCaptureId,
+    normalizeCaptures,
     type ActiveVideoRecording,
     type VideoCapture,
   } from "../lib/cameraCapture";
@@ -30,7 +33,13 @@
   } from "../lib/mediaExport";
   import type { Capability } from "../lib/permissions";
   import { grantCapability } from "./osPermissions";
-  import { PHOTOS_KEY, newPhotoForCapture, newCapturePhoto, type Photo } from "../lib/photos";
+  import {
+    PHOTOS_KEY,
+    newPhotoForCapture,
+    newCapturePhoto,
+    normalizePhotos,
+    type Photo,
+  } from "../lib/photos";
   import { localId } from "../lib/localId";
   import {
     ZOOM_STEPS,
@@ -55,6 +64,7 @@
     afInit,
     afTap,
     afCaption,
+    classifyTap,
     type AfState,
     type CamFacing,
     type CamFlash,
@@ -105,7 +115,7 @@
   let af = $state<AfState>(afInit());
   let flashFx = $state(false);
   let last = $state<Photo | null>(
-    latestPhoto(readStoreValue<Photo[]>(PHOTOS_KEY, [])) ?? null,
+    latestPhoto(normalizePhotos(readStoreValue<unknown>(PHOTOS_KEY, []))) ?? null,
   );
   // ── "存到系统存储" (REQ-A356) ─────────────────────────────────────────────────
   // The camera's own album (`lib/photos.ts` / `lib/cameraCapture.ts`) is private, so a shot or
@@ -173,9 +183,20 @@
   let recState = $state<"idle" | "recording">("idle");
   let recErr = $state("");
   let elapsed = $state(0);
+  // （REQ-A1466 ∕ F-SH-735）`amos.captures` 的写入者不止本页：相册那一半（`PhotosApp.deleteVideo`
+  // → `removeVideoCapture`）也在写。平板上两者同台（相机在 Slide Over 面板里），相册里删掉一条录
+  // 像时本页不会重挂 —— 「只读一次」的胶片条会一直留着那格，点开却只剩「录像不存在」。订阅让这份
+  // 列表**就是**存储本身（本页自己的录制 ∕ 删除仍照旧读裁决并刷新，订阅是幂等的）。
+  const capturesStore = createStoreValue<unknown>(CAPTURES_KEY, listCaptures());
   let captures = $state<VideoCapture[]>(listCaptures());
+  $effect(() => {
+    const un = capturesStore.subscribe((v) => (captures = normalizeCaptures(v)));
+    return un;
+  });
   let viewerId = $state<string | null>(null);
   let viewUrl = $state("");
+  /** Why a recording is not playing: its bytes are gone, or this build cannot play them. */
+  let viewErr = $state("");
 
   // Capture resolution tier + honest HDR preference.
   let res = $state<CamResId>("hd");
@@ -193,7 +214,13 @@
   let burstSeqId: number | null = null;
 
   // ---- dynamic / pinch zoom + tap-to-focus ----
-  let lastTapMs = 0; // last single-tap time, to tell a slow (focus) tap from a fast double (zoom)
+  // `null` = no tap armed. A double-tap consumes the clock (classifyTap resets it),
+  // so a third tap starts a fresh gesture rather than chaining into a second double.
+  let lastTapMs: number | null = null;
+  // The AF state a focus tap replaced — so the second tap of a double-tap (the
+  // zoom gesture) can **undo** the first tap's aim. iOS: double-tap zooms without
+  // moving the focus point; the old code left the first tap's AF box behind.
+  let preTapAf: AfState | null = null;
   let pinch: {
     ids: Map<number, { x: number; y: number }>;
     d0: number;
@@ -357,7 +384,7 @@
   };
   // ---- Capture: real frame → canvas (aspect + zoom applied); else demo ----
   function doCapture(): void {
-    const list = readStoreValue<Photo[]>(PHOTOS_KEY, []);
+    const list = normalizePhotos(readStoreValue<unknown>(PHOTOS_KEY, []));
     const now = Date.now();
     // REQ-A402: the shot's id comes from `localId`. It used to be `c${now}-${shotSeq++}` —
     // a wall-clock reading plus a **per-process** counter, i.e. no entropy at all: two
@@ -544,15 +571,17 @@
     pinch.ids.delete(e.pointerId);
     // a quick, still single tap = tap-to-focus. A *rapid* repeat of it (a
     // double-tap, <300 ms apart) is the zoom gesture on iOS, so skip focusing —
-    // the container's ondblclick drives the zoom instead.
+    // and **undo** the aim the first tap of the pair applied (the container's
+    // ondblclick then drives the zoom). Focus and double-tap-zoom stay exclusive.
     const t = pinch.tap;
     if (t && t.id === e.pointerId) {
       pinch.tap = null;
       const now = performance.now();
       if (now - t.t < 500) {
-        const doubleTap = now - lastTapMs < 300;
-        lastTapMs = now;
-        if (!doubleTap) tapToFocus(t.x, t.y, e.currentTarget as HTMLElement);
+        const { kind, lastTapMs: next } = classifyTap(lastTapMs, now);
+        lastTapMs = next;
+        if (kind === "focus") tapToFocus(t.x, t.y, e.currentTarget as HTMLElement);
+        else undoDoubleTapFocus();
       }
     }
     if (pinch.ids.size < 2) pinch.d0 = 0;
@@ -632,20 +661,29 @@
   };
   async function openViewer(id: string): Promise<void> {
     viewerId = id;
+    viewErr = "";
     const blob = await captureBlob(id);
-    if (blob) {
-      try {
-        if (typeof URL !== "undefined" && URL.createObjectURL)
-          viewUrl = URL.createObjectURL(blob);
-      } catch {
-        /* object URLs unavailable (headless) — the overlay shows a spinner */
-      }
+    if (!blob) {
+      // Listed in the index, absent from the binary store (an earlier session, a cleared
+      // store). The overlay used to sit on a "…" that would never resolve (REQ-A1172).
+      viewErr = t("media.recordingMissing");
+      return;
     }
+    try {
+      if (typeof URL !== "undefined" && URL.createObjectURL) {
+        viewUrl = URL.createObjectURL(blob);
+        return;
+      }
+    } catch {
+      /* fall through: object URLs unavailable in this build */
+    }
+    viewErr = t("media.recordingUnplayable");
   }
   function closeViewer(): void {
     if (viewUrl) URL.revokeObjectURL(viewUrl);
     viewUrl = "";
     viewerId = null;
+    viewErr = "";
   }
   async function delCapture(id: string): Promise<void> {
     // A rejected index write keeps the capture listed (and its bytes), so say so.
@@ -675,15 +713,27 @@
     const rect = el.getBoundingClientRect();
     const p = focusFromRect(x, y, rect);
     if (!p) return;
-    aimAt(p);
+    preTapAf = af; // remembered so a following double-tap can undo this aim
+    applyAf(afTap(af, p));
   };
-  const aimAt = (p: { x: number; y: number }) => {
-    af = afTap(af, p);
+  /** A double-tap's second tap: restore the AF state the first tap replaced
+   *  (including clearing the point when there was none) and re-apply it. */
+  const undoDoubleTapFocus = () => {
+    const prev = preTapAf;
+    preTapAf = null;
+    if (prev === null) return;
+    applyAf(prev);
+  };
+  const applyAf = (next: AfState) => {
+    af = next;
     const track = stream?.getVideoTracks()[0];
+    const hasPoint = next.x !== null && next.y !== null;
     try {
       if (track?.applyConstraints)
         void track.applyConstraints({
-          advanced: [{ pointsOfInterest: [{ x: p.x, y: p.y }] }],
+          advanced: [
+            { pointsOfInterest: hasPoint ? [{ x: next.x as number, y: next.y as number }] : [] },
+          ],
         } as unknown as MediaTrackConstraints);
     } catch {
       /* focus point unsupported — the UI indicator still reflects the model */
@@ -823,8 +873,13 @@
     <!-- top toolbar (hidden while recording a video) -->
     {#if live && recState !== "recording" && burstSeq == null}
       <div class="absolute inset-x-0 top-0 flex items-center justify-between p-3">
+        <!-- `grid` is a plain on/off toggle whose ONLY signal is `controlCls(grid)` — a class. The
+             burst button (`camera.burst`) beside it already reports its own state with
+             `aria-pressed`, and a static label overrides the glyph for the accessible name, so this
+             control could not say what it showed (REQ-A1001 / F-SH-322). -->
         <button
           aria-label={t("camera.grid")}
+          aria-pressed={grid}
           title={t("camera.grid")}
           onclick={() => (grid = !grid)}
           class={controlCls(grid)}
@@ -862,6 +917,7 @@
           >{resOf(res).label}</button>
           <button
             aria-label={t("camera.hdr")}
+            aria-pressed={hdr}
             title={t("camera.hdr")}
             onclick={toggleHdr}
             class={controlCls(hdr)}
@@ -999,7 +1055,13 @@
           {#if viewUrl}
             <video src={viewUrl} controls autoplay playsinline class="max-h-[70vh] w-full rounded-xl"><track kind="captions" /></video>
           {:else}
-            <div class="grid h-40 w-full place-items-center text-white/50">…</div>
+            <!-- No bytes yet (a read still in flight) shows the placeholder; a read that came
+                 back empty shows why. -->
+            <div
+              role={viewErr ? "status" : undefined}
+              data-testid="viewer-msg"
+              class={"grid h-40 w-full place-items-center px-4 text-center " + (viewErr ? "text-white/80" : "text-white/50")}
+            >{viewErr || "…"}</div>
           {/if}
           <div class="mt-3 flex items-center justify-between">
             <button

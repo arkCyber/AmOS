@@ -165,11 +165,18 @@ export function suggestPassword(rand?: () => number, len = 12): string {
  * Everything that would stop this config from producing a working AP: a blank
  * network name, or a WPA2/WPA3 key shorter than `PW_MIN`. `open` has no password
  * requirement (its risk is surfaced separately via `isOpenNetwork`). Pure.
+ *
+ * The key is measured **as stored**, not trimmed: a PSK is 8–63 characters and a
+ * space is one of them, so a key that begins or ends with a space is legal — and
+ * {@link setPassword} deliberately keeps it ("not trimmed — spaces are legal"), as
+ * does the `PW_MAX` bound two definitions up. Judging `password.trim().length` read
+ * a legal 8-character key as 7 and blocked the switch; the string handed to the AP
+ * is the one to count (REQ-A1261).
  */
 export function hotspotProblems(cfg: HotspotCfg): HotspotProblem[] {
   const out: HotspotProblem[] = [];
   if (cfg.ssid === "") out.push("ssidEmpty");
-  if (cfg.security !== "open" && cfg.password.trim().length < PW_MIN) {
+  if (cfg.security !== "open" && cfg.password.length < PW_MIN) {
     out.push("passwordTooShort");
   }
   return out;

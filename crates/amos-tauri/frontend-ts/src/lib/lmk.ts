@@ -8,7 +8,7 @@
  * level (outside Tauri it degrades to a no-op unsubscribe).
  */
 
-import { invoke, subscribe } from "./backend";
+import { bridgeDiag, invoke, subscribe } from "./backend";
 import { wmWindows } from "./wm";
 
 // The wire type has one owner: `lib/wm.ts` (the `wm_*` bridge). Re-exported here so
@@ -85,7 +85,11 @@ export function staleLegacySurfaceLabels(
  * 自己的"守卫"（daemon down ≠ app dead）也就失效了。取不到 ⇒ null。
  */
 export async function androidLmkTasks(): Promise<AndroidLmkTask[] | null> {
-  const raw = await invoke<unknown>("android_lmk_tasks");
+  const raw = await invoke<AndroidLmkTask[]>("android_lmk_tasks");
+  // REQ-A555: the generic names the reply (`Vec<AndroidLmkTaskInfo>`) — the type is what a
+  // gate can compare; the guard below is what a **runtime** payload is held to. The bridge
+  // casts an IPC result, it does not validate one, so keeping the check costs nothing and
+  // still refuses a non-array answer from an older daemon.
   return Array.isArray(raw) ? (raw as AndroidLmkTask[]) : null;
 }
 
@@ -93,25 +97,38 @@ export async function androidLmkTasks(): Promise<AndroidLmkTask[] | null> {
  * Reconcile: close any `legacy:*` surface that is registered but whose container
  * task is no longer alive per the authoritative daemon snapshot. Guards: if the
  * daemon snapshot is unavailable (daemon down ≠ app dead) or we're not bridged,
- * nothing is closed. Returns the number of stale surfaces closed.
+ * nothing is closed. Returns the number of stale surfaces **closed**.
+ *
+ * REQ-A845 / F-SH-271: the count is a claim about the screen, so it is counted from the
+ * verdicts, not from the list. `wm_close` answers unit (`Result<(), String>`), `invoke` never
+ * rejects, and a refusal arrives as the same `null` a success produces — so `stale.length`
+ * counted *attempts* and was documented as *closes*. Every other `wm_close` in the repo asks
+ * (`lib/wm.ts::wmClose` answers `!== null`, `desktopSystemKeys.ts` reads `.ok`,
+ * `DockContextMenu.svelte` reads `.diag`); this was the one place that did not.
  */
 export async function reconcileLegacySurfaces(): Promise<number> {
   const tasks = await androidLmkTasks();
   if (!tasks) return 0; // daemon down is not "everything is dead".
   const wm = await wmWindows();
   const stale = staleLegacySurfaceLabels(wm?.windows ?? [], tasks);
+  let closed = 0;
   for (const label of stale) {
     await invoke("wm_close", { label });
+    // The per-command diagnosis is the only place a `void` command's outcome survives
+    // (REQ-A296): `bridgeDiag` for `wm_close` is written by the `invoke` just above.
+    if (bridgeDiag("wm_close").ok) closed += 1;
   }
-  return stale.length;
+  return closed;
 }
 
 /**
  * Subscribe to the `lmk-surface` feed and auto-tear-down any surface the container
  * reclaimed/destroyed, then reconcile the rest against the authoritative snapshot
- * (covers events we might have missed). Returns an unsubscribe (noop outside Tauri).
+ * (covers events we might have missed). Returns an unsubscribe, or `null` when the
+ * subscription was **not** established (REQ-A838) — in which case nothing here will fire and
+ * the caller must say so rather than present an idle watcher as a live one.
  */
-export async function startLmkSurfaceWatcher(): Promise<() => void> {
+export async function startLmkSurfaceWatcher(): Promise<(() => void) | null> {
   return subscribe(LMK_SURFACE_EVENT, (raw) => {
     const p = raw as LmkSurfacePayload;
     if (shouldTearDown(p)) {

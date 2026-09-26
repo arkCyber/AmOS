@@ -129,6 +129,18 @@ pub async fn sync_device(
         .get_policies(&device.organization_id, DEFAULT_LIST_LIMIT, 0)
         .await?;
 
+    // 组织钉死的快捷指令由**策略表**决定（REQ-A1808）。旧代码在这里写死 `vec![]`：`create_policy`
+    // 收下并存储 `forced_shortcuts`，客户端的编辑/删除门槛读的是 `config.enforcedShortcuts`，
+    // 于是那份列表结构性地永远是空的 —— 组织要求的强制项在设备上照旧可改可删。
+    let enforced_shortcuts = enforced_shortcuts_from(&policies)?;
+
+    // 限制表同样由**策略表**派生（REQ-A1823）。旧代码在这里写死 `Restrictions::default()`：
+    // 一份服务器从未配置过的"慷慨默认"，而那张表的每个字段都参与序列化 —— 于是客户端
+    // `normalizeRestrictions(server, local)` 里「键不存在 ⇒ 用本地值」的规则永远走不到，每次
+    // 同步都把设备本地的限制整块换成默认；组织存在策略表里的 `execution_limit` ∕
+    // `sharing_control` 也从未下发过。这一版只发「组织确有意见的键」。
+    let restrictions = restrictions_from_policies(&policies)?;
+
     // 检查是否有待处理的命令
     let commands = state
         .db
@@ -146,8 +158,8 @@ pub async fn sync_device(
         server_url: format!("http://{}", state.config.listen_address),
         api_key,
         policies,
-        restrictions: Restrictions::default(),
-        enforced_shortcuts: vec![],
+        restrictions,
+        enforced_shortcuts,
         enforced_templates: vec![],
         sync_interval: state.config.default_sync_interval as i64,
         last_sync_at: device.last_sync_at,
@@ -161,7 +173,17 @@ pub async fn sync_device(
         device_status: device.status.to_string(),
         lock_message: device.lock_message.clone(),
         enrolled_at: device.enrolled_at,
-        enrolled_by: "admin".to_string(),
+        // The enroller is a fact we stored at enroll (`org.admin_email`, or the
+        // token holder); `device.enrolled_by` is exactly that. Emitting the
+        // literal `"admin"` here discarded it and, via the client's
+        // `{...this.config, ...serverConfig}` merge, then overwrote the real
+        // value the client captured at enroll — so the UI reported `"admin"`
+        // instead of the actual enroller. Only a legacy row with a NULL column
+        // (pre-dating the column) still falls back to the literal.
+        enrolled_by: device
+            .enrolled_by
+            .clone()
+            .unwrap_or_else(|| "admin".to_string()),
         version: "1.0.0".to_string(),
     };
 
@@ -215,6 +237,12 @@ pub struct CommandsQuery {
     pub device_id: String,
 }
 
+/// What `result` holds when a device reports failure and sends no reason (REQ-A410).
+///
+/// Storing an empty string would leave the operator staring at a blank explanation; this sentence
+/// is exactly true instead — the device reported failure and gave no detail.
+const DEVICE_REPORTED_FAILURE_WITHOUT_REASON: &str = "device reported failure without a reason";
+
 /// POST /api/mdm/commands/:id/ack
 /// 确认命令执行结果
 pub async fn ack_command(
@@ -236,18 +264,49 @@ pub async fn ack_command(
     }
 
     // 只认领**这个设备自己的**命令；不是它的，就与不存在同答（404，不泄露存在性）。
-    if !state
-        .db
-        .ack_command(&command_id, &req.device_id, req.result.as_deref())
-        .await?
-    {
-        return Err(MdmError::CommandNotFound(command_id));
-    }
-
-    tracing::info!("Command acknowledged: {} by {}", command_id, req.device_id);
+    //
+    // REQ-A410：`ok: false` **不是**「确认」。旧版本没有这个信号，于是一台回报「lock 失败」的设备
+    // 被记成 `acknowledged` —— 运维在控制台读到的是成功，而设备根本没有按指令锁屏。两条路径都只
+    // 认领属于自己的命令，并且都把**实际记下的**状态回给设备。
+    let recorded = match req.ok {
+        Some(false) => {
+            let reason = req
+                .result
+                .as_deref()
+                .unwrap_or(DEVICE_REPORTED_FAILURE_WITHOUT_REASON);
+            if !state
+                .db
+                .fail_command(&command_id, &req.device_id, reason)
+                .await?
+            {
+                return Err(MdmError::CommandNotFound(command_id));
+            }
+            tracing::warn!(
+                "Command failed: {} by {} — {}",
+                command_id,
+                req.device_id,
+                reason
+            );
+            "failed"
+        }
+        _ => {
+            if !state
+                .db
+                .ack_command(&command_id, &req.device_id, req.result.as_deref())
+                .await?
+            {
+                return Err(MdmError::CommandNotFound(command_id));
+            }
+            tracing::info!("Command acknowledged: {} by {}", command_id, req.device_id);
+            "acknowledged"
+        }
+    };
 
     Ok(Json(serde_json::json!({
         "success": true,
+        // What the row now says (REQ-A410) — a device that reports failure can see that the server
+        // recorded *failure* rather than an acknowledgement.
+        "status": recorded,
         "serverTime": chrono::Utc::now().timestamp_millis(),
     })))
 }
@@ -499,6 +558,10 @@ pub async fn create_policy(
         )));
     }
 
+    // 形状校验在**落地之前**（REQ-A1808）：一份读不动的 `forced_shortcuts` config 存进去之后，
+    // 该组织每一台设备的下一次同步都会失败 —— 拒绝要在操作员面前发生，不是在设备面前。
+    validate_policy_config(&req.policy_type, &req.config)?;
+
     let org = state.db.get_default_organization().await?;
 
     let policy = state
@@ -535,6 +598,11 @@ pub async fn update_policy(
         .get_policy(&id)
         .await?
         .ok_or_else(|| MdmError::PolicyNotFound(id.clone()))?;
+
+    // 同 `create_policy`：只有真的换了 config 才校验，且按**策略自己的类型**判断（REQ-A1808）。
+    if let Some(config) = req.config.as_ref() {
+        validate_policy_config(&existing.policy_type, config)?;
+    }
 
     // 更新
     state
@@ -703,6 +771,114 @@ pub fn validate_enroll_request(req: &EnrollRequest) -> Result<(), MdmError> {
     Ok(())
 }
 
+/// `forced_shortcuts` 策略的 `config` 形状：`{"shortcuts": ["id", …]}`。
+///
+/// 读不出来就**拒绝**，绝不静默折叠成"没有强制项"：一条组织明确下发的强制策略读不动时，
+/// "设备端一个都不锁"和"组织没下发任何强制项"在下发渠道里长得一模一样，而前者的后果是
+/// 用户能改掉组织要求钉死的快捷指令（REQ-A1808）。
+fn forced_shortcut_ids(config: &serde_json::Value) -> Result<Vec<String>, String> {
+    let entries = config
+        .get("shortcuts")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| {
+            "config must be an object with a `shortcuts` array of strings".to_string()
+        })?;
+    let mut ids = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let id = entry
+            .as_str()
+            .ok_or_else(|| "every entry of `shortcuts` must be a string".to_string())?;
+        if id.trim().is_empty() {
+            return Err("`shortcuts` entries must not be blank".to_string());
+        }
+        ids.push(id.to_string());
+    }
+    Ok(ids)
+}
+
+/// 把组织的策略表派生成下发给设备的 `enforcedShortcuts`（REQ-A1808）。
+///
+/// 只取 **enabled** 的 `forced_shortcuts` 策略 —— 组织关掉的策略不是"要钉死的"；其余类型
+/// 一律不参与，哪怕它的 `config` 里碰巧有个 `shortcuts` 键。顺序沿用 `get_policies` 的
+/// `priority DESC`，同一 id 只发一次。
+///
+/// 一条 enabled 的 `forced_shortcuts` 策略 config 读不出来时返回 `Err`：派生的结果要么是
+/// 组织真正下发的全集，要么是一次响亮的拒绝，不是一份"看起来成功"的残缺列表。
+pub(crate) fn enforced_shortcuts_from(policies: &[Policy]) -> Result<Vec<String>, MdmError> {
+    let mut ids: Vec<String> = Vec::new();
+    for policy in policies {
+        if policy.policy_type != "forced_shortcuts" || !policy.enabled {
+            continue;
+        }
+        for id in forced_shortcut_ids(&policy.config).map_err(|why| {
+            MdmError::InvalidRequest(format!(
+                "forced_shortcuts policy '{}' ({}) has an unusable config: {why}",
+                policy.id, policy.name
+            ))
+        })? {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    }
+    Ok(ids)
+}
+
+/// 把组织的策略表派生成下发给设备的限制**增量**（REQ-A1823）。
+///
+/// 只取 **enabled** 的策略 —— 组织关掉的策略不是"在生效的"。一条策略的 `config` 里，凡是
+/// 名字对得上一个限制项的键（见 [`RestrictionsDelta::apply`]）就被并入；其余键原样忽略，
+/// 因为策略 `config` 允许带别的字段。优先级沿用 `get_policies` 的 `priority DESC`：
+/// 高优先级先并入，同一键先到先得。
+///
+/// 一条 enabled 策略的 config 里出现**认识但读不动**的限制键时返回 `Err`：派生的结果要么
+/// 是组织真正下发的增量，要么是一次响亮的拒绝 —— 不是一份"看起来成功"的残缺表。
+pub(crate) fn restrictions_from_policies(
+    policies: &[Policy],
+) -> Result<RestrictionsDelta, MdmError> {
+    let mut delta = RestrictionsDelta::default();
+    for policy in policies {
+        if !policy.enabled {
+            continue;
+        }
+        let Some(entries) = policy.config.as_object() else {
+            continue; // 非对象 config（理论上存不进来）不带任何限制项
+        };
+        for (key, value) in entries {
+            delta.apply(key, value).map_err(|why| {
+                MdmError::InvalidRequest(format!(
+                    "policy '{}' ({}) has an unusable '{}' restriction: {why}",
+                    policy.id, policy.name, key
+                ))
+            })?;
+        }
+    }
+    Ok(delta)
+}
+
+/// 创建/更新策略时的形状校验：把上面那条拒绝提前到**操作员还在场**的时刻。否则一份读不动的
+/// config 会先存进去，再让该组织的每一台设备同步失败（REQ-A1808 的 `forced_shortcuts`，
+/// REQ-A1823 把同一理由扩展到所有会被下发的限制键）。
+fn validate_policy_config(policy_type: &str, config: &serde_json::Value) -> Result<(), MdmError> {
+    if policy_type == "forced_shortcuts" {
+        forced_shortcut_ids(config).map_err(|why| {
+            MdmError::InvalidRequest(format!("invalid forced_shortcuts config: {why}"))
+        })?;
+    }
+    // 同一批键在同步时会被 `restrictions_from_policies` 读出来下发，所以它们的形状也在
+    // 这里验：验的是**键**，不是策略类型 —— 一条 `data_retention` 的 config 里碰巧写了
+    // `maxExecutionTime`，它一样会被下发，一样得是可解释的。
+    if let Some(entries) = config.as_object() {
+        let mut delta = RestrictionsDelta::default();
+        for (key, value) in entries {
+            delta.apply(key, value).map_err(|why| {
+                MdmError::InvalidRequest(format!("invalid {policy_type} config: {why}"))
+            })?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -757,5 +933,163 @@ mod tests {
         assert!(validate_enroll_request(&long_name).is_err());
         assert!(validate_enroll_request(&request(&long)).is_ok());
         assert!(validate_enroll_request(&request(&"x".repeat(MAX_USER_AGENT_CHARS + 1))).is_err());
+    }
+
+    fn policy(id: &str, policy_type: &str, enabled: bool, shortcuts: &[&str]) -> Policy {
+        Policy {
+            id: id.to_string(),
+            organization_id: "org".to_string(),
+            policy_type: policy_type.to_string(),
+            name: id.to_string(),
+            description: None,
+            config: serde_json::json!({ "shortcuts": shortcuts }),
+            enabled,
+            priority: 0,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn enforced_shortcuts_union_two_policies_without_repeating_an_id() {
+        let policies = vec![
+            policy("p1", "forced_shortcuts", true, &["sc-a", "sc-b"]),
+            policy("p2", "forced_shortcuts", true, &["sc-b", "sc-c"]),
+            // Disabled, and the wrong type — neither may contribute even though both
+            // spell a well-formed `shortcuts` list.
+            policy("p3", "forced_shortcuts", false, &["sc-off"]),
+            policy("p4", "data_retention", true, &["sc-impostor"]),
+        ];
+        assert_eq!(
+            enforced_shortcuts_from(&policies).expect("well-formed"),
+            vec!["sc-a", "sc-b", "sc-c"],
+            "the union keeps first-seen order and drops the duplicate"
+        );
+        assert_eq!(
+            enforced_shortcuts_from(&[]).expect("no policies"),
+            Vec::<String>::new(),
+            "positive control: no policies is an empty list, not an error"
+        );
+    }
+
+    #[test]
+    fn an_enabled_forced_shortcuts_policy_with_an_unreadable_config_is_an_error() {
+        // Each shape is unusable in a different way; all four must be refused rather
+        // than folded into "nothing is pinned".
+        for config in [
+            serde_json::json!({}),
+            serde_json::json!({ "shortcuts": "sc-a" }),
+            serde_json::json!({ "shortcuts": [7] }),
+            serde_json::json!({ "shortcuts": ["   "] }),
+        ] {
+            let mut p = policy("p1", "forced_shortcuts", true, &[]);
+            p.config = config.clone();
+            let err = enforced_shortcuts_from(&[p]).expect_err("must refuse");
+            assert!(
+                matches!(err, MdmError::InvalidRequest(ref m) if m.contains("p1")),
+                "the refusal must name the policy, got {err:?} for {config}"
+            );
+        }
+        // A *disabled* policy with the same broken config is simply skipped — the
+        // refusal is about a policy that is actually in force.
+        let mut off = policy("p2", "forced_shortcuts", false, &[]);
+        off.config = serde_json::json!({});
+        assert_eq!(
+            enforced_shortcuts_from(&[off]).expect("skipped"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn a_policy_config_is_shape_checked_before_it_touches_the_database() {
+        // REQ-A1823. A restriction-shaped key in an enabled policy's config is read by
+        // `restrictions_from_policies` on every device sync, so an unusable value has to be
+        // refused while the operator is still in front of it — the same rationale as the
+        // `forced_shortcuts` case above, now extended to the restriction keys.
+        for (kind, config) in [
+            (
+                "execution_limit",
+                serde_json::json!({ "maxExecutionTime": -1 }),
+            ),
+            (
+                "execution_limit",
+                serde_json::json!({ "maxExecutionTime": "300" }),
+            ),
+            (
+                "sharing_control",
+                serde_json::json!({ "allowSharing": "yes" }),
+            ),
+            (
+                "feature_disable",
+                serde_json::json!({ "disabledCategories": ["a", 2] }),
+            ),
+        ] {
+            let err = validate_policy_config(kind, &config).expect_err("must refuse");
+            assert!(
+                matches!(err, MdmError::InvalidRequest(ref m) if m.contains(kind)),
+                "the refusal must name the policy type, got {err:?} for {config}"
+            );
+        }
+        // A config that names no restriction key is not an error, whatever its type: the
+        // projection ignores keys it does not recognise.
+        assert!(validate_policy_config("execution_limit", &serde_json::json!({})).is_ok());
+        assert!(
+            validate_policy_config("data_retention", &serde_json::json!({ "days": 30 })).is_ok()
+        );
+        // Positive control: well-formed restriction keys pass.
+        assert!(validate_policy_config(
+            "execution_limit",
+            &serde_json::json!({ "maxExecutionTime": 60, "maxExecutionsPerDay": 250 })
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn restrictions_come_from_the_orgs_enabled_policies() {
+        let mut execution = policy("p1", "execution_limit", true, &[]);
+        execution.config =
+            serde_json::json!({ "maxExecutionTime": 60, "maxExecutionsPerDay": 250 });
+        let mut sharing = policy("p2", "sharing_control", true, &[]);
+        sharing.config = serde_json::json!({ "allowSharing": false });
+        // Disabled, and a policy whose config names no restriction key: neither contributes.
+        let mut off = policy("p3", "execution_limit", false, &[]);
+        off.config = serde_json::json!({ "maxExecutionTime": 1 });
+        let mut retention = policy("p4", "data_retention", true, &[]);
+        retention.config = serde_json::json!({ "days": 30 });
+
+        let delta =
+            restrictions_from_policies(&[execution, sharing, off, retention]).expect("well-formed");
+        assert_eq!(
+            serde_json::to_value(&delta).unwrap(),
+            serde_json::json!({
+                "maxExecutionTime": 60,
+                "maxExecutionsPerDay": 250,
+                "allowSharing": false,
+            }),
+            "only the keys an enabled policy expresses are sent, under their wire names"
+        );
+        // Positive control: no policies ⇒ an empty delta, never a full table.
+        assert_eq!(
+            serde_json::to_value(restrictions_from_policies(&[]).expect("no policies")).unwrap(),
+            serde_json::json!({})
+        );
+    }
+
+    #[test]
+    fn an_enabled_policy_with_an_unreadable_restriction_is_an_error() {
+        let mut p = policy("p1", "execution_limit", true, &[]);
+        p.config = serde_json::json!({ "maxExecutionTime": -1 });
+        let err = restrictions_from_policies(&[p]).expect_err("must refuse");
+        assert!(
+            matches!(err, MdmError::InvalidRequest(ref m) if m.contains("p1") && m.contains("maxExecutionTime")),
+            "the refusal must name the policy and the key, got {err:?}"
+        );
+        // A disabled policy with the same broken config is simply skipped.
+        let mut off = policy("p2", "execution_limit", false, &[]);
+        off.config = serde_json::json!({ "maxExecutionTime": -1 });
+        assert_eq!(
+            serde_json::to_value(restrictions_from_policies(&[off]).expect("skipped")).unwrap(),
+            serde_json::json!({})
+        );
     }
 }

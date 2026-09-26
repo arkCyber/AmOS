@@ -2,18 +2,18 @@
  * cellularService.ts — honest cellular *service state*, derived only from REAL,
  * non-fabricated inputs.
  *
- * This OS deliberately never invents a signal/carrier (see `lib/cellular.ts`):
- * there is no real modem on the host path. So instead of fake bars we model the
- * truth we can actually assert:
+ * This OS deliberately never invents a signal/carrier (see `lib/cellular.ts`).
+ * So instead of fake bars we model the truth we can actually assert:
  *
- *   • no radio  — this build has no real SIM/modem source (`RadioSignal.present`
- *                 is false today; a future Android telephony signal source would
- *                 flip it to true with a real `signal`).  → "no cellular service".
+ *   • no radio  — no SIM/modem source answered: a desktop build, a tablet, or an
+ *                 ejected SIM (`RadioSignal.present` false).  → "no cellular service".
+ *                 Since 2026-09-25 (A6) this is a *measured* answer from
+ *                 `cellular_signal` (Android `TelephonyManager`), not a placeholder.
  *   • data off  — cellular data is switched off (real persisted preference).
- *   • no signal — a radio is present but reports no usable signal yet → honest
- *                 "no signal", never a made-up dBm.
- *   • connected — a real radio reports a real signal. (Only reachable once a real
- *                 modem source is wired; never synthesized here.)
+ *   • no signal — a radio is present but reports no usable level → honest
+ *                 "no signal", never a made-up dBm. Covers both a reported `0`
+ *                 and an unreadable level (no `READ_PHONE_STATE`, API < 28).
+ *   • connected — a real radio reports a real `1..=4` level. Never synthesized here.
  *
  * Pure + headlessly testable.
  */
@@ -26,8 +26,9 @@ export type CellularService =
   | "no-signal" // 有 radio 但拿不到真实信号
   | "connected"; // 有真源且真有信号（需接线真机）
 
-/** The honest radio/signal seam. Defaults to "no modem" because none exists yet;
- *  wiring a real Android signal source replaces it with a real reading. */
+/** The honest radio/signal seam. The default is "no modem" and is what a desktop /
+ *  tablet / SIM-less device actually measures — `lib/cellularHost.ts` replaces it
+ *  with a real reading on a phone. */
 export interface RadioSignal {
   /** Whether a real cellular radio + SIM source is present on this host. */
   present: boolean;

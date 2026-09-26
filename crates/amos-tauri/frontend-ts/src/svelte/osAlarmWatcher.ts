@@ -28,7 +28,13 @@ export function alarmWatcherTick(
 ): boolean {
   if (activeAppId === CLOCK_APP_ID) return false;
   try {
-    syncDueAlarmAlerts(nowMs);
+    if (syncDueAlarmAlerts(nowMs)) {
+      // Something rang → re-arm it for its NEXT occurrence, so a daily alarm keeps
+      // waking the phone. This is `osAlarmArm`'s job (it also cancels, and it is the
+      // only place that reads the host's device verdict). REQ-A875: `alarmCore` used to
+      // do this itself, fire-and-forget, dropping the reply.
+      void reconcileNativeAlarms(nowMs);
+    }
     return true;
   } catch {
     return false;

@@ -1,12 +1,15 @@
 //! Device-sensor descriptors, sample types and stream configs shared across AmOS.
 //!
-//! Three hardware families are modelled — the same three the roadmap lists as the
-//! missing multimedia / motion surface:
+//! Four hardware families are modelled — the same families the roadmap lists as the
+//! missing multimedia / motion / wellness surface:
 //!
 //! * [`CameraId`] / [`CameraConfig`] / [`CameraFrame`] — one or more physical
 //!   camera sensors with a chosen resolution / FPS / pixel format.
 //! * [`GeoFix`] / [`FixMode`] — a GNSS position lock (satellites, accuracy).
 //! * [`ImuSample`] — a fused accelerometer + gyroscope + temperature sample.
+//! * [`VitalsSample`] — the wellness pair: a cumulative step counter and a heart
+//!   rate reading, each independently optional (a device may have one, both or
+//!   neither).
 //!
 //! [`SensorKind`] is the single discriminator used by the provider seam and the
 //! energy-policy [`crate::SensorManager`] (PowerSave limits are per-kind). It also
@@ -23,11 +26,19 @@ pub enum SensorKind {
     Gnss,
     /// The inertial measurement unit (accelerometer + gyroscope).
     Imu,
+    /// The wellness pair — step counter and/or heart rate. Low-rate and
+    /// independent of the motion bus, so the Health app reads it on its own.
+    Vitals,
 }
 
 impl SensorKind {
     /// Every sensor family AmOS models.
-    pub const ALL: [SensorKind; 3] = [SensorKind::Camera, SensorKind::Gnss, SensorKind::Imu];
+    pub const ALL: [SensorKind; 4] = [
+        SensorKind::Camera,
+        SensorKind::Gnss,
+        SensorKind::Imu,
+        SensorKind::Vitals,
+    ];
 
     /// Stable wire/UI key.
     pub fn key(self) -> &'static str {
@@ -35,6 +46,7 @@ impl SensorKind {
             SensorKind::Camera => "camera",
             SensorKind::Gnss => "gnss",
             SensorKind::Imu => "imu",
+            SensorKind::Vitals => "vitals",
         }
     }
 
@@ -44,6 +56,7 @@ impl SensorKind {
             "camera" => Some(SensorKind::Camera),
             "gnss" => Some(SensorKind::Gnss),
             "imu" => Some(SensorKind::Imu),
+            "vitals" => Some(SensorKind::Vitals),
             _ => None,
         }
     }
@@ -56,6 +69,7 @@ impl SensorKind {
             SensorKind::Camera => CAMERA_HARDWARE_MAX_FPS,
             SensorKind::Gnss => GNSS_HARDWARE_MAX_HZ,
             SensorKind::Imu => IMU_HARDWARE_MAX_HZ,
+            SensorKind::Vitals => VITALS_HARDWARE_MAX_HZ,
         }
     }
 
@@ -66,6 +80,7 @@ impl SensorKind {
             SensorKind::Camera => CAMERA_SAVE_MAX_FPS,
             SensorKind::Gnss => GNSS_SAVE_MAX_HZ,
             SensorKind::Imu => IMU_SAVE_MAX_HZ,
+            SensorKind::Vitals => VITALS_SAVE_MAX_HZ,
         }
     }
 }
@@ -238,24 +253,47 @@ impl Vec3 {
 }
 
 /// One IMU sample: fused accelerometer + gyroscope + die temperature.
+///
+/// Only the **acceleration** vector is always present — a sample whose accel is
+/// absent is not a sample at all. The other two fields are `Option`, for the same
+/// reason [`VitalsSample`]'s two readings are: **a device may have no source for
+/// them, and that is a different fact from a measurement**.
+///
+/// * `gyro_rad_s` — a phone with no gyroscope is a real configuration, not a
+///   hypothetical: the field device this seam was verified on (a K-Touch S5,
+///   Android 14) has none, and `dumpsys sensorservice` says so outright
+///   (`geomag fusion (no gyro)`). Android's IMU glue registers a
+///   `TYPE_GYROSCOPE` listener only when the platform exposes one, so on that
+///   device no angular-rate event ever arrives. The honest value is `None`
+///   (the glue states it with its `Float.NaN` sentinel, decoded at the seam).
+///   `None` is *not* `Vec3::ZERO`: zero is a measurement — "this device is not
+///   rotating" — and the placeholder the glue used to send was exactly that
+///   fabricated zero, paired onto every accelerometer sample.
+/// * `temperature_c` — there is no standard die-temperature sensor behind
+///   `TYPE_ACCELEROMETER` / `TYPE_GYROSCOPE`, so the honest value is likewise
+///   `None`; the one placeholder the glue used to send — a hardcoded `25.0` —
+///   was worse still, because it is a *plausible* reading.
+///
+/// The UI prints `—` for `None`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ImuSample {
     /// Device-relative millisecond timestamp.
     pub timestamp_ms: u64,
-    /// Linear acceleration, m/s², body frame.
+    /// Linear acceleration, m/s², body frame. Always present.
     pub accel_m_s2: Vec3,
-    /// Angular velocity, rad/s, body frame.
-    pub gyro_rad_s: Vec3,
-    /// Die temperature, °C.
-    pub temperature_c: f32,
+    /// Angular velocity, rad/s, body frame — `None` when the device has no
+    /// gyroscope (or none has reported yet).
+    pub gyro_rad_s: Option<Vec3>,
+    /// Die temperature, °C — `None` when the device has no source for one.
+    pub temperature_c: Option<f32>,
 }
 
 impl ImuSample {
     pub const fn new(
         timestamp_ms: u64,
         accel_m_s2: Vec3,
-        gyro_rad_s: Vec3,
-        temperature_c: f32,
+        gyro_rad_s: Option<Vec3>,
+        temperature_c: Option<f32>,
     ) -> Self {
         Self {
             timestamp_ms,
@@ -263,6 +301,50 @@ impl ImuSample {
             gyro_rad_s,
             temperature_c,
         }
+    }
+}
+
+/// One wellness sample: a cumulative step counter and a heart-rate reading.
+///
+/// Both fields are `Option` because the two sensors are independent — a device
+/// may expose a step counter and no heart-rate sensor, or a heart-rate sensor
+/// that is not currently in contact. `None` is a distinct fact from `0`: an
+/// absent step count is **unknown**, and a `0` rendered in its place would read
+/// as "the device is perfectly still all day", i.e. a measurement. The UI prints
+/// `—` for `None`.
+///
+/// `steps_total` is the raw **cumulative count since boot**, exactly as Android's
+/// `TYPE_STEP_COUNTER` reports it (it resets when the device reboots). Turning it
+/// into a per-day figure is the consumer's job — see the frontend `lib/health.ts`
+/// `stepDelta`, which re-baselines on a counter that moved backwards.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VitalsSample {
+    /// Device-relative millisecond timestamp.
+    pub timestamp_ms: u64,
+    /// Cumulative steps since boot, when a step counter is present.
+    pub steps_total: Option<f64>,
+    /// Heart rate in beats per minute, when a sensor reported one (no contact ⇒
+    /// `None`).
+    pub heart_rate_bpm: Option<f64>,
+}
+
+impl VitalsSample {
+    pub const fn new(
+        timestamp_ms: u64,
+        steps_total: Option<f64>,
+        heart_rate_bpm: Option<f64>,
+    ) -> Self {
+        Self {
+            timestamp_ms,
+            steps_total,
+            heart_rate_bpm,
+        }
+    }
+
+    /// Whether the sample carries at least one real reading (a sample with both
+    /// fields `None` is not worth storing or announcing).
+    pub fn has_reading(&self) -> bool {
+        self.steps_total.is_some() || self.heart_rate_bpm.is_some()
     }
 }
 
@@ -321,10 +403,21 @@ pub const IMU_HARDWARE_MAX_HZ: u32 = 1000;
 /// Ceiling while PowerSave for a continuous IMU stream, Hz (coarse motion
 /// tracking is enough to keep the screen usable).
 pub const IMU_SAVE_MAX_HZ: u32 = 25;
+/// Hardware ceiling for a continuous vitals request, Hz. Steps and heart rate are
+/// inherently low-rate: a couple of samples a second already over-samples both.
+pub const VITALS_HARDWARE_MAX_HZ: u32 = 5;
+/// Ceiling while PowerSave for a continuous vitals stream, Hz.
+pub const VITALS_SAVE_MAX_HZ: u32 = 1;
 
-/// Upper bound on one decoded frame we will hold (≈ 16 MP RGBA) — a safety rail
-/// against a misbehaving provider claiming an absurd allocation.
-pub const MAX_FRAME_BYTES: u64 = 64 * 1024 * 1024;
+/// Upper bound on one decoded frame we will hold — a safety rail against a
+/// misbehaving provider claiming an absurd allocation.
+///
+/// 16 MiB is a 4 MP RGBA frame (or an ~11 MP NV21 frame): comfortably above any
+/// preview resolution the System UI negotiates, far below "size of the process
+/// heap". It is the same ceiling the JNI glue seam enforces
+/// ([`crate::sim::GLUE_MAX_FRAME_BYTES`]), so a frame that passes one boundary
+/// cannot be refused by the other for being oversized.
+pub const MAX_FRAME_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Byte length a full frame at `cfg` carries, validated. This lets a frame
 /// consumer / service bus pre-allocate exactly the right buffer.
@@ -418,6 +511,21 @@ mod tests {
         let mut bad = frame.clone();
         bad.bytes = vec![0u8; 63];
         assert!(!bad.payload_is_valid());
+    }
+
+    #[test]
+    fn vitals_sample_keeps_absent_readings_distinct_from_zero() {
+        // A present zero step count is a reading; an absent one is `None`. The two
+        // must never collapse, or the UI would draw a fabricated "0 steps".
+        let present = VitalsSample::new(10, Some(0.0), None);
+        let absent = VitalsSample::new(10, None, None);
+        assert_eq!(present.steps_total, Some(0.0));
+        assert_eq!(absent.steps_total, None);
+        assert!(present.has_reading());
+        assert!(
+            !absent.has_reading(),
+            "a sample with no reading is not stored"
+        );
     }
 
     #[test]

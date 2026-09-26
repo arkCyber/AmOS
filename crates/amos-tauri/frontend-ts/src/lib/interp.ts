@@ -6,7 +6,7 @@
  * reopening the app (mirroring the legacy vanilla interpreter app's `amos.interp`
  * / `amos.interp.log` keys so both UIs interoperate in the shared store).
  */
-import { readStoreValue, writeStoreValue, writeStoreValueChecked } from "./amosStore";
+import { readStoreValue, writeStoreValueChecked } from "./amosStore";
 
 export const INTERP_PREFS_KEY = "amos.interp";
 export const INTERP_LOG_KEY = "amos.interp.log";
@@ -78,13 +78,50 @@ export function readPrefs(): InterpPrefs {
   };
 }
 
-export function writePrefs(p: InterpPrefs): void {
-  writeStoreValue(INTERP_PREFS_KEY, p);
+/**
+ * Persist the remembered prefs, returning the **store's own verdict**.
+ *
+ * The language pair + auto-speak are the user's choice, so a caller that draws them must not
+ * claim they were remembered when the write was refused — this signs the same way as `saveSegs`
+ * below, and the screen reads both (`storeErr` ∕ `prefsErr` + `StoreErrorBar`). REQ-A1420.
+ */
+export function writePrefs(p: InterpPrefs): boolean {
+  return writeStoreValueChecked(INTERP_PREFS_KEY, p);
+}
+
+/**
+ * Corruption guard for the persisted transcript — the same rule `normalizePhotos` /
+ * `normalizeNotes` / `normalizeFavs` apply to their keys: anything that is not an array
+ * reads as "an empty transcript" rather than reaching the reader as an object.
+ *
+ * `amos.interp.log` is one of `lib/cloud.ts`'s `SYNC_STORES` and is shared with the
+ * legacy vanilla interpreter, and `restoreBackup` writes a backup's value into the key
+ * **verbatim** (no shape check), so a valid-JSON non-array (`{}` / `5` / `null` / `"x"` —
+ * returned verbatim by `readJson`, whose `fallback` fires only when the bytes are
+ * *absent*) can land here by restoring a backup. A segment whose `src`/`target` are not
+ * both strings is dropped; the optional language codes are kept only when they are.
+ *
+ * Deliberately **uncapped**: `SEG_CAP` belongs to the writer (`InterpApp`'s `capTail`),
+ * and truncating here would change what an already-over-long stored transcript renders.
+ */
+export function normalizeSegs(list: unknown): InterpSeg[] {
+  if (!Array.isArray(list)) return [];
+  const out: InterpSeg[] = [];
+  for (const raw of list) {
+    if (!raw || typeof raw !== "object") continue;
+    const o = raw as Record<string, unknown>;
+    if (typeof o.src !== "string" || typeof o.target !== "string") continue;
+    const seg: InterpSeg = { src: o.src, target: o.target };
+    if (typeof o.srcLang === "string") seg.srcLang = o.srcLang;
+    if (typeof o.targetLang === "string") seg.targetLang = o.targetLang;
+    out.push(seg);
+  }
+  return out;
 }
 
 /** Load the persisted interpretation transcript (empty array by default). */
 export function loadSegs(): InterpSeg[] {
-  return readStoreValue<InterpSeg[]>(INTERP_LOG_KEY, []);
+  return normalizeSegs(readStoreValue<unknown>(INTERP_LOG_KEY, []));
 }
 
 export function saveSegs(segs: InterpSeg[]): boolean {

@@ -22,6 +22,18 @@
  *      A site with no `Context` available (it only has the captured `JavaVM`) is
  *      recorded in `scripts/jni-allowlist.json` **with a reason**, and must at least
  *      wrap the call in `amos_jni::jni_call!` so a failure cannot poison the thread.
+ *   3. **A glue class must not be *named* at a `call_static_method` site** — same rule,
+ *      one step removed. The `jni` crate resolves a `&str` class argument with
+ *      `JNIEnv::find_class`, so `call_static_method(SOME_CLASS, …)` is a `find_class`
+ *      that rule 2's token list cannot see. A device round measured the consequence:
+ *      `screen_record_status` and
+ *      `screen_record_stop` — both `async`, so both on a tokio worker — answered
+ *      `ClassNotFoundException` for `com.amos.ai.glue.ScreenRecordGlue` while the same
+ *      class resolved fine from the main thread. The class must be resolved through the
+ *      `Context` (`amos_jni::resolve_class`) and passed as a `JClass`/`GlobalRef`, which
+ *      is what **both** `screen_record_android.rs` and every `amos-radio` site do.
+ *      A file that still names classes is allow-listed **with a reason**; the reason is
+ *      the place to say which of its commands run off the main thread.
  *
  * Usage (from the repo root):
  *   node scripts/jni-exception-scan.mjs              # gate
@@ -60,6 +72,67 @@ export function productionRust() {
   return out.sort();
 }
 
+/** The class-name token rule 3 keys on. */
+export const CLASS_NAME_TOKEN = "call_static_method(class-name)";
+
+/** A glue class named as a string — dotted or slashed. */
+const GLUE_NAME = /com[./]amos[./]ai[./]glue[./][A-Za-z_]\w*/;
+
+/**
+ * The first argument of every `call_static_method(` call, as written, with whether the
+ * enclosing (nearest preceding) `fn` is `async`.
+ *
+ * A one-level textual walk, not a parser: Rust `fn`s do not nest, so the nearest `fn`
+ * declaration before a call site is the one it sits in — closures inside a fn body included,
+ * which is exactly where these calls live (`with_context(|ctx, env| { … })`).
+ */
+export function staticClassArgs(code) {
+  const fns = [...code.matchAll(/(^|[^\w])(async\s+)?fn\s+([A-Za-z_]\w*)\s*[<(]/g)].map((m) => ({
+    at: m.index,
+    async: Boolean(m[2]),
+  }));
+  const out = [];
+  const re = /(?<!\w)call_static_method\s*\(/g;
+  let m;
+  while ((m = re.exec(code)) !== null) {
+    let i = m.index + m[0].length;
+    let depth = 0;
+    let j = i;
+    let inStr = false;
+    for (; j < code.length; j++) {
+      const c = code[j];
+      if (inStr) {
+        if (c === "\\") j++;
+        else if (c === '"') inStr = false;
+        continue;
+      }
+      if (c === '"') inStr = true;
+      else if ("([{".includes(c)) depth++;
+      else if (")]}".includes(c)) {
+        if (depth === 0) break;
+        depth--;
+      } else if (c === "," && depth === 0) break;
+    }
+    const enclosing = fns.filter((f) => f.at < m.index).pop() ?? null;
+    out.push({
+      index: m.index,
+      arg: code.slice(i, j).trim(),
+      async: enclosing?.async ?? false,
+    });
+    re.lastIndex = j;
+  }
+  return out;
+}
+
+/** File-level `const`/`static` names bound to a glue class name. */
+export function glueConstNames(code) {
+  const out = new Set();
+  const re = /\b(?:const|static)\s+([A-Za-z_]\w*)\s*:\s*&(?:'static\s+)?str\s*=\s*"([^"]*)"/g;
+  let m;
+  while ((m = re.exec(code)) !== null) if (GLUE_NAME.test(m[2])) out.add(m[1]);
+  return out;
+}
+
 /**
  * Findings for a `{ file: text }` map given the allow-list entries. Pure, so the
  * selftest drives it with fixtures.
@@ -88,6 +161,29 @@ export function scanSources(sources, allow = []) {
           line: line.trim().slice(0, 90),
         });
       }
+    }
+    // Rule 3: a glue class *named* at a static call site — `find_class` one step removed.
+    const consts = glueConstNames(code);
+    const named = staticClassArgs(code).filter((site) => {
+      const arg = site.arg.replace(/^&/, "").trim();
+      // A constant is usually reached through its module (`android_jni::BLE_CLASS`), so the
+      // *last* path segment is what has to be looked up — `ble.rs` reaches every one of its
+      // glue classes that way, and a bare-identifier test would have missed the whole file.
+      const leaf = arg.split("::").pop().trim();
+      return GLUE_NAME.test(arg) || consts.has(leaf);
+    });
+    if (named.length > 0) {
+      if (allowed.has(`${file}::${CLASS_NAME_TOKEN}`)) used.add(`${file}::${CLASS_NAME_TOKEN}`);
+      else
+        for (const site of named) {
+          findings.push({
+            file,
+            token: CLASS_NAME_TOKEN,
+            kind: "class-by-name",
+            async: site.async,
+            line: site.arg.slice(0, 90),
+          });
+        }
     }
   }
   const stale = allow.filter((e) => !used.has(`${e.file}::${e.token}`)).map((e) => `${e.file}::${e.token}`);
@@ -118,6 +214,67 @@ export function runSelftest() {
   ok(
     "a stale allow entry is reported",
     scanSources({ "crates/amos-y/src/other.rs": "fn f() {}" }, allowEntry).stale.length === 1,
+  );
+
+  // Rule 3 (REQ-A1866): a glue class *named* at a static call site is a `find_class`.
+  const byLiteral = {
+    "crates/amos-z/src/a.rs":
+      'fn f(env: &mut JNIEnv) { env.call_static_method("com/amos/ai/glue/X", "m", "()V", &[]); }',
+  };
+  const l3 = scanSources(byLiteral);
+  ok("a glue class named as a literal is a finding", l3.findings.length === 1);
+  ok("its kind names the rule", l3.findings[0]?.kind === "class-by-name");
+  ok("a sync fn is not marked async", l3.findings[0]?.async === false);
+  const byConst = scanSources({
+    "crates/amos-z/src/a.rs": [
+      'const C: &str = "com.amos.ai.glue/X";',
+      "async fn f(env: &mut JNIEnv) { env.call_static_method(C, \"m\", \"()V\", &[]); }",
+    ].join("\n"),
+  });
+  ok("a file-level const standing for a glue class is a finding", byConst.findings.length === 1);
+  ok("the enclosing async fn is recorded", byConst.findings[0]?.async === true);
+  ok(
+    "a const reached through its module is a finding too (the ble.rs shape)",
+    scanSources({
+      "crates/amos-z/src/a.rs": [
+        "pub mod glue {",
+        '    pub const BLE_CLASS: &str = "com/amos/ai/glue/BluetoothGattGlue";',
+        "}",
+        "async fn f(env: &mut JNIEnv) { env.call_static_method(glue::BLE_CLASS, \"m\", \"()V\", &[]); }",
+      ].join("\n"),
+    }).findings.length === 1,
+  );
+  ok(
+    "a resolved class handle is not a finding (the fixed shape)",
+    scanSources({
+      "crates/amos-z/src/a.rs": [
+        'const C: &str = "com.amos.ai.glue/X";',
+        "async fn f(env: &mut JNIEnv, ctx: &GlobalRef) {",
+        "    let class = amos_jni::resolve_class(env, ctx.as_ref(), C)?;",
+        '    env.call_static_method(&class, "m", "()V", &[]);',
+        "}",
+      ].join("\n"),
+    }).findings.length === 0,
+  );
+  ok(
+    "a platform class is not ours to flag",
+    scanSources({
+      "crates/amos-z/src/a.rs":
+        'fn f(env: &mut JNIEnv) { env.call_static_method("android/net/Uri", "parse", "()V", &[]); }',
+    }).findings.length === 0,
+  );
+  ok(
+    "a mention in a comment is not a call",
+    scanSources({
+      "crates/amos-z/src/a.rs":
+        '// env.call_static_method("com/amos/ai/glue/X", "m", "()V", &[]) is the shape we removed\nfn f() {}',
+    }).findings.length === 0,
+  );
+  const l3Allow = [{ file: "crates/amos-z/src/a.rs", token: CLASS_NAME_TOKEN, reason: "sync only" }];
+  ok("an allow-listed file passes rule 3", scanSources(byLiteral, l3Allow).findings.length === 0);
+  ok(
+    "and the entry is not reported stale",
+    scanSources(byLiteral, l3Allow).stale.length === 0,
   );
 
   let failed = 0;
@@ -152,7 +309,9 @@ function runScan() {
       const why =
         f.kind === "raw-attach"
           ? "attaches a thread without clearing a pending exception — use amos_jni::attached (a pooled thread can inherit one and the next JNI call would abort the app)"
-          : "resolves a class through the calling thread's loader — use amos_jni::resolve_class, or allow-list it with a reason";
+          : f.kind === "class-by-name"
+            ? `names a glue class at a static call site${f.async ? " inside an async fn (a tokio worker: the bootstrap loader, so ClassNotFoundException)" : " — a find_class one step removed; resolve it through the Context (amos_jni::resolve_class) and pass the JClass, or allow-list the file with a reason"}`
+            : "resolves a class through the calling thread's loader — use amos_jni::resolve_class, or allow-list it with a reason";
       console.error(`[jni-exception-scan] FAIL — ${f.file} ${f.token} ${why}`);
     }
     for (const s of stale) {

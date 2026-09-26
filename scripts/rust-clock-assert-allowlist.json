@@ -1,0 +1,14 @@
+{
+  "_why": "Sites where an assertion judges a wall-clock reading in the machine-measuring direction (`elapsed() < bound`) and the min-of-K instrument could not be used. Every entry needs a `kind` from the table below and its own `note`; the scan prints the notes on every run so a reader can rebut them, and it fails on an entry that names a kind the table does not define. An empty list is the honest state: the three sites this scan found (REQ-A854 / F-DEV-109) are all bound through `fastest_of`, so nothing is excused here yet.",
+  "kinds": {
+    "no-instrument-possible": {
+      "reason": "The measured quantity is not repeatable in-process: the first call performs one-time work (JIT-ish warmup, a lazily built table, a first-touch allocation) that later attempts do not, so the minimum over K would measure a different program than the one under test. The note must say which one-time effect, and the site should prefer a bound so wide that only a hang can cross it.",
+      "note": "Shape of a member: { \"file\", \"line\", \"kind\": \"no-instrument-possible\", \"note\": \"…which one-time effect, and why the bound is a hang guard rather than a budget…\" }"
+    },
+    "deliberate-machine-claim": {
+      "reason": "The test exists to decide something about the machine (a throughput floor, a hardware capability gate, a benchmark-derived calibration), not about the code's asymptotics. The note must say why the machine IS the subject.",
+      "note": "Shape of a member: { \"file\", \"line\", \"kind\": \"deliberate-machine-claim\", \"note\": \"…why the machine is the subject here…\" }"
+    }
+  },
+  "sites": []
+}

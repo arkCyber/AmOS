@@ -20,9 +20,13 @@
 //!   and lets the next transport try; the daemon stays alive.
 //! * Suppression windows merge duplicates into a single counter the
 //!   operator can query — never a silent drop.
-//! * When no transports are configured (or every transport fails), alerts
-//!   still reach the operator through stderr — the system logs are the
-//!   fallback the operator can always read.
+//! * When no transports are configured — or every configured transport fails
+//!   or refuses the alert — it still reaches the operator: one structured
+//!   stderr line (or a `tracing` line when the stderr path is off), and a
+//!   `fallbacks` count on [`DispatchMetrics`] so the fallback is visible, not
+//!   merely printed. The system logs are the fallback the operator can always
+//!   read. (REQ-A769: the first half was implemented, the "every transport
+//!   fails" half was only promised until this round.)
 
 // P0-1 gate (all three lints, as `scripts/rust-panic-scan.mjs` requires and
 // every other crate root in this workspace declares). This crate previously

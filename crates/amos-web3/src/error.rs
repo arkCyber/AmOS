@@ -6,8 +6,8 @@ use thiserror::Error;
 #[derive(Error, Debug, PartialEq, Eq)]
 pub enum Error {
     /// A 32-byte seed could not be turned into a valid secp256k1 secret scalar.
-    /// This is effectively impossible after deterministic RFC6979 rejection
-    /// sampling, but is still surfaced rather than masked.
+    /// The seed is used directly as the scalar, so a zero or `>= n` seed is
+    /// rejected rather than silently mapped to a different key.
     #[error("seed did not yield a valid secp256k1 secret scalar")]
     InvalidSecret,
 
@@ -18,10 +18,6 @@ pub enum Error {
     /// Bytes handed in as a signature were not a valid ECDSA signature.
     #[error("invalid ECDSA signature encoding")]
     InvalidSignature,
-
-    /// A hex string could not be decoded for the expected length.
-    #[error("invalid hex: {0}")]
-    Hex(String),
 
     /// A structured (EIP-712) value was malformed / of an unsupported shape.
     #[error("EIP-712: {0}")]

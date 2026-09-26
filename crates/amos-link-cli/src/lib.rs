@@ -1768,7 +1768,7 @@ async fn run_discover(opts: &Opts) -> Result<()> {
     // (`with_local`) — an earlier version put `amos-node` in the table, where it reads as
     // "another machine is on the link".
     let mut registry =
-        PeerRegistry::with_local(Duration::from_secs(3), PeerId::new(opts.peer.clone())?);
+        PeerRegistry::with_local(PeerRegistry::DEFAULT_TTL, PeerId::new(opts.peer.clone())?);
     let now = amos_link::codec::Timestamp::now();
     for peer in &opts.peers {
         let info = PeerInfo::new(PeerId::new(peer.clone())?, NodeKind::Robot);
@@ -1838,10 +1838,9 @@ impl PeerRow {
         Self {
             id: peer.id.clone(),
             // A kind this build does not know is reported as `unknown`, never dropped or
-            // guessed: the row still names the peer.
-            kind: NodeKind::from_key(&peer.kind)
-                .map(NodeKind::key)
-                .unwrap_or("unknown"),
+            // guessed: the row still names the peer. The fold is `NodeKind::wire_token` — the
+            // same rule the System UI bridge applies, so a peer cannot read two ways.
+            kind: NodeKind::wire_token(&peer.kind),
             endpoint: Some(peer.endpoint.clone()).filter(|endpoint| !endpoint.is_empty()),
             last_seen_ms: peer.last_seen_ms,
             beacons: peer.beacons,
@@ -2023,16 +2022,17 @@ fn note_self_refusals(refused: u64) {
 /// The announce cadence every CLI command uses when it joins the federation.
 ///
 /// **One rule, one place** (`docs/amos-link.md` §3): a beacon every `TTL/3`, with a
-/// 100 ms floor so a tiny TTL cannot turn the announcer into a spin.
+/// 100 ms floor so a tiny TTL cannot turn the announcer into a spin. The `TTL/3` half is
+/// **not** re-implemented here — it is [`amos_link::discovery::federation_period`], the
+/// kernel's single implementation of the rule that `spawn_federation` enforces; the CLI
+/// owns only the floor (a property of this sweep, not of the rule).
 ///
-/// `spawn_federation` enforces the *upper* bound (a period longer than a third of the
-/// peer TTL makes every other table see this node appear and expire forever — a
-/// flapping link). Announcing **faster** than that is legal but it is wire noise, and
-/// it makes this node's own `published` counter read mostly its own beacons: a
-/// hard-coded 200 ms used to make `watch` report 6 publishes/s for a 1 Hz heartbeat
-/// (1 beat + 5 beacons), which is not what the design record says the CLI does.
+/// Announcing **faster** than `TTL/3` is legal but it is wire noise, and it makes this
+/// node's own `published` counter read mostly its own beacons: a hard-coded 200 ms used
+/// to make `watch` report 6 publishes/s for a 1 Hz heartbeat (1 beat + 5 beacons), which
+/// is not what the design record says the CLI does.
 fn federation_period(ttl: Duration) -> Duration {
-    (ttl / 3).max(Duration::from_millis(100))
+    amos_link::discovery::federation_period(ttl).max(Duration::from_millis(100))
 }
 
 #[cfg(feature = "lan")]
@@ -2061,7 +2061,7 @@ async fn run_discover_lan(opts: &Opts) -> Result<()> {
     // (`IP_MULTICAST_LOOP` is on by default), and listing the machine we are running on as
     // a peer of the LAN is exactly the "invented fact" this command exists to avoid —
     // measured before this fix: `+ peer self-test`, four beacons, `peers=1`.
-    let mut registry = PeerRegistry::with_local(Duration::from_secs(3), me.id.clone());
+    let mut registry = PeerRegistry::with_local(PeerRegistry::DEFAULT_TTL, me.id.clone());
     // Announce for as long as we listen instead of once at startup: a single beacon is
     // found only by a peer that was already listening, which inverts the question this
     // command exists to answer ("who is on this LAN?"). The cadence follows the rule
@@ -3413,10 +3413,12 @@ mod tests {
     #[test]
     fn one_federation_cadence_governs_every_command() {
         // The documented rule (docs/amos-link.md §3): a beacon every TTL/3.
-        // `PeerRegistry::DEFAULT_TTL` is 3 s ⇒ a 1 s cadence.
+        // At the default TTL that is `LinkNode::FEDERATION_PERIOD` — the same value the
+        // kernel claims as "the default federation period", asserted here from the CLI's
+        // side so the two crates cannot disagree.
         assert_eq!(
-            federation_period(Duration::from_secs(3)),
-            Duration::from_secs(1)
+            federation_period(PeerRegistry::DEFAULT_TTL),
+            LinkNode::FEDERATION_PERIOD
         );
         assert_eq!(
             federation_period(Duration::from_secs(9)),
@@ -4383,7 +4385,7 @@ mod tests {
     fn the_peer_table_renders_as_json() {
         let now = amos_link::codec::Timestamp::now();
         let mut registry = PeerRegistry::with_local(
-            Duration::from_secs(3),
+            PeerRegistry::DEFAULT_TTL,
             PeerId::new("self-node").expect("peer"),
         );
         registry.learn(

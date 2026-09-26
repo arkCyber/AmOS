@@ -5,13 +5,21 @@
   // the always-reachable emergency quick-dial. Emits 'unlock' to the shell.
   import { t, locale } from "./locale.svelte";
   import { fmtClock } from "../lib/time";
-  import { telephonyDial } from "../lib/backend";
-  import { EMERGENCY_QUICK_NUMBER } from "../lib/emergency";
+  import {
+    realDial,
+    realDialStatus,
+    telephonyBackendKind,
+    telephonyDefaultDialerStatus,
+    telephonyDial,
+  } from "../lib/backend";
+  import { placeOutgoingCall } from "../lib/phone";
+  import { wmOpenReported } from "../lib/wm";
+  import { deviceQuickEmergencyNumber } from "../lib/emergency";
   import { createStoreValue } from "./store";
   import { propsChannel } from "./propsBus";
   import { isCustomWallpaper, WALLPAPER_FILES } from "../lib/wallpaper";
   import { iconSvg, batterySvg } from "../lib/sysIcons";
-  import { batteryTone } from "../lib/batteryStatus";
+  import { batteryReadout, batteryTone } from "../lib/batteryStatus";
   import { systemStatusWithHostBattery } from "../lib/system";
   import { attachFocusTrap } from "../lib/focusTrap";
 
@@ -48,6 +56,17 @@
   let bad = $state(false);
   let emergency = $state(false);
   let dialFailed = $state(false);
+  let simulated = $state(false);
+  let handedOff = $state(false);
+  let owned = $state(false);
+  let roleUnread = $state(false);
+
+  // The one-tap number is the **device's** region choice, not a constant: a
+  // hardcoded 110 reaches nobody outside CN/JP (KR's police is 112, AU/NZ dial
+  // 000, the US dials 911). Read once per mount — the OS locale does not change
+  // under a locked screen — and used for both the dial and the label, so what the
+  // user reads is exactly what is dialed.
+  const quickDial = deviceQuickEmergencyNumber();
 
   // Keyboard focus trap (WCAG 2.1.2): Tab cycles inside the lock screen only.
   // Escape is not handled here (a locked device must not escape without auth).
@@ -77,6 +96,8 @@
   let batteryLevel = $state<number | null>(null);
   let batteryCharging = $state<boolean | null>(null);
   const battTone = $derived(batteryTone({ levelPct: batteryLevel, charging: batteryCharging }));
+  /** The shared read-out: the shown text AND the accessible name (see below). */
+  const readout = $derived(batteryReadout({ levelPct: batteryLevel, charging: batteryCharging }));
   $effect(() => {
     let stopped = false;
     const read = async () => {
@@ -111,12 +132,65 @@
   const dialEmergency = async () => {
     if (emergency) return;
     dialFailed = false;
+    simulated = false;
+    handedOff = false;
+    owned = false;
+    roleUnread = false;
     emergency = true;
-    const res = await telephonyDial(EMERGENCY_QUICK_NUMBER, true);
-    if (!res) {
-      emergency = false;
+    // The **same** routing the keypad and Contacts use (`lib/phone::placeOutgoingCall`):
+    // the real platform path (`ACTION_CALL` through Android Telecom) first, then a daemon
+    // backed by a genuinely real stack, and only a host with no telephony stack at all may
+    // answer with a simulated call. This surface used to call `telephonyDial` directly,
+    // which meant the OS's most safety-critical button — the one-tap emergency dial a
+    // locked user reaches without authenticating — was answered by the daemon's mock
+    // provider (an unconditional `Ok`) and never reached `ACTION_CALL` on a real device.
+    // The routing is the library's, so this screen and the other two cannot drift apart.
+    const outcome = await placeOutgoingCall(quickDial, true, {
+      system: (n) => realDial(n),
+      daemonReal: async () => (await telephonyBackendKind())?.real === true,
+      hostStatus: () => realDialStatus(),
+      daemon: (n, e) => telephonyDial(n, e),
+    });
+    // The in-flight guard ends **here**, on every outcome. `placeOutgoingCall` resolves once
+    // the attempt is placed, not when the call ends, and this screen keeps no in-call state
+    // to stay disabled for — so `emergency` is not a "a call is up" fact. Left set (as it was:
+    // only the `failed` branch cleared it), the one control a locked user reaches without
+    // authenticating stayed `disabled` and read "正在呼叫 …" for the rest of the lock session,
+    // on the very successful dial the rest of the routing works to make possible.
+    emergency = false;
+    if (outcome.kind === "failed") {
       dialFailed = true;
+      return;
     }
+    // A simulated emergency call is the one thing a user must never be told is real, so
+    // the fact rides on screen when the only path available was the daemon's.
+    if (outcome.kind === "managed") {
+      simulated = outcome.simulated;
+      return;
+    }
+    // `ACTION_CALL` was handed to Android Telecom — but **who owns the call now** is the
+    // `ROLE_DIALER` role, not the mere fact that this screen handed it off. The other two
+    // consumers of `placeOutgoingCall` (`PhoneApp.startCall`, `ContactsApp.callNumber`)
+    // both ask; this one did not, and asserted "the system dialer owns it" on every
+    // hand-off. When AmOS itself holds the role, Telecom resolves the call straight back
+    // into *this app's own* `AmosInCallService` (fixed id `real`), so the sentence is
+    // false and — while locked only this screen is drawn — the user has no hang-up
+    // anywhere. The in-call surface is brought up; it sits behind the lock overlay until
+    // the unlock that makes a hang-up key relevant.
+    const role = await telephonyDefaultDialerStatus();
+    if (role?.role_held) {
+      owned = true;
+      await wmOpenReported("phone", "lockscreen");
+      return;
+    }
+    // `null` is 「我没问到」, not "another dialer holds it": `invoke` resolves `null` on a
+    // failed command and never rejects, so a refused probe established no owner at all.
+    if (role === null) {
+      roleUnread = true;
+      await wmOpenReported("phone", "lockscreen");
+      return;
+    }
+    handedOff = true;
   };
 </script>
 
@@ -137,11 +211,11 @@
   {#if batteryLevel !== null}
     <div
       data-testid="lock-battery"
-      aria-label={t("a11y.batteryLevel")}
+      aria-label={readout ? t(readout.key, { pct: readout.pct }) : t("a11y.batteryLevel")}
       class="absolute right-6 top-6 z-20 flex items-center gap-1.5 text-neutral-100 tabular-nums"
     >
       {@html batterySvg(batteryLevel, "h-3.5 w-3.5", battTone)}
-      <span>{Math.round(batteryLevel)}%</span>
+      <span aria-hidden="true">{readout?.pct}</span>
     </div>
   {/if}
     <div class="relative z-10 flex w-full flex-col items-center">
@@ -199,14 +273,26 @@
       onclick={() => void dialEmergency()}
       disabled={emergency}
       class="mt-10 rounded-full bg-danger/20 px-8 py-3 text-ios-body font-medium text-white ring-1 ring-danger/40 backdrop-blur-md transition active:scale-95 active:bg-danger/30 disabled:opacity-60"
-      aria-label={t("shell.emergency", { num: EMERGENCY_QUICK_NUMBER })}
+      aria-label={t("shell.emergency", { num: quickDial })}
     >
       {emergency
-        ? t("shell.emergencyCalling", { num: EMERGENCY_QUICK_NUMBER })
-        : t("shell.emergency", { num: EMERGENCY_QUICK_NUMBER })}
+        ? t("shell.emergencyCalling", { num: quickDial })
+        : t("shell.emergency", { num: quickDial })}
     </button>
     {#if dialFailed}
       <p class="mt-3 max-w-xs text-center text-xs text-red-200/80">{t("shell.emergencyUnreachable")}</p>
+    {/if}
+    {#if handedOff}
+      <p role="status" class="mt-3 max-w-xs text-center text-xs text-neutral-300/90">{t("phone.handedToSystem")}</p>
+    {/if}
+    {#if owned}
+      <p role="status" class="mt-3 max-w-xs text-center text-xs text-neutral-300/90">{t("shell.emergencyOwned")}</p>
+    {/if}
+    {#if roleUnread}
+      <p role="status" class="mt-3 max-w-xs text-center text-xs text-neutral-300/90">{t("shell.emergencyRoleUnread")}</p>
+    {/if}
+    {#if simulated}
+      <p role="status" class="mt-3 max-w-xs text-center text-xs text-amber-200/90">{t("phone.simulatedCall")}</p>
     {/if}
   </div>
 </div>

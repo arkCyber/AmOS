@@ -116,6 +116,13 @@ impl WebInstaller {
     }
 
     /// Path where `id`'s bundle lives (not yet guaranteed to exist).
+    ///
+    /// **Computing a path is not the same as acting on it.** `root.join(id)` replaces the whole
+    /// path when `id` is absolute and walks out of the root on `..`, so every caller that *does*
+    /// something with the result must refuse a non-slug id first — [`crate::is_valid_app_id`] is
+    /// the public form of the same rule `AppManifest` is validated with. [`Self::install`] and
+    /// [`Self::uninstall`] are this crate's two callers and both check; `crate::host` and
+    /// `crate::serve` check the id before they reach here.
     pub fn dir_for(&self, id: &str) -> PathBuf {
         self.root.join(id)
     }
@@ -126,6 +133,10 @@ impl WebInstaller {
     /// `archive` must already be integrity-checked by the caller (sha256).
     pub fn install(&self, manifest: &AppManifest, archive: &[u8]) -> Result<WebInstall> {
         manifest.validate()?;
+        // `validate()` already applies the id rule; repeating it here is deliberate — the
+        // guarantee belongs next to the I/O that depends on it, so a future refactor of
+        // `validate()` cannot quietly remove it from underneath `dir_for` + `remove_dir_all`.
+        check_id(&manifest.id)?;
         let dir = self.dir_for(&manifest.id);
         if dir.exists() {
             fs::remove_dir_all(&dir).map_err(|e| io_err("remove old install", &dir, &e))?;
@@ -159,12 +170,31 @@ impl WebInstaller {
     }
 
     /// Remove `id`'s install directory (a no-op when absent).
+    ///
+    /// The id is refused **before** the `dir_for` join. This is the crate's only recursive delete
+    /// and `WebInstaller` is public, so the rule cannot be left to whatever the caller happens to
+    /// check first: with the guard removed, `uninstall("../victim")` deletes `<root>/../victim`
+    /// entirely, and an absolute `id` aims the delete anywhere at all.
     pub fn uninstall(&self, id: &str) -> Result<()> {
+        check_id(id)?;
         let dir = self.dir_for(id);
         if dir.exists() {
             fs::remove_dir_all(&dir).map_err(|e| io_err("remove install", &dir, &e))?;
         }
         Ok(())
+    }
+}
+
+/// Refuse an id that is not an app slug, on any path that is about to touch the filesystem.
+///
+/// The rule is [`crate::model::valid_id`] — **one** implementation, shared with `AppManifest`
+/// validation and with the `amos-app://<id>/…` netloc; this is only the typed refusal, and it is
+/// `StoreError::InvalidAppId`, the same variant `AppManifest::validate` returns.
+fn check_id(id: &str) -> Result<()> {
+    if crate::model::valid_id(id) {
+        Ok(())
+    } else {
+        Err(StoreError::InvalidAppId(id.to_string()))
     }
 }
 
@@ -327,6 +357,82 @@ mod tests {
         installer.uninstall(&mf.id).unwrap();
         assert!(!installer.dir_for(&mf.id).exists());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ─── the id is a path component (REQ-A657) ────────────────────────────
+    //
+    // `uninstall` is the crate's only recursive delete and `WebInstaller` is public, so the id
+    // rule has to live next to the I/O rather than in whatever the caller checks first.
+
+    /// The **behavioural** negative control: with the id rule removed, this deletes
+    /// `<root>/../victim` and everything under it.
+    #[test]
+    fn uninstall_refuses_a_traversal_id_and_deletes_nothing_outside_the_root() {
+        let base = std::env::temp_dir().join(format!("amos-webinst-esc-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let root = base.join("root");
+        // The real precondition: the install root exists as soon as one app has been installed.
+        // Without it the `..` in `root/../victim` cannot resolve, `exists()` answers false by
+        // accident, and the escape would look impossible.
+        fs::create_dir_all(&root).unwrap();
+        let victim = base.join("victim");
+        fs::create_dir_all(&victim).unwrap();
+        fs::write(victim.join("keep.txt"), b"not yours to delete").unwrap();
+        let installer = WebInstaller::new(&root);
+
+        let err = installer
+            .uninstall("../victim")
+            .expect_err("a traversal id must be refused");
+        assert!(
+            matches!(err, StoreError::InvalidAppId(_)),
+            "expected a typed refusal, got {err:?}"
+        );
+        assert!(
+            victim.join("keep.txt").is_file(),
+            "the outside tree must survive: an app id may not delete anything outside the root"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// The other shape: `Path::join` **replaces** the base when the id is absolute, so an
+    /// unguarded delete lands exactly where the caller pointed. The plant stays inside this
+    /// test's own temp tree.
+    #[test]
+    fn an_absolute_id_cannot_aim_the_recursive_delete() {
+        let base = std::env::temp_dir().join(format!("amos-webinst-abs-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let root = base.join("root");
+        let victim = base.join("absvictim");
+        fs::create_dir_all(&victim).unwrap();
+        fs::write(victim.join("keep.txt"), b"nor this one").unwrap();
+        let installer = WebInstaller::new(&root);
+
+        let absolute = victim.to_string_lossy().into_owned();
+        let err = installer
+            .uninstall(&absolute)
+            .expect_err("an absolute id must be refused");
+        assert!(matches!(err, StoreError::InvalidAppId(_)), "{err:?}");
+        assert!(
+            victim.join("keep.txt").is_file(),
+            "an absolute id must not aim the delete at {absolute:?}"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn uninstall_refuses_every_shape_that_is_not_an_app_slug() {
+        let root = std::env::temp_dir().join(format!("amos-webinst-ids-{}", std::process::id()));
+        let installer = WebInstaller::new(&root);
+        for evil in [
+            "", ".", "..", "../x", "a/b", "a\\b", "UPPER", "-lead", "trail-", "a..b", "index/",
+        ] {
+            match installer.uninstall(evil) {
+                Err(StoreError::InvalidAppId(ref got)) => assert_eq!(got, evil),
+                other => panic!("id {evil:?} must be refused, got {other:?}"),
+            }
+        }
+        // A well-formed slug is still accepted — and is a no-op when nothing is installed.
+        installer.uninstall("org.amos.pomodoro").unwrap();
     }
 
     #[test]

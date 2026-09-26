@@ -35,8 +35,39 @@ pub trait SmsProvider: Send + Sync {
     ) -> Result<Vec<SmsMessage>, SmsError>;
     /// Distinct thread counts per folder (folder tabs / badges).
     fn counts(&self) -> Result<SmsFolderCounts, SmsError>;
-    /// Send `text` to `address`. Errors honestly; never fakes a delivery.
-    fn send(&self, address: &str, text: &str) -> Result<(), SmsError>;
+    /// Send `text` to `address` and answer the platform's verdict honestly.
+    ///
+    /// The return is [`SmsSendOutcome`], not `()`: on Android `SmsManager` queues
+    /// the message and returns *without throwing even when the radio cannot send
+    /// it*, so the only honest answer comes from the `SENT` broadcast. A provider
+    /// that has no verdict must say [`SmsSendOutcome::Unconfirmed`] — never
+    /// [`Sent`](SmsSendOutcome::Sent).
+    fn send(&self, address: &str, text: &str) -> Result<SmsSendOutcome, SmsError>;
+}
+
+/// What a provider can honestly say about a send.
+///
+/// Three states, because "it did not throw" is not one answer: the radio either
+/// **took** the message, **refused** it (an `Err` — see [`SmsError`]), or has not
+/// said anything yet. Folding the third into either of the others is the defect
+/// this type exists to prevent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SmsSendOutcome {
+    /// The platform confirmed it handed the message to the network.
+    Sent,
+    /// **No verdict** — the platform did not confirm within its window. Not a
+    /// success, not a failure; the caller keeps the user's text and says so.
+    Unconfirmed(String),
+}
+
+impl SmsSendOutcome {
+    /// Stable wire spelling, so the frontend branches without parsing a sentence.
+    pub fn wire(&self) -> &'static str {
+        match self {
+            SmsSendOutcome::Sent => "sent",
+            SmsSendOutcome::Unconfirmed(_) => "unconfirmed",
+        }
+    }
 }
 
 /// One seeded demo row (single source of truth for the mock's three folders).
@@ -239,12 +270,15 @@ impl SmsProvider for MockSms {
         })
     }
 
-    fn send(&self, address: &str, text: &str) -> Result<(), SmsError> {
+    fn send(&self, address: &str, text: &str) -> Result<SmsSendOutcome, SmsError> {
         // Validate exactly like the real backend (domain-level contract).
         let _address = normalize_address(address)?;
         validate_text(text)?;
-        // Honest mock: we accept the request but never claim a real delivery.
-        Ok(())
+        // The mock has no radio to consult, so it can never claim the platform
+        // took the message — it accepts the request and says exactly that.
+        Ok(SmsSendOutcome::Unconfirmed(
+            "mock provider: no radio to confirm the send".into(),
+        ))
     }
 }
 
@@ -307,6 +341,22 @@ mod tests {
         assert!(sent[0].from_me);
         // A folder with no rows for that thread is an honest empty list.
         assert!(p.messages("1", Some(SmsFolder::Draft)).unwrap().is_empty());
+    }
+
+    /// The mock is the **authority** for what the wire's `from_me` means: a seeded **draft**
+    /// row is the user's own text, so `from_me: true` — the same as a sent row, and unlike an
+    /// inbox row. The Android glue must agree (`SmsGlue.messages`, pinned by
+    /// `sms.rs::tests::a_draft_row_is_from_me_not_a_received_message`); before that pin the
+    /// glue answered `false` for a draft while this fixture said `true` (PH-P2-07).
+    #[test]
+    fn a_seeded_draft_row_is_from_me() {
+        let p = MockSms::seeded();
+        let drafts = p.messages("3", Some(SmsFolder::Draft)).unwrap();
+        assert_eq!(drafts.len(), 1, "thread 3 carries exactly one seeded draft");
+        assert!(
+            drafts[0].from_me,
+            "a draft is the user's own text, not a received message"
+        );
     }
 
     #[test]

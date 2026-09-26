@@ -370,13 +370,15 @@ impl LinuxFreqGovernor {
             // Impose a ceiling.
             Some(khz) => self.write_khz(&scaling, khz, what, report),
             // Release: restore the hardware max so any cap we applied earlier is
-            // actually lifted (otherwise a PowerSave would throttle forever).
+            // actually lifted (otherwise a PowerSave would throttle forever). A
+            // zero max is *not* a frequency we may write (it would halt the
+            // cluster) — it is a degenerate/unreadable node, reported like one.
             None => match Self::read_khz(&self.cpuinfo_max_path(cpu)) {
-                Some(max) => self.write_khz(&scaling, max, what, report),
-                None => report.failures.push((
+                Some(max) if max > 0 => self.write_khz(&scaling, max, what, report),
+                _ => report.failures.push((
                     what,
                     format!(
-                        "cannot release cluster: {} is unreadable",
+                        "cannot release cluster: {} is unreadable or reports no usable max frequency",
                         self.cpuinfo_max_path(cpu).display()
                     ),
                 )),
@@ -502,6 +504,44 @@ mod tests {
         assert_eq!(rep.applied, 0);
         assert_eq!(rep.failures.len(), 1);
         assert!(rep.failures[0].0.contains('7'));
+    }
+
+    #[test]
+    fn release_over_a_degenerate_zero_hw_max_is_reported_not_written_zero() {
+        let root = TestRoot::new();
+        // cpu5 reports a 0 hardware max (degenerate / misconfigured sysfs) and a
+        // stale non-zero ceiling. An uncapped plan must *not* "restore" it to 0 —
+        // 0 kHz is not a frequency, writing it would halt the cluster. It must be
+        // reported as an unmanageable cluster instead (mirrors the unreadable-node
+        // path), and the stale ceiling must be left untouched.
+        let dir = root.path().join("cpu5/cpufreq");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("cpuinfo_max_freq"), "0\n").unwrap();
+        fs::write(dir.join("scaling_max_freq"), "999999\n").unwrap();
+
+        let gov = LinuxFreqGovernor::new(root.path().to_path_buf(), vec![(3, 5)], Vec::new());
+        let plan = FreqPlan {
+            cpu_caps: vec![FreqCap {
+                cluster: 3,
+                max_khz: None,
+            }],
+            npu_cap_khz: None,
+        };
+        let rep = gov.apply(&plan);
+        assert!(!rep.is_clean(), "a 0 hw max cannot be released to");
+        assert_eq!(rep.applied, 0);
+        assert_eq!(rep.failures.len(), 1);
+        assert_eq!(rep.failures[0].0, "cluster-3");
+        assert!(
+            rep.failures[0].1.contains("no usable max frequency"),
+            "{:?}",
+            rep.failures[0].1
+        );
+        assert_eq!(
+            read_scaling(root.path(), 5),
+            999_999,
+            "we must never write 0 kHz"
+        );
     }
 
     #[test]

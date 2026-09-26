@@ -1,0 +1,10 @@
+[
+  {
+    "path": "/api/audit/sync",
+    "reason": "`lib/enterprise/audit.ts` posts a device's audit log to this endpoint, and `crates/amos-mdm` routes only `/api/mdm/*` and `/api/admin/*` (measured 2026-09-19: 15 route literals, none of them audit). The gap is **dormant, not user-visible**: nothing in production calls the sync method — only its own tests do, and they assert what the *client* does with a mocked reply, never that the endpoint is served. Closing it is server work (an ingest handler + a store + device-enrolment auth) that only becomes reachable once the enterprise UI is integrated, which is itself a registered decision — see the allow-list entries for `src/svelte/modules/{APISettings,AuditLogViewer,MDMPanel,TemplateLibrary}.svelte` in `unwired-allowlist.json`."
+  },
+  {
+    "path": "/api/templates/sync",
+    "reason": "Same server gap, for template distribution: `templateManager.syncTemplates()` targets it and `amos-mdm` does not route it. This is also the producer the enterprise template library would need (measured: uncalled in production, called only from `lib/__tests__/enterprise-templates.test.ts`), i.e. one measurement explains both this gap and the `TemplateLibrary.svelte` allow-list entry. Registered so the client/server disagreement is **visible and gated** instead of silent."
+  }
+]

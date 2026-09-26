@@ -126,10 +126,18 @@ macro_rules! forward_samples {
                     }
                 } else {
                     // Best-effort: a full queue *is* the policy working — drop and say so, never
-                    // throttle the link.
+                    // throttle the link. A **closed** queue is not the policy: the typed
+                    // subscriber is gone, and this relay owns its own Zenoh subscriber, so
+                    // without the `return` below the task outlived its consumer and moved the
+                    // node's `dropped` once per arriving sample, for the session's life.
                     match tx.try_send(ingress) {
                         Ok(()) => relay.stored(),
-                        Err(_) => relay.lost(),
+                        Err(mpsc::error::TrySendError::Full(_)) => relay.lost(),
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            relay.lost();
+                            tracing::debug!("typed subscriber dropped: relay ends");
+                            return;
+                        }
                     }
                 }
             }
@@ -176,6 +184,16 @@ macro_rules! forward_latest {
                             return;
                         }
                     }
+                } else if slot.is_closed() {
+                    // The consumer is gone. Checked **before** `offer`, which would also count a
+                    // subscription-side drop for a closed slot: `RelayCounters::lost` moves both
+                    // counters once, the same way the broker's own closed-consumer path does.
+                    // The `return` is the point — this relay owns its own Zenoh subscriber, so
+                    // without it the task outlived its consumer and moved the node's counter
+                    // once per arriving sample, for the session's life.
+                    relay.lost();
+                    tracing::debug!("typed subscriber dropped: relay ends");
+                    return;
                 } else if slot.offer(ingress) {
                     relay.stored();
                 } else {
@@ -601,6 +619,100 @@ mod tests {
             metrics.snapshot().dropped,
             3,
             "…and so does the node's counter, on a real session"
+        );
+    }
+
+    /// A best-effort relay whose typed subscriber is gone must **end**, not live on counting
+    /// losses for a consumer that no longer exists.
+    ///
+    /// The relay owns its own Zenoh subscriber, so dropping the typed one closes the *sink*
+    /// but leaves the samples arriving; treating that `Closed` like a full queue (drop and
+    /// keep going) left the task running for the session's life, moving the node's
+    /// `dropped` once per arriving sample — a leak and a counter that grows forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_best_effort_relay_ends_when_its_typed_subscriber_is_dropped() {
+        use crate::qos::DropPolicy;
+
+        let metrics = Arc::new(crate::metrics::LinkMetrics::new());
+        let (listener, dialer) = loopback_pair_with(Arc::clone(&metrics)).await;
+        let qos = Qos::new(Reliability::BestEffort, 2, DropPolicy::DropNewest);
+        let sub = crate::pubsub::Subscriber::<crate::telemetry::Heartbeat>::subscribe(
+            listener.clone().shared(),
+            Topic::pattern("amos/**/telemetry/beat").expect("pattern"),
+            qos,
+            Arc::clone(&metrics),
+        )
+        .await
+        .expect("subscribe");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        drop(sub);
+
+        publish_beats(&dialer, "amos/dog1/telemetry/beat", 8).await;
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let after_first_wave = metrics.snapshot().dropped;
+
+        publish_beats(&dialer, "amos/dog1/telemetry/beat", 8).await;
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let after_second_wave = metrics.snapshot().dropped;
+
+        // The relay ended with its subscriber: a second wave adds nothing. While it leaked,
+        // every wave added its own 8 to the node's loss count.
+        assert_eq!(
+            after_first_wave, after_second_wave,
+            "the relay ended with its subscriber — later frames reach nobody and must not be \
+             counted against the node (first wave: {after_first_wave}, second: {after_second_wave})"
+        );
+        // It did *start* (the frames that arrived before the relay noticed are honestly
+        // counted as lost), rather than never relaying at all.
+        assert!(
+            after_first_wave <= 8,
+            "at most the first wave's frames are counted, got {after_first_wave}"
+        );
+    }
+
+    /// The one-slot (sensor profile) twin of the test above: a best-effort latest relay must
+    /// end with its typed subscriber too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_best_effort_latest_relay_ends_when_its_typed_subscriber_is_dropped() {
+        let metrics = Arc::new(crate::metrics::LinkMetrics::new());
+        let (listener, dialer) = loopback_pair_with(Arc::clone(&metrics)).await;
+        let sub = crate::pubsub::Subscriber::<crate::telemetry::Heartbeat>::subscribe(
+            listener.clone().shared(),
+            Topic::pattern("amos/**/telemetry/beat").expect("pattern"),
+            Qos::sensor(),
+            Arc::clone(&metrics),
+        )
+        .await
+        .expect("subscribe");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        drop(sub);
+
+        publish_beats(&dialer, "amos/dog1/telemetry/beat", 8).await;
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let first = metrics.snapshot();
+
+        publish_beats(&dialer, "amos/dog1/telemetry/beat", 8).await;
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let second = metrics.snapshot();
+
+        // The counters stop moving once the relay has ended with its consumer: a frame counted
+        // `delivered` (writing into a dead slot) or `dropped` once per arriving sample is what
+        // the leak looked like, and neither must keep climbing.
+        assert_eq!(
+            first.delivered + first.dropped,
+            second.delivered + second.dropped,
+            "the relay ended with its subscriber — no counter may keep climbing \
+             (wave 1: delivered {} dropped {}, wave 2: delivered {} dropped {})",
+            first.delivered,
+            first.dropped,
+            second.delivered,
+            second.dropped
+        );
+        assert_eq!(
+            second.delivered, 0,
+            "nothing was delivered to a consumer that no longer exists"
         );
     }
 

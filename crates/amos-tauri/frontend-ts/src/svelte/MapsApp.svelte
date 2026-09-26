@@ -2,11 +2,16 @@
   // MapsApp.svelte — Svelte 5 (runes) single-source implementation of the maps
   // screen. Offline-capable map over pure lib/maps.ts:
   // slippy OSM tiles, city chips + search, drag/pan/zoom. "定位" (geolocation)
-  // honours the system location master switch + per-app location grant; real
-  // device fix is the same browser `navigator.geolocation`
-  // (device acceptance), while the master/grant/offline gating is fully testable.
+  // honours the system location master switch + per-app location grant; the real
+  // device fix comes from the sensor host's `gnss` block (the same
+  // `LocationManager` read the rest of the system reports, REQ-A772) and falls
+  // back to the browser `navigator.geolocation` only on a host that has no GNSS
+  // at all — which is the only path a desktop has. The master/grant/offline
+  // gating stays fully testable.
   import { readStoreValue } from "../lib/amosStore";
   import { SETTINGS_KEY, locationEnabled, normalizeQuick } from "../lib/settings";
+  import { readGnss, type GnssRead } from "../lib/gps";
+  import { locationPermissionRequest } from "../lib/backend";
   import {
     PLACES,
     latLonToTile,
@@ -22,6 +27,7 @@
   import { capSet, loadLedger } from "../lib/permissions";
   import { grantCapability } from "./osPermissions";
   import { t, locale } from "./locale.svelte";
+  import StoreErrorBar from "./StoreErrorBar.svelte";
 
   const PX = 256;
   const SPAN = 3;
@@ -36,6 +42,8 @@
   let status = $state("");
   let askLoc = $state(false);
   let granted = $state(capSet(loadLedger(), "maps", "location"));
+  /** The ledger write's refusal, shown inside the still-open prompt (`StoreErrorBar`). */
+  let storeErr = $state("");
   let online = $state(typeof navigator === "undefined" || navigator.onLine !== false);
 
   $effect(() => {
@@ -55,11 +63,10 @@
   const locMaster = () =>
     locationEnabled(normalizeQuick(readStoreValue<unknown>(SETTINGS_KEY, {})));
 
-  const locate = () => {
-    if (!locMaster()) {
-      status = t("maps.locOff");
-      return;
-    }
+  /** The WebView fallback: only reached when this host has **no GNSS at all** (a desktop) or no
+   *  sensor bridge (a browser preview). On a device the sensor host answers, so this path is the
+   *  one that would otherwise hide the real receiver's state behind a browser prompt. */
+  const browserLocate = () => {
     if (typeof navigator !== "undefined" && navigator.geolocation) {
       navigator.geolocation.getCurrentPosition(
         (pos) => {
@@ -73,11 +80,69 @@
       status = t("maps.offline");
     }
   };
+
+  /**
+   * Map the sensor host's honest GNSS reading onto the map.
+   *
+   * The five outcomes are kept apart on purpose — a failed read is *not* "searching", and a
+   * receiver that was switched off is a third thing again. `retried` bounds the permission round
+   * to one attempt, so a denial cannot become a loop.
+   */
+  const locateFromGnss = async (read: GnssRead, retried = false): Promise<void> => {
+    switch (read.kind) {
+      case "fix":
+        center = [read.location.latitude, read.location.longitude];
+        zoom = 13;
+        status = "";
+        return;
+      case "permission-required": {
+        if (retried) {
+          status = t("maps.locPermission");
+          return;
+        }
+        // Post the **native** location dialog (not the WebView's — the two prompts are separate),
+        // then read again. What the dialog answered is not the fact; whether the next snapshot
+        // could reach the receiver is.
+        await locationPermissionRequest();
+        await locateFromGnss(await readGnss(), true);
+        return;
+      }
+      case "no-fix":
+        status = read.enabled ? t("maps.locSearching") : t("maps.locReceiverOff");
+        return;
+      case "read-failed":
+        status = t("maps.locReadFailed");
+        return;
+      case "absent":
+      case "unavailable":
+        browserLocate();
+        return;
+    }
+  };
+
+  const locate = async () => {
+    if (!locMaster()) {
+      status = t("maps.locOff");
+      return;
+    }
+    await locateFromGnss(await readGnss());
+  };
+  // `granted` is seeded from the persisted ledger (`capSet(loadLedger(), …)`), so it is a
+  // *display of* `amos.permissions` — the ledger every OS capability gate reads back. The
+  // prompt's answer must adopt the **write's own verdict**: on a refused write `grantCapability`
+  // answers the ledger the store still holds, so drawing a granted location off the intent would
+  // show a permission the next boot does not have (and `locate()` would run on it). The adopted
+  // value decides whether the prompt may close; a still-ungranted ledger keeps it up and says why.
   const allowLoc = () => {
-    grantCapability("maps", "location");
-    granted = true;
+    const res = grantCapability("maps", "location");
+    granted = capSet(res.ledger, "maps", "location");
+    if (!granted) {
+      storeErr = t("common.storeWriteFailed");
+      return;
+    }
+    storeErr = "";
     askLoc = false;
-    locate();
+    void locate();
   };
   const denyLoc = () => {
     askLoc = false;
@@ -186,13 +251,14 @@
         <button onclick={denyLoc} class="rounded-full bg-neutral-300 px-3 py-1 dark:bg-neutral-700">
           {t("perm.deny")}
         </button>
+        <StoreErrorBar message={storeErr} />
       </div>
     {/if}
     <button
       onclick={() => {
         if (!locMaster()) status = t("maps.locOff");
         else if (!granted) askLoc = true;
-        else locate();
+        else void locate();
       }}
       class="rounded-full bg-neutral-300 px-3 py-1 text-sm dark:bg-neutral-700"
     >

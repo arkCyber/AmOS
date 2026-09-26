@@ -12,7 +12,10 @@
 //!   step is **logged**, so the returned error never hides a half-applied state.
 //! * The non-airplane radios (Wi-Fi / Bluetooth / hotspot) cannot be switched on
 //!   while Airplane mode is active — the set is refused with
-//!   [`RadioError::AirplaneActive`].
+//!   [`RadioError::AirplaneActive`]. Only **enabling** is gated: switching one off
+//!   is always allowed, because a platform may hold a radio on while Airplane mode
+//!   is on (Android permits Wi-Fi there) and that request is what puts the device
+//!   back into the state this guard exists to keep.
 //!
 //! [`RadioManager::set`] returns the resulting authoritative [`RadioSnapshot`]
 //! so callers (e.g. the System UI bridge) can mirror exactly what the radios now
@@ -114,15 +117,23 @@ impl RadioManager {
                 }
             }
             RadioMode::Wifi => {
-                self.ensure_airplane_off(RadioMode::Wifi).await?;
+                if on {
+                    self.refuse_enabling_under_airplane(RadioMode::Wifi).await?;
+                }
                 self.provider.set_wifi(on).await?;
             }
             RadioMode::Bluetooth => {
-                self.ensure_airplane_off(RadioMode::Bluetooth).await?;
+                if on {
+                    self.refuse_enabling_under_airplane(RadioMode::Bluetooth)
+                        .await?;
+                }
                 self.provider.set_bluetooth(on).await?;
             }
             RadioMode::Hotspot => {
-                self.ensure_airplane_off(RadioMode::Hotspot).await?;
+                if on {
+                    self.refuse_enabling_under_airplane(RadioMode::Hotspot)
+                        .await?;
+                }
                 self.provider.set_hotspot(on).await?;
             }
         }
@@ -235,8 +246,18 @@ impl RadioManager {
         }
     }
 
-    /// Refuse non-airplane radios while Airplane mode is on.
-    async fn ensure_airplane_off(&self, radio: RadioMode) -> Result<()> {
+    /// Refuse **enabling** a non-airplane radio while Airplane mode is on.
+    ///
+    /// Only the *on* direction is gated, and the name says so. "Airplane mode is
+    /// on" is a claim about what a radio may be **switched on to**; it says nothing
+    /// about a switch being flipped **off**, which is the direction that takes a
+    /// device whose radio is on under Airplane mode — a state Android permits and
+    /// the provider reports as fact — back to the state this guard exists to keep.
+    /// Gating the whole write made `RadioError::AirplaneActive`'s own sentence
+    /// ("turn it off before **enabling** Wifi") the answer to a request to switch
+    /// Wi-Fi off. Callers must therefore only reach this from an enabling write;
+    /// the `if on` at each call site is that precondition, not a convenience.
+    async fn refuse_enabling_under_airplane(&self, radio: RadioMode) -> Result<()> {
         let snap = self.snapshot().await?;
         if snap.airplane {
             return Err(RadioError::AirplaneActive(radio));
@@ -295,6 +316,66 @@ mod tests {
             m.set(RadioMode::Hotspot, true).await,
             Err(RadioError::AirplaneActive(RadioMode::Hotspot))
         ));
+    }
+
+    /// The Airplane guard is about **enabling**, so switching a radio **off** under
+    /// Airplane mode must be allowed.
+    ///
+    /// Four prose faces say the rule is the enabling direction — this module's
+    /// header ("cannot be switched **on** while Airplane mode is active"),
+    /// `RadioError::AirplaneActive`'s doc ("was **enabled**"), its `Display`
+    /// ("turn it off before **enabling** {0:?}"), and the sentence the screen prints
+    /// for `kind() == "airplane_active"` ("Airplane mode is on — turn it off before
+    /// **enabling** this radio."). Only the code refused both: the guard ran before
+    /// the write whatever the write was, so a request to switch a radio off came
+    /// back as a sentence about switching it on.
+    ///
+    /// The state it left stuck is not hypothetical. A platform may hold Wi-Fi on
+    /// *while* Airplane mode is on (Android permits it), and
+    /// [`RadioProvider::snapshot`]'s contract is to report what the platform holds —
+    /// so the manager refused the one request that would put the device back where
+    /// the guard's own prose says it already is.
+    #[tokio::test]
+    async fn a_radio_can_still_be_switched_off_while_airplane_mode_is_on() {
+        // What a real provider can report: every radio on *and* Airplane mode on.
+        let m = manager(RadioSnapshot {
+            wifi: true,
+            bluetooth: true,
+            airplane: true,
+            hotspot: true,
+        });
+
+        assert!(
+            !m.set(RadioMode::Wifi, false).await.unwrap().wifi,
+            "switching Wi-Fi off is the direction that un-sticks the device"
+        );
+        assert!(!m.set(RadioMode::Bluetooth, false).await.unwrap().bluetooth);
+        let snap = m.set(RadioMode::Hotspot, false).await.unwrap();
+        assert!(!snap.hotspot, "the AP can be switched off too");
+        assert!(snap.airplane, "and none of that touches the airplane bit");
+    }
+
+    /// …and nothing was weakened by that: **enabling** is still refused, by name.
+    ///
+    /// The companion to `a_radio_can_still_be_switched_off_while_airplane_mode_is_on`,
+    /// kept as its own test so the two halves of the rule have **disjoint** negative
+    /// controls: re-opening the guard to both directions reds only the off-case,
+    /// while dropping the refusal reds only the enabling case.
+    #[tokio::test]
+    async fn enabling_a_radio_is_refused_while_airplane_mode_is_on() {
+        let m = manager(RadioSnapshot {
+            wifi: true,
+            bluetooth: true,
+            airplane: true,
+            hotspot: true,
+        });
+        for radio in [RadioMode::Wifi, RadioMode::Bluetooth, RadioMode::Hotspot] {
+            assert_eq!(
+                m.set(radio, true).await.unwrap_err(),
+                RadioError::AirplaneActive(radio),
+                "enabling {radio:?} is still refused under Airplane mode"
+            );
+        }
     }
 
     #[tokio::test]

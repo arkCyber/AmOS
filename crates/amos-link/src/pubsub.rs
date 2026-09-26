@@ -105,7 +105,7 @@ pub struct Received<T> {
     /// The concrete topic this frame was published on (wildcard subscribers need it).
     ///
     /// This is the transport's **routing key**, not the header's claim: the two must agree
-    /// or the frame is refused ([`decode_ingress`]), so a consumer can dispatch on
+    /// or the frame is refused (`decode_ingress`), so a consumer can dispatch on
     /// `Received::topic` without being spoofed into believing another publisher's topic.
     pub topic: Topic,
     /// The publisher's peer id.

@@ -1,13 +1,18 @@
-//! `embed_commands` — the CLI's command set driven from a program (no shell).
+//! `appstore_embed_commands` — the CLI's command set driven from a program (no shell).
 //!
 //! `run` is exactly what `main.rs` calls: parse argv, build the offline demo store,
 //! dispatch, print. Here three argv vectors are fed in as data — a catalog listing, a
 //! detail view, and a `download`-only flow (which verifies and writes bytes but installs
 //! nothing).
 //!
+//! The name carries the crate because `amos-link-cli` ships an `embed_commands` too, and cargo
+//! writes both examples to the **same** path (`target/debug/examples/embed_commands`) — it warns
+//! about it as an "output filename collision". A workspace-unique name keeps the by-path
+//! artefact unambiguous (`scripts/isolation-check.mjs` fails on any future collision).
+//!
 //! Usage:
 //! ```text
-//! cargo run -p amos-appstore-cli --example embed_commands
+//! cargo run -p amos-appstore-cli --example appstore_embed_commands
 //! ```
 
 use amos_appstore_cli::run;

@@ -509,18 +509,40 @@ pub enum EstopReason {
     Commanded,
     /// No action arrived within the watchdog period: the link is presumed lost.
     Watchdog,
+    /// The bus **itself** failed while a batch was being written.
+    ///
+    /// The one reason that is not about the command: the action may have been perfectly
+    /// valid. It exists because a write that dies part-way leaves the joints in a *mixed*
+    /// state — the frames before the failure reached the drivers, the rest did not, and the
+    /// HAL stops at the first error without undoing what left ([`RobotHal::apply`]) — so the
+    /// bridge latches rather than let the next motion be written into a bus that has just
+    /// proven it is not honouring frames.
+    BusFault,
 }
 
 impl EstopReason {
+    /// Every reason this build knows, in one place.
+    ///
+    /// The vocabulary had two hand-kept copies of itself — one in the round-trip test here,
+    /// one in the bridge's acceptance test (`crates/amos-tauri/src/link.rs`) — so adding a
+    /// variant left both green while their claim ("the tokens `key()` actually returns") got
+    /// weaker. Both now iterate this, so a new variant is exercised without a second edit.
+    pub const ALL: [EstopReason; 3] = [
+        EstopReason::Commanded,
+        EstopReason::Watchdog,
+        EstopReason::BusFault,
+    ];
+
     /// Stable wire/CLI key.
     pub fn key(self) -> &'static str {
         match self {
             EstopReason::Commanded => "commanded",
             EstopReason::Watchdog => "watchdog",
+            EstopReason::BusFault => "bus-fault",
         }
     }
 
-    /// Parse a stable key back (`"commanded"` / `"watchdog"`).
+    /// Parse a stable key back (`"commanded"` / `"watchdog"` / `"bus-fault"`).
     ///
     /// Anything else — including the empty string a consumer uses for "no e-stop" — is
     /// `None`: an unknown reason is **not invented**, and the `estopped` flag travels
@@ -529,6 +551,7 @@ impl EstopReason {
         match s.trim().to_ascii_lowercase().as_str() {
             "commanded" => Some(EstopReason::Commanded),
             "watchdog" => Some(EstopReason::Watchdog),
+            "bus-fault" => Some(EstopReason::BusFault),
             _ => None,
         }
     }
@@ -1314,7 +1337,7 @@ impl RobotHal for MockRobotHal {
 ///    the frames that did get out — never with a number taken from the plan.
 ///
 /// [`RobotHal::armed`] is the running fold of the ops that were actually written
-/// ([`armed_after`]), so it is a measurement of the wire, not of the caller's intent.
+/// (`armed_after`), so it is a measurement of the wire, not of the caller's intent.
 pub struct StreamRobotHal<W> {
     writer: tokio::sync::Mutex<W>,
     armed: AtomicBool,
@@ -1564,7 +1587,7 @@ pub const MAX_WATCHDOG_MS: u64 = 3_600_000;
 
 /// A command that was refused **before it reached the bus**, as reported to the commander.
 ///
-/// **The wire form is validated** ([`RefusalWire`]): a refusal may travel as a stand-alone
+/// **The wire form is validated** (`RefusalWire`): a refusal may travel as a stand-alone
 /// frame on a future control-plane surface (today it appears inside an [`ActuationState`]),
 /// so its `reason` is bounded at decode time, the same way [`MotorFrame`] bounds its argument
 /// and [`ActuationState`] bounds its counts. A refusal whose `reason` exceeds
@@ -1593,7 +1616,7 @@ struct RefusalWire {
 impl Refusal {
     /// Validate a refusal's reason against the byte ceiling ([`MAX_REFUSAL_REASON_BYTES`]).
     ///
-    /// Called by the wire path ([`RefusalWire`]); a local producer does not need it (its
+    /// Called by the wire path (`RefusalWire`); a local producer does not need it (its
     /// reasons are measured strings), but calling it is always safe and cheap.
     ///
     /// ```
@@ -1662,7 +1685,7 @@ impl From<Refusal> for RefusalWire {
 /// doctrine in `docs/amos-link.md` §2 describes, so the payload does not duplicate it. The
 /// report time is the envelope's stamp for the same reason.
 ///
-/// **The wire form is validated** ([`ActuationStateWire`]): a report arrives from *another*
+/// **The wire form is validated** (`ActuationStateWire`): a report arrives from *another*
 /// peer, so this is a trust boundary like a motor frame's, not a local call. A count, a deadman
 /// period or a reason outside its bound is **refused at decode** — counted as a decode error by
 /// the subscriber and never folded into the control plane's table — instead of being stored,
@@ -1771,9 +1794,9 @@ impl From<ActuationState> for ActuationStateWire {
 
 impl ActuationState {
     /// Check a report's **untrusted** fields against their bounds (see
-    /// [`ActuationStateWire`]): a count, a deadman period and a refusal reason.
+    /// `ActuationStateWire`): a count, a deadman period and a refusal reason.
     ///
-    /// Called by the wire path ([`ActuationStateWire`]); a local producer does not need it
+    /// Called by the wire path (`ActuationStateWire`); a local producer does not need it
     /// (its numbers are measured), but calling it is always safe and cheap.
     pub fn validate(&self) -> Result<()> {
         if self.frames > MAX_ACTUATION_FRAMES {
@@ -2132,16 +2155,90 @@ impl<H: RobotHal> RobotBridge<H> {
         self.watchdog
     }
 
+    /// Command the safest thing this layer can, in the shape the vocabulary implies.
+    ///
+    /// The deadman and a failed bus both want the same action, so the shape is written once:
+    /// a platform profile's halt batch (a car's is full braking, a drone's is its six motors),
+    /// or the HAL's own cut for the reference machine — where a bus may cut torque with a
+    /// single hardware line and that shape is the driver's business. Either way the count is
+    /// what the bus **accepted**, never a guess.
+    async fn command_halt(&mut self) -> Result<usize> {
+        match self.vocabulary.platform() {
+            Some(platform) => {
+                let halt = platform.halt_frames()?;
+                self.hal.apply(&halt).await
+            }
+            None => self.hal.estop().await,
+        }
+    }
+
+    /// What the bridge does the moment the bus refuses a batch it was told to write.
+    ///
+    /// `RobotHal::apply` stops at the first failed frame and does **not** undo what already
+    /// left, so the joints are in a mixed state and the safe state has to be commanded, not
+    /// assumed. Two things happen here:
+    ///
+    /// * **Latch** ([`EstopReason::BusFault`]) — without it the loop's next step hands the
+    ///   same bus the next motion command, and every retry writes another partial batch into
+    ///   a bus that has just proven it is not honouring frames.
+    /// * **Cut, best effort and counted** — the profile's halt batch, or the HAL's own cut.
+    ///   If the bus is gone the cut fails too and the count stays `0`, which is the truth
+    ///   ("the bus accepted nothing"), never a claim that the torque went away.
+    ///
+    /// The recovery is the one every other reason has: an explicit `arm`.
+    async fn on_bus_fault(&mut self) -> usize {
+        let cut = match self.command_halt().await {
+            Ok(accepted) => accepted,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "the torque cut after a bus fault could not be written either"
+                );
+                0
+            }
+        };
+        self.estop_latched = true;
+        self.estop_reason = Some(EstopReason::BusFault);
+        cut
+    }
+
+    /// Write a batch, and drive the bridge to the safe state if the bus refuses it.
+    ///
+    /// The **error is still returned**: the caller's loop must learn the bus is broken (it
+    /// stops), and `step` reports the latched fault before it returns — a console that kept
+    /// painting the pre-fault state is the defect this shape exists to prevent.
+    async fn apply_or_latch(&mut self, frames: &[MotorFrame]) -> Result<usize> {
+        match self.hal.apply(frames).await {
+            Ok(accepted) => Ok(accepted),
+            Err(e) => {
+                let cut = self.on_bus_fault().await;
+                tracing::warn!(
+                    cut,
+                    error = %e,
+                    "the bus refused a batch: torque cut and latched"
+                );
+                Err(e)
+            }
+        }
+    }
+
     /// Wait for the next action (or for the watchdog), act on it, and **report the result**
     /// on the link when the actuation *mode* changed (see [`RobotBridge::reporting`]).
     ///
     /// A *refusal* is an `Ok` event, not an error: it is the safety layer doing its job.
-    /// Only a transport failure or a broken bus surfaces as `Err` — and then nothing is
-    /// reported, because the bridge learned nothing new about the robot.
+    /// A transport failure or a broken bus surfaces as `Err` — and it is reported **before**
+    /// the error is returned, because such a failure is not "nothing new about the robot":
+    /// a bus that died mid-batch has energized some joints and not others, and the bridge's
+    /// own response to that (a latched [`EstopReason::BusFault`] and a counted torque cut) is
+    /// exactly what the return path has to carry. Reporting it only on the `Ok` path left the
+    /// commander reading a pre-fault state (`armed: true`, the last gait) while the robot sat
+    /// in a mixed pose — measured, `docs/robot-autonomy.md` §65.
     pub async fn step(&mut self) -> Result<BridgeEvent> {
-        let event = self.step_inner().await?;
+        let outcome = self.step_inner().await;
+        // Report on both paths: `on_bus_fault` changed the mode, and a mode change that never
+        // leaves the process is a return path asserting something the bridge knows is false.
         self.report().await;
-        Ok(event)
+        outcome
     }
 
     /// The safety core of one step: the decisions themselves, with no reporting — so they
@@ -2151,25 +2248,22 @@ impl<H: RobotHal> RobotBridge<H> {
             Some(period) => match tokio::time::timeout(period, self.subscriber.recv()).await {
                 Ok(result) => result?,
                 Err(_) => {
-                    // Deadman: no action within the period → cut torque / stop, and latch.
+                    // Deadman: no action within the period → latch, and cut torque / stop.
                     //
                     // What the stop *is* depends on how this loop reads the control channel:
                     // a platform profile knows its own actuator table, so its halt batch is the
                     // profile's (a car's deadman is full braking, a drone's is its six motors);
                     // the reference machine keeps the HAL's own cut, because a bus may cut torque
-                    // with a single hardware line and that shape is the driver's business.
+                    // with a single hardware line and that shape is the driver's business. The
+                    // shape itself is written once, in `command_halt`.
                     //
-                    // Either way the count comes back from what the bus **accepted** — never from
-                    // a guess — and the report carries a measured number.
-                    let frames = match self.vocabulary.platform() {
-                        Some(platform) => {
-                            let halt = platform.halt_frames()?;
-                            self.hal.apply(&halt).await?
-                        }
-                        None => self.hal.estop().await?,
-                    };
+                    // The latch is set **before** the cut is attempted: a cut that cannot be
+                    // written (a dead bus) must not leave the bridge willing to accept the next
+                    // motion command. Only the *cause* is the watchdog; whether the cut was
+                    // delivered is a second, separate fact — the count.
                     self.estop_latched = true;
                     self.estop_reason = Some(EstopReason::Watchdog);
+                    let frames = self.command_halt().await?;
                     tracing::warn!(
                         period_ms = period.as_millis(),
                         frames,
@@ -2204,7 +2298,7 @@ impl<H: RobotHal> RobotBridge<H> {
 
         if intent.class == IntentClass::Arm {
             let frames = self.vocabulary.plan(&intent)?;
-            let applied = self.hal.apply(&frames).await?;
+            let applied = self.apply_or_latch(&frames).await?;
             let was_latched = self.estop_latched;
             self.estop_latched = false;
             self.estop_reason = None;
@@ -2256,7 +2350,7 @@ impl<H: RobotHal> RobotBridge<H> {
         }
 
         let frames = self.vocabulary.plan(&intent)?;
-        let applied = self.hal.apply(&frames).await?;
+        let applied = self.apply_or_latch(&frames).await?;
         self.last_seq = Some(seq);
         // Same `gait` discipline as the Arm branch: the reference machine reports its gait
         // (the field is what makes `actuation_topic` useful for a quadruped), a profile leaves
@@ -2521,6 +2615,83 @@ mod tests {
         );
     }
 
+    /// The three wire forms each declare, in their own docs, "identical field order, types and
+    /// encoding, so the bytes on the link are unchanged" ([`MotorFrameWire`], [`RefusalWire`],
+    /// [`ActuationStateWire`]). That claim is *entirely* about field order — `bincode` lays a
+    /// struct out positionally — and nothing enforces it today:
+    ///
+    /// * the `From`/`TryFrom` impls bind fields **by name**, so a reorder still compiles;
+    /// * every round-trip test encodes and decodes in the **same build**, which is
+    ///   order-insensitive (`<ActuationState as Message>::decode(&encode(x)) == x` holds for any
+    ///   order);
+    /// * `MotorFrame`'s `wire.len() == 9` pin survives a reorder too — the width is unchanged,
+    ///   only the offsets move.
+    ///
+    /// So reordering a `*Wire` struct (a plausible readability edit) silently rewrites the bytes
+    /// on the link, and a peer on the previous build decodes the **wrong field** — for
+    /// `ActuationState` that is `armed` / `estopped` / `estop_reason`, the control loop's own
+    /// safety verdict — with no error on either side. These literals are the bytes the
+    /// documented order produces; they are the bind the claim was missing (REQ-A833).
+    #[test]
+    fn the_wire_forms_encode_to_the_bytes_their_field_order_documents() {
+        use crate::codec::Message;
+
+        // A set point: `u8` joint | `u32` op variant (LE) | `i32` arg (LE). `-15_000` = 0xFFFFC568.
+        // The op here is the **serde variant index** (`SetPosition` is variant 0), not the bus
+        // opcode `MotorOp::code()` (0x01) — the bincode link form and the CRC bus frame number
+        // an op two different ways, and this is the link's.
+        assert_eq!(
+            <MotorFrame as Message>::encode(&MotorFrame::new(
+                JointId(3),
+                MotorOp::SetPosition,
+                -15_000
+            ))
+            .expect("encode"),
+            vec![0x03, 0x00, 0x00, 0x00, 0x00, 0x68, 0xC5, 0xFF, 0xFF],
+        );
+
+        // A refusal: `u64` seq (LE) | `u64` reason length (LE) | UTF-8 reason.
+        assert_eq!(
+            <Refusal as Message>::encode(&Refusal {
+                seq: 6,
+                reason: "e-stop".to_string()
+            })
+            .expect("encode"),
+            vec![
+                0x06, 0, 0, 0, 0, 0, 0, 0, // seq = 6
+                0x06, 0, 0, 0, 0, 0, 0, 0, // reason length = 6
+                b'e', b'-', b's', b't', b'o', b'p',
+            ],
+        );
+
+        // The full report, in wire order: seq | gait | frames | armed | estopped | estop_reason |
+        // watchdog_ms | last_refusal. `Gait::Trot` is variant 1 (`Stand` is 0). That this is the
+        // order a peer reads is the whole point: `armed` / `estopped` sit at fixed offsets.
+        assert_eq!(
+            <ActuationState as Message>::encode(&ActuationState {
+                seq: Some(7),
+                gait: Some(Gait::Trot),
+                frames: 5,
+                armed: true,
+                estopped: false,
+                estop_reason: None,
+                watchdog_ms: Some(1_000),
+                last_refusal: None,
+            })
+            .expect("encode"),
+            vec![
+                0x01, 0x07, 0, 0, 0, 0, 0, 0, 0, // seq = Some(7)
+                0x01, 0x01, 0, 0, 0, // gait = Some(Trot), variant 1
+                0x05, 0, 0, 0, 0, 0, 0, 0,    // frames = 5
+                0x01, // armed
+                0x00, // estopped
+                0x00, // estop_reason = None
+                0x01, 0xE8, 0x03, 0, 0, 0, 0, 0, 0,    // watchdog_ms = Some(1000)
+                0x00, // last_refusal = None
+            ],
+        );
+    }
+
     #[test]
     fn every_planned_pose_respects_the_travel_limits() {
         // A consistency proof between the pose table and the limits: whatever a gait asks
@@ -2658,6 +2829,22 @@ mod tests {
         assert_eq!(Gait::from_key("gallop"), None);
         assert!(Gait::Estop.is_emergency());
         assert!(!Gait::Stand.is_emergency());
+    }
+
+    /// `EstopReason::key()` and `EstopReason::from_key` are two hand-written tables in the same
+    /// `impl`; every sibling vocabulary in this crate pins their round-trip (`Gait::ALL`,
+    /// `Channel`, `NodeKind`, `Reliability`, `DropPolicy`) and this one did not. The token
+    /// travels producer → wire → consumer (`service::proto_actuation` writes `key()`, the UI
+    /// bridge resolves it back), so a one-table rename makes the reason unresolvable and the
+    /// operator lose the **why** of an e-stop while `estopped` still reports torque was cut.
+    #[test]
+    fn estop_reason_keys_round_trip() {
+        for reason in EstopReason::ALL {
+            assert_eq!(EstopReason::from_key(reason.key()), Some(reason));
+        }
+        // The empty string a consumer uses for "no e-stop" is `None`, never invented.
+        assert_eq!(EstopReason::from_key(""), None);
+        assert_eq!(EstopReason::from_key("meltdown"), None);
     }
 
     #[test]
@@ -3467,5 +3654,254 @@ mod tests {
         assert_eq!(report.message.gait, Some(Gait::Trot));
         assert!(report.message.armed);
         assert!(!report.message.estopped);
+    }
+
+    // ── a bus that fails while a batch is being written ─────────────────────────────────
+
+    /// A HAL whose bus dies part-way through a batch, the way a serial write fails: the
+    /// frames before the fault reach the drivers, the rest never do, and nothing rolls the
+    /// first ones back.
+    ///
+    /// `MockRobotHal` cannot fail — which is exactly why the defect these tests pin (a bus
+    /// fault was neither latched nor reported, and the next motion was written into the same
+    /// dead bus) was invisible to a suite whose only HAL always succeeds.
+    struct FaultyHal {
+        armed: AtomicBool,
+        /// The `apply` call that dies mid-batch (its index, counted from 0).
+        fail_on_call: usize,
+        /// Frames of that batch which get through before the fault.
+        fail_after: usize,
+        /// A bus that is simply *gone*: even the torque cut cannot be written.
+        cut_gone: bool,
+        calls: AtomicU64,
+        written: AtomicU64,
+    }
+
+    impl FaultyHal {
+        /// The batch at `fail_on_call` dies after `fail_after` frames; every other batch —
+        /// and the torque cut — works. One glitch on the bus, not a bus that is gone.
+        fn glitching(fail_on_call: usize, fail_after: usize) -> Self {
+            Self {
+                armed: AtomicBool::new(false),
+                fail_on_call,
+                fail_after,
+                cut_gone: false,
+                calls: AtomicU64::new(0),
+                written: AtomicU64::new(0),
+            }
+        }
+
+        /// A bus that is gone from the first byte: it gives up `fail_after` frames of the
+        /// first batch and then refuses everything, including the cut.
+        fn gone_after(fail_after: usize) -> Self {
+            Self {
+                cut_gone: true,
+                ..Self::glitching(0, fail_after)
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RobotHal for FaultyHal {
+        async fn apply(&self, frames: &[MotorFrame]) -> Result<usize> {
+            for frame in frames {
+                frame.validate()?;
+            }
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let take = if call == self.fail_on_call as u64 {
+                self.fail_after
+            } else {
+                frames.len()
+            };
+            let mut armed = self.armed.load(Ordering::SeqCst);
+            for (i, frame) in frames.iter().enumerate() {
+                if i >= take {
+                    break;
+                }
+                // The same wire-order fold the real HALs apply to the frames that left.
+                armed = armed_after(armed, std::slice::from_ref(frame));
+                self.armed.store(armed, Ordering::SeqCst);
+                self.written.fetch_add(1, Ordering::Relaxed);
+            }
+            if take < frames.len() {
+                return Err(LinkError::Transport(format!(
+                    "the bus refused frame {}/{}",
+                    take,
+                    frames.len()
+                )));
+            }
+            Ok(frames.len())
+        }
+
+        async fn estop(&self) -> Result<usize> {
+            if self.cut_gone {
+                return Err(LinkError::Transport("the bus is gone".to_string()));
+            }
+            self.armed.store(false, Ordering::SeqCst);
+            Ok(JOINTS)
+        }
+
+        fn armed(&self) -> bool {
+            self.armed.load(Ordering::SeqCst)
+        }
+
+        fn name(&self) -> &'static str {
+            "faulty"
+        }
+    }
+
+    /// A bridge over one in-process node, with a subscriber on the return path and a
+    /// commander on the control channel.
+    async fn bridge_over<H: RobotHal>(
+        hal: H,
+    ) -> (
+        RobotBridge<H>,
+        crate::pubsub::Publisher<AgentAction>,
+        crate::pubsub::Subscriber<ActuationState>,
+    ) {
+        use crate::discovery::{NodeKind, PeerId};
+        use crate::keyexpr::Topic;
+        use crate::node::LinkNode;
+        use crate::qos::Qos;
+
+        let node = LinkNode::in_process(PeerId::new("dog1").expect("peer"), NodeKind::Robot);
+        let control = node
+            .subscriber::<AgentAction>(
+                Topic::pattern("amos/dog1/control/*").expect("pattern"),
+                Qos::control(),
+            )
+            .await
+            .expect("subscribe");
+        let reports = node
+            .subscriber::<ActuationState>(
+                Topic::pattern("amos/*/state/actuation").expect("pattern"),
+                Qos::for_channel(Channel::State),
+            )
+            .await
+            .expect("subscribe");
+        let me = PeerId::new("dog1").expect("peer");
+        let bridge = RobotBridge::new(control, hal)
+            .reporting(node.publisher::<ActuationState>(actuation_topic(&me).expect("topic")));
+        let commander = node.publisher::<AgentAction>(
+            Topic::channel_topic("dog1", Channel::Control, "action").expect("topic"),
+        );
+        (bridge, commander, reports)
+    }
+
+    /// Publish one action to the bridge's control channel.
+    async fn command(commander: &crate::pubsub::Publisher<AgentAction>, json: &str) {
+        commander
+            .publish(&AgentAction::new(json))
+            .await
+            .expect("publish");
+    }
+
+    /// A bus that dies mid-batch must drive the bridge to the safe state **and** report it.
+    ///
+    /// Measured before the fix (`docs/robot-autonomy.md` §65): `step` returned the transport
+    /// error straight out of `step_inner`, so the latch was never set, `report` never ran, and
+    /// the very next motion command was written into the same bus that had just refused a
+    /// batch — while the return path kept painting `armed: true` with the pre-fault gait.
+    /// Every frame of the run was green, because the suite's only HAL could not fail.
+    #[tokio::test]
+    async fn a_bus_fault_mid_batch_latches_and_reaches_the_return_path() {
+        // The arm batch (call 0) goes through; the trot batch (call 1) dies four frames in;
+        // the re-arm at the end (call 2) goes through. One glitch, not a bus that is gone.
+        let (mut bridge, commander, mut reports) = bridge_over(FaultyHal::glitching(1, 4)).await;
+
+        // (1) the machine is armed and running; the console has a state to compare against.
+        command(&commander, r#"{"action":"arm"}"#).await;
+        bridge.step().await.expect("arm");
+        let before = tokio::time::timeout(Duration::from_millis(200), reports.recv())
+            .await
+            .expect("an arm report")
+            .expect("recv")
+            .message;
+        assert!(before.armed && !before.estopped);
+
+        // (2) the bus dies four frames into the trot batch.
+        command(&commander, r#"{"action":"trot","speed":0.6}"#).await;
+        let err = bridge.step().await.expect_err("the bus failed");
+        assert!(matches!(err, LinkError::Transport(_)), "got {err:?}");
+
+        // (3) the bridge is in the safe state, and it names the right cause.
+        let state = bridge.state();
+        assert!(state.estopped, "a bus that refused a batch latches");
+        assert_eq!(state.estop_reason, Some(EstopReason::BusFault));
+        assert!(
+            bridge.is_estopped(),
+            "the latch is the bridge's, not just the report's"
+        );
+        assert!(
+            !state.armed,
+            "the faulty bus's cut went through, so the drivers are de-energized"
+        );
+
+        // (4) …and the fault **reaches the return path**, which is what the old `?` skipped.
+        let after = tokio::time::timeout(Duration::from_millis(200), reports.recv())
+            .await
+            .expect("a fault report follows the failed step")
+            .expect("recv")
+            .message;
+        assert!(
+            after.estopped,
+            "the console must learn torque is cut, not keep reading the pre-fault state"
+        );
+        assert_eq!(after.estop_reason, Some(EstopReason::BusFault));
+
+        // (5) the next motion is **refused**, not written into the failed bus.
+        let written_before = bridge.hal().written.load(Ordering::Relaxed);
+        command(&commander, r#"{"action":"trot","speed":0.6}"#).await;
+        match bridge.step().await.expect("a refusal is an Ok event") {
+            BridgeEvent::Refused { reason, .. } => {
+                assert!(reason.contains("e-stop"), "names the latch: {reason}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert_eq!(
+            bridge.hal().written.load(Ordering::Relaxed),
+            written_before,
+            "a refused motion puts no frame on the bus"
+        );
+
+        // (6) the recovery is the one every other reason has: an explicit `arm`.
+        command(&commander, r#"{"action":"arm"}"#).await;
+        bridge.step().await.expect("re-arm");
+        assert!(!bridge.is_estopped(), "an explicit arm clears the latch");
+    }
+
+    /// A cut that could not be written is **not** claimed: the drivers stay armed and the
+    /// report says so, because "torque was cut" is a measurement, not an intention.
+    #[tokio::test]
+    async fn a_fault_whose_cut_cannot_be_written_still_latches_and_still_reports() {
+        let (mut bridge, commander, mut reports) = bridge_over(FaultyHal::gone_after(4)).await;
+
+        // The arm batch dies four `Enable` frames in, and the bus is gone: even the cut
+        // that would undo them cannot be written.
+        command(&commander, r#"{"action":"arm"}"#).await;
+        bridge.step().await.expect_err("the bus is gone");
+
+        let state = bridge.state();
+        assert!(state.estopped && state.estop_reason == Some(EstopReason::BusFault));
+        assert!(
+            state.armed,
+            "the four `Enable` frames that did leave are a measurement: the drivers are \
+             armed, and a cut that could not be written cannot change that"
+        );
+
+        let report = tokio::time::timeout(Duration::from_millis(200), reports.recv())
+            .await
+            .expect("the fault is reported even when the cut failed")
+            .expect("recv")
+            .message;
+        assert_eq!(report.estop_reason, Some(EstopReason::BusFault));
+        assert!(
+            report.armed,
+            "the report repeats the bus's own answer, not a wish"
+        );
+        assert!(
+            bridge.is_estopped(),
+            "a failed cut does not excuse leaving the bridge willing to move"
+        );
     }
 }

@@ -624,7 +624,18 @@ impl Platform {
                 )));
             }
         }
-        self.validate_actions(label)
+        self.validate_actions(label)?;
+        // The envelope is checked *against the kind*, not on its own: a machine whose safest end
+        // state is not stopped, answering a lost link with a stop, has declared a plan that lands
+        // it in the one state it cannot reach safely (REQ-A852 / F-LK-028).
+        if self.kind.must_manoeuvre_when_lost() && self.envelope.failsafe.is_stop() {
+            return Err(LinkError::Robot(format!(
+                "platform {label} cannot stop safely, so a lost link must be answered by a \
+                 manoeuvre: `{}` is a torque cut, not a landing",
+                self.envelope.failsafe.key()
+            )));
+        }
+        Ok(())
     }
 
     /// The vocabulary half of [`Platform::validate`]: unique keys, poses that fit the actuator

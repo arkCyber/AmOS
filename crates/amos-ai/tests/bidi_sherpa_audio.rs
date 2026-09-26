@@ -101,6 +101,11 @@ async fn bidi_audio_runs_real_sherpa_asr() {
     // Configure the daemon to use the real local sherpa recognizer.
     std::env::set_var("AMOS_ASR_BACKEND", "sherpa");
     std::env::set_var("AMOS_SHERPA_MODEL_DIR", &dir);
+    // The LLM side is the deterministic mock on purpose: this test's subject is
+    // the *real* ASR transcript reaching a reply. With no GGUF staged the unset
+    // default is now an honest `unconfigured` engine (Gap 4), which answers
+    // nothing — so the mock must be requested explicitly.
+    std::env::set_var("AMOS_BACKEND", "mock");
 
     let path: PathBuf =
         std::env::temp_dir().join(format!("amos-bidi-sherpa-{}.sock", std::process::id()));
@@ -188,6 +193,9 @@ async fn bidi_audio_real_sherpa_finalizes_on_explicit_audio_end() {
 
     std::env::set_var("AMOS_ASR_BACKEND", "sherpa");
     std::env::set_var("AMOS_SHERPA_MODEL_DIR", &dir);
+    // Deterministic mock LLM (see the note in the test above): the unset default
+    // is an honest `unconfigured` with no model staged (Gap 4).
+    std::env::set_var("AMOS_BACKEND", "mock");
 
     let path: PathBuf = std::env::temp_dir().join(format!(
         "amos-bidi-sherpa-audioend-{}.sock",

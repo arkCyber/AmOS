@@ -113,6 +113,9 @@ export function normalizePhotos(list: unknown): Photo[] {
     seen.add(id);
     const p: Photo = {
       id,
+      // An unreadable `ts` becomes the documented sentinel (`knownTs(0) === false`), not
+      // a fabricated epoch: the row is kept, its date is withheld. `0` here is *not*
+      // 1970-01-01 — see `knownTs`.
       ts: typeof o.ts === "number" && Number.isFinite(o.ts) ? o.ts : 0,
     };
     if (typeof o.data === "string") p.data = o.data;
@@ -186,6 +189,31 @@ export function neighborOf(list: Photo[], id: string, delta: 1 | -1): Photo | nu
  * calendar timezone* — pure + headlessly testable (single source of truth the
  * screen renders). ------------------------------------------------------------------ */
 
+/**
+ * Whether a stored `ts` is a **measurement** rather than the "unknown" sentinel.
+ *
+ * A photo's `ts` is a bare `number` (no presence in the type), and both ends of the
+ * pipeline document **`0` = unknown**: the host's `MediaItem.ts`
+ * (`crates/amos-media/src/spec.rs` — "Last-modified epoch milliseconds (0 = unknown)",
+ * folded from an unreadable mtime in `hostfs.rs`), and {@link normalizePhotos} above,
+ * which folds a stored row it cannot read a finite number out of to `0` for
+ * back-compat. So `0` answers no question about *when* — it is not 1970-01-01, and
+ * every face that prints a date must ask this first (REQ-A1852).
+ */
+export function knownTs(ts: number): boolean {
+  return Number.isFinite(ts) && ts > 0;
+}
+
+/** Section key for the items whose `ts` is the unknown sentinel — deliberately not a
+ * calendar key, so an unknown stamp can never collide with a real day (in particular
+ * a genuine `1970-01-01` row, which `dayKey(0)` would otherwise claim). */
+export const UNKNOWN_DAY_KEY = "unknown";
+
+/** Sort index for the unknown bucket: after every real day, so un-dated photos trail
+ * the wall instead of being presented as the oldest ones (they are not older — they
+ * are unmeasured). */
+const UNKNOWN_DAY = Number.MAX_SAFE_INTEGER;
+
 /** Local calendar key (YYYY-MM-DD) for a timestamp, in the current timezone. */
 export function dayKey(ts: number): string {
   const d = new Date(ts);
@@ -212,14 +240,19 @@ export interface DaySectionText {
   yesterday: string;
   /** Format a concrete older date, e.g. `(ts) => new Date(ts).toLocaleDateString()`. */
   date(ts: number): string;
+  /** Header for a section of items whose `ts` is the unknown sentinel ({@link knownTs})
+   * — a wording of its own, because 「1970/1/1」 is a date no photo was taken on. */
+  unknown: string;
 }
 
 export interface DaySection<I> {
-  /** Calendar key (YYYY-MM-DD), stable for reactivity keys. */
+  /** Calendar key (YYYY-MM-DD) for a real day, or `UNKNOWN_DAY_KEY`, stable for
+   * reactivity keys. */
   key: string;
-  /** `dayIndex` of this section (0 today …). */
+  /** `dayIndex` of this section (0 today …, ascending = older); the unknown bucket
+   * carries a sentinel index so it sorts last. */
   day: number;
-  /** Header text: Today / Yesterday / concrete date. */
+  /** Header text: Today / Yesterday / concrete date / the caller's `unknown` wording. */
   label: string;
   items: I[];
 }
@@ -244,12 +277,22 @@ export function groupDays<I extends { ts: number }>(
 ): DaySection<I>[] {
   const map = new Map<string, DaySection<I>>();
   for (const it of items) {
-    const key = dayKey(it.ts);
+    // An unknown stamp is not a day: it gets its own trailing bucket with the caller's
+    // `unknown` wording, so `1970-01-01` (what `dayKey(0)` would mint) is never drawn
+    // as the day a photo was taken — the same distinction `FilesApp` already makes with
+    // `f.ts ? fmtTime(f.ts) : "—"`.
+    const known = knownTs(it.ts);
+    const key = known ? dayKey(it.ts) : UNKNOWN_DAY_KEY;
     const e = map.get(key);
     if (e) e.items.push(it);
     else {
-      const day = dayIndex(it.ts, now);
-      map.set(key, { key, day, label: dayLabel(day, it.ts, tx), items: [it] });
+      const day = known ? dayIndex(it.ts, now) : UNKNOWN_DAY;
+      map.set(key, {
+        key,
+        day,
+        label: known ? dayLabel(day, it.ts, tx) : tx.unknown,
+        items: [it],
+      });
     }
   }
   return [...map.values()].sort((a, b) => a.day - b.day);

@@ -46,7 +46,11 @@ crate; three pieces:
   - `touch(now)` — a user interaction: resets the idle clock; wakes if off.
   - `probe(now, charging, hold_screen)` — periodic: turns `Off` exactly once
     when On and idle ≥ the policy timeout; auto-off is suppressed while the
-    transient `hold_screen` is true **or** any persistent hold is active.
+    transient `hold_screen` is true **or** any persistent hold is active. A
+    **zero** timeout means auto-off is **disabled** for that source (never
+    `Off` from idleness) — the shipped contract's `0` (Settings' 「关闭」, the
+    shell's `AUTO_OFF_DEFAULT_SEC`), *not* the same as the sub-second floor,
+    which only applies to a **positive** `<1 s` timeout (REQ-A627).
   - `set_hold(reason)` / `clear_hold(reason)` / `held()` / `holds()` — first-class,
     **reason-keyed, sticky** keep-awake (an active call, media, nav): a host
     asserts `"call"` once and it suppresses auto-off until explicitly cleared;
@@ -81,7 +85,10 @@ Off / 15 s / 30 s / 60 s), and the shell reads it when the watcher arms, so a li
 change re-arms it without a remount. When enabled and the shell is not locked, the
 idle watcher (`svelte/osAutoOff.ts`, 1 s ticker over
 `keydown`/`pointerdown`/`touchstart`/`pointermove` last-activity) sleeps after the
-timeout.
+timeout. Because the shell starts that watcher **once** and the sleep it triggers
+is a surface change inside the same component (not the process going away), the
+shell hands it `isLocked` so the loop can sleep again after an unlock — a sleep is
+latched **per idle period**, not for the watcher's lifetime (REQ-A1401).
 
 All **screen-off paths go through one entry**, `lock()` (shellState): the lock
 screen appears, and the shell reports `off` to the daemon. It is used by both the
@@ -115,11 +122,14 @@ headless tests.
 
 ## 5. Verification
 
-- `cargo test -p amos-display` — controller + host (4 unit + 9 integration =
-  13; includes a sub-second-timeout safety regression — a misconfigured `<1s`
-  timeout is floored to 1 s and never sleeps on the very first probe — plus
-  first-class hold tests: a `"call"` hold keeps the screen on until cleared,
-  overlapping holds each need their own clear, and `holds()` enumerates them).
+- `cargo test -p amos-display` — controller + host (4 unit + 11 integration =
+  15; includes a sub-second-timeout safety regression — a misconfigured
+  **positive** `<1s` timeout is floored to 1 s and never sleeps on the very
+  first probe — plus the zero-timeout contract tests: `Duration::ZERO` disables
+  auto-off per power source, never sleeping on either source, and a battery `0`
+  does not leak into the charger's positive timeout — plus first-class hold
+  tests: a `"call"` hold keeps the screen on until cleared, overlapping holds
+  each need their own clear, and `holds()` enumerates them).
 - `cargo test -p amos-ai --lib energy::` — `screen_state_file_overrides_env_flag`
   proves the file beats the env flag in both directions + the env fallback.
 - `cargo test -p amos-tauri --lib display::` — pure write/read + a command-level

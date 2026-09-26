@@ -117,8 +117,12 @@ describe("clipboard bridge wrappers", () => {
   test("clipboardChanged subscribes and forwards a metadata-only notice", async () => {
     const store = new Map<string, string>();
     const handlers: Record<string, (e: { payload: unknown }) => void> = {};
+    const invoked: string[] = [];
     const fake = {
-      invoke: async () => null,
+      invoke: async (cmd: string) => {
+        invoked.push(cmd);
+        return cmd === "clipboard_subscribe" ? 1 : null;
+      },
       listen: async (ch: string, h: (e: { payload: unknown }) => void) => {
         handlers[ch] = h;
         return async () => {};
@@ -136,8 +140,12 @@ describe("clipboard bridge wrappers", () => {
     const un = await onClipboardChanged((n) => {
       box.n = n;
     });
+    expect(un).not.toBeNull(); // REQ-A838：监听成立，才谈得上"已订阅"
     const h = handlers["clipboard-changed"];
     expect(typeof h).toBe("function");
+    // REQ-A557: subscribing **opts in** — without this the host never applies its
+    // per-window throttle (F-CLB-002) and floods every window instead.
+    expect(invoked).toContain("clipboard_subscribe");
     h!({ payload: { seq: 9, timestamp_ms: 2, source: "wechat" } });
     expect(box.n).toBeDefined();
     if (box.n) {
@@ -145,7 +153,63 @@ describe("clipboard bridge wrappers", () => {
       expect(box.n.timestamp_ms).toBe(2);
       expect(box.n.source).toBe("wechat");
     }
-    un();
+    un!();
+  });
+
+  test("clipboardChanged listens before opting in, so no notice falls in the gap", async () => {
+    const order: string[] = [];
+    const fake = {
+      invoke: async (cmd: string) => {
+        order.push(`invoke:${cmd}`);
+        return 1;
+      },
+      listen: async () => {
+        order.push("listen");
+        return async () => {};
+      },
+    };
+    setWindow({
+      __TAURI_INTERNALS__: fake,
+      localStorage: {
+        getItem: () => null,
+        setItem: () => {},
+      },
+    });
+
+    await onClipboardChanged(() => {});
+    // Listening first means a copy landing mid-call is still delivered by the host's global
+    // `emit`; opting in first would open a window where neither path reaches this window.
+    expect(order).toEqual(["listen", "invoke:clipboard_subscribe"]);
+  });
+
+  test("a refused listen must NOT opt in — the opt-in would close the path that still works", async () => {
+    // REQ-A838 / F-SH-267, the sharp instance of the family.
+    //
+    // The host's delivery has two modes (`clipboard.rs::broadcast_changed`): with no subscriber
+    // it uses a global `emit` that reaches every window; once a window opts in, delivery becomes
+    // `emit_to` for subscribers only. `onClipboardChanged` listens first and *then* opts in —
+    // and that order is only safe while the listen actually succeeded. If `listen` is refused
+    // but we opt in anyway, the host moves this window off the global broadcast and onto a
+    // subscriber list we are **not on**: every clipboard notice is then dropped, and the window
+    // looks exactly as subscribed as a quiet one. The correct move on a refused listen is to
+    // leave the host on the global path — no opt-in, and `null` back to the caller.
+    const invoked: string[] = [];
+    const fake = {
+      invoke: async (cmd: string) => {
+        invoked.push(cmd);
+        return 1;
+      },
+      listen: async () => {
+        throw new Error("event plugin refused the registration");
+      },
+    };
+    setWindow({
+      __TAURI_INTERNALS__: fake,
+      localStorage: { getItem: () => null, setItem: () => {} },
+    });
+
+    expect(await onClipboardChanged(() => {})).toBeNull();
+    expect(invoked).not.toContain("clipboard_subscribe");
   });
 
   test("copySelection is true when the bridge returns an entry", async () => {

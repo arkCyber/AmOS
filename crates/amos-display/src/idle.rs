@@ -9,16 +9,29 @@ use crate::spec::{ScreenChange, ScreenState};
 /// Idle timeouts for auto screen-off, per power source. Keeping them separate is
 /// phone-accurate: on a charger the screen may stay alive far longer than on
 /// battery, and a host can tune either without the other.
+///
+/// A **zero** timeout means auto-off is **disabled** for that source (the screen
+/// is never turned off by idleness), which is the shipped contract's own `0`
+/// (Settings → Auto screen-off 「关闭」, durable-store key `amos.displayAutoOffSec`,
+/// shell default `0`). See [`ScreenController::probe`] for why that is not the
+/// same thing as the sub-second floor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IdlePolicy {
-    /// Idle time (in caller monotonic ticks) before auto-off while on battery.
+    /// Idle time (in caller monotonic ticks) before auto-off while on battery;
+    /// `Duration::ZERO` disables auto-off on battery.
     pub on_battery_timeout: Duration,
-    /// Idle time (in caller monotonic ticks) before auto-off while charging.
+    /// Idle time (in caller monotonic ticks) before auto-off while charging;
+    /// `Duration::ZERO` disables auto-off on the charger.
     pub on_charger_timeout: Duration,
 }
 
 impl IdlePolicy {
     /// A sane default: ~30 s on battery, ~2 min while charging.
+    ///
+    /// Note this is *not* the shipped shell's default: the System UI starts at `0`
+    /// (auto-off **off**, Settings' 「关闭」) so a fresh install never self-locks —
+    /// see `svelte/osAutoOff.ts::AUTO_OFF_DEFAULT_SEC`. It is a phone-like default
+    /// for a caller that has no user setting to read.
     pub fn default_for_phones() -> Self {
         Self {
             on_battery_timeout: Duration::from_secs(30),
@@ -161,6 +174,10 @@ impl ScreenController {
     ///   a foreground-heavy task). Auto-off is suppressed while it is `true` OR
     ///   while any persistent [`ScreenController::set_hold`] reason is active —
     ///   either alone is enough to keep the display on.
+    ///
+    /// A **zero** timeout disables auto-off entirely (never `Off` from idleness) —
+    /// the shipped contract's `0` (Settings' 「关闭」, the shell's
+    /// `AUTO_OFF_DEFAULT_SEC`). Only a **positive** timeout is floored to 1 s.
     pub fn probe(&mut self, now: u64, charging: bool, hold_screen: bool) -> ScreenChange {
         if self.state == ScreenState::Off {
             return ScreenChange::None;
@@ -168,12 +185,22 @@ impl ScreenController {
         if hold_screen || self.held() {
             return ScreenChange::None;
         }
+        let timeout = self.policy.timeout_for(charging);
+        // `0` is the shipped contract's "auto-off disabled" — the whole point of
+        // the Settings 「关闭」 option and the shell's fresh-install default — so it
+        // must never be read as "sleep after 1 s". Ruling it out *before* the
+        // sub-second floor is what keeps this kernel's rule identical to the one
+        // the shell actually runs (`lib/display.ts::autoOffDue`: `<= 0` ⇒ never
+        // due); flooring `0` to 1 s here is the opposite of that contract.
+        if timeout.is_zero() {
+            return ScreenChange::None;
+        }
         // Timeouts are wall-time Durations but the caller drives `now` in whole
-        // seconds. A sub-second timeout would truncate to 0 and (via `idle >= 0`)
-        // turn the screen off on the very first probe — so floor it at 1 s: the
-        // finest granularity this controller can honour, never an instant sleep
-        // from a misconfigured Duration.
-        let timeout_ticks = self.policy.timeout_for(charging).as_secs().max(1);
+        // seconds. A sub-second *positive* timeout would truncate to 0 and (via
+        // `idle >= 0`) turn the screen off on the very first probe — so floor it at
+        // 1 s: the finest granularity this controller can honour, never an instant
+        // sleep from a misconfigured Duration.
+        let timeout_ticks = timeout.as_secs().max(1);
         let idle = now.saturating_sub(self.last_activity);
         if idle >= timeout_ticks {
             self.state = ScreenState::Off;

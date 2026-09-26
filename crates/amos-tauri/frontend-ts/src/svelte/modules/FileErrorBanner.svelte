@@ -5,9 +5,10 @@
    * 显示详细的错误信息、严重程度和可选的重试按钮。
    * 支持错误风暴检测和自动消失。
    */
+  import { untrack } from "svelte";
   import { t } from "../locale.svelte";
   import type { FileOperationError } from "../../lib/filesError";
-  import { getErrorMessageKey } from "../../lib/filesError";
+  import { getErrorMessageKey, retrySignature, shouldRetry } from "../../lib/filesError";
 
   interface Props extends Record<string, unknown> {
     error: FileOperationError | null;
@@ -18,6 +19,49 @@
   }
 
   let { error, onRetry, onDismiss, isStorm = false } = $props<Props>();
+
+  /**
+   * How many 重试 attempts **this** failure has spent (REQ-A607).
+   *
+   * The bound is the *declared* retry policy (`DEFAULT_RETRY_CONFIG`, via
+   * `shouldRetry`) — not the storm detector, which only bounds the **rate** of
+   * same-type errors (three within 5s). A user who waits out that window could
+   * otherwise retry a permanently-refused write (disk full) forever, while the
+   * module header promises a bounded "重试机制".
+   */
+  let retryKey = $state<string | null>(null);
+  let retries = $state(0);
+
+  // A different failing action is a fresh budget; the same action retried is not.
+  // `untrack` keeps the read of `retryKey` out of the effect's dependencies, so
+  // writing it cannot re-trigger the effect.
+  $effect(() => {
+    const key = retrySignature(error);
+    untrack(() => {
+      if (key !== retryKey) {
+        retryKey = key;
+        retries = 0;
+      }
+    });
+  });
+
+  /** Offer 重试? Only for a retryable error, with a handler, outside a storm, within budget. */
+  const canRetry = $derived.by(() => {
+    if (!error || !onRetry || isStorm) return false;
+    return shouldRetry(error, retries);
+  });
+
+  /** The budget is spent: say *that*, rather than dropping the button without a word. */
+  const exhausted = $derived.by(() => {
+    if (!error || !onRetry || isStorm || !error.retryable) return false;
+    return !shouldRetry(error, retries);
+  });
+
+  function handleRetry(): void {
+    if (!onRetry) return;
+    retries += 1;
+    onRetry();
+  }
 
   // 根据严重程度生成样式
   const getSeverityClass = (severity: FileOperationError["severity"]): string => {
@@ -78,14 +122,18 @@
 
     <!-- 操作按钮 -->
     <div class="flex gap-2">
-      {#if error.retryable && onRetry && !isStorm}
+      {#if canRetry}
         <button
-          onclick={onRetry}
+          onclick={handleRetry}
           class="rounded-full px-3 py-1 text-xs font-medium bg-current/10 hover:bg-current/20 transition active:scale-95"
           data-testid="retry-button"
         >
           {t("files.retryAction")}
         </button>
+      {:else if exhausted}
+        <span class="text-xs opacity-70" data-testid="retry-exhausted">
+          {t("files.retryExhausted")}
+        </span>
       {/if}
       <button
         onclick={onDismiss}

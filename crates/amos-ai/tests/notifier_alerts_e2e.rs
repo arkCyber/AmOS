@@ -18,13 +18,13 @@
 //! default build, where `notifier` is off).
 //!
 //! This is a sibling test, not the feature-gated `notifier_sink` path —
-//! see `notifier_sink::tests::the_bridge_severity_to_p0_p1_mapping_*`
+//! see `notifier_sink::tests::fire_sends_the_page_level_that_severity_to_p_level_owns`
 //! for the wiring through `amos-notifier`.
 
 use std::sync::Mutex;
 
 use amos_ai::alerts::{ActiveAlert, AlertTracker, Observations, Severity};
-use amos_ai::notifier_bridge::{severity_to_p_level, Alert, AlertBridge, AlertSink};
+use amos_ai::notifier_bridge::{severity_to_p_level, Alert, AlertBridge, AlertSink, PLevel};
 
 #[derive(Default, Debug)]
 struct Capture {
@@ -92,7 +92,7 @@ fn the_open_breaker_paging_chain_emits_one_p0_on_appear() {
     assert_eq!(log.len(), 1, "open breaker → one P0");
     assert_eq!(log[0].id, "amos-ai.breaker_open");
     assert_eq!(log[0].severity, Severity::Error);
-    assert_eq!(severity_to_p_level(log[0].severity), "P0");
+    assert_eq!(severity_to_p_level(log[0].severity), PLevel::P0);
 }
 
 #[test]
@@ -123,7 +123,12 @@ fn a_recovered_breaker_fires_a_resolution_alert() {
         );
     }
     // Closed again: a `breaker_open.cleared` fires so the operator's
-    // timeline reads "P0 at 12:01 → resolved at 12:14".
+    // timeline reads "P0 at 12:01 → resolved at 12:14" — the resolution
+    // carries the **cleared alert's** severity (the `breaker_open` alert is
+    // an `Error`), which is what makes the sentence above true at the page
+    // level. This assertion used to pin `Warn`, i.e. the defect the module
+    // docs forbid: a P0 incident "resolved" as a P1 never acknowledges the
+    // P0 page. See `notifier_bridge::tests::a_cleared_alert_fires_a_resolution`.
     poll(
         &mut tracker,
         &mut bridge,
@@ -138,7 +143,42 @@ fn a_recovered_breaker_fires_a_resolution_alert() {
     assert_eq!(log[0].id, "amos-ai.breaker_open");
     assert_eq!(log[0].severity, Severity::Error);
     assert_eq!(log[1].id, "amos-ai.breaker_open.cleared");
-    assert_eq!(log[1].severity, Severity::Warn);
+    assert_eq!(log[1].severity, Severity::Error);
+    assert_eq!(severity_to_p_level(log[1].severity), PLevel::P0);
+}
+
+/// The other half of the table, at the chain level: a `Warn` breach's
+/// resolution is a `Warn`/P1, not a blanket P0. Without this, a fix that
+/// hardcoded `Error` on every clear would pass the test above.
+#[test]
+fn a_recovered_warn_breach_resolves_at_its_own_p_level() {
+    let mut tracker = AlertTracker::new();
+    let capture = std::sync::Arc::new(Capture::default());
+    let mut bridge = AlertBridge::new().with_sink(capture.clone());
+
+    poll(
+        &mut tracker,
+        &mut bridge,
+        &Observations {
+            degraded: true, // Warn → P1
+            ..Default::default()
+        },
+    );
+    poll(
+        &mut tracker,
+        &mut bridge,
+        &Observations {
+            degraded: false,
+            ..Default::default()
+        },
+    );
+
+    let log = capture.fired.lock().unwrap();
+    assert_eq!(log.len(), 2, "appear + clear");
+    assert_eq!(log[0].id, "amos-ai.engine_degraded");
+    assert_eq!(severity_to_p_level(log[0].severity), PLevel::P1);
+    assert_eq!(log[1].id, "amos-ai.engine_degraded.cleared");
+    assert_eq!(severity_to_p_level(log[1].severity), PLevel::P1);
 }
 
 #[test]
@@ -171,7 +211,7 @@ fn multiple_independent_breaches_each_page_once() {
         vec!["amos-ai.breaker_open", "amos-ai.log_trail_incomplete"]
     );
     for a in log.iter() {
-        assert_eq!(severity_to_p_level(a.severity), "P0");
+        assert_eq!(severity_to_p_level(a.severity), PLevel::P0);
     }
 }
 
@@ -197,8 +237,8 @@ fn mixed_severity_breaches_each_go_to_their_own_p_level() {
     let by_id = |id: &str| log.iter().find(|a| a.id == id).cloned();
     let breaker = by_id("amos-ai.breaker_open").unwrap();
     let degraded = by_id("amos-ai.engine_degraded").unwrap();
-    assert_eq!(severity_to_p_level(breaker.severity), "P0");
-    assert_eq!(severity_to_p_level(degraded.severity), "P1");
+    assert_eq!(severity_to_p_level(breaker.severity), PLevel::P0);
+    assert_eq!(severity_to_p_level(degraded.severity), PLevel::P1);
 }
 
 #[test]

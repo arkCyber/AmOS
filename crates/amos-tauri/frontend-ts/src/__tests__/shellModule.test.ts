@@ -133,6 +133,10 @@ describe("the shipped chrome registry", () => {
       "launchpad-trigger",
       "spotlight-trigger",
       "control-center",
+      // The live screen-recording marker (REQ-A1581): right after the control center it
+      // is the popover twin of. It draws nothing unless a session is live, but its
+      // **root** is always in the slot — the container contract `TopBar` relies on.
+      "screen-record",
       "radios",
       "clock",
       "battery",
@@ -147,6 +151,13 @@ describe("the shipped chrome registry", () => {
       "spotlight",
       "mission-control",
       "control-center-panel",
+      // app-expose is the 6th overlay (order 40, REQ-A476): macOS's Application Windows
+      // (`⌃↓`). Like `spaces-panel` below it declares **no** `shortcuts` row — the
+      // registry's overlay-shortcut set (`F3 / F4 / ⌘Space / ⌘Tab`) is a documented,
+      // test-pinned invariant, and `⌃↓` belongs to the Control-arrow family configured in
+      // the keyboard-config `spaces` domain (so it is rebindable in Settings, which the
+      // four registry keys are not).
+      "app-expose",
       // spaces-panel is the 5th overlay (order 50). It deliberately has no entry
       // in the chrome shortcuts table — its launch binding (Ctrl+↑) is wired in
       // `DesktopShell` so the doc-vs-code invariant on the shortcut set

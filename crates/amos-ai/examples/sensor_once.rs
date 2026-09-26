@@ -77,17 +77,32 @@ async fn main() -> Result<()> {
         println!("gnss: enabled={} no fix yet", gnss.enabled);
     }
 
+    // An absent field prints `—`, never a folded `0`: a gyroscope-less device
+    // sends no `gyro_rad_s` at all, and `(0.00,0.00,0.00) rad/s` would read as
+    // the measurement "not rotating" — the same fold this probe is used to
+    // diagnose (REQ-A1872 / F-SEN-008). `rate_hz` and `temperature_c` are the
+    // message's zero-sentinels for "not reported" and are printed the same way.
     let imu = client.get_imu(Empty {}).await?.into_inner();
     println!(
-        "imu: @{}Hz acc=({:.2},{:.2},{:.2})m/s² gyro=({:.2},{:.2},{:.2})rad/s temp={}°C",
-        imu.rate_hz,
-        imu.accel_m_s2.as_ref().map(|v| v.x).unwrap_or(0.0),
-        imu.accel_m_s2.as_ref().map(|v| v.y).unwrap_or(0.0),
-        imu.accel_m_s2.as_ref().map(|v| v.z).unwrap_or(0.0),
-        imu.gyro_rad_s.as_ref().map(|v| v.x).unwrap_or(0.0),
-        imu.gyro_rad_s.as_ref().map(|v| v.y).unwrap_or(0.0),
-        imu.gyro_rad_s.as_ref().map(|v| v.z).unwrap_or(0.0),
-        imu.temperature_c
+        "imu: @{}Hz acc={} m/s² gyro={} rad/s temp={}°C",
+        if imu.rate_hz == 0 {
+            "—".to_string()
+        } else {
+            imu.rate_hz.to_string()
+        },
+        imu.accel_m_s2
+            .as_ref()
+            .map(|v| format!("{:.2},{:.2},{:.2}", v.x, v.y, v.z))
+            .unwrap_or_else(|| "—".to_string()),
+        imu.gyro_rad_s
+            .as_ref()
+            .map(|v| format!("{:.2},{:.2},{:.2}", v.x, v.y, v.z))
+            .unwrap_or_else(|| "—".to_string()),
+        if imu.temperature_c == 0.0 {
+            "—".to_string()
+        } else {
+            format!("{:.1}", imu.temperature_c)
+        }
     );
     Ok(())
 }

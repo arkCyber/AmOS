@@ -1,4 +1,4 @@
-.PHONY: all build test check lint fmt cov verify smoke sup-smoke timesync-smoke e2e-local gated-check run-ai run-ui run-ui-dev dev run-ui-release run-backends health supervise gui-smoke gui-smoke-check mobile-init mobile-check android-app android-app-strip android-app-check android-glue-check android-audio-check android-ai-sherpa-check android-usb android-voice-bringup android-rag-bringup pdf-android-check vector-db-check ci-local clean honesty-smoke deploy doctor hot-loop examples-smoke isolation-check release-artifacts api-docs device-eval device-media-probe frontend-dist frontend-fresh app-open
+.PHONY: all build test check lint fmt cov verify smoke sup-smoke timesync-smoke e2e-local gated-check run-ai run-ui run-ui-dev dev run-ui-release run-backends health supervise gui-smoke gui-smoke-check mobile-init mobile-check android-app android-app-strip android-app-check android-recording-e2e android-glue-check android-audio-check android-ai-sherpa-check android-usb android-voice-bringup android-rag-bringup android-camera-bringup pdf-android-check vector-db-check ci-local clean honesty-smoke deploy doctor hot-loop examples-smoke isolation-check release-artifacts api-docs device-eval device-tool device-media-probe frontend-dist frontend-fresh app-open
 
 all: build
 
@@ -150,6 +150,22 @@ gated-check:
 	# flags gate vendor-NPU claims — compile + unit-test both branches (no network).
 	cargo check -p amos-ai --features qnn,neuropilot
 	cargo test -p amos-ai --features qnn,neuropilot --lib accelerator::
+	# RK3588 NPU (`rknn`) and in-process llama.cpp (`llama-cpp-inproc`) bring-up seams
+	# (`inference/rknn.rs`, `inference/llama_cpp.rs`; docs/rk3588-bringup.md). Both flags
+	# gate no code yet — they only flip the honest-refusal branch from
+	# `Provider("… not linked")` to `NotImplemented("…")` — so without a step of their own
+	# nothing compiles them (scripts/feature-surface-scan.mjs: `never enabled`). Compiled
+	# with the flags on so the NotImplemented branch is the one under test, not the gate.
+	cargo check -p amos-ai --features rknn,llama-cpp-inproc
+	cargo test -p amos-ai --features rknn,llama-cpp-inproc --lib inference::
+	# Bundled on-device model seam (`bundled-model`; Gap 4, TODO 4.2; F-AI-017).
+	# Off by default, so without a step of its own the
+	# `#[cfg(feature = "bundled-model")]` branch of `build_backend_from_env` is
+	# compiled by nothing (scripts/feature-surface-scan.mjs: `never enabled`).
+	# Compiled + tested with the flag on so the staged-GGUF resolution path is the
+	# one under test; the default-feature run covers the feature-off branch.
+	cargo check -p amos-ai --features bundled-model
+	cargo test -p amos-ai --features bundled-model --lib build_backend_from_env
 	# Host compile-checks of the feature-gated Android HAL/power seams (no device /
 	# no NDK needed; runtime requires a real Android VM + Context at device bring-up).
 	cargo check -p amos-radio --features android
@@ -183,6 +199,13 @@ gated-check:
 	# `#[ignore]`-gated.
 	cargo clippy -p amos-appstore -p amos-appstore-cli --all-targets --features live -- -D warnings
 	cargo test -p amos-appstore -p amos-appstore-cli --features live
+	# Podcast `live` seam (`amos-podcast::http` — the `ureq` `HttpFeedProvider`). Like
+	# the store's, it is `#[cfg(feature = "live")]` so **no other target compiles it**;
+	# the crate is offline-green by default on purpose (the deterministic
+	# `MockFeedProvider` is what every other test drives). Compile and test it here.
+	# Loopback-only: the one test that would hit a real network is `#[ignore]`-gated.
+	cargo clippy -p amos-podcast -p amos-podcast-cli --all-targets --features live -- -D warnings
+	cargo test -p amos-podcast -p amos-podcast-cli --features live
 	# The `audit` features have the same shape as `live` above (REQ-A188): only
 	# `--features audit` compiles `amos-telemetry-spy/src/capture.rs` and
 	# `amos-ai/src/telemetry_spy_capture.rs`, so their 6 tests would never run anywhere.
@@ -253,7 +276,7 @@ lint:
 	# `gated-check`. scripts/feature-surface-scan.mjs fails if a feature loses its step.
 	cargo clippy -p amos-network-guard --all-targets --features nftables,vpn -- -D warnings
 	cargo clippy -p amos-mail-cli --all-targets --features amos-mail-cli/live -- -D warnings
-	cargo clippy -p amos-tauri --all-targets --features appstore-live,tcp,terminal-pty -- -D warnings
+	cargo clippy -p amos-tauri --all-targets --features appstore-live,podcast-live,tcp,terminal-pty -- -D warnings
 	# amos-link's two network channels: the `lan` UDP-beacon discovery and the `zenoh`
 	# inter-board transport (docs/amos-link.md). Neither is in the default build, so
 	# without these steps `src/lan.rs` and `src/zenoh.rs` would be compiled by nothing
@@ -289,6 +312,21 @@ lint:
 	# not there (REQ-A367 / F-DEV-004). The rest of the tool needs a phone and stays a manual target
 	# (`make device-eval`).
 	node scripts/device-ui-eval.mjs --selftest
+	# The APK re-packer's device-free half (see scripts/android-app-strip.sh --selftest): the
+	# APK is only installable if `lib/**/*.so` and `resources.arsc` are STORED while everything
+	# else is DEFLATE'd, and getting that wrong is invisible on the build host — it surfaces as
+	# `INSTALL_FAILED_INVALID_APK, res=-2` on a phone (REQ-A1862 / F-DEV-157). Measured: the
+	# repack inherited ZipFile's ZIP_STORED default for every entry it wrote, so one unpacked
+	# tree packs to 70,276,570 B uncompressed versus 61,279,001 B under this policy (-12.8%).
+	bash scripts/android-app-strip.sh --selftest
+	# The macOS device tool's device-free half (see scripts/device/amos-device.swift, REQ-A486): the
+	# Accessibility reading and the pointer driving need a running app and real events, but the
+	# *decoding* — AppKit's modifier bitmask, a menu item's key equivalent, frame formatting — does
+	# not, and that is where a wrong reading would come from. The wrapper also refuses a selftest that
+	# prints nothing, because a tool which exits 0 without acting is exactly the silent instrument
+	# this repository keeps finding (measured: `@main` in a file not named main.swift links an empty
+	# main — see the wrapper's comment).
+	bash scripts/device.sh --selftest
 	# The reverse direction (see scripts/unwired-script-scan.mjs): a script that ships but
 	# that the Makefile, the CI workflows and every reachable script never name is dead
 	# weight — and the *executable* layer is the one every gate above depends on. Wired by
@@ -297,6 +335,14 @@ lint:
 	# scripts/script-allowlist.json and is reported stale once it stops being unwired.
 	node scripts/unwired-script-scan.mjs --selftest
 	node scripts/unwired-script-scan.mjs
+	# The instruments themselves (see scripts/gate-index-scan.mjs + docs/GATES.md): the set of
+	# gates above is 60-odd scripts, and until REQ-A483 the only index of it was the comments in
+	# this file — so the way to learn "is X already covered?" was to read the whole build or to
+	# write a gate that already existed (that happened twice: REQ-A480's Rust module pass and
+	# REQ-A483's command sweep). The index is now a checked artifact: every script must have a
+	# row, every row must name a script, and `--emit` drafts a row from the script's own header.
+	node scripts/gate-index-scan.mjs --selftest
+	node scripts/gate-index-scan.mjs
 	# Deliverable integrity (see scripts/untracked-source-scan.mjs): no untracked,
 	# non-ignored file may sit in the working tree, and no deletion may be left unstaged —
 	# the deliverable is the index, and this repository's recurring defect is exactly a
@@ -313,6 +359,16 @@ lint:
 	# after adding a module). `--selftest` pins the parsers first.
 	node scripts/dangling-source-scan.mjs --selftest
 	node scripts/dangling-source-scan.mjs
+	# Committed-manifest integrity (see scripts/committed-manifest-scan.mjs): the workspace
+	# manifest pair the *commit* describes must be self-consistent, not just the pair on disk.
+	# The sibling above catches "committed the importer, forgot the module"; this catches
+	# "committed the consumer, forgot the provider entry" — `24bc9703` landed `amos-ai`'s
+	# `amos-notifier = { workspace = true }` without the `members`/`[workspace.dependencies]`
+	# half, so a clean checkout of `24bc9703`..`5468c5b3` cannot be *parsed* (`cargo metadata`
+	# EXIT=101) while every gate stayed green on a working tree whose repair was merely staged.
+	# Reads the committed tree, never the working tree; `AMOS_MANIFEST_REV` overrides it.
+	node scripts/committed-manifest-scan.mjs --selftest
+	node scripts/committed-manifest-scan.mjs
 	# The reverse direction (see scripts/unreached-source-scan.mjs): a file that **is**
 	# in a crate's `src/` but that the compiler never reads. Found by this gate's
 	# absence: `crates/amos-mdm/src/error.rs.tmp_tests` held a byte-identical copy of
@@ -329,6 +385,16 @@ lint:
 	# ratcheted by scripts/unsafe-baseline.json so the surface only grows deliberately.
 	node scripts/unsafe-scan.mjs --selftest
 	node scripts/unsafe-scan.mjs
+	# The ledgers' own prose (see scripts/claim-scan.mjs): every `*-allowlist.json` /
+	# `*-baseline.json` justifies a decision by naming files, symbols, commands and other
+	# ledgers — and nothing checked those names. Rule 1: every claimed token must be a repo
+	# path or a live identifier (or declared in scripts/claim-allowlist.json with a reason;
+	# wildcards, snippets and historical names). Rule 2: an entry whose reason cites another
+	# ledger must be **right** about it — the rule that would have caught
+	# `unwired-allowlist.json`'s claim that two biometric commands were allow-listed while
+	# that table had deleted them (REQ-A518/A524). `--selftest` pins both rules.
+	node scripts/claim-scan.mjs --selftest
+	node scripts/claim-scan.mjs
 	# Async-runtime hygiene (see scripts/blocking-in-async-scan.mjs): no blocking call
 	# (std::fs / std::process / std::thread::sleep / std::net) may sit directly in an
 	# `async fn` — it would occupy a tokio worker. Work goes to `spawn_blocking`; the
@@ -351,6 +417,31 @@ lint:
 	# its count, or a new file with a discard, fails.
 	node scripts/rust-discard-scan.mjs --selftest
 	node scripts/rust-discard-scan.mjs
+	# Wall-clock assertions (see scripts/rust-clock-assert-scan.mjs, REQ-A854/F-DEV-109): an
+	# `assert!(start.elapsed() < bound)` decides how busy the box is, not how the code behaves
+	# — measured (frontend half, 40 spinners on 18 cores) as 4/12 single-shot samples over a
+	# 50 ms bound vs 0/12 for the minimum over K=5 attempts of the same work. The scan reads
+	# the comparison's **polarity** (a lower bound cannot flake from load, so only the
+	# "must be small" direction fails), follows an **alias** (`let hit = start.elapsed();`) so
+	# a clock cannot be laundered through a name, and requires the judged value to be bound
+	# through a `fastest_of`-style min-of-K helper. Three sites were found and are instrumented;
+	# `MUST_SEE_INSTRUMENTED` is set equality, so a deleted assertion (which trips no other
+	# rule) still fails the run.
+	node scripts/rust-clock-assert-scan.mjs --selftest
+	node scripts/rust-clock-assert-scan.mjs
+	# Fabricated state (see scripts/rust-fabrication-scan.mjs, REQ-A865/F-DEV-116): a comment
+	# that *admits* the code is not real ("for now", "simulate", "would go here", ...) sitting
+	# within five lines of a write to a granted state (`set_permission(`, `granted =`,
+	# `Authorized`, `<x> = true`). `push_request_permission` used to write
+	# `PermissionStatus::Authorized` under a `// For now, simulate authorization` comment and
+	# answer `Ok`, and the panel printed 「你现在可以接收推送通知了」 off it. Neither half is
+	# evidence alone — 275 admission comment lines and many `permission =` writes exist here,
+	# the pair occurred **once** — so this is a census (one site per write, nearest admission)
+	# that fails until each site is fixed or recorded with a reason in
+	# scripts/rust-fabrication-baseline.json; an entry that no longer matches a site is rot and
+	# also fails, and an entry with no readable `reason` is not an acknowledgement.
+	node scripts/rust-fabrication-scan.mjs --selftest
+	node scripts/rust-fabrication-scan.mjs
 	# Feature-gated test modules (see scripts/feature-test-scan.mjs): a module behind
 	# `#[cfg(feature = "…")]` is not compiled by `cargo test --workspace`, so a test inside
 	# it is dead weight no gate reports — the same blind spot R187 found for clippy, one
@@ -410,6 +501,70 @@ lint:
 	# show a change the store rejected. `--selftest` pins the extractor first.
 	cd crates/amos-tauri/frontend-ts && node scripts/write-scan.mjs --selftest
 	cd crates/amos-tauri/frontend-ts && node scripts/write-scan.mjs
+	# Void-bridge-command verdicts (see scripts/void-cmd-scan.mjs, REQ-A835 / F-SH-265):
+	# `invoke()` never rejects and a `void` command's success value is `null`, so "it
+	# happened" and "we never reached the host" arrive at the caller as the same value —
+	# the verdict is the per-command diagnosis. write-scan above asks this family for the
+	# *local* store only, which is why two shipped defects fell between the two. Per file
+	# per command, every call site must bind `bridgeDiag("<command>").ok` (or hand the
+	# literal to a one-hop helper that reads it), or be allow-listed with a reason and its
+	# own note.
+	# REQ-A845 / F-SH-273 widened the WINDOW, not the rule: the inventory used to be built
+	# from backend.ts alone with a predicate requiring the literal `invoke<null>(`, so two
+	# more defects shipped green through this gate (robot.ts's heartbeat stream, the push
+	# clear-history path) and a name that went missing could not fail anything. It now
+	# inventories every source file, accepts `invoke("cmd")` / `'cmd'`, sees direct
+	# `await invoke(...)` / `void invoke(...)` statements, pins the wrapper set by set
+	# equality (missing AND unpinned), and asserts the sites that must be visible.
+	cd crates/amos-tauri/frontend-ts && node scripts/void-cmd-scan.mjs --selftest
+	cd crates/amos-tauri/frontend-ts && node scripts/void-cmd-scan.mjs
+	# Read-side twins of the family above (see scripts/read-fold-scan.mjs, REQ-A836 /
+	# F-SH-266): `invoke()` answers `null` for a REFUSED call, and every read wrapper is
+	# declared `Promise<T | null>` — so coercing that `null` with `?? []` / `?? default`
+	# turns "we could not ask" into "there is nothing", which the empty-state wording
+	# then states as a fact about the machine (《本机没有安装 Wine》). A `||` here is a
+	# GUARD, not a default, when it sits in a boolean position (`if (!perm || !perm.native)`)
+	# — that distinction is what the scan enforces. Accepted when the default is `null`
+	# itself, when the file reads `bridgeDiag("<command>").ok`, when the enclosing scope
+	# guards the read (`=== null` or `!x`), or by allow-list with a reason.
+	cd crates/amos-tauri/frontend-ts && node scripts/read-fold-scan.mjs --selftest
+	cd crates/amos-tauri/frontend-ts && node scripts/read-fold-scan.mjs
+	# The render point of the diagnostic ledger (see scripts/diag-render-scan.mjs,
+	# REQ-A839 / F-SH-268): the two gates above ask whether a verdict was *kept*, and this
+	# one asks whether it *reaches the reader*. `lib/debugLog.ts` is the shell's bounded
+	# failures ledger, and a failure could be lost twice over — `JSON.stringify` renders an
+	# exception as `{}` (a non-enumerable `message`), and the only UI that reads the ring
+	# rendered `level · area · msg`, dropping `detail` (the reason) and `ts` (when). The
+	# field set is a PIN (a floor cannot see one name leave a set), every field must be read
+	# by the `{#each … as e (e.seq)}` loop that draws the rows, and `safeDetail` must branch
+	# on an exception and pass `JSON.stringify` a replacer (the nested `BridgeDiag` shape).
+	cd crates/amos-tauri/frontend-ts && node scripts/diag-render-scan.mjs --selftest
+	cd crates/amos-tauri/frontend-ts && node scripts/diag-render-scan.mjs
+	# Perf budgets that measure the machine instead of the code (see
+	# scripts/perf-budget-scan.mjs, REQ-A850 / F-DEV-106): `now() - start` is the work PLUS
+	# whatever else the OS scheduled on that core, so a "performance" assertion was really a
+	# claim about how busy the box was — and `bun run check` became non-deterministic (green
+	# proved nothing, red got re-run until green). Measured paired in ONE run under one load:
+	# single-shot blew a 50ms budget in 4 of 12 samples (max 201.49ms) while min-of-K never
+	# did (max 40.90ms). Every budget assertion (22 of them) is bound through
+	# `src/__tests__/perfBudget.ts`; not one threshold was widened. The file census is pinned
+	# by set equality in both directions, because a file leaving it has no call sites and
+	# touches no threshold — nothing else can see that.
+	cd crates/amos-tauri/frontend-ts && node scripts/perf-budget-scan.mjs --selftest
+	cd crates/amos-tauri/frontend-ts && node scripts/perf-budget-scan.mjs
+	# Fire-and-forget that cannot be read back (see scripts/void-rejection-scan.mjs,
+	# REQ-A856 / F-DEV-111): `void f()` is right when `f` cannot reject, and in this repo
+	# that is the usual case because `invoke` catches and answers `null` (REQ-A296). The
+	# defect is the other case — the callee throws in plain JS, so the rejection has no
+	# receiver and no `bridgeDiag` can recover it: `ShareSheet.runTarget` dismissed the
+	# sheet first, so a timed-out shortcut closed the overlay and did nothing, shaped
+	# exactly like success, while its own comment claimed parity with the `handleRun`
+	# that wraps the identical call in `try/catch/finally`. Its mirror (the readable
+	# verdict nobody reads) is scripts/void-cmd-scan.mjs. Two hops over a verified
+	# `src/lib/**` throw-set, 2 sites, both pinned by set equality in both directions —
+	# a reachability fixpoint marks 41% of definitions and judges nothing.
+	cd crates/amos-tauri/frontend-ts && node scripts/void-rejection-scan.mjs --selftest
+	cd crates/amos-tauri/frontend-ts && node scripts/void-rejection-scan.mjs
 	# Compiler suppressions (see scripts/svelte-ignore-scan.mjs, REQ-A472): a
 	# `svelte-ignore` is a *local* exemption whose reason used to live only in a
 	# comment on site, with nothing checking it still held, and `--compiler-warnings`
@@ -423,9 +578,35 @@ lint:
 	# exemption from a retired one (svelte-check reports nothing for an unused
 	# ignore; measured 2026-09-19).
 	# The file is restored and sha256-verified; a failed restore aborts with exit 2.
-	# `--selftest` pins the readers first (24 assertions).
+	# **`--static`** (REQ-A473): `make lint` is the *clean-checkout* gate — no Makefile,
+	# workflow or `deploy.sh` line runs `bun install`, and every other frontend step here
+	# is a dependency-free `node` script — so only the half that needs nothing but the
+	# working tree runs here (carrier/reason/drift/stale/flag-sync). The compiler-dependent
+	# half (R5 liveness spawns `svelte-check`; R7 classifies codes against Svelte's own
+	# list) runs in `bun run check`. Measured 2026-09-19: the first version read
+	# `node_modules/svelte/...` unconditionally and died on a clean checkout with an ENOENT
+	# stack trace — i.e. it could not run where this repository runs its lint. The full
+	# mode now fails with one actionable sentence (R8) instead. `--selftest` pins the
+	# readers first (36 assertions, no node_modules needed).
 	cd crates/amos-tauri/frontend-ts && node scripts/svelte-ignore-scan.mjs --selftest
-	cd crates/amos-tauri/frontend-ts && node scripts/svelte-ignore-scan.mjs
+	cd crates/amos-tauri/frontend-ts && node scripts/svelte-ignore-scan.mjs --static
+	# Hover / lifetime / React-free / test-reach scanners (REQ-A473): these four are
+	# dependency-free hard gates that existed **only** in `bun run check`, which no
+	# workflow ran — so `make lint` (the CI lint step) never ran them and a regression in
+	# their subject matter (hover scoped to hover-capable pointers, every interval/subscription
+	# with a lifetime, the shell staying React-free, every test file executed by a runner)
+	# would have been invisible to CI. `--selftest` first, per convention. The fifth such
+	# scanner, `a11y-scan`, is deliberately **not** here: it always exits 0 (it *reports*
+	# gaps instead of failing) and rewrites `docs/A11Y_AUDIT.md` when it runs, so gating it
+	# needs a `--check` mode first — recorded in the round's honest boundaries.
+	cd crates/amos-tauri/frontend-ts && node scripts/hover-scan.mjs --selftest
+	cd crates/amos-tauri/frontend-ts && node scripts/hover-scan.mjs
+	cd crates/amos-tauri/frontend-ts && node scripts/lifetime-scan.mjs --selftest
+	cd crates/amos-tauri/frontend-ts && node scripts/lifetime-scan.mjs
+	cd crates/amos-tauri/frontend-ts && node scripts/react-free-scan.mjs --selftest
+	cd crates/amos-tauri/frontend-ts && node scripts/react-free-scan.mjs
+	cd crates/amos-tauri/frontend-ts && node scripts/orphan-test-scan.mjs --selftest
+	cd crates/amos-tauri/frontend-ts && node scripts/orphan-test-scan.mjs
 
 	# Identity minting (see scripts/idgen-scan.mjs): a persisted row's id may not be
 	# `Date.now()` + a slice of `Math.random` — that family's three remaining sites
@@ -458,6 +639,20 @@ lint:
 	# being 100% covered). `--selftest` pins both halves of the classifier: structure drops,
 	# and every real statement / `} else {` / brace-containing string is **kept**, so a real
 	# gap cannot hide behind the filter.
+	# The same gate's REQ-A405 rule ("every src/lib module is mentioned by a report, or
+	# allowlisted with a reason") used to infer "no test imports it?" from an absence in
+	# `coverage/*.info` — a snapshot of the *last* coverage run, not of the tree. Measured
+	# 2026-09-21: all 13 modules it named had a test importing them (newest report 09-20
+	# 18:16; the 13 tests date from 20:05 that evening to 22:57 the next day), so its most
+	# specific sentence was wrong 13/13 — and its third suggested fix, allowlisting them,
+	# would have written modules that *have* tests into the one file that means "this module
+	# has no test at all". REQ-A863 replaces the guess with the measurement: the unmentioned
+	# set is split into "a test imports it, the reports are older than the tree" (re-run the
+	# coverage command) and "nothing imports it" (write the test, or allowlist with a
+	# reason). Both still fail — a stale corpus must not pass, and the percentage above is
+	# computed from the same stale reports. (Same gate, second defect: `coverage/` is
+	# gitignored, and reading the missing directory threw an uncaught ENOENT on a fresh
+	# checkout instead of saying "nothing to measure yet".)
 	cd crates/amos-tauri/frontend-ts && node scripts/lib-coverage-gate.mjs --selftest
 	# Rust loop hygiene (see scripts/hot-loop-scan.mjs): no `loop` may be a busy wait
 	# (neither waiting nor able to exit), and a long-running loop must say who ends
@@ -501,6 +696,28 @@ lint:
 	# links and 404'd). `--selftest` pins the strip/extract/classify logic first.
 	node scripts/docs-link-scan.mjs --selftest
 	node scripts/docs-link-scan.mjs
+	# Document citations in **source comments** (see scripts/doc-cite-scan.mjs, REQ-A1655):
+	# `docs-link-scan` above reads Markdown link syntax inside `.md` files only, so a
+	# `docs/….md` path written in a Rust / Svelte / TS / shell *comment* sat in no gate's
+	# window — `screen_record.rs` cited a document three times as its honest-boundary
+	# disclosure while the file did not exist (REQ-A1628), and the sweep that found it left
+	# two further citations naming a document that lives elsewhere in the tree. This reads
+	# comment lines only (a path in a string literal is a fixture, not a citation) and
+	# requires each cited document to exist; legitimate placeholders carry a reason in
+	# scripts/doc-cite-allowlist.json, where a stale entry fails.
+	node scripts/doc-cite-scan.mjs --selftest
+	node scripts/doc-cite-scan.mjs
+	# HTTP contract integrity (see scripts/http-route-scan.mjs): an `/api/…` path the UI
+	# calls must exist as a route on the server that answers it. The Tauri bridge already
+	# had two such gates (`tauri-args-scan` / `tauri-reply-scan`); HTTP had **none**, and
+	# the two sides disagreed on two endpoints (`/api/audit/sync`, `/api/templates/sync`)
+	# while the client's own tests stayed green (they assert the client's handling of a
+	# mocked reply, never that the endpoint is served). Scope is `/api/*` by measurement:
+	# the other relative paths in the tree are static assets served by the UI's own origin.
+	# A gap must be declared in scripts/http-route-allowlist.json with a reason, and an
+	# exemption whose route is now served fails too. `--selftest` pins both extractors.
+	node scripts/http-route-scan.mjs --selftest
+	node scripts/http-route-scan.mjs
 	# ENV central registry integrity (see scripts/env-doc-gen.mjs): docs/ENV_VARIABLES.md
 	# must list every `AMOS_*` env var the Rust code declares (env::var / option_env! /
 	# read_env / env_flag / ... and `pub const FOO: &str = "AMOS_*"` plus a usage),
@@ -577,6 +794,32 @@ lint:
 	# `System.loadLibrary` names a library a workspace crate builds.
 	node scripts/android-component-scan.mjs --selftest
 	node scripts/android-component-scan.mjs
+	# Android *input method* action (see scripts/ime-action-scan.mjs): an IME is discovered
+	# only by the action the platform queries for — `InputMethod.SERVICE_INTERFACE`, the
+	# camelCase `android.view.InputMethod`. The package-shaped spelling
+	# (`android.view.inputmethod.InputMethod`) installs, resolves in `dumpsys package` with
+	# the right permission and `@xml/method` meta-data, and is still absent from the method
+	# map Settings reads, because IMMS drops a service its query never returned with **no
+	# log at all**. No host gate could see it either: the component scan's own action table
+	# had been taught the wrong literal, and the mirror script compares the two manifests by
+	# `android:name`, where both copies carried it (REQ-A1897 / F-DEV-163). Found on device
+	# by diffing a known-good third-party IME's filter against ours.
+	node scripts/ime-action-scan.mjs --selftest
+	node scripts/ime-action-scan.mjs
+	# Android *role qualification* (see scripts/android-role-scan.mjs): a component can
+	# only exist on device if the app holds the role that binds it, and RoleManager
+	# qualifies a package by resolving the role's `RequiredComponent` through the
+	# PackageManager — for DIALER that is action DIAL with **no data URI**. An
+	# intent-filter scoped by `<data android:scheme="tel"/>` cannot match that query
+	# (`IntentFilter.matchData` → NO_MATCH_DATA), so on a retail S5 the app was
+	# installed, advertised DIAL, and `cmd role add-role-holder android.app.role.DIALER`
+	# was still refused with "Package does not qualify for the role" — AmosInCallService
+	# never bound and the whole real-call surface was unreachable. `android-glue-mirror.sh`
+	# compares the two manifests by `android:name` strings, so a filter that adds or drops
+	# the qualifying element is invisible to it; this gate compares the filter **shape**,
+	# in the tracked fragment and in the generated manifest alike (REQ-A1873 / F-AND-018).
+	node scripts/android-role-scan.mjs --selftest
+	node scripts/android-role-scan.mjs
 	# JNI hygiene (see scripts/jni-exception-scan.mjs): every provider must attach
 	# through `amos_jni::attached` (a pooled thread can inherit a *pending* exception
 	# and the next JNI call then aborts the process under CheckJNI — device-proven,
@@ -602,13 +845,22 @@ lint:
 	# reason.
 	node scripts/jni-contract-scan.mjs --selftest
 	node scripts/jni-contract-scan.mjs
-	# Registered Tauri command with no frontend consumer (see
+	# Registered Tauri command with no frontend consumer **and its mirror** (see
 	# scripts/tauri-command-scan.mjs): the reverse of the unwired-scan — a command
 	# the host exposes but no screen asks for is a capability the UI cannot reach
 	# (that is how the documented "selection → AI" flow sat dead). Also checks that
-	# every registered name really is a `#[tauri::command]` fn. Deliberate
-	# non-wirings are listed in scripts/tauri-command-allowlist.json **with a
-	# reason**; `--selftest` pins the extractors first.
+	# every registered name really is a `#[tauri::command]` fn, and (REQ-A517) that
+	# every **literal `invoke`/`call` the production UI makes has a command behind
+	# it** — the direction nothing looked at, which is how `mediaStreamBase()` called
+	# a `media_stream_base` that never existed (always `null`, plus a fake
+	# `command-failed` in the ledger on every call). (REQ-A518) the "a screen asks for
+	# it" test ignores modules `unwired-allowlist.json` records as unreachable — a
+	# wrapper nothing imports is not a screen — and a **stale allow-list entry now
+	# fails** instead of printing a note (that note is how 15 accurate records were
+	# deleted while the "consumption" was a string in a dead module). Deliberate
+	# non-wirings are listed in scripts/tauri-command-allowlist.json /
+	# scripts/tauri-call-allowlist.json **with a reason**; `--selftest` pins the
+	# extractors first.
 	node scripts/tauri-command-scan.mjs --selftest
 	node scripts/tauri-command-scan.mjs
 	# Command *arguments* on the wire (see scripts/tauri-args-scan.mjs): Tauri looks
@@ -624,7 +876,43 @@ lint:
 	# their Rust spelling (no `rename_all` in this workspace) and a `bool`/`usize`
 	# stays a boolean/number. How the SMS trash panel read camelCase fields off
 	# snake_case rows and compared a bool to a string — dead on device, green in CI.
-	# `--selftest` pins the extractors first.
+	# `--selftest` pins the extractors first. (REQ-A532) the reply type is resolved through the
+	# repo's own aliases (`AmosResult<T>` / `AppStoreResult<T>`), a TS `null` counts as the unit
+	# wire value, and reply shapes defined in **other workspace members** are used under two guards
+	# (the tauri crate's declaration wins a name collision; a name declared twice elsewhere is
+	# dropped) — together `117 checked / 99 skipped` → `167 / 49`. What was left was the shell's own
+	# gap and the scan **named** it: commands read as `invoke<unknown>(…)` with no reply type
+	# declared (31 at the time).
+	#
+	# (REQ-A555) that named list is now empty — every one of those 31 reads names the host's real
+	# reply — and the round also fixed three things that had been hiding pairs, each measured:
+	#   * a **field's own** `#[serde(…)]` used to make its whole shape `opaque` (17 shapes:
+	#     `AppManifest`, `CareReport`, `SensorHostSnapshot`, `FsRead`, `NfcWriteResult`, …). The
+	#     attributes are read now (`rename` is the wire name, `skip*` drops the item,
+	#     `default`/`skip_serializing_if` are neutral, everything unmodelled still fails closed);
+	#   * `stripComments` had **no replacement argument** on the block-comment `replace`, so every
+	#     `/* … */` became the text `undefined` and the field behind such a comment vanished from a
+	#     TS body (`ReportView`'s `assessed`);
+	#   * a reply type declared in **another module** (`WmWindowsSnapshot` used from
+	#     `lib/shortcuts.ts`) is resolved through the file's relative imports / `export … from`
+	#     re-exports, the same disposition REQ-A532 gave a shape declared in another crate.
+	# Together: `167 / 49` → **`219 checked / 9 skipped`**, and the 9 are named categories rather
+	# than a number (6 need union-aware TS comparison, 1 `HashMap`↔`Record`, 1 Rust
+	# `#[serde(flatten)]`, 1 `#[serde(untagged)]`).
+	#
+	# (REQ-A558) those six got the comparison they needed — a TS **object-literal union** is judged
+	# per member against the host's one flat struct (`{ok:true;bytes}|{ok:false;error}` vs
+	# `BleReadResult{ok,bytes,error}`), a TS **discriminant-literal** union is compared set-to-set
+	# with an **externally tagged** enum's wire tags (`RustPermissionStatus` vs
+	# `#[serde(rename_all="lowercase")] PermissionStatus`), and a Rust **`#[serde(untagged)]`** enum
+	# now records each variant's field set so a union member must fit a *single* variant
+	# (`sms_trash_add`'s three states). Two defects in the parser came out of the same measurements:
+	# an external enum recorded the **Rust** variant spellings instead of the wire ones (two *false*
+	# failures the instant the literals were compared), and `parseRustShapes` took "the next `{` in
+	# the file" as the body, so `pub struct SubscriptionId(pub u64);` inherited *another* struct's
+	# fields and a correct `invoke<number>("clipboard_subscribe")` read as a failure — a tuple struct
+	# is now followed to its inner type. Together: **`227 checked / 2 skipped`** (the two being
+	# `HashMap`↔`Record` and one `#[serde(flatten)]`), selftest 85 → **103**.
 	node scripts/tauri-reply-scan.mjs --selftest
 	node scripts/tauri-reply-scan.mjs
 	# Host→UI *events* (see scripts/tauri-event-scan.mjs): the fourth wire
@@ -632,7 +920,11 @@ lint:
 	# reason in scripts/tauri-event-allowlist.json), every subscription must have an
 	# emitter, and for the events whose payload is a plain struct the TS type that
 	# mirrors it must name fields the struct actually serializes (the reviewed table
-	# in the script; tagged enums/tuples are documented as out of scope).
+	# in the script). (REQ-A521) that table is a **census**: every emitted event is
+	# classified object / unit / scalar / opaque+reason (or allow-listed), and an
+	# unclassified event, a row for an event nobody emits, or a stale allow-list entry
+	# fails — the table used to hold 7 rows for 20 events with nothing saying so, and a
+	# doc asserted a payload was "checked by its own unit tests" that no test named.
 	node scripts/tauri-event-scan.mjs --selftest
 	node scripts/tauri-event-scan.mjs
 	# Documented configuration (see scripts/env-doc-scan.mjs): every AMOS_* env var
@@ -657,6 +949,16 @@ lint:
 	# links and `env-doc-scan` sees env names — neither reads a command.
 	node scripts/make-target-doc-scan.mjs --selftest
 	node scripts/make-target-doc-scan.mjs
+	# Link-surface claim integrity (see scripts/link-surface-claim-scan.mjs, REQ-A896): the
+	# narrative that describes the System UI's AmOS-Link surface must agree with the bridge's
+	# actual command list. The robot command console landed four write-side commands
+	# (`link_publish` / `link_topics` / `link_watch_heartbeats` / `link_stop_heartbeats`) beside the
+	# read-only `link_status`, and six narrative surfaces kept saying the opposite — the bridge's own
+	# module doc ("one read-only command"), README twice, `docs/amos-link.md` §6, `LinkPage.svelte`'s
+	# header and the i18n block comment. `docs-link-scan` sees links, `make-target-doc-scan` sees
+	# commands, `claim-scan` sees allow-list reasons — none reads a *capability* claim.
+	node scripts/link-surface-claim-scan.mjs --selftest
+	node scripts/link-surface-claim-scan.mjs
 	# Makefile .PHONY hygiene (see scripts/phony-target-scan.mjs): an undeclared
 	# command target is *silently skippable* — a same-named file makes `make` report
 	# success without running it (the "gate that quietly does nothing" class), and a
@@ -664,6 +966,54 @@ lint:
 	# `timesync-smoke` were undeclared.
 	node scripts/phony-target-scan.mjs --selftest
 	node scripts/phony-target-scan.mjs
+	# Python type-stub integrity (see scripts/py-stub-scan.mjs, REQ-A719): the
+	# checked-in `.pyi` for `amos_link._native` is a *declared mirror* of the pyo3
+	# surface in crates/amos-link-py/src/lib.rs. Nothing read it, and it had drifted
+	# (a `History` class and `QoS(reliability, history)` that do not exist, a
+	# `NodeKind.GATEWAY` the module never had, `ReceivedMessage.peer_id`/`timestamp`
+	# where the module exposes `publisher`/`stamp`) — and it was named for nothing
+	# (`amos_link_py.pyi`), with no `py.typed`, so no tool read it at all. The crate
+	# is a maturin package, not a Cargo member, so no `cargo test` can host the check;
+	# this gate reads both files as text and fails on any class/member (or constructor
+	# parameter name) that exists on one side only.
+	node scripts/py-stub-scan.mjs --selftest
+	node scripts/py-stub-scan.mjs
+	# Kotlin SMS glue caps ↔ their Rust authority (see scripts/sms-glue-const-scan.mjs,
+	# REQ-A723): `SmsGlue.kt` declares its caps "mirroring crates/amos-sms/src/wire.rs"
+	# (three of the five actually live in validate.rs) and keeps a third copy of the
+	# folder `MESSAGE_TYPE_*` map. No host test reads the glue (it only compiles under
+	# the heavy Android/JDK path), so the two sides drift unseen — and the contract is
+	# two-sided (the glue truncates to its cap, Rust *rejects* a reply over its own),
+	# so a one-sided change blanks the on-device inbox. This reads both as text.
+	node scripts/sms-glue-const-scan.mjs --selftest
+	node scripts/sms-glue-const-scan.mjs
+	# Kotlin biometric glue ↔ the androidx `canAuthenticate` result codes (see
+	# scripts/biometric-glue-const-scan.mjs, REQ-A779): `BiometricGlue.kt` translates
+	# `BiometricManager.canAuthenticate(BIOMETRIC_STRONG)` into the two answers the
+	# settings screen shows. It shipped with the two *exchanged* — `BIOMETRIC_ERROR_
+	# NO_HARDWARE` (12) sat on the arm that reports the sensor as PRESENT, so a phone
+	# with no sensor was told "you have hardware, enrol a fingerprint", and
+	# `BIOMETRIC_ERROR_NONE_ENROLLED` (11) fell to `else`, so the one phone that should
+	# have been told exactly that was told "this device has no biometrics". Three more
+	# codes that answer *nothing* about the hardware were folded into "no sensor" too.
+	# No host test can reach the glue (it only compiles under the Android/JDK path), so
+	# this reads the Kotlin and the Rust as text and pins every code's answer to the
+	# meanings dumped from the linked artifact with `javap -constants` (SDK-verified,
+	# never from memory).
+	node scripts/biometric-glue-const-scan.mjs --selftest
+	node scripts/biometric-glue-const-scan.mjs
+	# Kotlin NFC glue ↔ the Rust/frontend read answer (see
+	# scripts/nfc-read-glue-const-scan.mjs, REQ-A781): `NfcGlue.readTagBytes()` returned
+	# `String?`, and that one `null` was the answer to "no tag is in the field", "the tag
+	# was read fine and holds no NDEF payload" and "the read threw"; `ble.rs` added a
+	# fourth (`Ok(result.flatten())` — unbound glue, JNI error, host build) and the screen
+	# had one branch for it, so all four printed "读取失败：系统没有返回卡片字节", a sentence
+	# about the tag. The reply's `id` is the other half: the glue acts on `lastTag` while
+	# the screen addresses a tag from a list, so a read that does not say which tag it read
+	# can be shown under the wrong one. Pins the glue's states, the Rust `NfcReadState`
+	# variants, the TS union, the notice keys and both locale dictionaries as text.
+	node scripts/nfc-read-glue-const-scan.mjs --selftest
+	node scripts/nfc-read-glue-const-scan.mjs
 
 # Regenerate the gRPC API reference after touching proto/*.proto (then commit it):
 # `make api-docs`. The doc is generated, never hand-edited.
@@ -869,6 +1219,24 @@ android-usb:
 android-voice-bringup:
 	bash scripts/android-voice-bringup.sh
 
+# One-shot DEVICE driver for the camera producer's use-after-free acceptance — the
+# executable half REQ-A45 left open. That round root-caused the `buffer is inaccessible`
+# use-after-free on the `amos-camera` thread and fixed it, but its own honest boundary
+# says the race cannot be reproduced on a host, so it needs device evidence — and the
+# acceptance steps it names include `CameraGlue.droppedFrameCount()`, a counter **nothing
+# in this repository can read** (no JNI entry point, no command, no caller). A protocol
+# whose instrument does not exist is not an acceptance protocol. This driver is that
+# instrument: it grants CAMERA, drives N foreground<->background cycles (the trigger
+# REQ-A45 identified — `MainActivity.onStart -> CameraGlue.attach` racing the reader
+# close), then judges the captured log against the named crash signatures, and
+# **refuses to pass** a run that never reached the camera (a green on an unexercised path
+# is the vacuous-gate defect F-DEV-074 registers).
+#   `make android-camera-bringup`                     -> dry run, prints the plan
+#   `make android-camera-bringup ARGS='--apply'`       -> run against the attached device
+#   `make android-camera-bringup ARGS='--selftest'`    -> the judge, on synthetic logs
+android-camera-bringup:
+	bash scripts/android-camera-bringup.sh $(ARGS)
+
 # One-shot device driver for the offline RAG chain (daemon `Rag` + rag_once +
 # bench_arm). Mirrors android-voice-bringup: --check-prereqs / --dry-run / --apply.
 # Pass extra args through ARGS (e.g. `make android-rag-bringup ARGS='--apply --device X'`).
@@ -887,20 +1255,24 @@ android-rag-bringup:
 #   3. install it with runtime permissions granted (`-g`).
 # Override the package/devices as needed: `make android-app DEVICE=...`.
 # Output goes to crates/amos-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk
-# (680 MB unstripped; `make android-app-strip` shrinks it to ~26 MB while keeping JNI exports).
+# (the debug build keeps its native symbols, so it is ~730 MB; `make android-app-strip`
+# re-packs it to a small signed APK — it prints the measured sizes).
 android-app:
 	scripts/android-glue-mirror.sh
 	cd crates/amos-tauri/frontend-ts && bun run build
 	cargo tauri android build --debug --features android --target aarch64
 	adb $(if $(DEVICE),-s $(DEVICE),) install -r -g crates/amos-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk
 
-# Strip the unstripped universal APK's libamos_tauri_lib.so of DWARF debug info, re-pack,
-# zipalign and debug-sign the result. Drops ~660 MB → ~26 MB while keeping every JNI export
-# (only the DWARF sections — `.debug_*`, `.symtab`, `.strtab` — are dropped; the dynamic
-# symbol table that the runtime loader consults is untouched). Requires NDK 23.x's
-# `llvm-strip` and a debug keystore (Android Studio's `~/.android/debug.keystore`).
+# Strip the unstripped universal APK's libamos_tauri_lib.so of DWARF debug info, re-pack
+# (STORED .so + resources.arsc, DEFLATE everything else), zipalign and debug-sign the
+# result. Keeps every JNI export — only the DWARF sections (`.debug_*`, `.symtab`,
+# `.strtab`) are dropped; the dynamic symbol table the runtime loader consults is
+# untouched. Requires NDK 23.x's `llvm-strip` and a debug keystore (Android Studio's
+# `~/.android/debug.keystore`). `--selftest` checks the packer's compression policy
+# without a device; `make gated-check` runs it.
 # Output: crates/amos-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug-stripped.apk
 android-app-strip:
+	bash scripts/android-app-strip.sh --selftest
 	bash scripts/android-app-strip.sh
 
 # Host-JVM gate for ALL the Android glue's Kotlin (no device needed): mirrors the
@@ -917,6 +1289,26 @@ android-app-strip:
 # and a warm Gradle cache — which is why it lives in `make verify`, not `make lint`.
 android-glue-check:
 	bash scripts/android-glue-nv21-check.sh
+
+# Four-layer device test for the in-call recording flow
+# (`AmosInCallService`, REQ-A1579 / F-TEL-038). Goes wider than `android-glue-check`
+# (which only pins the **host-JVM** half):
+#
+#   1. compile + host-JVM tests + Lint (mirrors `android-glue-check`'s surface),
+#   2. device pre-flight (verifies `com.amos.ai` 0.1.0 is installed and
+#      `RECORD_AUDIO` is granted on the connected ADB device),
+#   3. `:app:connectedArmDebugAndroidTest` — a real `MediaRecorder.start()/stop()`
+#      round-trip on the device writing into `<filesDir>/recordings/<id>.m4a`,
+#      pinned against the cross-language report envelope Rust's
+#      `parse_recording_report` consumes,
+#   4. `<filesDir>/recordings/` filesystem + permission probe (the live app uid
+#      must be able to create that directory and write into it).
+#
+# Pass `--skip-device` to run layer 1 only (no ADB required). Requires JDK 17 +
+# a connected S5/equivalent (the host names `YY000286`). Not in `verify`: a
+# device-only gate is not reproducible on CI's Ubuntu runner.
+android-recording-e2e:
+	bash scripts/recording-e2e.sh $(ARGS)
 
 # Cross-compile gate for the offline-RAG PDF data-extraction crate on Android.
 # The crate is pure Rust on lopdf (no C), so this only needs the rustup android
@@ -976,6 +1368,23 @@ clean:
 #   make device-media-probe                  # REQ-A350 acceptance: camera + recordings
 device-eval:
 	node scripts/device-ui-eval.mjs $(JS)
+
+# The **macOS** device tool (REQ-A486): read the real UI through the Accessibility tree and drive it
+# with real pointer events — the instruments that found most of this session's defects, now in the
+# repository instead of `/tmp` (a reading that cannot be re-run is not evidence). Build-on-demand; the
+# binary is cached under `target/device-tool/`.
+#   make device-tool ARGS='ax Amos 新建窗口'         # who is on screen, with frames/enabled/keycaps
+#   make device-tool ARGS='ax Amos 隐藏 --visible'    # …only what is actually inside a window
+#   make device-tool ARGS='activate Amos'            # bring it to the front (before clicking)
+#   make device-tool ARGS='rclick 793 868'           # open a Dock context menu
+#   make device-tool ARGS='click 893 928'            # click a row found above (inside the window!)
+#   make device-tool ARGS='scroll 700 500 10'        # bring off-screen content into the window
+#   make device-tool ARGS='key cmd+shift+n'          # a real chord (⌘⇧N works too)
+#   make device-tool ARGS='press Amos 新建窗口'       # activate a control via AX (bypasses the pointer)
+#   make device-tool ARGS='drag 300 120 430 250'     # a real drag
+# See docs/gui-verify.md §设备读数 for what each reading means and how to read it.
+device-tool:
+	bash scripts/device.sh $(ARGS)
 
 # Device-side acceptance for REQ-A350 (a memo must be a file the user can find):
 # reads the camera + recordings collections through the *real* host bridge on the

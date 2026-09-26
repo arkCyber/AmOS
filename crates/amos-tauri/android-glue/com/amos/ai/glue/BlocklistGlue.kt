@@ -60,14 +60,39 @@ object BlocklistGlue {
     /** Rust JNI upcall: `true` when this caller must be rejected. */
     private external fun shouldBlockCall(address: String): Boolean
 
-    /** Rust JNI upcall: `true` when at least one rule covers calls. */
-    private external fun hasCallRules(): Boolean
+    /**
+     * Rust JNI upcall: `true` when the call path can reject a call *at all* — a
+     * rule covers calls **or** the unknown-number switch is on.
+     *
+     * Not "at least one call rule exists": with the switch on and no call rules a
+     * withheld caller is still rejected (`shouldBlockCall("")`), so the role is
+     * still worth requesting. See `BlocklistState::filters_calls`.
+     */
+    private external fun filtersCalls(): Boolean
 
-    /** Whether requesting the call-screening role is worthwhile (call rules exist). */
+    init {
+        // The system can cold-start this process **just to screen one call**
+        // (`AmosCallScreeningService.onScreenCall`), in which case the Tauri
+        // runtime's normal library load never happened and every JNI declaration
+        // above is unbound. Touching this object is what triggers this block, so
+        // the library is loaded here too — the first `bind`/`mustRejectCall` from
+        // a screen-only process must not be an `UnsatisfiedLinkError` that
+        // `mustRejectCall`'s fail-open catch turns into "allow every call".
+        // (REQ-A1569 / F-TEL-036.)
+        try {
+            System.loadLibrary("amos_tauri_lib")
+        } catch (_: UnsatisfiedLinkError) {
+            // No native lib on the classpath (e.g. a host lint pass): the JNI calls
+            // below will throw and `mustRejectCall` stays fail-open, as before.
+            Log.w(TAG, "amos_tauri_lib not loaded — the blocklist engine is inert")
+        }
+    }
+
+    /** Whether requesting the call-screening role is worthwhile (a rule or the switch). */
     fun needsScreeningRole(context: Context): Boolean {
         if (screeningRoleHeld(context)) return false
         return try {
-            hasCallRules()
+            filtersCalls()
         } catch (t: Throwable) {
             false
         }
@@ -123,12 +148,27 @@ object BlocklistGlue {
      * Rust `blocklist_status`: does AmOS hold the Call Screening role right now?
      * `false` when the glue was never bound (no context) — callers must not read
      * that as "granted but off".
+     *
+     * So that a caller *can* tell the two apart, [`screeningRoleBoundReady`] answers
+     * the "were we able to ask at all?" half on its own; the Rust side folds it into
+     * `role_requestable`, which is the field the UI gates the sentence on.
      */
     @JvmStatic
     fun screeningRoleHeldBound(): Boolean {
         val ctx = appContext ?: return false
         return screeningRoleHeld(ctx)
     }
+
+    /**
+     * Rust `blocklist_status`: is the glue bound at all?
+     *
+     * `screeningRoleHeldBound` and `requestScreeningRoleBound` both open with
+     * `appContext ?: return false`, so this is exactly their reachability condition —
+     * a role request cannot be delivered until `bind` has run. A local check, so it
+     * cannot fail the way a JNI round-trip can.
+     */
+    @JvmStatic
+    fun screeningRoleBoundReady(): Boolean = appContext != null
 
     /**
      * Rust `blocklist_request_role`: post the system role dialog from the

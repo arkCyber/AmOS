@@ -24,15 +24,23 @@ export interface SensorGnss {
   /** WGS-84 degrees — `null` when the fix was not reported (never a fabricated 0). */
   latitude_deg: number | null;
   longitude_deg: number | null;
-  /** Horizontal accuracy in metres — `null` when not reported. */
+  /** Horizontal accuracy in metres, or `null` when the fix carries none. The wire is a
+   *  zero-sentinel `double` (no field presence) and Android returns `0.0` from
+   *  `getAccuracy()` for a fix with no estimate, so `0` is **unknown**, never a `±0m`
+   *  precision claim (REQ-A1623 / F-SH-825). */
   accuracy_m: number | null;
-  /** Satellites in use — `null` when not reported. */
+  /** Satellites in use, or `null` when not reported. `Location` carries no satellite
+   *  count, so the producer writes `0` to mean "not reported" and `0` is **unknown**,
+   *  never a `0sats` count the receiver never had (REQ-A1623 / F-SH-825). */
   sats: number | null;
   fix_mode: string;
 }
 
 export interface SensorImu {
-  rate_hz: number;
+  /** The negotiated IMU report rate in Hz, or `null` when the producer has not negotiated
+   *  one yet. The wire writes `0` for "not negotiated" (`uint32` has no presence), so `0`
+   *  is **unknown**, never a 0 Hz measurement (REQ-A1612 / F-SH-821). */
+  rate_hz: number | null;
   /** Acceleration in m/s² — `null` when the bus reported no sample for that axis.
    *  An absent reading is **unknown**, never a fabricated `0` (AEROSPACE P0-3: a
    *  zero here would read as "the device is perfectly still", i.e. a measurement). */
@@ -62,6 +70,25 @@ export interface SensorAcquireResult {
 /** Total pixel count of a camera preview (0 when unknown). */
 export function sensorPixels(c: SensorCamera): number {
   return c.width > 0 && c.height > 0 ? c.width * c.height : 0;
+}
+
+/**
+ * The `±Nm` accuracy clause for a GNSS fix, or `null` when there is no accuracy to state.
+ *
+ * A `null` / non-finite / `≤ 0` accuracy is the platform's "no accuracy reported" sentinel —
+ * `0` is the wire's no-presence value and a negative is not a precision — so the clause is
+ * dropped, exactly as a `null` field is dropped from the fix line (REQ-A1623).
+ *
+ * A **positive** accuracy is a measurement and must never be rounded down to `±0m`: `0.4 m`
+ * is a real reading, and `±0m` reads as a *perfect* fix — the very string the wire's `0`
+ * sentinel produced before it was folded (REQ-A1623 / F-SH-825). Rounding a positive error
+ * *up* to `1 m` is the conservative direction (`±1m` is still true of a 0.4 m fix), and it
+ * is the rule `gps.ts::accuracyLabel` follows one snapshot over — it tiers a positive
+ * accuracy so nothing ever rounds to `±0m`.
+ */
+export function gnssAccuracyLabel(acc: number | null): string | null {
+  if (acc === null || !Number.isFinite(acc) || acc <= 0) return null;
+  return `±${Math.max(1, Math.round(acc))}m`;
 }
 
 /** Number of cameras the snapshot reports. */
@@ -108,7 +135,11 @@ function normalizeImu(raw: unknown): SensorImu | null {
   const imu = asRecord(raw);
   if (!imu) return null;
   return {
-    rate_hz: optNum(imu.rate_hz) ?? 0,
+    // The wire's `uint32 rate_hz` has no field presence, and the producer writes `0` to
+    // mean "not negotiated yet" (see `SensorImu::rate_hz`), so a wire `0` is **unknown**,
+    // never a 0 Hz rate — the same fold the Rust payload applies, kept here so an older
+    // daemon that still sends `0` cannot make the panel print `@0 Hz` (REQ-A1612).
+    rate_hz: imu.rate_hz === 0 ? null : optNum(imu.rate_hz),
     accel_x: optNum(imu.accel_x),
     accel_y: optNum(imu.accel_y),
     accel_z: optNum(imu.accel_z),
@@ -127,8 +158,13 @@ function normalizeGnss(raw: unknown): SensorGnss | null {
     has_fix: optBool(g.has_fix),
     latitude_deg: optNum(g.latitude_deg),
     longitude_deg: optNum(g.longitude_deg),
-    accuracy_m: optNum(g.accuracy_m),
-    sats: optNum(g.sats),
+    // Both wires are zero-sentinel (`double` / `uint32`, no field presence) and the
+    // producer writes `0` for "not reported" — Android's `getAccuracy()` returns `0.0`
+    // and `Location` carries no satellite count. Read `0` as **unknown** here too, so an
+    // older daemon that still sends `0` cannot make the panel print `±0m · 0sats`
+    // (the rule `gps.ts::accuracyLabel` already follows one field over; REQ-A1623).
+    accuracy_m: g.accuracy_m === 0 ? null : optNum(g.accuracy_m),
+    sats: g.sats === 0 ? null : optNum(g.sats),
     fix_mode: typeof g.fix_mode === "string" ? g.fix_mode : "",
   };
 }

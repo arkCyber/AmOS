@@ -62,6 +62,25 @@ pub const MAX_TERM_ALLOW_BYTES: usize = 256;
 /// Upper bound on the **number** of binaries in one allowlist.
 pub const MAX_TERM_ALLOW_LEN: usize = 64;
 
+/// Upper bound on a `term_resize` column count.
+///
+/// `cols`/`rows` are `u16`, so the wire can carry up to 65535 — a value no
+/// real terminal has, and one some PTY backends answer by panicking or
+/// spinning rather than returning `EINVAL`. A 1000-column window is already
+/// far past any legitimate display (a 4K portrait monitor is ~240 columns),
+/// so this is a generous ceiling that still refuses a nonsensical one.
+pub const MAX_TERM_COLS: u16 = 1000;
+
+/// Upper bound on a `term_resize` row count. See [`MAX_TERM_COLS`].
+pub const MAX_TERM_ROWS: u16 = 500;
+
+/// (Policy helper, pure) Whether a `term_resize` request is within the
+/// realistic window bounds — `> 0` on both axes and `<=` the ceilings above.
+/// Extracted so the boundary is unit-testable without a live PTY.
+pub fn resize_within_bounds(cols: u16, rows: u16) -> bool {
+    (1..=MAX_TERM_COLS).contains(&cols) && (1..=MAX_TERM_ROWS).contains(&rows)
+}
+
 /// Uniform result envelope for every terminal bridge call.
 #[derive(Debug, Clone, Serialize)]
 pub struct TermOut {
@@ -358,8 +377,10 @@ pub async fn term_kill(session: u64) -> TermOut {
 /// Resize a session's PTY window (TIOCSWINSZ).
 #[tauri::command]
 pub async fn term_resize(session: u64, cols: u16, rows: u16) -> TermOut {
-    if cols == 0 || rows == 0 {
-        return err("terminal: invalid resize (cols/rows must be > 0)");
+    if !resize_within_bounds(cols, rows) {
+        return err(format!(
+            "terminal: invalid resize (cols {cols}, rows {rows}; must be 1..={MAX_TERM_COLS} x 1..={MAX_TERM_ROWS})"
+        ));
     }
     #[cfg(feature = "terminal-pty")]
     {
@@ -402,6 +423,21 @@ pub fn allowed(allowlist: Option<&[String]>, bin: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A resize is bounded on **both** ends: zero (which the older check caught)
+    /// and the `u16` ceiling a paste attack could carry (which it did not).
+    #[test]
+    fn resize_bounds_refuse_zero_and_the_u16_ceiling() {
+        assert!(resize_within_bounds(80, 24), "a normal window is fine");
+        assert!(resize_within_bounds(MAX_TERM_COLS, MAX_TERM_ROWS));
+        assert!(!resize_within_bounds(0, 24), "zero columns is refused");
+        assert!(!resize_within_bounds(80, 0), "zero rows is refused");
+        assert!(
+            !resize_within_bounds(u16::MAX, 24),
+            "the u16 maximum must not reach the PTY backend"
+        );
+        assert!(!resize_within_bounds(80, MAX_TERM_ROWS + 1));
+    }
 
     #[test]
     fn allowlist_policy_is_fail_open_only_when_unrestricted() {

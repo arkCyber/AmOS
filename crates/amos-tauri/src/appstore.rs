@@ -434,14 +434,36 @@ pub async fn appstore_uninstall(state: State<'_, StoreBridge>, id: String) -> Ap
         )
     })?;
     state.persist_best_effort();
+    // Drop the app's declared egress from the netguard registry so a removed app
+    // stops contributing rules. Best-effort on purpose: uninstall must succeed
+    // even with no daemon attached (the registry then keeps a stale entry until
+    // the next restart — never a reason to fail the uninstall).
+    if let Err(e) = crate::netguard::revoke_app_egress(&id).await {
+        tracing::warn!(
+            target: "amos::appstore",
+            app = %id,
+            "uninstalled app's egress declaration not revoked with the netguard daemon \
+             (best-effort): {e}"
+        );
+    }
     Ok(())
 }
 
-/// Validate the caller-supplied app id at the command seam and refuse path-segment
-/// metacharacters (`..` / `/` / `\`) so an id cannot escape `<install-root>/`.
-/// Mirrors the same `valid_id` rule the install/upgrade paths use internally —
-/// exposes it here so a UI bug cannot slip an unvalidated id to the on-disk
-/// `dir_for(id)` join in `webinstall`.
+/// Validate the caller-supplied app id at the command seam.
+///
+/// The slug rule is **not** re-implemented here: it is
+/// [`amos_appstore::is_valid_app_id`] — the store's own `valid_id`, which
+/// `AppManifest::validate` and every filesystem-touching install path
+/// (`webinstall::check_id`, `host` netloc, `pwa`) already share. This seam adds only
+/// the two bounds the store does not own — a non-empty id and [`MAX_APPSTORE_ID_BYTES`]
+/// — and otherwise **defers**, so a UI bug cannot hand the on-disk `dir_for(id)` join
+/// a value the store would later refuse with a *different* error.
+///
+/// It exists because the two rules had **drifted**: this function used to hand-roll a
+/// looser check (path metacharacters only) while claiming to "mirror the same `valid_id`
+/// rule the install/upgrade paths use internally". An id like `com.example.My_App-1`
+/// therefore passed here and was refused deeper in the store, and a unit test had
+/// enshrined exactly that disagreement (REQ-A732 / F-SH-190).
 ///
 /// Returns `Ok(())` on success; [`AppStoreResult`] on failure so callers can
 /// use `?` without wrapping.
@@ -462,18 +484,10 @@ fn validate_appstore_id(id: &str) -> AppStoreResult<()> {
             ),
         ));
     }
-    if id.contains('/')
-        || id.contains('\\')
-        || id.contains('\0')
-        || id == "."
-        || id == ".."
-        || id.starts_with("../")
-        || id.contains("/../")
-        || id.ends_with("/..")
-    {
+    if !amos_appstore::is_valid_app_id(id) {
         return Err(AmosError::new(
             ErrorCode::AppStoreIdInvalid,
-            format!("appstore id is not a valid id: {id:?}"),
+            format!("appstore id is not a valid app slug: {id:?}"),
         ));
     }
     Ok(())
@@ -632,6 +646,87 @@ pub fn csp_probe(report: String) {
 #[tauri::command]
 pub fn pwa_index_url() -> String {
     amos_appstore::index_base_url()
+}
+
+/// Open a **remote** PWA manifest by URL: fetch it over HTTPS, validate it with
+/// the same strict parser the local index uses, and install it into the active
+/// index (persisted under `$AMOS_PWA_INDEX_DIR` when configured).
+///
+/// The whole policy lives in `amos_appstore::pwa::open_remote_pwa` — this command
+/// is the thin, typed seam over it:
+///
+/// * the URL is length-checked here (a paste-sized string never reaches the
+///   engine), then the engine refuses anything that is not `https://` on a host
+///   in `$AMOS_PWA_REMOTE_ALLOW` (no wildcard, no cleartext, no TLS downgrade);
+/// * the fetch is a **blocking** call with a 10 s timeout and a 256 KiB body cap,
+///   so it runs on `spawn_blocking` and never stalls the async runtime;
+/// * a failure is an [`AmosError`] envelope with the engine's truthful reason
+///   (which host, which field), never a generic "install failed".
+///
+/// # Not persisted here
+///
+/// `open_remote_pwa` persists the *manifest* itself (`apps/<id>.toml`). The
+/// app-store **registry** (installed app packages) is a different artifact and is
+/// untouched by this command: opening a PWA registers a web app in the index, it
+/// does not install a package.
+#[tauri::command]
+pub async fn pwa_open_remote(url: String) -> AppStoreResult<amos_appstore::PwaManifest> {
+    if url.trim().is_empty() {
+        return Err(AmosError::new(
+            ErrorCode::AppStoreIdEmpty,
+            "pwa_open_remote: manifest URL is empty",
+        ));
+    }
+    if url.len() > amos_appstore::pwa::MAX_MANIFEST_URL_BYTES {
+        return Err(AmosError::new(
+            ErrorCode::AppStoreIdTooLong,
+            format!(
+                "pwa_open_remote: manifest URL is {} bytes (max {})",
+                url.len(),
+                amos_appstore::pwa::MAX_MANIFEST_URL_BYTES
+            ),
+        ));
+    }
+    // The fetch is a blocking HTTPS GET: keep it off the async executor.
+    let fetched = tokio::task::spawn_blocking(move || amos_appstore::open_remote_pwa(&url))
+        .await
+        .map_err(|e| {
+            AmosError::new(
+                ErrorCode::AppStoreInstallFailed,
+                format!("pwa_open_remote: fetch task failed: {e}"),
+            )
+        })?;
+    let manifest: amos_appstore::PwaManifest = fetched.map_err(|e| {
+        AmosError::with_cause(
+            ErrorCode::AppStoreInstallFailed,
+            format!("pwa_open_remote refused the manifest: {e}"),
+            e,
+        )
+    })?;
+
+    // Register the manifest's declared egress with the netguard daemon, so
+    // `allowed_domains` is a **held rule** the daemon can report, not only a
+    // WebView CSP header. Best-effort on purpose: opening a PWA must still work
+    // with no daemon attached (the declaration is then simply not registered and
+    // `netguard_status` reports the truth — never a fabricated hold).
+    //
+    // `uid = 0`: a hosted bundle shares the shell's uid, so it cannot be
+    // isolated at the packet layer. The daemon records the declaration
+    // (`declared_apps`) without inventing a uid to make a rule of it — see
+    // `SetAppEgressRequest.uid`. The manifest validator already guaranteed every
+    // host is in the allow-list grammar, so the daemon will not refuse them.
+    let domains = manifest.permissions.network.allowed_domains.clone();
+    if let Err(e) = crate::netguard::grant_app_egress(&manifest.app.id, 0, &domains).await {
+        tracing::warn!(
+            target: "amos::appstore",
+            app = %manifest.app.id,
+            hosts = domains.len(),
+            "PWA declared egress not registered with the netguard daemon \
+             (best-effort; netguard_status will not show it): {e}"
+        );
+    }
+
+    Ok(manifest)
 }
 
 /// Where an installed web-bundle's entry document lives, as the WebView must
@@ -1097,21 +1192,65 @@ mod tests {
     }
 
     /// The `validate_appstore_id` seam is the single place that decides whether an
-    /// id may proceed to the on-disk `dir_for(id)` join. The unit tests below
-    /// pin down what is (and is not) acceptable, so a future relaxation is a
-    /// conscious change rather than a silent drift toward "anything goes".
+    /// id may proceed to the on-disk `dir_for(id)` join. It must agree with the
+    /// store's own slug rule ([`amos_appstore::is_valid_app_id`]) rather than carry a
+    /// second, looser copy — the disagreement this test table would have caught.
+    #[test]
+    fn validate_appstore_id_agrees_with_the_store_slug_rule() {
+        for id in [
+            "org.amos.pomodoro",
+            "a",
+            "a-b_c.d",
+            "com.example.1_2-3",
+            // The values the old hand-rolled check wrongly accepted (the store refuses
+            // every one of them): uppercase, a space, a repeated/leading/trailing
+            // separator, and a disallowed character.
+            "com.example.My_App-1",
+            "has space",
+            "a..b",
+            "-lead",
+            "trail-",
+            "org.amos/pomodoro",
+            "org.amos:pomodoro",
+        ] {
+            assert_eq!(
+                validate_appstore_id(id).is_ok(),
+                amos_appstore::is_valid_app_id(id),
+                "the seam and the store must agree on id {id:?}"
+            );
+        }
+    }
+
     #[test]
     fn validate_appstore_id_accepts_well_formed_ids() {
         for ok in [
             "org.amos.pomodoro",
             "a",
             "a-b_c.d",
-            "com.example.My_App-1",
             "x".repeat(MAX_APPSTORE_ID_BYTES).as_str(),
         ] {
             assert!(
                 validate_appstore_id(ok).is_ok(),
                 "legitimate id {ok:?} should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_appstore_id_rejects_ids_the_store_would_refuse() {
+        // These are *not* path-traversal shaped, so the old metacharacter-only check
+        // let them through even though the store's `valid_id` rejects them — the seam
+        // and the install path disagreed. Pinning them here keeps them refused.
+        for bad in [
+            "com.example.My_App-1",
+            "has space",
+            "a..b",
+            "-lead",
+            "trail-",
+        ] {
+            assert!(
+                validate_appstore_id(bad).is_err(),
+                "id {bad:?} fails the store slug rule and must be refused at the seam"
             );
         }
     }
@@ -1169,6 +1308,11 @@ mod tests {
         assert_eq!(e.code(), "amos.appstore.id_too_long");
 
         let e = validate_appstore_id("../etc/passwd").unwrap_err();
+        assert_eq!(e.code(), "amos.appstore.id_invalid");
+
+        // A slug-rule refusal (not path-shaped) reports the same typed code, so the JS
+        // layer renders the same translated explanation for both.
+        let e = validate_appstore_id("has space").unwrap_err();
         assert_eq!(e.code(), "amos.appstore.id_invalid");
     }
 }

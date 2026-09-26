@@ -204,10 +204,23 @@ fn armed_link_mirrors_a_background_copy_and_ingests_the_container_reply() {
         "the container copy must land in the host shared clipboard"
     );
 
+    // The guest confirmed the push it applied; the ack rides the same socket and is
+    // ingested by the host ingest loop as an `Ack` (never as a copy). The two
+    // directions are independent asynchronous paths, so wait for the read rather
+    // than assuming the frame already landed.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && link::status().stats.acks == 0 {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
     // --- Audit tells the truth -------------------------------------------------
     let st = link::status();
     assert!(st.armed && st.connected);
     assert_eq!(st.stats.pushes, 1, "exactly one push reached the wire");
+    assert_eq!(
+        st.stats.acks, 1,
+        "the guest must confirm, over the real socket, the push it applied"
+    );
     assert_eq!(st.stats.push_failures, 0);
     assert_eq!(
         st.stats.ingests, 1,

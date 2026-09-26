@@ -10,6 +10,9 @@
  * Honest semantics:
  *  * A `camera_frame` event carries only *metadata* (id / size / format / seq) —
  *    frame bytes never cross this event bus (they stay in the media plane).
+ *  * A `vitals` event carries the wellness pair (cumulative steps / heart rate); each
+ *    reading is `number | null` because a device may expose neither, one or both, and
+ *    an absent reading is **not** a `0` measurement.
  *  * A `cleared` event means a producer detached and the bus dropped its samples.
  *  * Only *accepted* changes are announced: a stale/out-of-order IMU push or a
  *    malformed frame is silently refused and never broadcasts.
@@ -21,8 +24,6 @@ import { subscribe } from "./backend";
 
 /** Tauri event name for one real-time sensor change (Rust bridge emits this). */
 export const SENSOR_DATA_EVENT = "sensor-data";
-
-export type SensorDataKind = "imu" | "camera_frame" | "mode" | "cleared";
 
 /**
  * Serializable mirror of the Rust `HostImu` sample payload.
@@ -52,6 +53,21 @@ export interface SensorFrameDatum {
   seq: number;
 }
 
+/**
+ * Serializable mirror of the Rust `HostVitals` (the wellness pair).
+ *
+ * Both readings are `number | null`: `null` means the device reported **no reading**
+ * (no such sensor, or a heart-rate sensor with no contact), and it is **not** the same
+ * fact as `0` (a fabricated `0` steps / `0` bpm reads as a measurement). The Health app
+ * prints `—` for `null` (REQ-A1454).
+ */
+export interface SensorVitalsDatum {
+  timestamp_ms: number;
+  /** Cumulative step count since boot (Android `TYPE_STEP_COUNTER` semantics). */
+  steps_total: number | null;
+  heart_rate_bpm: number | null;
+}
+
 /** Serializable mirror of the Rust `SensorHostEvent` (snake_case wire keys). */
 export interface SensorDataEvent {
   ts_ms: number;
@@ -62,6 +78,8 @@ export interface SensorDataEvent {
   imu: SensorImuDatum | null;
   /** Set when `kind === "camera_frame"`. */
   frame: SensorFrameDatum | null;
+  /** Set when `kind === "vitals"`. */
+  vitals: SensorVitalsDatum | null;
   /** Set when `kind === "mode"` — the mode we left. */
   prev_mode: string | null;
 }
@@ -70,7 +88,9 @@ function isObj(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null;
 }
 
-const KINDS: readonly SensorDataKind[] = ["imu", "camera_frame", "mode", "cleared"];
+/** The one declaration of the sensor data kinds; {@link SensorDataKind} derives from it. */
+export const KINDS = ["imu", "camera_frame", "vitals", "mode", "cleared"] as const;
+export type SensorDataKind = (typeof KINDS)[number];
 
 function num(v: unknown): number | null {
   return typeof v === "number" && Number.isFinite(v) ? v : null;
@@ -99,6 +119,26 @@ function toImu(v: unknown): SensorImuDatum | null {
   };
 }
 
+/**
+ * Normalize the vitals payload. Both readings are optional by design — a device may
+ * expose the step counter, the heart-rate sensor, both or neither — so a well-shaped
+ * block is one that carries a finite `timestamp_ms`; the two readings stay `null` when
+ * absent/non-finite (never `0`). A block with **neither** reading is still returned: the
+ * Rust side only announces a material change, and "both absent" is a real state (the
+ * heart rate lost contact while the step counter is not running) the app must be able to
+ * show.
+ */
+export function normalizeVitals(v: unknown): SensorVitalsDatum | null {
+  if (!isObj(v)) return null;
+  const timestamp_ms = num(v.timestamp_ms);
+  if (timestamp_ms === null) return null;
+  return {
+    timestamp_ms,
+    steps_total: num(v.steps_total),
+    heart_rate_bpm: num(v.heart_rate_bpm),
+  };
+}
+
 function toFrame(v: unknown): SensorFrameDatum | null {
   if (!isObj(v)) return null;
   const id = num(v.id);
@@ -121,8 +161,10 @@ export function toSensorData(raw: unknown): SensorDataEvent | null {
   if (ts_ms === null || !KINDS.includes(kind)) return null;
   const imu = toImu(raw.imu);
   const frame = toFrame(raw.frame);
+  const vitals = normalizeVitals(raw.vitals);
   if (kind === "imu" && !imu) return null;
   if (kind === "camera_frame" && !frame) return null;
+  if (kind === "vitals" && !vitals) return null;
   return {
     ts_ms,
     kind,
@@ -130,6 +172,7 @@ export function toSensorData(raw: unknown): SensorDataEvent | null {
     mode: str(raw.mode, "unknown"),
     imu,
     frame,
+    vitals,
     prev_mode: typeof raw.prev_mode === "string" ? raw.prev_mode : null,
   };
 }
@@ -141,11 +184,13 @@ export function isKind(ev: SensorDataEvent, kind: SensorDataKind): boolean {
 
 /**
  * Subscribe to the `sensor-data` feed and invoke `onEvent` for every well-shaped
- * change. Returns an unsubscribe (a no-op outside Tauri / when offline).
+ * change. Returns an unsubscribe, or `null` when the subscription was not established
+ * (REQ-A838) — a sensor that is steady and a sensor feed we are not on produce the same
+ * silence, so the caller must be able to tell which one it is holding.
  */
 export async function subscribeSensorData(
   onEvent: (ev: SensorDataEvent) => void,
-): Promise<() => void> {
+): Promise<(() => void) | null> {
   return subscribe(SENSOR_DATA_EVENT, (raw) => {
     const ev = toSensorData(raw);
     if (ev) onEvent(ev);

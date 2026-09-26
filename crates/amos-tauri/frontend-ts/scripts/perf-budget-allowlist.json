@@ -1,0 +1,14 @@
+{
+  "_why": "Sites where a performance budget is deliberately measured by a SINGLE clock delta instead of min-of-K. An entry is a decision, not a proof: each one has to say which kind it is and, in its own `note`, why this site is different from the other 22 (see REQ-A850 / F-DEV-106). The list is empty on purpose — every budget assertion in the tree is bound through fastest()/fastestAsync() (`src/__tests__/perfBudget.ts`), and a site may only be added here with an argument that survives being read out loud.",
+  "kinds": {
+    "measures-machine-not-code": {
+      "reason": "The assertion's verdict is about how loaded the machine was, not about the code. Nothing in this repo has a legitimate use for that.",
+      "note": "Kept as a defined kind with no members so that adding the first member is an explicit, reviewable act rather than a new category."
+    },
+    "semantics-not-performance": {
+      "reason": "The measurement is a claim about TIME ITSELF (a timeout, a debounce, a dwell), not about the code's cost — so it must be single-shot, and the budget is a semantic constant rather than a performance envelope.",
+      "note": "Correct member shape: file::ident, kind semantics-not-performance, plus a note naming the semantic constant (e.g. 'the 300ms debounce from lib/debounce.ts') and the test that would fail if the constant were wrong."
+    }
+  },
+  "sites": []
+}

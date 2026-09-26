@@ -268,6 +268,17 @@ export function clockIdioms(sources) {
  * deliberate — adding a second draw to an already-excused file is exactly how this family
  * grew the first time, so it must make the maintainer look again (`count-drift`).
  */
+/** Whether a `kind` no site references declares why it is still on file (REQ-A1492):
+ *  a non-empty `note` on an object-shaped kind, or a reason beginning `RETIRED` ∕
+ *  `UNUSED` ∕ `KEPT` — the spellings the other allow-lists already use. */
+function declaresMemberless(spec) {
+  if (spec && typeof spec === "object") {
+    if (typeof spec.note === "string" && spec.note.trim() !== "") return true;
+    return /^(RETIRED|UNUSED|KEPT)\b/.test(String(spec.reason ?? "").trim());
+  }
+  return /^(RETIRED|UNUSED|KEPT)\b/.test(String(spec ?? "").trim());
+}
+
 export function scan({ sources, allow }) {
   const findings = [];
   const hits = scanHits(sources);
@@ -275,6 +286,19 @@ export function scan({ sources, allow }) {
   for (const h of hits) {
     if (!byFile.has(h.file)) byFile.set(h.file, []);
     byFile.get(h.file).push(h);
+  }
+
+  // The `kinds` map is the allow-list's second dimension (REQ-A1492): a kind no site
+  // references is a permission nobody asked for, and nothing looked at it — the scan reads
+  // kinds *for* the sites, never the other way, so a reason can outlive the site it
+  // described. `write-allowlist.json`'s `derived-tick` rotted exactly that way.
+  const referencedKinds = new Set(
+    (allow.sites ?? []).map((s) => s?.kind).filter((k) => typeof k === "string"),
+  );
+  for (const [name, spec] of Object.entries(allow.kinds ?? {})) {
+    if (!referencedKinds.has(name) && !declaresMemberless(spec)) {
+      findings.push({ kind: "memberless-kind", detail: name });
+    }
   }
 
   const entries = [];
@@ -514,6 +538,29 @@ function runSelfTest() {
   want(
     "R3: the sanctioned generator itself is exempt by name",
     clockIdioms([{ file: "src/lib/localId.ts", src: "export function localId(prefix) {\n  return `${prefix}-${Date.now()}-${seq}`;\n}" }]),
+    [],
+  );
+
+  // The kinds map's second dimension (REQ-A1492): a kind no site references is a permission
+  // nobody asked for, and the scan never looked at it (it reads kinds *for* the sites).
+  want(
+    "a memberless kind that explains nothing is reported",
+    kinds(scan({ sources: [], allow: { kinds: { "presentation-draw": "why" }, sites: [] } })),
+    ["memberless-kind"],
+  );
+  want(
+    "a memberless kind that declares itself is not reported",
+    kinds(scan({ sources: [], allow: { kinds: { k: "UNUSED — never had a site." }, sites: [] } })),
+    [],
+  );
+  want(
+    "a kind a site references is not reported",
+    kinds(
+      scan({
+        sources: [{ file: "src/lib/a.ts", src: "const x = Math.random();" }],
+        allow: { kinds: { k: "why" }, sites: [{ file: "src/lib/a.ts", kind: "k", hits: 1 }] },
+      }),
+    ),
     [],
   );
 

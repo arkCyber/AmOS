@@ -15,6 +15,7 @@ import {
   isSaved,
   normalizeWifi,
   wifiInit,
+  wifiLink,
   NEIGHBORHOOD,
   type WifiCfg,
 } from "../lib/wifi";
@@ -170,5 +171,22 @@ describe("wifi persistence guard", () => {
     expect(normalizeWifi("x")).toEqual(wifiInit());
     expect(normalizeWifi({ current: "" }).saved).toEqual([]);
     expect(normalizeWifi({ current: 5 }).current).toBeNull();
+  });
+});
+
+describe("wifiLink — the three-state link fact a Wi-Fi row shows (REQ-A1123)", () => {
+  test("radio off is 'off', regardless of a remembered SSID", () => {
+    // The SSID outlives the radio: reading only `current` is what made the Settings
+    // index say 「未连接」/「开」 while the phone was joined or off.
+    expect(wifiLink(false, "Cafe_Free")).toEqual({ kind: "off" });
+    expect(wifiLink(false, null)).toEqual({ kind: "off" });
+  });
+
+  test("radio on with nothing joined is 'unjoined' — not 'joined'", () => {
+    expect(wifiLink(true, null)).toEqual({ kind: "unjoined" });
+  });
+
+  test("radio on and joined names the network", () => {
+    expect(wifiLink(true, "Cafe_Free")).toEqual({ kind: "joined", ssid: "Cafe_Free" });
   });
 });

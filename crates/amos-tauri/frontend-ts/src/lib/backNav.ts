@@ -22,7 +22,7 @@
  */
 
 /** Which surface the shell is showing (mirrors `shellState.Surface["kind"]`). */
-export type BackSurface = "home" | "app" | "library" | "lock" | "edit";
+export type BackSurface = "home" | "app" | "library" | "lock" | "edit" | "split";
 
 /** The system overlays that sit above the surface (independent flags in `shellState`). */
 export interface BackOverlays {
@@ -38,11 +38,14 @@ export interface BackPosition {
 }
 
 /** What a back press should do, or `none` = "nothing left inside the shell". */
-export type BackAction = "close-overlay" | "home" | "none";
+export type BackAction = "close-overlay" | "home" | "exit-split" | "none";
 
 /** Depth of a position: one history entry per level. */
 export function levelOf(p: BackPosition): number {
-  const base = p.surface === "app" || p.surface === "library" || p.surface === "edit" ? 1 : 0;
+  const base =
+    p.surface === "app" || p.surface === "library" || p.surface === "edit" || p.surface === "split"
+      ? 1
+      : 0;
   return base + (topOverlay(p.overlays) === null ? 0 : 1);
 }
 
@@ -73,6 +76,10 @@ export function topOverlay(o: BackOverlays): "nc" | "spot" | "recents" | null {
  */
 export function backActionAt(p: BackPosition): BackAction {
   if (topOverlay(p.overlays) !== null) return "close-overlay";
+  // A split is one level like an app, but back collapses it to the **primary app**
+  // rather than jumping home — the secondary pane is what the user is undoing
+  // (REQ-A512). `exitSplit()` owns that transition.
+  if (p.surface === "split") return "exit-split";
   if (p.surface === "app" || p.surface === "library" || p.surface === "edit") return "home";
   return "none";
 }

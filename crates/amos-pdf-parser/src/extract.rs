@@ -8,14 +8,21 @@
 //!
 //! Soft failures are local: one unreadable page yields a warning + empty text,
 //! not a failed document, which is the behaviour an ingestion queue wants.
+//!
+//! One failure is *not* soft: an **encrypted** document is refused with
+//! [`PdfError::Encrypted`]. `lopdf` loads an encrypted file's *structure* but not
+//! its (still encrypted) streams, so continuing would emit whatever the ciphertext
+//! happens to decode to — garbage or silently empty pages, presented as success.
+//! With no password API to open the file, the crate declines instead
+//! (REQ-A594 / F-SH-080).
 
 use std::path::Path;
 
 use lopdf::{Document, ObjectId};
 
 use crate::error::{PdfError, Result};
-use crate::layout::{ascii_text, rows_from_ops_decoded};
-use crate::model::{ParsedPage, ParsedPdf, Table};
+use crate::layout::{ascii_text, rows_from_ops_decoded, Row};
+use crate::model::{ParsedPage, ParsedPdf};
 use crate::table::detect_tables;
 
 /// Behaviour switches for one extraction run.
@@ -110,6 +117,15 @@ pub fn extract_path<P: AsRef<Path>>(path: P) -> Result<ParsedPdf> {
 
 /// Extract every page from an already-loaded `lopdf` document.
 pub fn extract_document(doc: &Document, source_name: &str, do_tables: bool) -> Result<ParsedPdf> {
+    // `lopdf` parses an encrypted document's *structure* and leaves `/Encrypt` in
+    // the trailer, but its strings and streams stay encrypted. Decoding those as
+    // plaintext would hand back a "successful" document whose pages are garbled or
+    // silently empty — the partial nonsense this crate promises never to emit. We
+    // have no password API, so an encrypted file (including owner-password-only
+    // ones that an empty user password would open) is refused with a typed error.
+    if doc.is_encrypted() {
+        return Err(PdfError::Encrypted);
+    }
     let page_ids = doc.get_pages();
     let page_count = page_ids.len();
     let mut pages = Vec::with_capacity(page_count);
@@ -128,11 +144,20 @@ pub fn extract_document(doc: &Document, source_name: &str, do_tables: bool) -> R
 
         let mut page = ParsedPage::new(page_number as usize, text);
 
-        if do_tables {
-            if let Some(page_id) = page_ids.get(&page_number) {
-                match tables_for_page(doc, *page_id, page.number) {
-                    Ok((tables, fallback_cells)) => {
-                        page.tables = tables;
+        // The font-aware cell walk runs when the table pass needs it, **and**
+        // whenever the canonical text came back empty: its fallback count is the
+        // only detector for the *silent* loss `extract_text` performs (see
+        // `decoded_rows_for_page`). Gating it on `do_tables` alone meant a caller
+        // asking only for text was handed a page that had lost its content with
+        // nothing in `warnings` saying so (REQ-A1785 / F-SH-888).
+        if let Some(page_id) = page_ids.get(&page_number) {
+            let page_text_is_empty = page.text.trim().is_empty();
+            if do_tables || page_text_is_empty {
+                match decoded_rows_for_page(doc, *page_id) {
+                    Ok((rows, fallback_cells)) => {
+                        if do_tables {
+                            page.tables = detect_tables(page_number as usize, &rows);
+                        }
                         if fallback_cells > 0 {
                             // No silent data loss: surface the degradation so the
                             // caller knows text may be lossy (ASCII fallback).
@@ -142,7 +167,16 @@ pub fn extract_document(doc: &Document, source_name: &str, do_tables: bool) -> R
                             ));
                         }
                     }
-                    Err(e) => warnings.push(format!("page {page_number}: table pass failed ({e})")),
+                    Err(e) => {
+                        if do_tables {
+                            warnings.push(format!("page {page_number}: table pass failed ({e})"));
+                        } else if page_text_is_empty {
+                            warnings.push(format!(
+                                "page {page_number}: content could not be decoded ({e}); \
+                                 reported empty"
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -157,18 +191,19 @@ pub fn extract_document(doc: &Document, source_name: &str, do_tables: bool) -> R
     ))
 }
 
-/// Table pass for one page: decode the content stream's cells **font-aware**
-/// (each `Tf` selects the font's encoding, incl. `ToUnicode` cmaps — the same
-/// power as `extract_text`, but keeping the per-cell geometry).
+/// Decode one page's content stream into positioned rows **font-aware** (each
+/// `Tf` selects the font's encoding, incl. `ToUnicode` cmaps — the same power as
+/// `extract_text`, but keeping the per-cell geometry).
 ///
-/// Returns the detected tables plus a count of cells that could **not** be
-/// decoded under their font/encoding and had to fall back to [`ascii_text`]
-/// (lossy). The caller MUST surface a non-zero count (no silent data loss).
-fn tables_for_page(
-    doc: &Document,
-    page_id: ObjectId,
-    page_number: usize,
-) -> Result<(Vec<Table>, usize)> {
+/// Also returns a count of cells that could **not** be decoded under their
+/// font/encoding and had to fall back to [`ascii_text`] (lossy). That count is
+/// this crate's **only** detector for the loss `extract_text` performs
+/// *silently*: `lopdf` answers an undecodable show-op with `Ok` plus an internal
+/// `warn!` (never an `Err`), so a page whose text vanished comes back as
+/// whitespace and the canonical path has nothing to catch. The caller MUST
+/// surface a non-zero count (no silent data loss) **whether or not** the table
+/// pass itself ran.
+fn decoded_rows_for_page(doc: &Document, page_id: ObjectId) -> Result<(Vec<Row>, usize)> {
     let content = doc.get_and_decode_page_content(page_id)?;
     let fonts = doc.get_page_fonts(page_id).unwrap_or_default();
     let mut fallback_cells = 0usize;
@@ -187,7 +222,7 @@ fn tables_for_page(
         }
     };
     let rows = rows_from_ops_decoded(&content.operations, &mut decode);
-    Ok((detect_tables(page_number, &rows), fallback_cells))
+    Ok((rows, fallback_cells))
 }
 
 /// Quick structural sanity check before handing bytes to the parser.

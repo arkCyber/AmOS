@@ -8,7 +8,9 @@
 //!
 //! * `snapshot()` → `{"threads":[…]}` (parsed by [`crate::wire::parse_snapshot`]).
 //! * `messages(threadId)` → `{"thread_id","messages":[…]}`.
-//! * `send(address, text)` → `{"ok":true}` or `{"error":"…"}`.
+//! * `send(address, text)` → `{"state":"sent"}` (the radio confirmed it took
+//!   every part), `{"state":"unconfirmed","detail":…}` (no verdict in the glue's
+//!   bounded window) or `{"error":"…","error_kind":…}`.
 //!
 //! Runtime needs a real Android VM + the glue instance; on host this only has to
 //! **compile** (`cargo check -p amos-sms --features android`). Nothing is faked:
@@ -19,7 +21,7 @@ use jni::{JNIEnv, JavaVM};
 
 use crate::error::SmsError;
 use crate::folder::{SmsFolder, SmsFolderCounts};
-use crate::provider::SmsProvider;
+use crate::provider::{SmsProvider, SmsSendOutcome};
 use crate::spec::{SmsMessage, SmsThread};
 use crate::validate::{normalize_address, validate_text};
 use crate::wire::{parse_counts, parse_messages_for, parse_send_reply, parse_snapshot};
@@ -136,7 +138,7 @@ impl SmsProvider for AndroidSmsProvider {
         parse_counts(&self.call0("counts")?)
     }
 
-    fn send(&self, address: &str, text: &str) -> Result<(), SmsError> {
+    fn send(&self, address: &str, text: &str) -> Result<SmsSendOutcome, SmsError> {
         // Domain-boundary validation: fail deterministically here rather than
         // handing malformed input to the radio (the glue re-checks too).
         let address = normalize_address(address)?;

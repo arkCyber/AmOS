@@ -15,6 +15,7 @@
  */
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
+import { fastest, PERF_ATTEMPTS } from "../../__tests__/perfBudget";
 import {
   normalizeCompassSettings,
   defaultCompassSettings,
@@ -26,6 +27,7 @@ import {
   isOrientationSupported,
   calculateDistance,
   isCachedDeclinationValid,
+  declinationFromApiPayload,
   fetchDeclination,
   fetchDeclinationWithCache,
 } from "../compass";
@@ -331,6 +333,21 @@ describe("compass", () => {
       expect(isLevel(0, 0, NaN)).toBe(false);
       expect(isLevel(0, 0, -1)).toBe(false);
     });
+
+    // REQ-A1510 / F-SH-755: an unmeasured axis is not "0°". A `deviceorientation`
+    // frame can carry one of `beta`/`gamma` and not the other, so the caller hands
+    // through `null` for the axis nobody measured. `isLevel` answers "may I claim
+    // 已水平?" — and a frame that never measured an axis must refuse the claim, not
+    // read the absent value as a level 0°.
+    it("refuses to claim level when an axis was not measured", () => {
+      expect(isLevel(null, 0)).toBe(false);
+      expect(isLevel(0, null)).toBe(false);
+      expect(isLevel(null, null)).toBe(false);
+      expect(isLevel(null, 1)).toBe(false);
+      // The negative control: the same values *measured* are level, so the two
+      // tests together pin that `null` — not the magnitude — is what refuses.
+      expect(isLevel(0, 1)).toBe(true);
+    });
   });
 
   describe("isOrientationSupported", () => {
@@ -485,26 +502,67 @@ describe("compass", () => {
       expect(fetchedUrls[0]).toContain("resultFormat=json");
     });
 
-    it("a non-2xx answer degrades to 0 instead of throwing", async () => {
+    // REQ-A768 / F-SH-225。这三条以前断言"失败 → 0"。那正是缺陷本身：0° 是一个**真实**的磁偏角
+    // （在零偏线上就是 0，赤道附近很多地方也就一两度），所以拿 0 顶替"没拿到"
+    // 之后，上层根本分不出"真北修正生效且恰好为零"和"压根没查到" —— 界面照着
+    // 0 去修正、再标上"真北"，显示的还是磁北。失败必须报"未知"（null），由调用方
+    // 决定怎么显示。
+    it("a non-2xx answer reports the value as unknown (null), not 0", async () => {
       respondWith = () => ({ ok: false, status: 503, statusText: "Service Unavailable", json: async () => ({}) });
-      await expect(fetchDeclination(40.7128, -74.006)).resolves.toBe(0);
+      await expect(fetchDeclination(40.7128, -74.006)).resolves.toBeNull();
     });
 
-    it("a non-numeric declination in the body degrades to 0", async () => {
+    it("a non-numeric declination in the body reports unknown (null)", async () => {
       respondWith = () => ({
         ok: true,
         status: 200,
         statusText: "OK",
         json: async () => ({ result: [{ declination: "east" }] }),
       });
-      await expect(fetchDeclination(40.7128, -74.006)).resolves.toBe(0);
+      await expect(fetchDeclination(40.7128, -74.006)).resolves.toBeNull();
     });
 
-    it("a thrown network error degrades to 0 (offline is not a crash)", async () => {
+    it("a thrown network error reports unknown (null) (offline is not a crash)", async () => {
       respondWith = () => {
         throw new TypeError("Failed to fetch");
       };
-      await expect(fetchDeclination(40.7128, -74.006)).resolves.toBe(0);
+      await expect(fetchDeclination(40.7128, -74.006)).resolves.toBeNull();
+    });
+  });
+
+  describe("declinationFromApiPayload", () => {
+    it("reads the number the API actually returns", () => {
+      expect(declinationFromApiPayload({ result: [{ declination: -13.5 }] })).toBe(-13.5);
+    });
+
+    it("accepts a numeric string, the other shape the endpoint uses", () => {
+      expect(declinationFromApiPayload({ result: [{ declination: "7.25" }] })).toBeCloseTo(7.25, 5);
+      expect(declinationFromApiPayload({ result: [{ declination: "0" }] })).toBe(0);
+    });
+
+    it("clamps an out-of-range value into the ±180 band", () => {
+      expect(declinationFromApiPayload({ result: [{ declination: 400 }] })).toBe(180);
+      expect(declinationFromApiPayload({ result: [{ declination: -400 }] })).toBe(-180);
+    });
+
+    it("returns null for every payload that carries no usable number", () => {
+      for (const raw of [
+        undefined,
+        null,
+        "nope",
+        {},
+        { result: [] },
+        { result: "12" },
+        { result: [{ declination: "east" }] },
+        { result: [{ declination: "" }] },
+        { result: [{ declination: "   " }] },
+        { result: [{ declination: null }] },
+        { result: [null] },
+        { result: [{ declination: NaN }] },
+        { result: [{ declination: Infinity }] },
+      ]) {
+        expect(declinationFromApiPayload(raw)).toBeNull();
+      }
     });
   });
 
@@ -529,7 +587,7 @@ describe("compass", () => {
       };
       const result = await fetchDeclinationWithCache(40.7128, -74.0060, -13.5, cached);
       expect(result.fromCache).toBe(false);
-      expect(result.cachedLocation.timestamp).toBeGreaterThan(cached.timestamp);
+      expect(result.cachedLocation?.timestamp).toBeGreaterThan(cached.timestamp);
       // 值确实来自 API（而不是把旧值原样发回来）——这是 stub 之后才能断言的。
       expect(result.declination).toBeCloseTo(12.5, 5);
       expect(fetchedUrls).toHaveLength(1);
@@ -544,8 +602,30 @@ describe("compass", () => {
       // Move to Los Angeles
       const result = await fetchDeclinationWithCache(34.0522, -118.2437, -13.5, cached);
       expect(result.fromCache).toBe(false);
-      expect(result.cachedLocation.lat).toBe(34.0522);
-      expect(result.cachedLocation.lon).toBe(-118.2437);
+      expect(result.cachedLocation?.lat).toBe(34.0522);
+      expect(result.cachedLocation?.lon).toBe(-118.2437);
+    });
+
+    // 失败的查询既不能伪造值，也不能伪造缓存的**时间戳** —— 时间戳是一句
+    // "这里量到过"，只在成功时才配得上。否则一次离线查询会把一个真的旧值
+    // 覆盖成 0，并让缓存再"有效"7 天。
+    it("reports unknown and mints no cache site when the look-up fails", async () => {
+      respondWith = () => {
+        throw new TypeError("Failed to fetch");
+      };
+      const result = await fetchDeclinationWithCache(40.7128, -74.006, -13.5, undefined);
+      expect(result.fromCache).toBe(false);
+      expect(result.declination).toBeNull();
+      expect(result.cachedLocation).toBeUndefined();
+    });
+
+    it("leaves an existing (stale) cache site untouched when the look-up fails", async () => {
+      respondWith = () => ({ ok: false, status: 503, statusText: "Service Unavailable", json: async () => ({}) });
+      const stale = { lat: 40.7128, lon: -74.006, timestamp: Date.now() - 8 * 24 * 60 * 60 * 1000 };
+      const result = await fetchDeclinationWithCache(40.7128, -74.006, -13.5, stale);
+      expect(result.declination).toBeNull();
+      // 原样回传：不刷新时间戳，也不把站点丢掉。
+      expect(result.cachedLocation).toEqual(stale);
     });
   });
 
@@ -558,13 +638,18 @@ describe("compass", () => {
      * 现在的判据：先热身（JIT 编译不该算进被测代码的账），再按**每个数量级的
      * 余量**给预算 —— 仍然能抓住"慢了 5 倍"这种真回归，但不再对 ±3% 的抖动
      * 过敏。
+     *
+     * REQ-A850 / F-DEV-106：上面那条「5 倍余量」在本轮被实测推翻了 —— 40 个自旋
+     * 打满 18 核时，1000 次的 Haversine 跑到 **9.72ms**（预算 5ms），真实代价 ~1ms。
+     * 也就是说「余量」是对**空机器**而言的，负载可以把它一次吃掉一个数量级。判据
+     * 改成 `fastest()`（取 K 次最小值，见 `src/__tests__/perfBudget.ts`）：抢占只会
+     * 给某一次尝试**加**时间，取 min 就把它筛掉了，而真回归会让每一次都变慢。
+     * 热身也被吸收进来了（最慢的那次本就是第一次）。预算一位未改。
      */
-    const measure = (iterations: number, fn: (i: number) => void): number => {
-      for (let i = 0; i < Math.min(iterations, 100); i++) fn(i); // warm-up
-      const start = performance.now();
-      for (let i = 0; i < iterations; i++) fn(i);
-      return performance.now() - start;
-    };
+    const measure = (iterations: number, fn: (i: number) => void): number =>
+      fastest(PERF_ATTEMPTS, () => {
+        for (let i = 0; i < iterations; i++) fn(i);
+      });
 
     it("Haversine calculation stays within budget for 1000 iterations", () => {
       // 预算 5ms/1000 次（≈5µs 一次）：实测 ~1ms，5 倍余量。

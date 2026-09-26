@@ -13,6 +13,7 @@ import {
   clearErrorHistory,
   getRetryDelay,
   shouldRetry,
+  retrySignature,
   sanitizeContext,
   DEFAULT_RETRY_CONFIG,
   type FileOperationError,
@@ -34,6 +35,16 @@ describe("filesError.ts", () => {
       const err = createFileError("write", "store_locked");
       expect(err.severity).toBe("error");
       expect(err.retryable).toBe(true);
+    });
+
+    // REQ-A510 — the reason the wired path must use for a refused write: `writeJson` cannot tell
+    // "full" from "unavailable", so the label must not claim either (and must not claim a lock
+    // this app can never observe). It stays retryable because the store's state can change.
+    test("store_unavailable is critical (data not saved) yet retryable", () => {
+      const err = createFileError("write", "store_unavailable", { store: "amos.files" });
+      expect(err.severity).toBe("critical");
+      expect(err.retryable).toBe(true);
+      expect(getErrorMessageKey(err)).toBe("files.error.write.store_unavailable");
     });
 
     test("name_conflict is non-retryable with warning severity", () => {
@@ -208,6 +219,31 @@ describe("filesError.ts", () => {
       expect(DEFAULT_RETRY_CONFIG.maxAttempts).toBe(3);
       expect(DEFAULT_RETRY_CONFIG.delayMs).toBe(500);
       expect(DEFAULT_RETRY_CONFIG.backoffMultiplier).toBe(2);
+    });
+
+    // REQ-A607 — the retry budget must survive a *retry* (a fresh error object for the same
+    // action) yet reset for a *different* failure. Identity, not object or timestamp, is what
+    // distinguishes them.
+    test("retrySignature is stable across a retried action's fresh errors", () => {
+      const first = createFileError("create", "name_conflict", { name: "工作" });
+      // A retry re-enters the same action: same operation/reason/context, a new timestamp.
+      const retried: FileOperationError = { ...first, timestamp: first.timestamp + 1 };
+      expect(retrySignature(retried)).toBe(retrySignature(first));
+    });
+
+    test("retrySignature distinguishes a different action or entry", () => {
+      const a = createFileError("create", "name_conflict", { name: "工作" });
+      const otherEntry = createFileError("create", "name_conflict", { name: "休假" });
+      const otherOp = createFileError("rename", "name_conflict", { name: "工作" });
+      expect(retrySignature(otherEntry)).not.toBe(retrySignature(a));
+      expect(retrySignature(otherOp)).not.toBe(retrySignature(a));
+    });
+
+    test("retrySignature ignores context key order and is null for no error", () => {
+      const a = createFileError("write", "unknown", { store: "amos.files", op: 1 });
+      const b = createFileError("write", "unknown", { op: 1, store: "amos.files" });
+      expect(retrySignature(a)).toBe(retrySignature(b));
+      expect(retrySignature(null)).toBeNull();
     });
   });
 

@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use crate::alerts::Severity;
-use crate::notifier_bridge::{Alert, AlertSink};
+use crate::notifier_bridge::{Alert, AlertSink, PLevel};
 
 /// Adapt an `amos-notifier::Dispatcher` to the bridge's `AlertSink` trait.
 ///
@@ -30,11 +30,13 @@ impl std::fmt::Debug for NotifierSink {
 
 impl AlertSink for NotifierSink {
     fn fire(&self, alert: Alert) {
-        // Map the bridge's severity → the notifier's P-level (the single
-        // mapping lives in `notifier_bridge::severity_to_p_level`).
-        let notifier_alert = match alert.severity {
-            Severity::Error => amos_notifier::Alert::p0(&alert.id, &alert.message),
-            Severity::Warn => amos_notifier::Alert::p1(&alert.id, &alert.message),
+        // The severity→P-level mapping lives in **one** place
+        // (`notifier_bridge::severity_to_p_level`); this adapter only renders
+        // the level it returns into the notifier's `Alert` constructor. Do not
+        // re-state the mapping here — that is exactly how the two could drift.
+        let notifier_alert = match crate::notifier_bridge::severity_to_p_level(alert.severity) {
+            PLevel::P0 => amos_notifier::Alert::p0(&alert.id, &alert.message),
+            PLevel::P1 => amos_notifier::Alert::p1(&alert.id, &alert.message),
         }
         .with_label(
             "amos_severity",
@@ -87,10 +89,17 @@ pub fn notifier_sink_from_env() -> Option<Arc<dyn AlertSink>> {
     if !amos_notifier_enabled() {
         return None;
     }
-    let dispatcher = build_dispatcher_from_env();
+    let (dispatcher, webhook_count) = build_dispatcher_from_env();
+    // `webhook_count` is the number of webhook channels **actually wired**, not
+    // the number of URLs the env listed: `WebhookChannel::try_new` refuses a bad
+    // URL (`ftp://…`, `https://…`) with only a `warn!`, so a box configured with
+    // two dead URLs has zero webhook channels. Reporting `webhook_urls().len()`
+    // here would tell the operator two webhooks are armed when none are —
+    // `configured_urls` is logged alongside so the gap is visible in one line.
     tracing::info!(
         notifier = true,
-        webhook_count = webhook_urls().len(),
+        webhook_count,
+        configured_urls = webhook_urls().len(),
         "amos-ai alerting: notifier sink is armed (AMOS_NOTIFIER=1)"
     );
     Some(notifier_sink(dispatcher))
@@ -104,14 +113,18 @@ pub fn notifier_sink_from_env() -> Option<Arc<dyn AlertSink>> {
 /// line per alert (the dispatcher's `with_stderr_fallback(true)` then
 /// guards the empty-channels case, though the fallback channel prevents us
 /// from ever being there).
-fn build_dispatcher_from_env() -> amos_notifier::Dispatcher {
+///
+/// Returns the dispatcher **and the number of webhook channels actually
+/// wired** (not the number of URLs seen) so the caller's startup log reports
+/// the channels that exist, not the config that may have been refused.
+fn build_dispatcher_from_env() -> (amos_notifier::Dispatcher, usize) {
     let mut b = amos_notifier::Dispatcher::builder().with_stderr_fallback(true);
-    let mut added_any = false;
+    let mut webhooks_wired = 0;
     for url in webhook_urls() {
         match amos_notifier::WebhookChannel::try_new(&url) {
             Ok(ch) => {
                 b = b.with_channel(ch);
-                added_any = true;
+                webhooks_wired += 1;
             }
             Err(why) => {
                 tracing::warn!(
@@ -122,12 +135,12 @@ fn build_dispatcher_from_env() -> amos_notifier::Dispatcher {
             }
         }
     }
-    if !added_any {
+    if webhooks_wired == 0 {
         // No usable webhook URL: rely on stderr so an unconfigured box still
         // surfaces alerts.
         b = b.with_channel(amos_notifier::StdoutChannel::stderr());
     }
-    b.build()
+    (b.build(), webhooks_wired)
 }
 
 /// Worker split out for unit testing. Returns true when the env tells us
@@ -165,79 +178,69 @@ fn webhook_urls() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use amos_notifier::channel::Recorder;
 
-    #[test]
-    fn a_notifier_sink_fires_an_amos_alert_through_the_recorder() {
-        // End-to-end smoke: the bridge hands an alert to the dispatcher;
-        // the dispatcher walks its channels and a Recorder swallows it.
-        // We don't introspect the recorder (it moves into the dispatcher
-        // and is not Clone); what we check is that **fire did not panic
-        // and the sink wired up exactly one channel**.
-        let recorder = Recorder::new("recorder-test");
-        let dispatcher = amos_notifier::Dispatcher::builder()
-            .with_channel(recorder)
-            .build();
-        let sink = NotifierSink {
-            dispatcher: dispatcher.clone(),
-        };
-
-        // The interesting behaviour is "this call doesn't lose the alert":
-        // `fire` is fire-and-forget on the dispatcher side, but the bridge
-        // wraps it in `Arc<dyn AlertSink>` which it calls once per active
-        // alert. No panic + no panic means the alert reached the channel.
-        sink.fire(Alert {
-            severity: Severity::Error,
-            id: "amos-ai.breaker_open".into(),
-            message: "the circuit breaker is open".into(),
-        });
-
-        // We can't reach into the dispatcher's private `channels` Vec from
-        // outside the crate, but `dispatcher.metrics()` is the public hook
-        // — calling it must not panic on a freshly-built dispatcher, which
-        // is enough to confirm the sink wired up correctly.
-        let _m = sink.dispatcher.metrics();
+    /// A `Channel` that keeps every alert the dispatcher hands it, sharing the
+    /// log with the test through an `Arc`. The notifier's own `Recorder` can't
+    /// serve here: the dispatcher takes it by value and it is not `Clone`, so
+    /// nothing in the test can read what it caught.
+    #[derive(Debug)]
+    struct Probe {
+        seen: std::sync::Arc<std::sync::Mutex<Vec<amos_notifier::Alert>>>,
     }
 
-    #[test]
-    fn a_warn_alert_becomes_a_p1() {
-        // End-to-end smoke: a fire round-trips through the dispatcher and
-        // a stub channel without panicking. The severity mapping is
-        // exhaustively unit-tested in `notifier_bridge::severity_to_p_level`;
-        // here we just need the wiring to compile and not lose the alert.
-        let recorder = Recorder::new("recorder-warn");
-        let dispatcher = amos_notifier::Dispatcher::builder()
-            .with_channel(recorder)
-            .build();
-        let sink = NotifierSink {
-            dispatcher: dispatcher.clone(),
-        };
-
-        sink.fire(Alert {
-            severity: Severity::Warn,
-            id: "amos-ai.power_throttled".into(),
-            message: "the governor is throttling".into(),
-        });
-
-        let _m = sink.dispatcher.metrics();
+    impl amos_notifier::Channel for Probe {
+        fn id(&self) -> amos_notifier::ChannelId {
+            amos_notifier::ChannelId::new("probe")
+        }
+        fn send(&self, alert: &amos_notifier::Alert) -> amos_notifier::channel::SendOutcome {
+            self.seen.lock().unwrap().push(alert.clone());
+            amos_notifier::channel::SendOutcome::Sent
+        }
     }
 
+    /// The join point at the unit tier: capture the alert `fire` actually
+    /// hands the dispatcher and assert it carries the page level
+    /// `severity_to_p_level` owns.
+    ///
+    /// The sibling integration tests (`tests/notifier_alerts_e2e_v2.rs`) pin
+    /// `Error → P0` / `Warn → P1` as a fact through the whole daemon path; this
+    /// one pins the *link* to the owner, so re-stating the mapping in the
+    /// adapter (the drift REQ-A449 ⑥(b) named) is caught where it would be
+    /// written. It replaces two earlier smoke tests that asserted only "fire
+    /// did not panic" and so observed nothing about the alert sent.
     #[test]
-    fn the_bridge_severity_to_p0_p1_mapping_matches_the_notifier_alert() {
-        // Direct mapping unit test — this is the join point that the
-        // end-to-end `fire` calls exercise. Asserting it here means a
-        // change to `severity_to_p_level` is caught by the bridge's own
-        // test suite, not just the notifier's.
-        assert_eq!(
-            crate::notifier_bridge::severity_to_p_level(Severity::Error),
-            "P0",
-            "Errors from the daemon's alert tracker page at P0 (the notifier's highest tier)"
-        );
-        assert_eq!(
-            crate::notifier_bridge::severity_to_p_level(Severity::Warn),
-            "P1",
-            "Warns page at P1"
-        );
+    fn fire_sends_the_page_level_that_severity_to_p_level_owns() {
+        for (severity, detail) in [
+            (Severity::Error, "breaker_open"),
+            (Severity::Warn, "power_throttled"),
+        ] {
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let dispatcher = amos_notifier::Dispatcher::builder()
+                .with_channel(Probe { seen: seen.clone() })
+                .build();
+            let sink = NotifierSink { dispatcher };
+
+            sink.fire(Alert {
+                severity,
+                id: format!("amos-ai.{detail}"),
+                message: "a condition the tracker reported".into(),
+            });
+
+            let log = seen.lock().unwrap();
+            assert_eq!(log.len(), 1, "the alert reached the channel ({detail})");
+            // This `match` is the adapter's own PLevel→notifier rendering,
+            // written here as the spec. If `fire` swaps p0/p1 the two diverge
+            // and this fails; if `severity_to_p_level` changes its mind, the
+            // expected value moves with it.
+            let expected = match crate::notifier_bridge::severity_to_p_level(severity) {
+                PLevel::P0 => amos_notifier::Severity::P0,
+                PLevel::P1 => amos_notifier::Severity::P1,
+            };
+            assert_eq!(
+                log[0].severity, expected,
+                "fire must send the page level severity_to_p_level owns ({detail})"
+            );
+        }
     }
 
     // -------------------------------------------------------------------
@@ -383,6 +386,24 @@ mod tests {
         assert!(
             sink.is_some(),
             "AMOS_NOTIFIER=1 with only bad URLs must still arm (stderr fallback)"
+        );
+    }
+
+    /// The startup log's `webhook_count` must report channels that **exist**,
+    /// not URLs the operator configured: `try_new` refuses `ftp://` (no scheme
+    /// parser) and `https://` (refused by design) with only a `warn!`. So a
+    /// three-URL config where two are dead wires exactly one webhook.
+    #[test]
+    fn the_wired_webhook_count_excludes_urls_the_constructor_refused() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _e = ScopedEnv::set(
+            Some("1"),
+            Some("ftp://a/x, http://127.0.0.1:1/ok, https://b/y"),
+        );
+        let (_dispatcher, wired) = build_dispatcher_from_env();
+        assert_eq!(
+            wired, 1,
+            "only the URL that became a WebhookChannel is counted as wired"
         );
     }
 

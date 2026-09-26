@@ -26,6 +26,52 @@
 > 以及 §3.3 的 AOSP 平台层补丁（按 §2 属真机/平台范围，不在本仓库）。
 > 因此下面 checklist 里遗留的 `[ ]` 是**落地前的计划文本**，**不代表当前待办**。
 >
+> **2026-09-20（REQ-A580）"seam 被实例化"补上一环 + 一条仍未做（据实）**：§3.1 说
+> `NetworkGuard` 是「transport layer 与之对话的那一个缝」，但此前守护进程**从未构造任何 guard** ——
+> `NetGuardSvc` 的 `backend: "mock"` 是一个**写死的字符串常量**、不是活的后端对象，`enforced` 也写死
+> `false`；整个缝（`MockNetworkGuard`/`VpnNetworkGuard`/`NftablesNetworkGuard` 与其 `apply`/`flush`）
+> 在守护进程里**零实例化**（只有 crate 自己的单测在调它）。现在守护进程持有 `Box<dyn NetworkGuard>`
+> （默认 `MockNetworkGuard`），`Toggle(true)` 驱动 `apply(held_rules)`、`Toggle(false)` 驱动 `flush()`，
+> 失败**如实返回** `Unavailable` 且**不**留下假的 armed；`enforced` 改为后端自己的
+> `NetworkGuard::enforces()` 声明（trait 默认 `false`，真后端在**确实丢包**后才覆写为 true）。
+> **2026-09-20（REQ-A734 / F-SH-191）规则有了来源：出口策略下发 RPC。** 上述「仍未做」的一环
+> 已补上：`SetAppEgress` / `RevokeAppEgress` 两条 RPC 把应用的 `allowed_domains` 变成守护进程
+> **持有的规则**，`StatusReply.policy_rules` 自此是一个**真测量**（不再恒 0），`RuleSet::insert` /
+> `Policy::allow` / `Destination::domain` 有了生产调用者。两条诚实边界：①**失败的 `apply` 会回滚** ——
+> `commit_app_egress` / `remove_app_egress` 先改注册表再 `guard.apply`，`apply` 报错即回滚并返回
+> `Unavailable`，**绝不留一只后端未持有的规则**（否则 `policy_rules` 会虚高成「已持有」）；②**共享
+> uid 不产规则** —— `Policy` 按 uid 作用，托管的 web bundle 跑在 shell 的 uid 上、无法在包层隔离，
+> 故 `uid == 0` 的声明只进 `declared_apps`（新字段），`flatten_rules` **跳过它**，绝不编造一个 uid
+> 去凑规则（那会拦到同 uid 无关应用的流量）。域名统一走 `amos-network-guard::is_valid_egress_host`
+> （与 appstore 的 `validate_domain_pattern` 同一文法），非法/通配主机在缝上被 `InvalidArgument` 拒。
+> PWA 打开路径（`amos-tauri/src/appstore.rs::pwa_open_remote`）以 **best-effort** 调 `grant_app_egress`
+> （`uid = 0`）：无守护进程时打开仍然成功，只是声明不被登记 —— 绝不兜造。卸载路径
+> （`appstore_uninstall`）对称地以 **best-effort** 调 `revoke_app_egress`，让被卸载的 app 不再贡献规则；
+> 两条路径都不把「守护进程不在」变成用户可见的失败。
+> **2026-09-20（REQ-A734 / F-SH-191，续）状态可跨重启存活。** 上一版「仍未做（据实）：声明只存在
+> 守护进程内存里，daemon 重启即清空」已补上：`AMOS_NETGUARD_STATE_PATH` 一设，`toggle` 的**意图**
+> 与 `commit_app_egress` / `remove_app_egress` 后的**注册表**即以**原子写**落进一个
+> `NetGuardState { enabled, apps }` JSON；`serve()` 走的同一个 `bootstrap()` 重启时经
+> `state_to_registry` **重新校验**后恢复——丢弃空/超长/带控制字符的 app id、只留 `is_valid_egress_host`
+> 通过且不重复的主机、按 `MAX_DOMAINS_PER_APP` 截断。两条诚实边界：①**重启绝不从文件伪造执行** ——
+> 恢复的注册表照旧走 `flatten_rules`（`uid == 0` 仍只记声明、不产规则），`enforced` 仍是**后端的**
+> 声明、mock 后端重启后仍报 `false`；②**文件是意图与登记，不是后端状态** —— 恢复的注册表是「用户
+> 声明了什么」，不是「后端正在拦什么」，故 `bootstrap()` 只按恢复的意图重发 `guard.apply`、并由后端
+> 自己的 `enforces()` 决定是否称执行。**仍未做（据实）**：文件是**单守护进程本地**的（无跨进程共享/
+> 无网络同步）；恢复路径只有 `serve()` 的 `bootstrap()` 走。
+> **2026-09-21（REQ-A744 / F-SH-202）它真的被接上了。** 上一版把边界写成「只有 `serve()` 的
+> `bootstrap()` 读它」—— 可**没有任何启动器设那个环境变量**：`deploy/android/amos.rc` 为守护进程设了
+> 五个 `AMOS_*`，唯独漏了 `AMOS_NETGUARD_STATE_PATH`（它的第 14 行还明写 `/data/amos` 是「socket + any
+> shared state」）。于是设备上 `bootstrap()` 永远拿到 `persist = None`：持久化代码在、测试在跑、生产却
+> 仍是纯内存 —— 每次重启，每个 app 声明的出口集照样无声消失（与 F-SH-056 / F-SH-197 / F-SH-198 同型：
+> **声明了、也测了，就是没接到生产路径上**）。修法：在 `amos.rc` 的 `amos-ai` 服务块补
+> `setenv AMOS_NETGUARD_STATE_PATH /data/amos/netguard.json`（落在同一 rc 创建的 `/data/amos` 下），
+> 并加一条绑定测试 `the_on_device_launcher_wires_the_persistence_it_documents`：读 `deploy/android/amos.rc`
+> 源码，断言该 `setenv` 存在且落在 rc 自己 mkdir 的 `/data/amos/` 之下 —— 删掉这行（悄悄退回内存）会**响亮变红**。
+> **仍未做（据实）**：①同族的 `AMOS_PRIVACY_PATH` / `AMOS_TIMESYNC_STATE` / RAG 状态文件**同样没被这个
+> rc 接上**，本轮只收 netguard（其余属各自模块，未擅自改其语义）；②**未做真机复跑**（无 rooted/AOSP 槽位），
+> 证据是配置绑定测试 + 两条活负控；③文件仍是单守护进程本地、无跨进程共享。
+>
 > **2026-09-16（REQ-A295）"enforced" 的**证据链**补上一环**：`enforced` 是**守护进程的声明**，
 > 而页面那句「已开启 · 正在执行（真实后端）」是在断言"流量真的被拦住了"。原先前端 `guardLevel`
 > 只信这一个布尔值 —— 出厂 mock 自己会报 `enforced: false`（`netguard_service.rs` 有测试钉住
@@ -134,6 +180,17 @@ Checklist（对应 crate 文件）：
 - 检测信号 = **DNS 查询 / SNI(ClientHello) / 证书 CN / 已知遥测域名 / per-app 体量**；
   不建议「在 payload 里 grep IMEI/CellID 字符串」当主判据——加密流不暴露明文，且误报高。
   若坚持做明文敏感串审计，只能作**可选、启发式**的低置信标记，绝不当作已证实的外泄证据。
+
+> **2026-09-20（REQ-A586 / F-SPY-001）：`amos-telemetry-spy` 的帧解码曾给自己挖了一个假阴性。**
+> `packet.rs::decode_frame` 原先按**第一个字节的高 4 位**判断 IP 版本、命中即当裸 IP 解码，
+> 否则才当 Ethernet。可一个真实 Ethernet II 帧的第一个字节是**目的 MAC 的最高字节** —— 网关 MAC
+> 以 `4x`/`6x` 开头（约 2/16）时，整个帧被当成裸 IPv6 从**错误偏移**解析，`decode_frame` 返回
+> `None`，于是一个**真的携带明文标识符**的帧**被静默丢弃**（探测器最不能犯的错）。修法：帧长够
+> Ethernet II 时**先看 EtherType**（`0x0800`/`0x86DD` 显式命名网络层协议），且**只有其后字节真能
+> 解码**才采用，否则回落裸 IP 分支 —— 两侧都不牺牲。**残余边界**：裸 IP 帧的源地址使
+> `frame[12..14]` 恰好拼成 `0x0800`/`0x86DD` **且**其后字节又能解成合法 IP 头的巧合仍会走
+> Ethernet 分支（概率极低，已在 FMEA 如实登记）；VLAN 标签仍未处理。真链路复跑仍需 rooted/AOSP
+> 槽位（§2.4）。
 
 Checklist：
 - [ ] `crates/amos-network-guard/src/audit.rs` —— 结构化的 `EgressEvent { ts, uid, app, domain,

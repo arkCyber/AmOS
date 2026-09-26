@@ -55,6 +55,24 @@ impl FlashlightManager {
         self.snapshot().await
     }
 
+    /// Like [`Self::set_on`], but also reports whether the provider actually
+    /// **confirmed** the requested change.
+    ///
+    /// Returns `(state, confirmed)`: `state` is the resulting authoritative
+    /// snapshot (the caller mirrors what the backend now reports, not its own
+    /// intent), and `confirmed` is `true` only when that snapshot's `lit()`
+    /// equals the requested `on`. A provider that reports success but leaves the
+    /// torch in the other state — an OS `TorchCallback` racing us, a driver that
+    /// dropped the write, a fallback backend serving a request the real hardware
+    /// never saw — yields `confirmed == false` while `state` still tells the
+    /// truth. This is the signal the System UI bridge turns into the
+    /// `amos.flashlight.provider_unconfirmed` wire code, which otherwise had no
+    /// producing path.
+    pub async fn set_on_checked(&self, on: bool) -> Result<(FlashlightState, bool)> {
+        let snap = self.set_on(on).await?;
+        Ok((snap, snap.lit() == on))
+    }
+
     /// Flip the torch: off→on, on→off. Turning off when it is already off (or on
     /// a torch-less device) is a harmless no-op that returns the current state.
     pub async fn toggle(&self) -> Result<FlashlightState> {
@@ -120,6 +138,58 @@ mod tests {
         assert!(m.toggle().await.unwrap().lit());
         assert!(!m.toggle().await.unwrap().lit());
         assert!(m.toggle().await.unwrap().lit());
+    }
+
+    /// A provider that accepts every write (`set_on` → `Ok(())`) but never
+    /// actually moves the torch — the "silent failure" the `provider_unconfirmed`
+    /// wire code exists to name. `snapshot` keeps returning the seeded truth, so
+    /// a request-vs-persisted comparison is the only way to catch it.
+    struct StuckProvider {
+        state: std::sync::Mutex<FlashlightState>,
+    }
+
+    impl StuckProvider {
+        fn new(initial: FlashlightState) -> Self {
+            Self {
+                state: std::sync::Mutex::new(initial),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl FlashlightProvider for StuckProvider {
+        async fn snapshot(&self) -> Result<FlashlightState> {
+            Ok(*self.state.lock().unwrap())
+        }
+
+        async fn set_on(&self, _on: bool) -> Result<()> {
+            Ok(()) // reports success, changes nothing
+        }
+    }
+
+    #[tokio::test]
+    async fn set_on_checked_confirms_a_provider_that_honours_the_request() {
+        let m = manager(FlashlightState::off_with_torch());
+        let (state, confirmed) = m.set_on_checked(true).await.unwrap();
+        assert!(state.lit());
+        assert!(confirmed, "the mock honours the write, so it is confirmed");
+
+        let (state, confirmed) = m.set_on_checked(false).await.unwrap();
+        assert!(!state.lit());
+        assert!(confirmed, "turning it off is confirmed too");
+    }
+
+    #[tokio::test]
+    async fn set_on_checked_flags_a_silent_failure() {
+        // The provider says Ok but the torch never lights: the request was NOT
+        // confirmed. `state` still reports the truth (dark), and `confirmed` is
+        // the signal the bridge emits as `amos.flashlight.provider_unconfirmed`.
+        let m = FlashlightManager::new(Arc::new(StuckProvider::new(
+            FlashlightState::off_with_torch(),
+        )));
+        let (state, confirmed) = m.set_on_checked(true).await.unwrap();
+        assert!(!state.lit(), "the authoritative snapshot stays dark");
+        assert!(!confirmed, "a write that changed nothing is not confirmed");
     }
 
     #[tokio::test]

@@ -34,6 +34,7 @@ import {
   dockOverflowCount,
   stageRect,
   shouldShowMissionControl,
+  shouldShowAppExpose,
   dockIconScale,
 } from "../lib/desktopLayout";
 
@@ -181,6 +182,45 @@ describe("stageRect", () => {
     expect(stageRect(NaN, NaN)).toEqual(stageRect(1440, 900));
     expect(stageRect(0, 0)).toEqual(stageRect(1440, 900));
     expect(stageRect(-100, -100)).toEqual(stageRect(1440, 900));
+  });
+});
+
+describe("shouldShowAppExpose — 焦点应用的窗口数（REQ-A476）", () => {
+  test("two or more of the app's windows → tile them", () => {
+    expect(shouldShowAppExpose(2)).toBe(true);
+    expect(shouldShowAppExpose(3)).toBe(true);
+    expect(shouldShowAppExpose(16)).toBe(true);
+  });
+
+  test("fewer than two → nothing to tile (and macOS shows nothing either)", () => {
+    // The count is the *application's* windows, so a machine with five windows of five apps
+    // still has nothing to tile here — that is the difference from Mission Control, which is
+    // gated on the **total** (shouldShowMissionControl).
+    expect(shouldShowAppExpose(0)).toBe(false);
+    expect(shouldShowAppExpose(1)).toBe(false);
+  });
+
+  test("a non-finite reading is not a count", () => {
+    for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+      expect(shouldShowAppExpose(bad), String(bad)).toBe(false);
+    }
+  });
+});
+
+/**
+ * The two gates side by side, because conflating them is the defect each one prevents:
+ * Mission Control is "are there windows to switch between at all", App Exposé is "does the
+ * app I am looking at have more than one".
+ */
+describe("shouldShowMissionControl vs shouldShowAppExpose — two questions, two totals", () => {
+  test("five windows of five apps: Mission Control opens, App Exposé does not", () => {
+    expect(shouldShowMissionControl(5)).toBe(true);
+    expect(shouldShowAppExpose(1)).toBe(false);
+  });
+
+  test("three windows of one app: both open", () => {
+    expect(shouldShowMissionControl(3)).toBe(true);
+    expect(shouldShowAppExpose(3)).toBe(true);
   });
 });
 

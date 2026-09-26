@@ -17,9 +17,12 @@
   // (`docs/DESKTOP_ECOSYSTEM_GAP_AUDIT.md`).
   import { bridged } from "../lib/backend";
   import { iconSvg, quickIcon } from "../lib/sysIcons";
+  import { openSysInk } from "./shellState.svelte";
   import { radioManagedState, type RadioRefusalView } from "../lib/radioControl";
   import {
     openRadioSettings,
+    radioDisplayOn,
+    radioGated,
     readManagedSwitches,
     syncQuickRadios,
     tapRadio,
@@ -29,6 +32,7 @@
     dndActive,
     flipQuick,
     normalizeQuick,
+    saveQuick,
     type QuickKey,
     type QuickSettings,
     type RadioKey,
@@ -37,13 +41,15 @@
     BRIGHTNESS_KEY,
     normalizeBrightness,
   } from "../lib/brightness";
-  import { writeStoreValue } from "../lib/amosStore";
+  import { writeStoreValueChecked } from "../lib/amosStore";
   import { themeDark, toggleTheme } from "./theme.svelte";
   import { createStoreValue } from "./store";
+  import StoreErrorBar from "./StoreErrorBar.svelte";
   import { t } from "./locale.svelte";
   import type { RadioControlReply } from "../lib/backend";
   import { GLASS_CONTROL_CENTER_STYLE, GLASS_BORDER_MEDIUM } from "../lib/shellChrome";
   import AirPlayPanel from "./AirPlayPanel.svelte";
+  import ScreenRecordingTile from "./ScreenRecordingTile.svelte";
 
   // The shell renders this overlay and hands it the dismissal (see `DesktopShell`).
   let { onclose }: { onclose?: () => void } = $props();
@@ -60,7 +66,28 @@
     return un;
   });
 
-  const persist = (next: QuickSettings) => writeStoreValue(SETTINGS_KEY, next);
+  /**
+   * 这一块（快速开关、外观与勿扰）的显示由 store 决定 —— `settings` 是从 `SETTINGS_KEY`
+   * 订阅来的，拒写时它**不动**，所以屏幕上不会出现假读数。但也正因为不动，一次被拒的点击
+   * 就变成了「按下去什么也没发生、也没有一句话」：同一个面板里的单选框会说
+   * `radio.openSettingsFailed` ∕ 拒绝原因，亮度滑杆会说 `common.storeWriteFailed`
+   * （`brightnessErr` + `StoreErrorBar`，第 88 行），只有这几枚开关把裁决丢在
+   * `writeStoreValue` 的 `void` 里。这里把裁决接回来，报法与滑杆逐字一致。
+   *
+   * 深色那一枚也走这里：主题真值是另一枚键（`amos-ui.theme`），而拒写通常来自整块
+   * localStorage 不可用 —— 那时 `THEME_KEY` 同样写不进去，屏幕真的会变暗、但重启后不会
+   * 保持：这句「本次改动未保存」正是要说的事，所以它**照旧立即切换**、只是如实报账。
+   */
+  let quickErr = $state("");
+  const persist = (next: QuickSettings) => {
+    // `next` is a narrowed flip; `saveQuick` carries it onto the raw blob, which also
+    // holds the AI provider and the cloud prefs (REQ-A1397 ∕ F-SH-656).
+    if (!saveQuick(next)) {
+      quickErr = t("common.storeWriteFailed");
+      return;
+    }
+    quickErr = "";
+  };
 
   /** G-β-1 · 屏幕降亮（WebView 内）—— 同源自 lib/brightness.ts。
    *
@@ -81,11 +108,21 @@
     });
     return un;
   });
+  /** 滑杆拒写时那一句 —— 渲染在滑杆自己那一块里（见下面的亮度块）。 */
+  let brightnessErr = $state("");
   const setBrightnessPct = (next: number) => {
     const clamped = Math.max(0, Math.min(100, Math.round(next)));
     if (clamped === brightnessPct) return; // 减少没必要的写盘
+    // 这一枚键的**权威读者是 `DesktopShell` 的降亮遮罩**（它订阅同一个键画
+    // `<div class="brightness-overlay">`）。所以拒写时本地 `brightnessPct` 必须原样不动 ——
+    // 否则面板上的读数与滑杆都移到了新值，而屏幕根本没有降亮：同屏两处说同一件事，只有一处
+    // 是真的（F-SH-632）。
+    if (!writeStoreValueChecked(BRIGHTNESS_KEY, { pct: clamped })) {
+      brightnessErr = t("common.storeWriteFailed");
+      return;
+    }
+    brightnessErr = "";
     brightnessPct = clamped;
-    writeStoreValue(BRIGHTNESS_KEY, { pct: clamped });
   };
 
   /**
@@ -187,12 +224,22 @@
     <!-- Radios: the same three the phone's quick settings switch, same rules, same words -->
     <div class="grid grid-cols-3 gap-2">
       {#each RADIO_TILES as key (key)}
-        {@const on = key === "airplane" ? !!settings.airplane : !settings.airplane && !!settings[key]}
         {@const state = managed(key)}
+        <!-- Airplane mode owns the other radios, and `tapRadio` will not even attempt the
+             write — so the tile is marked **before** the tap (the same rule the settings
+             page applies: `RadioPage` disables its ToggleRow under airplane mode). Leaving
+             it live made a tap do nothing at all, which is what this panel's header says
+             must never happen. Both what the tile *reads* (`radioDisplayOn`) and whether it
+             is live (`radioGated`) are the shared predicates tapRadio reads — this panel
+             used to spell the first one out inline (`!settings.airplane && !!settings[key]`),
+             which is the second copy of a rule that is only correct while it matches. -->
+        {@const gated = radioGated(settings, key)}
+        {@const on = radioDisplayOn(settings, key)}
         <button
-          class="flex flex-col items-start gap-1 rounded-xl px-2.5 py-2 text-left transition-colors {on
+          class="flex flex-col items-start gap-1 rounded-xl px-2.5 py-2 text-left transition-colors disabled:cursor-not-allowed disabled:opacity-40 {on
             ? 'bg-white/85 text-neutral-900'
-            : 'bg-white/10 text-white/80 hover:bg-white/15'}"
+            : 'bg-white/10 text-white/80 enabled:hover:bg-white/15'}"
+          disabled={gated}
           aria-pressed={on}
           aria-label={t(`q.${key}`)}
           title={t(`q.${key}`)}
@@ -213,6 +260,15 @@
         </button>
       {/each}
     </div>
+
+    <!-- Why the tiles above cannot be tapped (REQ-A1082). The sentence is the one the
+         settings page already shows for the same state (`settings.airplaneBlocks`), so the
+         two screens say the same thing about the same fact. -->
+    {#if RADIO_TILES.some((k) => radioGated(settings, k))}
+      <p data-testid="cc-airplane-blocks" class="mt-2 px-1 text-[11px] leading-snug text-white/60">
+        {t("settings.airplaneBlocks")}
+      </p>
+    {/if}
 
     <!-- Appearance + quiet -->
     <div class="mt-2 grid grid-cols-2 gap-2">
@@ -249,6 +305,9 @@
       </button>
     </div>
 
+    <!-- 快速开关被存储拒写时的那一句（与下面滑杆同一条纪律、同一枚 testid）。 -->
+    <StoreErrorBar message={quickErr} />
+
     <!-- G-β-1 · 屏幕亮度滑杆（WebView 内降亮；显式标注「仅桌面」避免误读为系统亮度） -->
     <div class="mt-2 space-y-1" data-testid="cc-brightness-block">
       <div class="flex items-center justify-between px-1">
@@ -274,6 +333,7 @@
         oninput={(e) => setBrightnessPct(Number((e.target as HTMLInputElement).value))}
         class="h-1 w-full appearance-none rounded-full bg-white/30 accent-white"
       />
+      <StoreErrorBar message={brightnessErr} />
       <!-- 诚实标注：slider 控件可被屏幕阅读器读出，但视觉用户需要看这行小字 -->
       <p class="px-1 text-[10px] leading-tight text-white/40">
         {t("cc.brightnessHint")}
@@ -307,6 +367,28 @@
         </div>
       {/if}
     </div>
+
+    <!-- Screen recording (REQ-A1580) — the front door the host's `screen_record_*` commands
+         never had (they were registered but no screen called them). -->
+    <ScreenRecordingTile />
+
+    <!-- 系统级手写（REQ-A1590）。唤起后本弹层收起：墨层盖住整个窗口，留着它也看不见，
+         而 `openSysInk` 只清三张系统浮层，不负责关掉注册表渲染的这个弹层。 -->
+    <button
+      type="button"
+      class="mt-2 flex w-full items-center gap-2 rounded-xl bg-white/10 px-2.5 py-2.5 text-left text-white/80 transition-colors enabled:active:bg-white/15"
+      aria-label={t("sysInk.open")}
+      data-testid="cc-ink"
+      onclick={() => {
+        openSysInk();
+        onclose?.();
+      }}
+    >
+      <span data-icon="ink" class="grid h-5 w-5 place-items-center" aria-hidden="true">
+        {@html iconSvg("ink", "h-5 w-5")}
+      </span>
+      <span class="text-[12px] font-medium">{t("sysInk.title")}</span>
+    </button>
 
     <!-- What the platform owns, and whether a tap could hand the user to it (REQ-A202) -->
     {#if surfaceFailed}

@@ -496,6 +496,16 @@ impl PwaManifest {
             }
         }
 
+        // The declaration is also the *size* of the CSP the bundle is served with
+        // (see `bundle_csp`), so an unbounded list is a way to make the WebView
+        // parse a document-sized policy — a denial of service dressed as a
+        // permission. 64 hosts is far above any real app (F-PWA-002).
+        if self.permissions.network.allowed_domains.len() > MAX_ALLOWED_DOMAINS {
+            return Err(bad(format!(
+                "app {id:?}: {} allowed_domains entries exceeds the {MAX_ALLOWED_DOMAINS} entry cap",
+                self.permissions.network.allowed_domains.len()
+            )));
+        }
         for pattern in &self.permissions.network.allowed_domains {
             validate_domain_pattern(pattern).map_err(|e| bad(format!("app {id:?}: {e}")))?;
         }
@@ -728,6 +738,19 @@ impl PwaIndex {
             .find(|m| m.mcp_tools.iter().any(|t| t.name == tool))
             .map(|m| m.app.id.as_str())
     }
+
+    /// Add one more manifest to this index, returning the new index.
+    ///
+    /// Runs the same cross-app rules [`PwaIndex::from_manifests`] applies, so an
+    /// app added at runtime (the remote opener) meets exactly the constraints an
+    /// app compiled from disk did: the id must be unused and every tool name must
+    /// be unique across the **whole** index. A duplicate is refused rather than
+    /// shadowing or merging into the existing app.
+    pub fn install(&self, manifest: PwaManifest) -> Result<PwaIndex> {
+        let mut apps = self.apps.clone();
+        apps.push(manifest);
+        Self::from_manifests(apps)
+    }
 }
 
 /// The manifests a build embeds as factory assets.
@@ -751,6 +774,445 @@ pub fn builtin_index() -> Result<PwaIndex> {
         apps.push(manifest);
     }
     PwaIndex::from_manifests(apps)
+}
+
+// ---------------------------------------------------------------------------
+// Remote opener (`open_remote_pwa`)
+// ---------------------------------------------------------------------------
+//
+// The local index is compiled from files an operator put on the device. The
+// remote opener is the *other* way a PWA enters the system: a user pastes an
+// `https://` URL to a manifest, AmOS fetches it, validates it with the **same**
+// strict parser the index uses, and installs it. Because the fetch is the only
+// place AmOS talks to a host nobody has vetted, the seam is deliberately narrow:
+//
+//   https only  →  host on the operator allow-list  →  10 s / 256 KiB fetch
+//               →  PwaManifest::parse + validate  →  install (unique id + tool)
+//
+// There is no second, looser validator here: a remote manifest is held to
+// exactly the rules an on-disk one is (F-PWA-003 is precisely the fear that a
+// side door skips them).
+
+/// Hard ceiling on a fetched manifest body. A manifest is a few hundred bytes to
+/// a few KiB; 256 KiB is orders of magnitude above that while still being far
+/// below "however much a hostile server decides to stream".
+pub const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
+
+/// Ceiling on `[permissions.network].allowed_domains` entries (F-PWA-002).
+///
+/// The declaration is what `bundle_csp` turns into a `connect-src` list, so an
+/// unbounded list is unbounded work for the WebView's policy parser. 64 hosts is
+/// far above any real app.
+pub const MAX_ALLOWED_DOMAINS: usize = 64;
+
+/// Ceiling on the manifest URL itself. A URL nobody could type is not one an
+/// operator read off a page — refusing it bounds the work before any parse.
+pub const MAX_MANIFEST_URL_BYTES: usize = 2048;
+
+/// The env var holding the operator's comma-separated allow-list of hosts a
+/// remote PWA manifest may be fetched from (e.g.
+/// `AMOS_PWA_REMOTE_ALLOW=apps.example.org,cdn.example.net`).
+///
+/// **No wildcard, fully-qualified lowercase hosts only** — each entry is checked
+/// with [`validate_domain_pattern`], the same grammar the index enforces, and a
+/// bare host already matches its subdomains.
+pub const PWA_REMOTE_ALLOW_ENV: &str = "AMOS_PWA_REMOTE_ALLOW";
+
+/// Per-request timeout for the manifest fetch, seconds.
+pub const REMOTE_FETCH_TIMEOUT_SECS: u64 = 10;
+
+/// Where an install request's manifest comes from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PwaInstallSource {
+    /// A manifest file already on disk (`<index dir>/apps/<id>.toml`, or any path
+    /// the operator names). No network is touched.
+    LocalIndex(PathBuf),
+    /// A manifest fetched over HTTPS from an operator-allow-listed host. This is
+    /// the **only** variant that reaches the network.
+    RemoteHttps,
+}
+
+/// One "install this PWA" request. The two fields are bound to each other: for
+/// [`PwaInstallSource::RemoteHttps`] `manifest_url` is the absolute `https://`
+/// URL to fetch, and for [`PwaInstallSource::LocalIndex`] it is the on-disk path
+/// the variant also carries — [`install_pwa`] refuses a request whose path and
+/// `manifest_url` disagree, so the pair is never silently half-honoured.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PwaInstallRequest {
+    pub manifest_url: String,
+    pub install_source: PwaInstallSource,
+}
+
+impl PwaInstallRequest {
+    /// A request to install `url` over HTTPS.
+    pub fn remote(url: impl Into<String>) -> Self {
+        Self {
+            manifest_url: url.into(),
+            install_source: PwaInstallSource::RemoteHttps,
+        }
+    }
+
+    /// A request to install the local manifest at `path`.
+    pub fn local(path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        Self {
+            manifest_url: path.to_string_lossy().into_owned(),
+            install_source: PwaInstallSource::LocalIndex(path),
+        }
+    }
+}
+
+/// The seam that actually performs the HTTPS fetch.
+///
+/// Injected rather than called directly so the *validation* half of the opener
+/// is testable without a TLS client or a certificate, while the real build still
+/// uses a real client ([`open_remote_pwa`] uses the `live`-gated one). An
+/// implementation **must** bound the body it returns; the opener re-checks the
+/// length anyway, because a contract a caller can violate is not a guarantee.
+pub trait ManifestFetcher {
+    /// Fetch `url`, returning at most `max_bytes` of body. A larger body is an
+    /// error, never a silent truncation.
+    fn fetch(&self, url: &str, timeout_secs: u64, max_bytes: u64) -> Result<Vec<u8>>;
+}
+
+/// The real HTTPS client (`live` builds only). Bounded by
+/// [`MAX_MANIFEST_BYTES`] at the *reader*, so an endless body fails closed
+/// instead of being buffered.
+#[cfg(feature = "live")]
+struct HttpsFetcher;
+
+#[cfg(feature = "live")]
+impl ManifestFetcher for HttpsFetcher {
+    fn fetch(&self, url: &str, timeout_secs: u64, max_bytes: u64) -> Result<Vec<u8>> {
+        crate::http::blocking_get_bytes_capped(url, timeout_secs, max_bytes)
+    }
+}
+
+/// The configured on-disk index directory, or `None` when [`INDEX_DIR_ENV`] is
+/// unset/empty.
+pub fn index_dir_from_env() -> Option<PathBuf> {
+    std::env::var_os(INDEX_DIR_ENV)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Parse an [`PWA_REMOTE_ALLOW_ENV`] value into a host allow-list.
+///
+/// Empty entries are skipped (so a trailing comma is not an error); every
+/// remaining entry must pass [`validate_domain_pattern`] unmodified, which is
+/// what rules out `*.` wildcards, uppercase, and dotless names. Duplicates
+/// collapse. More than [`MAX_ALLOWED_DOMAINS`] entries is refused.
+pub fn parse_remote_allow_list(raw: &str) -> Result<Vec<String>> {
+    let mut hosts: Vec<String> = Vec::new();
+    for entry in raw.split(',') {
+        let host = entry.trim();
+        if host.is_empty() {
+            continue;
+        }
+        validate_domain_pattern(host).map_err(|e| bad(format!("{PWA_REMOTE_ALLOW_ENV}: {e}")))?;
+        if !hosts.iter().any(|h| h == host) {
+            hosts.push(host.to_string());
+        }
+    }
+    if hosts.len() > MAX_ALLOWED_DOMAINS {
+        return Err(bad(format!(
+            "{PWA_REMOTE_ALLOW_ENV}: {} hosts exceeds the {MAX_ALLOWED_DOMAINS} entry cap",
+            hosts.len()
+        )));
+    }
+    Ok(hosts)
+}
+
+/// The operator allow-list from the environment (`Ok(vec![])` when unset — an
+/// unset variable means "no remote host is allow-listed", never "allow all").
+pub fn remote_allow_list_from_env() -> Result<Vec<String>> {
+    match std::env::var(PWA_REMOTE_ALLOW_ENV) {
+        Ok(raw) => parse_remote_allow_list(&raw),
+        Err(_) => Ok(Vec::new()),
+    }
+}
+
+/// Whether `host` is covered by `allowed`.
+///
+/// The matching is **exactly** the grammar the index declares and
+/// `amos-network-guard`'s matcher implements: an entry matches itself and every
+/// subdomain of it (`apps.example.org` covers `cdn.apps.example.org`), there is
+/// no wildcard form, and a suffix that is not at a label boundary does **not**
+/// match (`notapps.example.org` is not covered by `apps.example.org`). A parity
+/// test pins this against the real guard matcher.
+pub fn host_allowed(host: &str, allowed: &[String]) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    allowed.iter().any(|pattern| {
+        let pattern = pattern.trim_end_matches('.').to_ascii_lowercase();
+        host == pattern
+            || host
+                .strip_suffix(&pattern)
+                .is_some_and(|prefix| prefix.ends_with('.'))
+    })
+}
+
+/// Validate a remote manifest URL and return its **lowercase host**.
+///
+/// Refusals, each with the reason named:
+/// * not `https://` (in particular `http://` — no TLS downgrade, ever);
+/// * no host, or a host with userinfo/`@` or a non-host authority;
+/// * a host that fails [`validate_domain_pattern`] (uppercase, dotless, `*`);
+/// * a URL longer than [`MAX_MANIFEST_URL_BYTES`], or containing whitespace or a
+///   control character (an embedded `\n` is how a "URL" smuggles a header).
+fn require_https_host(url: &str) -> Result<String> {
+    if url.len() > MAX_MANIFEST_URL_BYTES {
+        return Err(bad(format!(
+            "remote PWA manifest URL is {} bytes (max {MAX_MANIFEST_URL_BYTES})",
+            url.len()
+        )));
+    }
+    if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(bad(format!(
+            "remote PWA manifest URL contains whitespace/control: {url:?}"
+        )));
+    }
+    if url.starts_with("http://") {
+        return Err(bad(format!(
+            "remote PWA manifest URL must be https:// — cleartext http:// is refused at the seam \
+             (no TLS downgrade): {url:?}"
+        )));
+    }
+    let rest = url.strip_prefix("https://").ok_or_else(|| {
+        bad(format!(
+            "remote PWA manifest URL must be an absolute https:// URL: {url:?}"
+        ))
+    })?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() {
+        return Err(bad(format!("remote PWA manifest URL has no host: {url:?}")));
+    }
+    if authority.contains('@') {
+        return Err(bad(format!(
+            "remote PWA manifest URL must not carry userinfo: {url:?}"
+        )));
+    }
+    if !authority
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':'))
+    {
+        return Err(bad(format!(
+            "remote PWA manifest URL host must be a plain host[:port]: {url:?}"
+        )));
+    }
+    // `authority` is host[:port]; an IPv6 literal would have been refused above
+    // (brackets are not in the allowed set), so a plain `split(':')` is exact.
+    let host = authority
+        .split(':')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    validate_domain_pattern(&host).map_err(|e| bad(format!("remote PWA manifest: {e}")))?;
+    Ok(host)
+}
+
+/// Read + validate a manifest already on disk. Refuses `..`/NUL in `path` and
+/// runs the **same** parser + validator the index uses.
+pub fn install_local_pwa(path: &Path) -> Result<PwaManifest> {
+    let raw = path.to_string_lossy();
+    if raw.contains('\0') {
+        return Err(bad(format!(
+            "local PWA manifest path contains NUL: {raw:?}"
+        )));
+    }
+    if path.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(bad(format!(
+            "local PWA manifest path must not contain '..': {raw:?}"
+        )));
+    }
+    let text = fs::read_to_string(path).map_err(|e| {
+        bad(format!(
+            "local PWA manifest {} unreadable: {e}",
+            path.display()
+        ))
+    })?;
+    let manifest = PwaManifest::parse(&text)?;
+    manifest.validate()?;
+    Ok(manifest)
+}
+
+/// Install a manifest from a [`PwaInstallRequest`], refusing a request whose two
+/// fields disagree about where the manifest lives.
+pub fn install_pwa(request: &PwaInstallRequest) -> Result<PwaManifest> {
+    match &request.install_source {
+        PwaInstallSource::RemoteHttps => open_remote_pwa(&request.manifest_url),
+        PwaInstallSource::LocalIndex(path) => {
+            if Path::new(&request.manifest_url) != path.as_path() {
+                return Err(bad(format!(
+                    "install request disagrees with itself: LocalIndex path {} does not match \
+                     manifest_url {:?}",
+                    path.display(),
+                    request.manifest_url
+                )));
+            }
+            install_local_pwa(path)
+        }
+    }
+}
+
+/// Persist a validated manifest as `<dir>/apps/<id>.toml`, atomically.
+///
+/// The written bytes are **re-parsed and compared to `manifest` before the write
+/// happens**: if the TOML serializer ever loses a field, the file would describe
+/// a different app than the one that passed validation, so the mismatch is
+/// refused rather than persisted.
+pub fn persist_manifest(dir: &Path, manifest: &PwaManifest) -> Result<PathBuf> {
+    let id = &manifest.app.id;
+    let text = toml::to_string_pretty(manifest)
+        .map_err(|e| bad(format!("serialize manifest {id:?}: {e}")))?;
+    let reparsed = PwaManifest::parse(&text)
+        .map_err(|e| bad(format!("serialized manifest {id:?} does not re-parse: {e}")))?;
+    if &reparsed != manifest {
+        return Err(bad(format!(
+            "serialized manifest {id:?} does not round-trip; refusing to persist bytes that \
+             describe a different app than the one validated"
+        )));
+    }
+    let apps = dir.join(APPS_DIR);
+    fs::create_dir_all(&apps).map_err(|e| bad(format!("create {}: {e}", apps.display())))?;
+    let path = apps.join(format!("{id}.toml"));
+    crate::atomic::write_atomic(&path, text.as_bytes())?;
+    Ok(path)
+}
+
+/// Merge `manifest` into the index at `dir` (creating `apps/` if needed),
+/// enforcing the index-wide rules (unique id, unique tool name) and then
+/// re-reading the directory to prove the artifact on disk reloads to exactly the
+/// manifest that was validated.
+fn install_manifest_into(dir: &Path, manifest: &PwaManifest) -> Result<()> {
+    let existing = if dir.join(APPS_DIR).is_dir() {
+        PwaIndex::from_dir(dir)?
+    } else {
+        PwaIndex {
+            schema: INDEX_SCHEMA,
+            apps: Vec::new(),
+        }
+    };
+    // Cross-app rules: this is the same `from_manifests` check the local index
+    // path runs, so a remote install cannot introduce an ambiguous tool name.
+    let merged = existing.install(manifest.clone())?;
+    debug_assert_eq!(merged.apps.len(), existing.apps.len() + 1);
+    persist_manifest(dir, manifest)?;
+
+    let reloaded = PwaIndex::from_dir(dir)?;
+    if reloaded.apps.iter().find(|m| m.app.id == manifest.app.id) != Some(manifest) {
+        return Err(bad(format!(
+            "installed manifest {:?} does not reload identically from {}",
+            manifest.app.id,
+            dir.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Validate a fetched body and install it. Kept separate from the fetch so the
+/// validation half is testable with any [`ManifestFetcher`].
+fn accept_remote_manifest(
+    manifest_url: &str,
+    body: &[u8],
+    index_dir: Option<&Path>,
+) -> Result<PwaManifest> {
+    if body.len() as u64 > MAX_MANIFEST_BYTES {
+        return Err(bad(format!(
+            "remote PWA manifest from {manifest_url} is {} bytes (max {MAX_MANIFEST_BYTES})",
+            body.len()
+        )));
+    }
+    let text = std::str::from_utf8(body).map_err(|e| {
+        bad(format!(
+            "remote PWA manifest from {manifest_url} is not valid UTF-8: {e}"
+        ))
+    })?;
+    // Exactly the index's parser + validator. No looser second path.
+    let manifest = PwaManifest::parse(text)
+        .map_err(|e| bad(format!("remote PWA manifest from {manifest_url}: {e}")))?;
+    manifest
+        .validate()
+        .map_err(|e| bad(format!("remote PWA manifest from {manifest_url}: {e}")))?;
+    if let Some(dir) = index_dir {
+        install_manifest_into(dir, &manifest)?;
+    }
+    Ok(manifest)
+}
+
+/// Open a remote PWA manifest **with an injected fetcher** — the testable core.
+///
+/// `allow_hosts` is the operator allow-list (see [`host_allowed`]); `index_dir`
+/// is where the manifest is persisted (`None` → validate only, install nothing).
+pub fn open_remote_pwa_with(
+    fetcher: &dyn ManifestFetcher,
+    allow_hosts: &[String],
+    manifest_url: &str,
+    index_dir: Option<&Path>,
+) -> Result<PwaManifest> {
+    require_remote_target(manifest_url, allow_hosts)?;
+    let body = fetcher.fetch(manifest_url, REMOTE_FETCH_TIMEOUT_SECS, MAX_MANIFEST_BYTES)?;
+    accept_remote_manifest(manifest_url, &body, index_dir)
+}
+
+/// Validate the URL + allow-list half of an open (no network).
+///
+/// The URL is checked **first**: a cleartext or malformed URL is refused even on
+/// a device that never configured an allow-list, so the reason the user sees is
+/// always about the URL they pasted and never a misleading "nothing is
+/// allow-listed" for a `http://` link.
+fn require_remote_target(manifest_url: &str, allow_hosts: &[String]) -> Result<String> {
+    let host = require_https_host(manifest_url)?;
+    if allow_hosts.is_empty() {
+        return Err(bad(format!(
+            "no remote PWA host is allow-listed: set {PWA_REMOTE_ALLOW_ENV} to a comma-separated \
+             list of fully-qualified hosts before opening a remote manifest"
+        )));
+    }
+    if !host_allowed(&host, allow_hosts) {
+        return Err(bad(format!(
+            "remote PWA host {host:?} is not on the operator allow-list ({PWA_REMOTE_ALLOW_ENV}); \
+             allow-listed hosts: {allow_hosts:?}"
+        )));
+    }
+    Ok(host)
+}
+
+/// Fetch, validate and install a remote PWA manifest.
+///
+/// * the URL must be `https://` on a host in [`PWA_REMOTE_ALLOW_ENV`];
+/// * the body is capped at [`MAX_MANIFEST_BYTES`] and fetched with a
+///   [`REMOTE_FETCH_TIMEOUT_SECS`] timeout;
+/// * the manifest goes through the **same** strict parser + validator as the
+///   local index (unknown keys, `eval_js`, URL templates, domain grammar);
+/// * when [`INDEX_DIR_ENV`] is configured the manifest is persisted to
+///   `<dir>/apps/<id>.toml`, enforcing unique id + unique tool name across the
+///   whole index.
+///
+/// # Egress
+///
+/// This function performs exactly one outbound request: the manifest fetch, to a
+/// host the operator named. The *installed* app's own egress is not granted here
+/// — it is the `allowed_domains` → [`bundle_csp`] `connect-src` mechanism, and
+/// the host that served the manifest does **not** thereby join that list.
+pub fn open_remote_pwa(manifest_url: &str) -> Result<PwaManifest> {
+    let allow = remote_allow_list_from_env()?;
+    require_remote_target(manifest_url, &allow)?;
+    let index_dir = index_dir_from_env();
+
+    #[cfg(feature = "live")]
+    {
+        let body =
+            HttpsFetcher.fetch(manifest_url, REMOTE_FETCH_TIMEOUT_SECS, MAX_MANIFEST_BYTES)?;
+        accept_remote_manifest(manifest_url, &body, index_dir.as_deref())
+    }
+    #[cfg(not(feature = "live"))]
+    {
+        let _ = index_dir;
+        Err(bad(
+            "this build has no HTTPS client: rebuild amos-appstore with the `live` feature to \
+             open a remote PWA manifest",
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -950,7 +1412,13 @@ pub fn csp_connect_sources(allowed_domains: &[String]) -> Vec<String> {
 /// to an external URL, and that navigation can carry data in its path. CSP's
 /// `navigate-to` is not implemented by the engines we ship, so this cannot be
 /// closed here; it needs a real egress guard, which (see above) cannot be
-/// per-bundle today.
+/// per-bundle today. What the shell *can* do — and now does — is register the
+/// declared hosts with the daemon's egress registry at open time (see
+/// `amos-tauri/src/appstore.rs::pwa_open_remote` → `netguard::grant_app_egress`),
+/// so `netguard_status` reports the declaration (`declared_apps`) instead of
+/// forgetting it. It is recorded as a declaration, **not** a packet rule: the
+/// bundle shares the shell's uid, so the daemon stores it without a rule rather
+/// than fabricating a uid that would block unrelated traffic.
 pub fn bundle_csp(allowed_domains: &[String]) -> String {
     let mut connect = vec!["'self'".to_string()];
     connect.extend(csp_connect_sources(allowed_domains));
@@ -1373,6 +1841,59 @@ allowed_domains = ["odds.example.org", "cdn.odds.example.net"]
         ));
     }
 
+    /// `is_valid_egress_host` (the guard's allow-list grammar) documents itself as
+    /// "Mirrors `amos-appstore::pwa::validate_domain_pattern` (the two must agree, or
+    /// a host the manifest accepts would be silently dropped at the guard)". That
+    /// sentence was the **only** tie between the two validators: the guard's copy is
+    /// `pub`, the manifest's is `pub(crate)`, and no test ever ran one against the
+    /// other. Drift where the manifest is *looser* installs a PWA whose declared host
+    /// the guard then refuses to store — the app cannot reach the host it was granted,
+    /// with no error anywhere. This binds the two acceptance sets (REQ-A745 / F-SH-201).
+    #[test]
+    fn the_manifest_domain_grammar_agrees_with_the_guards_egress_host_grammar() {
+        let cases = [
+            // A shared accept set the guard's matcher can actually use.
+            "api.example.com",
+            "cdn.odds.example.net",
+            "a1.b-c.example",
+            "x.y",
+            // Rejected by both, through *different* mechanics — which is exactly
+            // where a one-sided edit would hide.
+            "*.example.com",    // manifest: the `*.` branch; guard: the `*` check
+            "a*b.example.com",  // manifest: the `*` check
+            "example.com/path", // guard: explicit `/`; manifest: only the label check
+            "https://example.com",
+            "example.com:443", // guard: explicit `:`; manifest: only the label check
+            "Example.com",     // uppercase
+            "example",         // dotless
+            "",                // empty
+            "example..com",    // empty label
+            "-example.com",    // leading `-`
+            "example-.com",    // trailing `-`
+            "exa mple.com",    // space
+            "caf\u{e9}.example.com", // non-ASCII label
+        ];
+        for host in cases {
+            let manifest_ok = validate_domain_pattern(host).is_ok();
+            let guard_ok = amos_network_guard::policy::is_valid_egress_host(host);
+            assert_eq!(
+                manifest_ok, guard_ok,
+                "the manifest grammar and the guard grammar disagree on {host:?} \
+                 (manifest accepts: {manifest_ok}, guard accepts: {guard_ok})"
+            );
+        }
+        // Guard against a vacuous pass (both collapsing to a single verdict): the
+        // accept set above must be non-empty.
+        assert!(
+            cases
+                .iter()
+                .filter(|h| validate_domain_pattern(h).is_ok())
+                .count()
+                >= 3,
+            "the accept set shrank — the equality above would pass vacuously"
+        );
+    }
+
     #[test]
     fn duplicate_ids_and_duplicate_tool_names_are_refused() {
         let dup_id = vec![
@@ -1600,5 +2121,517 @@ allowed_domains = ["odds.example.org", "cdn.odds.example.net"]
         let csp = index_csp();
         assert!(csp.contains("default-src 'none'"), "{csp}");
         assert!(csp.contains("frame-ancestors 'none'"), "{csp}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Remote opener (Gap 6)
+    // -----------------------------------------------------------------------
+
+    /// A [`ManifestFetcher`] that returns a canned body (or error) and records
+    /// the URL it was asked for — so a test can prove the fetch never happened.
+    struct FakeFetcher {
+        body: Result<Vec<u8>>,
+        seen: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl FakeFetcher {
+        fn serving(body: &str) -> Self {
+            Self {
+                body: Ok(body.as_bytes().to_vec()),
+                seen: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn failing(msg: &str) -> Self {
+            Self {
+                body: Err(bad(msg)),
+                seen: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.seen.lock().unwrap_or_else(|p| p.into_inner()).clone()
+        }
+    }
+
+    impl ManifestFetcher for FakeFetcher {
+        fn fetch(&self, url: &str, _timeout_secs: u64, max_bytes: u64) -> Result<Vec<u8>> {
+            self.seen
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(url.to_string());
+            // Mirror the real client's contract: an over-cap body is an error.
+            let body = self.body.as_ref().map_err(|e| bad(e.to_string()))?;
+            if body.len() as u64 > max_bytes {
+                return Err(bad(format!(
+                    "body from {url} exceeds the {max_bytes} byte limit"
+                )));
+            }
+            Ok(body.clone())
+        }
+    }
+
+    /// The documented remote-manifest shape: a valid manifest at a host the
+    /// operator has allow-listed. Reuses [`SAMPLE`] with a renamed id/tool so an
+    /// install into a temp dir never collides with the reference app.
+    fn remote_toml(id: &str, tool: &str, eval_js: bool, url: &str) -> String {
+        let action = if eval_js { "eval_js" } else { "url_redirect" };
+        format!(
+            r##"
+[app]
+id = "{id}"
+name = "Remote App"
+version = "1.0.0"
+
+[display]
+url = "{url}"
+
+[[mcp_tools]]
+name = "{tool}"
+description = "does a remote thing"
+
+    [mcp_tools.inputSchema]
+    type = "object"
+    required = ["q"]
+
+    [mcp_tools.inputSchema.properties.q]
+    type = "string"
+    description = "the query"
+
+    [mcp_tools.execution]
+    action = "{action}"
+    url_template = "{url}/?q={{q}}"
+
+[permissions.network]
+allowed_domains = ["cdn.example.org"]
+"##
+        )
+    }
+
+    #[test]
+    fn open_remote_pwa_refuses_http_scheme() {
+        // The URL is checked before anything else, so this holds whether or not
+        // an allow-list is configured — and the fetch is never attempted.
+        let f = FakeFetcher::serving("whatever");
+        let allow = vec!["apps.example.org".to_string()];
+        for url in [
+            "http://apps.example.org/amos-app.toml",
+            "http://apps.example.org:80/m.toml",
+            "file:///etc/amos-app.toml",
+            "javascript:alert(1)",
+            "apps.example.org/m.toml",
+        ] {
+            let err = open_remote_pwa_with(&f, &allow, url, None).unwrap_err();
+            assert!(
+                err.to_string().contains("https")
+                    || err.to_string().contains("cleartext")
+                    || err.to_string().contains("https:// URL"),
+                "{url} must be refused with a truthful https reason: {err}"
+            );
+        }
+        assert!(f.calls().is_empty(), "no refusal may reach the network");
+
+        // And the env-driven entry point agrees, without needing an allow-list:
+        // a cleartext URL is refused for being cleartext, not for being unlisted.
+        let err = open_remote_pwa("http://apps.example.org/amos-app.toml").unwrap_err();
+        assert!(
+            err.to_string().contains("cleartext") || err.to_string().contains("https://"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn open_remote_pwa_refuses_unallowed_host_with_truthful_reason() {
+        let f = FakeFetcher::serving(&remote_toml(
+            "org.amos.remote.good",
+            "remote_good",
+            false,
+            "https://apps.example.org",
+        ));
+        let allow = vec!["apps.example.org".to_string()];
+
+        // A nearby-but-different host is NOT covered: the suffix must land on a
+        // label boundary, which is exactly the guard's matcher rule.
+        for host in [
+            "evil.example.org",
+            "notapps.example.org",
+            "apps.example.org.evil.test",
+        ] {
+            let url = format!("https://{host}/amos-app.toml");
+            let err = open_remote_pwa_with(&f, &allow, &url, None).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains(host) && msg.contains(PWA_REMOTE_ALLOW_ENV),
+                "the refusal must name the host and the allow-list: {msg}"
+            );
+        }
+        assert!(f.calls().is_empty(), "an unlisted host is never fetched");
+
+        // A subdomain of an allow-listed host IS covered (bare host = host + subs).
+        let ok = open_remote_pwa_with(
+            &f,
+            &allow,
+            "https://cdn.apps.example.org/amos-app.toml",
+            None,
+        )
+        .unwrap();
+        assert_eq!(ok.app.id, "org.amos.remote.good");
+        assert_eq!(f.calls().len(), 1);
+
+        // An empty allow-list refuses everything, with its own honest reason.
+        let err = open_remote_pwa_with(
+            &FakeFetcher::serving(""),
+            &[],
+            "https://apps.example.org/m.toml",
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains(PWA_REMOTE_ALLOW_ENV), "{err}");
+    }
+
+    #[test]
+    fn open_remote_pwa_refuses_unparseable_manifest() {
+        let allow = vec!["apps.example.org".to_string()];
+        // Not TOML at all.
+        let err = open_remote_pwa_with(
+            &FakeFetcher::serving("<!doctype html><html>not a manifest</html>"),
+            &allow,
+            "https://apps.example.org/amos-app.toml",
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("invalid amos-app.toml"), "{err}");
+
+        // Valid TOML with an unknown key: `deny_unknown_fields` refuses it, so a
+        // manifest cannot smuggle in a field a future parser might honour.
+        let err = open_remote_pwa_with(
+            &FakeFetcher::serving(
+                "[app]\nid = \"org.amos.remote.x\"\nname = \"X\"\nversion = \"1.0.0\"\nsneaky = 1\n",
+            ),
+            &allow,
+            "https://apps.example.org/amos-app.toml",
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("invalid amos-app.toml"), "{err}");
+
+        // A fetch failure stays a typed error, not a panic or a default.
+        let err = open_remote_pwa_with(
+            &FakeFetcher::failing("connection refused"),
+            &allow,
+            "https://apps.example.org/amos-app.toml",
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("connection refused"), "{err}");
+    }
+
+    #[test]
+    fn open_remote_pwa_refuses_manifest_with_eval_js() {
+        let allow = vec!["apps.example.org".to_string()];
+        let err = open_remote_pwa_with(
+            &FakeFetcher::serving(&remote_toml(
+                "org.amos.remote.eval",
+                "remote_eval",
+                true,
+                "https://apps.example.org",
+            )),
+            &allow,
+            "https://apps.example.org/amos-app.toml",
+            None,
+        )
+        .unwrap_err();
+        // serde names the offending variant, so the operator can fix it.
+        assert!(err.to_string().contains("eval_js"), "{err}");
+        assert!(err.to_string().contains("url_redirect"), "{err}");
+    }
+
+    #[test]
+    fn open_remote_pwa_enforces_unique_id_and_tool_name() {
+        let allow = vec!["apps.example.org".to_string()];
+        let dir = temp_index("remote-unique");
+        let url = "https://apps.example.org/amos-app.toml";
+
+        // First install lands on disk.
+        let first = open_remote_pwa_with(
+            &FakeFetcher::serving(&remote_toml(
+                "org.amos.remote.one",
+                "remote_one",
+                false,
+                "https://apps.example.org",
+            )),
+            &allow,
+            url,
+            Some(&dir),
+        )
+        .unwrap();
+        assert_eq!(first.app.id, "org.amos.remote.one");
+        assert!(dir.join("apps").join("org.amos.remote.one.toml").is_file());
+
+        // The same id again is refused (no silent overwrite).
+        let err = open_remote_pwa_with(
+            &FakeFetcher::serving(&remote_toml(
+                "org.amos.remote.one",
+                "remote_other",
+                false,
+                "https://apps.example.org",
+            )),
+            &allow,
+            url,
+            Some(&dir),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("duplicate app id"), "{err}");
+
+        // A different id reusing an installed tool name is refused too — tool
+        // names are the model's routing key, so a collision is an ambiguous call.
+        let err = open_remote_pwa_with(
+            &FakeFetcher::serving(&remote_toml(
+                "org.amos.remote.two",
+                "remote_one",
+                false,
+                "https://apps.example.org",
+            )),
+            &allow,
+            url,
+            Some(&dir),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("duplicate tool name"), "{err}");
+
+        // A genuinely new app still installs, and the directory now holds both.
+        let second = open_remote_pwa_with(
+            &FakeFetcher::serving(&remote_toml(
+                "org.amos.remote.two",
+                "remote_two",
+                false,
+                "https://apps.example.org",
+            )),
+            &allow,
+            url,
+            Some(&dir),
+        )
+        .unwrap();
+        assert_eq!(second.app.id, "org.amos.remote.two");
+        let index = PwaIndex::from_dir(&dir).unwrap();
+        assert_eq!(index.apps.len(), 2, "both installed apps compile");
+        assert_eq!(
+            index.app_for_tool("remote_one"),
+            Some("org.amos.remote.one")
+        );
+        assert_eq!(
+            index.app_for_tool("remote_two"),
+            Some("org.amos.remote.two")
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn csp_connects_derived_from_manifest_declared_domains() {
+        // Regression: a remotely-installed manifest must produce exactly the CSP
+        // its `allowed_domains` imply — the opener must not widen or drop it.
+        let allow = vec!["apps.example.org".to_string()];
+        let manifest = open_remote_pwa_with(
+            &FakeFetcher::serving(&remote_toml(
+                "org.amos.remote.csp",
+                "remote_csp",
+                false,
+                "https://apps.example.org",
+            )),
+            &allow,
+            "https://apps.example.org/amos-app.toml",
+            None,
+        )
+        .unwrap();
+        let declared = manifest.permissions.network.allowed_domains.clone();
+        assert_eq!(declared, vec!["cdn.example.org".to_string()]);
+
+        let csp = bundle_csp(&declared);
+        assert!(
+            csp.contains("connect-src 'self' https://cdn.example.org https://*.cdn.example.org"),
+            "{csp}"
+        );
+        // The host that *served* the manifest is not thereby granted egress.
+        assert!(!csp.contains("apps.example.org"), "{csp}");
+        // And no cleartext is ever granted from a declaration.
+        assert!(!csp.contains("http://"), "{csp}");
+        assert!(!csp.contains("ws://"), "{csp}");
+    }
+
+    #[test]
+    fn remote_allow_list_grammar_matches_the_index_and_the_guard() {
+        // The same grammar as an `allowed_domains` entry: lowercase, fully
+        // qualified, no wildcard, no dotless name.
+        for bad_entry in [
+            "*.example.org",
+            "Example.org",
+            "localhost",
+            "a..b.org",
+            "x*y.org",
+        ] {
+            assert!(
+                parse_remote_allow_list(bad_entry).is_err(),
+                "{bad_entry:?} must be refused"
+            );
+        }
+        // An empty variable is an empty allow-list, not "allow everything": the
+        // opener then refuses every host (see the empty-list case above).
+        assert!(parse_remote_allow_list("").unwrap().is_empty());
+        assert!(parse_remote_allow_list(" , , ").unwrap().is_empty());
+        // Empty entries are skipped, duplicates collapse, order is preserved.
+        assert_eq!(
+            parse_remote_allow_list("apps.example.org, ,cdn.example.net,apps.example.org").unwrap(),
+            vec![
+                "apps.example.org".to_string(),
+                "cdn.example.net".to_string()
+            ]
+        );
+
+        // `host_allowed` implements exactly `domain_matches`, which is what the
+        // network guard will enforce for the same declaration.
+        use amos_network_guard::policy::domain_matches;
+        let rules = vec!["apps.example.org".to_string()];
+        for observed in [
+            "apps.example.org",
+            "cdn.apps.example.org",
+            "a.b.apps.example.org",
+            "notapps.example.org",
+            "apps.example.org.evil.test",
+            "evil.test",
+        ] {
+            assert_eq!(
+                host_allowed(observed, &rules),
+                domain_matches("apps.example.org", observed),
+                "host_allowed disagrees with the guard matcher for {observed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_allow_list_is_capped_and_an_oversize_body_is_refused() {
+        // F-PWA-002 at the allow-list level.
+        let many: Vec<String> = (0..=MAX_ALLOWED_DOMAINS)
+            .map(|i| format!("h{i}.example.org"))
+            .collect();
+        let err = parse_remote_allow_list(&many.join(",")).unwrap_err();
+        assert!(err.to_string().contains("entry cap"), "{err}");
+
+        // F-PWA-002 at the manifest level: a fetched body past the cap is refused
+        // before the parser sees it (the fake mirrors the real client's contract).
+        let allow = vec!["apps.example.org".to_string()];
+        let huge = "x".repeat(MAX_MANIFEST_BYTES as usize + 1);
+        let err = open_remote_pwa_with(
+            &FakeFetcher::serving(&huge),
+            &allow,
+            "https://apps.example.org/amos-app.toml",
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("byte limit"), "{err}");
+
+        // And the manifest's own `allowed_domains` declaration is capped by the
+        // ordinary validator, so a remote manifest cannot blow up the CSP.
+        let mut domains = String::new();
+        for i in 0..=MAX_ALLOWED_DOMAINS {
+            domains.push_str(&format!("d{i}.example.org\", \""));
+        }
+        let toml = remote_toml(
+            "org.amos.remote.wide",
+            "remote_wide",
+            false,
+            "https://apps.example.org",
+        )
+        .replace(
+            "allowed_domains = [\"cdn.example.org\"]",
+            &format!("allowed_domains = [\"{domains}\"]"),
+        );
+        let err = open_remote_pwa_with(
+            &FakeFetcher::serving(&toml),
+            &allow,
+            "https://apps.example.org/amos-app.toml",
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("entry cap"), "{err}");
+    }
+
+    #[test]
+    fn without_the_live_feature_the_env_entry_point_says_so() {
+        // `open_remote_pwa` with no client must fail with a typed, truthful error
+        // — never a fake success and never a panic.
+        let allow = vec!["apps.example.org".to_string()];
+        // The injected seam is always available; the *default* client is what is
+        // gated. Assert the honest boundary text exists in the build.
+        assert!(open_remote_pwa_with(
+            &FakeFetcher::serving(&remote_toml(
+                "org.amos.remote.nolive",
+                "remote_nolive",
+                false,
+                "https://apps.example.org",
+            )),
+            &allow,
+            "https://apps.example.org/amos-app.toml",
+            None,
+        )
+        .is_ok());
+
+        #[cfg(not(feature = "live"))]
+        {
+            // With an allow-list configured but no client, the error names the
+            // missing feature rather than pretending to fetch.
+            let err = open_remote_pwa("https://apps.example.org/amos-app.toml");
+            // Either "no host allow-listed" (env unset in this process) or the
+            // missing-client message — both are honest, neither is a success.
+            assert!(err.is_err());
+        }
+    }
+
+    #[test]
+    fn a_local_install_request_refuses_a_self_inconsistent_pair() {
+        let dir = temp_index("local-req");
+        let path = dir.join("apps").join("org.amos.demo.odds.toml");
+        fs::write(&path, SAMPLE).unwrap();
+
+        // Consistent request → parses + validates.
+        let ok = install_pwa(&PwaInstallRequest::local(&path)).unwrap();
+        assert_eq!(ok.app.id, "org.amos.demo.odds");
+        assert!(matches!(
+            PwaInstallRequest::local(&path).install_source,
+            PwaInstallSource::LocalIndex(_)
+        ));
+
+        // A request whose path and manifest_url disagree is refused, so the two
+        // fields can never be half-honoured.
+        let inconsistent = PwaInstallRequest {
+            manifest_url: "https://elsewhere.example.org/m.toml".to_string(),
+            install_source: PwaInstallSource::LocalIndex(path.clone()),
+        };
+        let err = install_pwa(&inconsistent).unwrap_err();
+        assert!(err.to_string().contains("disagrees with itself"), "{err}");
+
+        // `..` never resolves out of the caller's tree.
+        let traversal = PwaInstallRequest::local(dir.join("../../etc/passwd"));
+        assert!(install_pwa(&traversal).is_err());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persist_manifest_round_trips_and_reloads_from_the_index() {
+        let dir = temp_index("persist-roundtrip");
+        let manifest = PwaManifest::parse(SAMPLE).unwrap();
+        manifest.validate().unwrap();
+        let path = persist_manifest(&dir, &manifest).unwrap();
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("org.amos.demo.odds.toml"),
+            "the file name is the app id"
+        );
+        // What is on disk compiles back to exactly the manifest validated, tools
+        // and all (the round-trip guard inside `persist_manifest` proves the TOML
+        // serializer loses nothing; this proves the directory reader agrees).
+        let index = PwaIndex::from_dir(&dir).unwrap();
+        assert_eq!(index.apps, vec![manifest]);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

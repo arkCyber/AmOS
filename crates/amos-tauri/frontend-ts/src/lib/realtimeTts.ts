@@ -11,7 +11,12 @@ import { finalSegmentOf } from "./stream";
 
 export interface SpeakDeps {
   synth?: (text: string, lang: string) => Promise<TtsPayload | null>;
-  play?: (pcm: TtsPayload) => void;
+  /**
+   * Playback. Returning `false` means the payload provably did **not** start playing;
+   * returning nothing (the test-double idiom, `void`) is read as "it played" — only a
+   * positive refusal may turn a successful synthesis into a failure.
+   */
+  play?: (pcm: TtsPayload) => boolean | void;
 }
 
 /** Lazily-created playback AudioContext (one per session, shared across segments). */
@@ -51,13 +56,17 @@ export function resetPlayCtx(): void {
   }
 }
 
-/** Play a synthesized PCM payload out of the speakers. No-op when unavailable. */
-export function playPcm(pcm: TtsPayload): void {
-  if (typeof window === "undefined" || !pcm.samples.length) return;
+/**
+ * Play a synthesized PCM payload out of the speakers. Returns `false` when nothing was
+ * started — no `AudioContext`, or an empty payload — so the caller can tell playback from
+ * a silent no-op instead of reporting the synthesis reply as audio (REQ-A1444).
+ */
+export function playPcm(pcm: TtsPayload): boolean {
+  if (typeof window === "undefined" || !pcm.samples.length) return false;
   const Ctor =
     window.AudioContext ??
     (window as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
-  if (!Ctor) return;
+  if (!Ctor) return false;
   const ctx = playCtx ?? new Ctor();
   playCtx = ctx;
   const buf = ctx.createBuffer(1, pcm.samples.length, pcm.sample_rate || 16000);
@@ -69,11 +78,15 @@ export function playPcm(pcm: TtsPayload): void {
   activeSrc?.stop();
   activeSrc = src;
   src.start();
+  return true;
 }
 
 /**
- * Speak an arbitrary translation string via the TTS backend. Resolves true when
- * audio was produced, false when nothing to say / backend unavailable.
+ * Speak an arbitrary translation string via the TTS backend. Resolves true when audio was
+ * **produced** — which is a claim about playback, not about the synthesis reply (REQ-A1444):
+ * a `playPcm` with no `AudioContext`, or an empty payload, starts nothing, and answering
+ * `true` there is how a caller ends up with no sound *and* no sentence. False when there was
+ * nothing to say, the backend did not answer, or the payload never reached the speakers.
  */
 export async function speakText(
   text: string,
@@ -84,8 +97,10 @@ export async function speakText(
   const play = deps.play ?? playPcm;
   if (!text.trim()) return false;
   const pcm = await synth(text, lang);
-  if (pcm) play(pcm);
-  return pcm !== null;
+  if (!pcm) return false;
+  // Only a positive refusal (`false`) counts as "not produced"; an injected `void` player
+  // is the test-double idiom and must not turn every successful synthesis into a failure.
+  return play(pcm) !== false;
 }
 
 /**

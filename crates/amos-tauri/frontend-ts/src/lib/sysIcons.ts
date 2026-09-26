@@ -27,6 +27,7 @@ export type SysIconName =
   | "appearance"
   | "search"
   | "pencil"
+  | "ink"
   | "lock"
   | "recents"
   | "x"
@@ -142,6 +143,10 @@ const INNER: Record<SysIconName, string> = {
     '<path d="M12 3a9 9 0 0 1 0 18Z" fill="currentColor" stroke="none"/>',
   search: '<circle cx="11" cy="11" r="7.5"/><path d="m20.5 20.5-4.3-4.3"/>',
   pencil: '<path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/>',
+  // A stylus: a barrel with a nib, distinct from the `pencil` used for "edit home".
+  ink:
+    '<path d="M4 20.5 7.6 19l10.9-10.9a2.2 2.2 0 0 0-3.1-3.1L4.5 15.9Z"/>' +
+    '<path d="m15 6.5 2.5 2.5"/>',
   lock: '<rect x="3.5" y="11" width="17" height="10" rx="2.5"/><path d="M7.5 11V7a4.5 4.5 0 0 1 9 0v4"/>',
   recents:
     '<rect x="8.5" y="8.5" width="13" height="13" rx="2.2"/>' +

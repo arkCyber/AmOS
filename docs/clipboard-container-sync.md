@@ -39,7 +39,7 @@
 |---|---|---|
 | Host→Guest | `PushText { seq, ts_ms, text }` | 把一条 AmOS 纯文本复制镜像进 guest 剪贴板 |
 | Guest→Host | `ClipboardChanged { ts_ms, text }` | guest 剪贴板变化（真实复制 **或** 我们推送的回显） |
-| Guest→Host | `PushAcked { seq }` | 信息性确认已应用推送（永不 ingest） |
+| Guest→Host | `PushAcked { seq }` | 信息性确认已应用推送（永不 ingest）。生产者是 guest 代理：`apply` 仅在**真正改变**容器剪贴板时发出（REQ-A1794） |
 
 **Echo 抑制**：推送会立刻使 guest 剪贴板变化、被 guest 代理如实回报；若不拦，宿主自己的推送会以「容器侧复制」身份回流成假条目（复制回环）。宿主 `EchoGuard` 记录最近一次推送，窗口 `ECHO_WINDOW_MS`=500ms 内**同文本**的 `ClipboardChanged` 判为本方回显并丢弃；异文本（或窗口外的同文本＝用户真再复制）正常 ingest。此语义与 Kotlin `SUPPRESS_WINDOW_MS` 一致，使形态 A/B 在 Rust 边界统一。
 
@@ -69,7 +69,7 @@
 * **`amos_clipboard::provider::ClipboardProvider` seam**：`primary_text` / `set_primary_text` / `set_change_listener`。`MockClipboardProvider`（确定性、headless 全测，真值变更才同步触发监听、同值 no-op——对齐 AOSP）；`#[cfg(feature="android")] crate::android::AndroidClipboardProvider`（经 Kotlin bridge 的 JNI，`cargo check --features android` 编译验证，运行时需设备）。
   > 配对 Kotlin bridge（设备 bring-up、符号对齐 native upcall）：`crates/amos-clipboard/android-glue/com/amos/ai/glue/AndroidClipboardGlue.kt`。
 
-* **`amos_clipboard::agent::GuestAgent<P>`**：`apply(HostToGuest::PushText)` 镜像进平台剪贴板（先记 echo、同值 no-op）；`attach(out)` 装监听，**真实** guest 复制 → `GuestToHost::ClipboardChanged` 交给 outbound（echo 抑制、`should_report` fail-safe）。headless 全测（Mock provider，含「宿主推送不回显」「真实复制上报」「同文本不再报」等 9 项）。
+* **`amos_clipboard::agent::GuestAgent<P>`**：`apply(HostToGuest::PushText)` 镜像进平台剪贴板（先记 echo、同值 no-op），**真正改变**剪贴板时经 `attach` 登记的出站通道回一条 `GuestToHost::PushAcked { seq }`（no-op ∕ 空白 ∕ 写失败不发——确认只在为真时发）；`attach(out)` 装监听**并**登记同一条出站通道，**真实** guest 复制 → `GuestToHost::ClipboardChanged`（echo 抑制、`should_report` fail-safe）。headless 全测（Mock provider，含「宿主推送不回显」「真实复制上报」「同文本不再报」「应用过的推送恰回一条 ack」「no-op ∕ 写失败不 ack」等 13 项）。
 * **`amos_clipboard::proto`**：共享分帧协议（见 §2）。
 
 实现形态二选一仍属设备判定（与两底座对应）：no-UI 基座（系统级 Rust 经 JNI/binder）或 Waydroid guest 内 system-app。`android` provider 是编译门 + Kotlin bridge 契约，**运行时未在设备验证**（诚实 no-op 惯例）。
@@ -153,7 +153,10 @@
 
 * P0（宿主半）+ P1（guest 代理 crate：provider/agent/proto）+ P2a（`link` Backoff/supervise 重连）已实现且**可离线验证**。**P2b 的传输代码已落地**（`unix`：真实 Unix 域套接字 bind/dial/split/serve + 惰性重拨 sink + drain），并在 **host 上用真实 socket 端到端验证**（`clipboard_e2e` 的 `real_unix_socket_carries_the_clipboard_both_ways`）。**P3 宿主半接线也已落地**（`clipboard_guest_link`：env 门控、默认 inert、单一共享全双工连接、审计计数、前台不对称与 `stop()` 均由 `clipboard_guest_link_e2e` 在真实 UDS 上钉住）。**仍属设备侧**的只有：Waydroid 宿主↔guest 的**命名空间桥接**（默认 UNIX 命名空间不互通）、`android` provider 的运行时（仅**编译门** + Kotlin bridge 契约）、guest 进程托管。真机 A↔微信互拷、断线重连的**产品级** e2e 仍未在设备验证——不伪造（同 DMA-BUF 表面合成/IME 共享的既有诚实标注）。
 * 本文只约束**文本**同步；图片/URI 多格式跨容器同步超出文本 `ClipboardManager` 能力，属后续。
-* 分支上 `crates/amos-tauri/src/terminal.rs` 存在**既有** fmt/clippy 债务（非本次改动引入），`make lint` 整体红需另行清理。
+* **图片负载不会镜像到文本剪贴板**（Gap 5 本轮加固）：`clipboard_write` 的 `Uris`/图片载荷**不**折进文本剪贴板的读路径——文本读拿到的只是文本，绝不把一次图片复制伪装成"文本也变了"。一次 `Uris` 复制受 `MAX_RECIPIENTS_PER_COPY`（**64**）条上限约束（`MAX_URIS` 同值），超出在入队前拒绝（F-CLB-002 的 DoS 面）。
+* **每一次读/清都过前台门**：`clipboard_read` / `clipboard_history` / `clipboard_clear` 一律经 `require_foreground(&WmState, caller)`；后台窗口读前台剪贴板是隐私失败（F-CLB-001），**写**任意窗口可发。这条不对称由单测直接扫源码钉住（每个读命令体必须含 `require_foreground(`）。
+* **广播是有界的、订阅是显式的**：窗口用类型化的 `clipboard_subscribe(window)` 显式订阅（窗口标签由 Tauri 注入，**非**调用方提供）；订阅后每窗口最多 `CLIPBOARD_EVENTS_PER_SEC`（**100**）条 `clipboard-changed`/秒（令牌桶），一个 JS 复制循环无法灌爆 WebView（F-CLB-002）。
+* 宿主半（`clipboard.rs`/`clipboard_glue.rs`）的上述规则由主机单测钉住、**编译期可见**；`AndroidClipboardGlue.onContainerCopy → push_out` 的**真机往返**仍只在 host 契约层覆盖，**未在设备验证**（同 §5 的 `android` provider 划线）。
 
 ## 9. 相关工件
 

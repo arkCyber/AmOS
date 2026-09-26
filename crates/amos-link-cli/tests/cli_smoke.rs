@@ -7,6 +7,7 @@
 
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use amos_proto::amos_link::robot_link_server::RobotLinkServer;
@@ -61,20 +62,32 @@ fn run_until_first_line(args: &[&str], wait: Duration) -> (String, bool, String)
     (first, still_running, stderr)
 }
 
+/// A **process-unique** path for a private Unix socket under the temp dir.
+///
+/// `(process::id(), SystemTime::now().as_nanos())` is not unique enough here: the tests in this
+/// binary run as concurrent threads of *one* process, and **five** of them call
+/// `start_control_plane()`. Two calls that land on the same clock tick compute the *same* path;
+/// the first `bind`s, the second panics with `AddrInUse`, and its caller then fails against a
+/// dead socket. Measured 2026-09-19 (REQ-A466, same class as the `restart_all_e2e` pidfiles):
+/// `cargo test --workspace` was green, then red on
+/// `remote_mode_reads_a_running_control_plane_over_a_unix_socket`, then green again, while this
+/// file alone passes 34/34 every time. The counter makes each call unique whatever the clock does.
+fn unique_socket_path(tag: &str) -> PathBuf {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    std::env::temp_dir().join(format!(
+        "amos-link-cli-{tag}-{}-{}.sock",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
 /// A live control plane on a private Unix socket: the very service the daemon mounts
 /// (`amos_link::service::mock_server`, heartbeat included) served over a real UDS.
 ///
 /// `--socket` is exercised through the shipped binary, so the remote path is proven
 /// against real gRPC rather than a stub — the same standard as the rest of this file.
 fn start_control_plane() -> (PathBuf, std::thread::JoinHandle<()>) {
-    let path = std::env::temp_dir().join(format!(
-        "amos-link-cli-remote-{}-{}.sock",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
+    let path = unique_socket_path("remote");
     let _ = std::fs::remove_file(&path);
     let bind = path.clone();
     let handle = std::thread::spawn(move || {
@@ -177,14 +190,7 @@ impl amos_proto::amos_link::robot_link_server::RobotLink for GetStatusOnly {
 
 /// The same UDS harness as [`start_control_plane`], serving [`GetStatusOnly`].
 fn start_older_control_plane() -> (PathBuf, std::thread::JoinHandle<()>) {
-    let path = std::env::temp_dir().join(format!(
-        "amos-link-cli-older-{}-{}.sock",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
+    let path = unique_socket_path("older");
     let _ = std::fs::remove_file(&path);
     let bind = path.clone();
     let handle = std::thread::spawn(move || {
@@ -220,14 +226,7 @@ fn start_older_control_plane() -> (PathBuf, std::thread::JoinHandle<()>) {
 fn start_control_plane_seeded(
     seeds: &[(&str, &str, Option<&str>)],
 ) -> (PathBuf, std::thread::JoinHandle<()>) {
-    let path = std::env::temp_dir().join(format!(
-        "amos-link-cli-seeded-{}-{}.sock",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
+    let path = unique_socket_path("seeded");
     let _ = std::fs::remove_file(&path);
     let bind = path.clone();
     let seeds: Vec<(String, String, Option<String>)> = seeds
@@ -295,14 +294,7 @@ fn start_control_plane_reported(
     use amos_link::discovery::{NodeKind, PeerId};
     use amos_link::metrics::LinkMetrics;
 
-    let path = std::env::temp_dir().join(format!(
-        "amos-link-cli-reported-{}-{}.sock",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
+    let path = unique_socket_path("reported");
     let _ = std::fs::remove_file(&path);
     let bind = path.clone();
     let robot = robot.to_string();
@@ -567,6 +559,23 @@ fn status_json_is_one_document_locally_and_over_a_socket() {
         remote_doc["peers"][0]["id"], "dog1",
         "the seeded peer travels in the same shape: {remote}"
     );
+
+    // Set `peers` aside and the same holds for the node's **own** role: the *local* document's
+    // `kind` reaches the JSON through `NodeStatus`'s derived `Serialize` (serde `rename_all`),
+    // the *remote* one through the daemon's `Peer`-side `key()`. A word of the vocabulary has to
+    // read back as itself through `from_key`/`key()` — otherwise the CLI spells a role the rest
+    // of the link has no word for, and a script matching `"kind"` in one mode misreads the other
+    // (the exact class this test exists for; REQ-A804).
+    for doc in [&local_doc, &remote_doc] {
+        let kind = doc["kind"]
+            .as_str()
+            .unwrap_or_else(|| panic!("a role is named: {doc}"));
+        assert_eq!(
+            amos_link::discovery::NodeKind::from_key(kind).map(|k| k.key()),
+            Some(kind),
+            "the document's role is the wire vocabulary, not a second spelling: {doc}"
+        );
+    }
 
     let _ = std::fs::remove_file(&path);
 }

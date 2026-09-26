@@ -34,6 +34,9 @@ const STATUS = {
 
 const SCAN = {
   status: STATUS,
+  // `ScanOut.report` is the domain `JunkReport`: groups/total_items/total_bytes
+  // only. The two sums sit on the reply **root** (F-SH-662) — putting them inside
+  // `report` made the fixture invent a field the real command never sends.
   report: {
     groups: [
       { kind: "app_cache", count: 1, bytes: 1024 },
@@ -41,15 +44,17 @@ const SCAN = {
     ],
     total_items: 2,
     total_bytes: 1536,
-    reclaimable_bytes: 1536,
-    review_bytes: 0,
   },
   auto_kinds: ["app_cache", "log_file"],
   review_kinds: [],
+  reclaimable_bytes: 1536,
+  review_bytes: 0,
 };
 
 interface Opts {
   available?: boolean;
+  /** The backend name the status read reports (`STATUS.backend` by default). */
+  backend?: string;
   scan?: unknown;
   report?: unknown;
   clean?: unknown;
@@ -61,16 +66,38 @@ interface Opts {
   storage?: unknown;
   boostResult?: unknown;
   lastError?: string | null;
+  /**
+   * Make `devcare_status` **fail** (throw across the bridge) instead of answering.
+   * A mutable object is returned so a test can heal the bridge and prove the retry
+   * actually re-reads — the failed state is the one that goes away on its own.
+   */
+  statusFail?: { on: boolean };
+  /**
+   * Never resolve the named command, so the screen is observably parked **mid-load**.
+   * The status read lands first, so `available` is already true while a later command
+   * — including the scan itself — is still in flight.
+   */
+  hangOn?: string;
 }
 
 function installBridge(opts: Opts = {}) {
   const calls: { cmd: string; args?: Record<string, unknown> }[] = [];
   const invoke = async (cmd: string, args?: Record<string, unknown>) => {
     calls.push({ cmd, args });
+    if (cmd === opts.hangOn) return new Promise(() => {});
     if (cmd === "appstore_installed") return [];
     if (cmd === "devcare_status") {
+      // A refused command crosses the bridge as a throw; `backend.invoke` records it and
+      // answers `null`, which is also a `void` command's success value (REQ-A296).
+      if (opts.statusFail?.on) throw new Error("daemon unreachable");
       const available = opts.available ?? true;
-      return { ...STATUS, available, can_clean: available, last_error: opts.lastError ?? null };
+      return {
+        ...STATUS,
+        backend: opts.backend ?? STATUS.backend,
+        available,
+        can_clean: available,
+        last_error: opts.lastError ?? null,
+      };
     }
     if (cmd === "devcare_scan") return opts.scan === undefined ? SCAN : opts.scan;
     if (cmd === "devcare_clean") {
@@ -233,6 +260,53 @@ describe("DeviceCareApp.svelte — offline / unavailable", () => {
     // The score is not a vacuous 100 — it is explicitly unknown.
     expect(q(h, "devcare-score")?.textContent).toBe("—");
   });
+
+  // REQ-A793 / F-DEV-097 — a FAILED read is not the host's "no backend" answer.
+  test("a failed status read says so (with the host's words) and offers a retry", async () => {
+    const fail = { on: true };
+    installBridge({ statusFail: fail });
+    const h = render(DeviceCareApp);
+    await settle();
+
+    // The failure is named as a failure, in the host's own words…
+    expect(q(h, "devcare-status-error")?.textContent).toContain("读取管家状态失败");
+    expect(q(h, "devcare-status-detail")?.textContent).toContain("daemon unreachable");
+    // …and it does NOT borrow the sentence that asserts what the device can do: that
+    // line ("在真机运行，或设置 AMOS_DEVCARE_ROOT …") is a claim about the environment,
+    // and a read that never landed establishes nothing about it.
+    expect(q(h, "devcare-unavailable")).toBeNull();
+    expect(txt(h)).not.toContain("AMOS_DEVCARE_ROOT");
+    // The backend is *unknown*, not "not connected" — `available` is false either way,
+    // which is exactly the fold this fixes.
+    const backend = q(h, "devcare-backend")?.textContent ?? "";
+    expect(backend).toContain("未知");
+    expect(backend).not.toContain("未连接");
+    // No score claim is made off a read that never happened.
+    expect(q(h, "devcare-score")?.textContent).toBe("—");
+
+    // The retry re-reads: heal the bridge and the card recovers in place.
+    fail.on = false;
+    await fireEvent.click(q(h, "devcare-status-retry")!);
+    await settle();
+    expect(q(h, "devcare-status-error")).toBeNull();
+    expect(q(h, "devcare-backend")?.textContent).toContain("host-fs");
+    expect(q(h, "devcare-score")?.textContent).toBe("95");
+  });
+
+  // The same fold, one line down: a scan that never ran must not be given a hardcoded
+  // backend name. `scan?.status.backend ?? "host-fs"` labelled the device as `host-fs`
+  // whenever the *scan* failed, even when the status read said otherwise.
+  test("a status that landed but a scan that failed still names the reported backend", async () => {
+    installBridge({ available: true, backend: "android", scan: null });
+    const h = render(DeviceCareApp);
+    await settle();
+    // The scan failure is its own state…
+    expect(q(h, "devcare-junk-error")).toBeTruthy();
+    // …and the backend line reports what the host actually said.
+    const backend = q(h, "devcare-backend")?.textContent ?? "";
+    expect(backend).toContain("android");
+    expect(backend).not.toContain("host-fs");
+  });
 });
 
 describe("DeviceCareApp.svelte — scan + clean", () => {
@@ -248,6 +322,10 @@ describe("DeviceCareApp.svelte — scan + clean", () => {
     expect(txt(h)).toContain("有可回收的缓存与残留文件");
     expect(q(h, "devcare-group-app_cache")).toBeTruthy();
     expect(q(h, "devcare-group-log_file")).toBeTruthy();
+    // The 「可回收」 header reads the host's own sum off the reply root — the nested
+    // `report` carries no such field, so the old read was a permanent `0 B`
+    // (F-SH-662). 1024 + 512 = 1536 → "2 KB".
+    expect(q(h, "devcare-junk")?.textContent).toContain("2 KB");
 
     await fireEvent.click(q(h, "devcare-clean")!);
     await settle();
@@ -357,11 +435,11 @@ describe("DeviceCareApp.svelte — review-only categories need acknowledgement",
       ],
       total_items: 2,
       total_bytes: 3072,
-      reclaimable_bytes: 1024,
-      review_bytes: 2048,
     },
     auto_kinds: ["app_cache"],
     review_kinds: ["stale_download"],
+    reclaimable_bytes: 1024,
+    review_bytes: 2048,
   };
 
   test("selecting a review-only kind without the ack is refused client-side", async () => {
@@ -402,6 +480,79 @@ describe("DeviceCareApp.svelte — review-only categories need acknowledgement",
   });
 });
 
+describe("DeviceCareApp.svelte — review-ness comes from the host's review_kinds (REQ-A1409 ∕ F-SH-667)", () => {
+  // These fixtures pin the *contract*: the screen asks the host which categories
+  // are review-only. They deliberately name a category other than the one the
+  // domain marks today, and withhold the name from the one it marks today — the
+  // two directions a hardcoded `stale_download` gets wrong. The host emits the
+  // agreeing shape today; that agreement is exactly why the literal went
+  // unnoticed.
+  const otherReviewKind = {
+    status: STATUS,
+    report: {
+      groups: [
+        { kind: "app_cache", count: 1, bytes: 1024 },
+        { kind: "crash_dump", count: 1, bytes: 2048 },
+      ],
+      total_items: 2,
+      total_bytes: 3072,
+    },
+    auto_kinds: ["app_cache"],
+    review_kinds: ["crash_dump"],
+    reclaimable_bytes: 1024,
+    review_bytes: 2048,
+  };
+
+  const noReviewKind = {
+    status: STATUS,
+    report: {
+      groups: [
+        { kind: "app_cache", count: 1, bytes: 1024 },
+        { kind: "stale_download", count: 1, bytes: 2048 },
+      ],
+      total_items: 2,
+      total_bytes: 3072,
+    },
+    auto_kinds: ["app_cache", "stale_download"],
+    review_kinds: [],
+    reclaimable_bytes: 3072,
+    review_bytes: 0,
+  };
+
+  test("a review-only kind the host names gets flagged and needs the ack", async () => {
+    const calls = installBridge({ scan: otherReviewKind });
+    const h = render(DeviceCareApp);
+    await settle();
+
+    expect(q(h, "devcare-ack")).toBeNull();
+    await fireEvent.click(q(h, "devcare-group-crash_dump")!.querySelector("input")!);
+    await settle();
+    // The acknowledgement is offered because *the host* called it review-only.
+    expect(q(h, "devcare-ack")).toBeTruthy();
+
+    await fireEvent.click(q(h, "devcare-clean")!);
+    await settle();
+    expect(q(h, "devcare-notice")?.textContent).toContain("该类别需要先确认");
+    expect(calls.some((c) => c.cmd === "devcare_clean")).toBe(false);
+  });
+
+  test("a kind the host does not name as review-only needs no ack", async () => {
+    const calls = installBridge({ scan: noReviewKind });
+    const h = render(DeviceCareApp);
+    await settle();
+
+    // No「需确认」flag, no acknowledgement affordance — the host said it is
+    // auto-cleanable, and both the chip and the guard must follow the host.
+    expect(q(h, "devcare-group-stale_download")!.textContent).not.toContain("需确认");
+    expect(q(h, "devcare-ack")).toBeNull();
+
+    await fireEvent.click(q(h, "devcare-clean")!);
+    await settle();
+    const clean = calls.find((c) => c.cmd === "devcare_clean");
+    expect(clean?.args?.acknowledgeReview).toBe(false);
+  });
+});
+
 describe("DeviceCareApp.svelte — memory boost", () => {
   test("renders the memory reading and the reclaimable count", async () => {
     installBridge();
@@ -421,8 +572,9 @@ describe("DeviceCareApp.svelte — memory boost", () => {
     await settle();
     expect(calls.some((c) => c.cmd === "devcare_boost")).toBe(true);
     expect(q(h, "devcare-boost-note")?.textContent).toContain("已回收 1 个应用");
-    // A forced stop is audited like clean/uninstall — and the UI says so.
-    expect(q(h, "devcare-audit")?.textContent).toContain("已记录审计 (1/1)");
+    // A forced stop is audited like clean/uninstall — and the UI says so, in the
+    // memory card's own slot (the clean card is not where a boost's verdict belongs).
+    expect(q(h, "devcare-boost-audit")?.textContent).toContain("已记录审计 (1/1)");
   });
 
   test("a partial boost says how many failed", async () => {
@@ -443,7 +595,7 @@ describe("DeviceCareApp.svelte — memory boost", () => {
     await settle();
     expect(q(h, "devcare-boost-note")?.textContent).toContain("已回收 1 个，1 个失败");
     // 1/2 recorded is NOT a complete trail: it must read as "not audited".
-    expect(q(h, "devcare-audit")?.textContent).toContain("审计未记录");
+    expect(q(h, "devcare-boost-audit")?.textContent).toContain("审计未记录");
   });
 
   test("a boost that never happened does not pretend to be audited", async () => {
@@ -465,7 +617,25 @@ describe("DeviceCareApp.svelte — memory boost", () => {
     await fireEvent.click(q(h, "devcare-boost")!);
     await settle();
     expect(q(h, "devcare-boost-note")?.textContent).toContain("守护进程未连接");
-    expect(q(h, "devcare-audit")).toBeNull();
+    expect(q(h, "devcare-boost-audit")).toBeNull();
+  });
+
+  test("a boost whose command never landed says so — it does not claim the daemon is offline", async () => {
+    // `invoke` answers `null` for a command that threw (REQ-A296 / F-DEV-097), and
+    // `devcareBoost` maps that to `null`. That is NOT the host saying "no governor":
+    // nothing about the device was established, and the host's own `devcare_boost`
+    // answers `Ok` in every reachable case. Rendering 「守护进程未连接」 off a missing
+    // answer is a device claim made from an absent fact — the same fold `clean` and
+    // `uninstall` already avoid by saying 「失败」.
+    installBridge({ boostResult: null });
+    const h = render(DeviceCareApp);
+    await settle();
+    await fireEvent.click(q(h, "devcare-boost")!);
+    await settle();
+    const note = q(h, "devcare-boost-note")?.textContent ?? "";
+    expect(note).toContain("加速失败");
+    expect(note).not.toContain("守护进程未连接");
+    expect(q(h, "devcare-boost-audit")).toBeNull();
   });
 
   test("an empty boost still happened — and its honest event is reported", async () => {
@@ -489,7 +659,7 @@ describe("DeviceCareApp.svelte — memory boost", () => {
     await fireEvent.click(q(h, "devcare-boost")!);
     await settle();
     expect(q(h, "devcare-boost-note")?.textContent).toContain("已回收 0 个应用");
-    expect(q(h, "devcare-audit")?.textContent).toContain("已记录审计 (1/1)");
+    expect(q(h, "devcare-boost-audit")?.textContent).toContain("已记录审计 (1/1)");
   });
 
   test("an unreachable governor is not shown as 'nothing to reclaim'", async () => {
@@ -533,6 +703,66 @@ describe("DeviceCareApp.svelte — memory boost", () => {
     await settle();
     expect(q(h, "devcare-memory-reclaimable")?.textContent).toContain("0 个");
     expect((q(h, "devcare-boost") as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  // A device can have a working governor and NO clean backend: `available` comes
+  // from the devcare scanner, the governor from `taskmgr`, and the boost button
+  // lives in the memory card precisely because the two are independent. So a
+  // boost's verdict must be rendered where the boost is, not inside the clean
+  // card the user never sees in that state.
+  test("a boost with no clean backend still reports its audit verdict", async () => {
+    installBridge({ available: false });
+    const h = render(DeviceCareApp);
+    await settle();
+    expect(q(h, "devcare-junk")).toBeNull();
+    expect(q(h, "devcare-boost")).toBeTruthy();
+
+    await fireEvent.click(q(h, "devcare-boost")!);
+    await settle();
+    expect(q(h, "devcare-boost-note")?.textContent).toContain("已回收 1 个应用");
+    expect(q(h, "devcare-boost-audit")?.textContent).toContain("已记录审计 (1/1)");
+  });
+
+  test("a boost that never happened does not erase the last clean's verdict", async () => {
+    // The two share the daemon's trail but not the screen region: the clean's line
+    // lives in the junk card, the boost's in the memory card. A race that leaves
+    // the governor gone clears the boost's own slot — and nothing else's.
+    installBridge({
+      boostResult: {
+        requested: [],
+        reclaimed: 0,
+        failures: [],
+        available_before: null,
+        available_after: null,
+        governor: false,
+        audit: { recorded: 0, attempted: 0, reason: null },
+      },
+    });
+    const h = render(DeviceCareApp);
+    await settle();
+    await fireEvent.click(q(h, "devcare-clean")!);
+    await settle();
+    expect(q(h, "devcare-audit")?.textContent).toContain("已记录审计 (1/1)");
+
+    await fireEvent.click(q(h, "devcare-boost")!);
+    await settle();
+    // The clean's still-standing verdict is untouched…
+    expect(q(h, "devcare-audit")?.textContent).toContain("已记录审计 (1/1)");
+    // …and the boost, which never ran, claims no verdict of its own.
+    expect(q(h, "devcare-boost-audit")).toBeNull();
+  });
+
+  test("a boost re-reads the audit trail it just wrote to", async () => {
+    const calls = installBridge();
+    const h = render(DeviceCareApp);
+    await settle();
+    const before = calls.filter((c) => c.cmd === "devcare_trail").length;
+
+    await fireEvent.click(q(h, "devcare-boost")!);
+    await settle();
+    // clean/uninstall refresh the trail after their event; a boost writes one too,
+    // so a card that omitted it would be stale by construction.
+    expect(calls.filter((c) => c.cmd === "devcare_trail").length).toBeGreaterThan(before);
   });
 });
 
@@ -851,6 +1081,42 @@ describe("DeviceCareApp.svelte — apps + permissions", () => {
     const report = calls.find((c) => c.cmd === "devcare_report");
     expect(report?.args?.sensitiveGrants).toBe(3);
   });
+
+  test("the reviewable-app count is NOT a shell input — the host derives it from the policy", async () => {
+    // Regression (REQ-A1410 ∕ F-SH-668): the screen sent `reviewableApps =
+    // apps.length` — the *whole* inventory — while the domain defines the count as
+    // `UninstallGuard::selectable()` (the `allowed` verdict). Given an inventory
+    // holding system/protected entries, the report then assessed the apps area and
+    // emitted `care.apps.reviewable` for review affordances the list never draws.
+    // The parameter is gone: the payload carries the grant count and nothing else.
+    const calls = installBridge({
+      apps: [
+        {
+          id: "com.a",
+          name: "A",
+          system: false,
+          size_bytes: 10,
+          verdict: "allowed",
+          reason_key: null,
+        },
+        {
+          id: "com.android.settings",
+          name: "S",
+          system: true,
+          size_bytes: 20,
+          verdict: "protected",
+          reason_key: "care.uninstall.protected",
+        },
+      ],
+    });
+    const h = render(DeviceCareApp);
+    await settle();
+    expect(q(h, "devcare-overview")).toBeTruthy();
+    const report = calls.find((c) => c.cmd === "devcare_report");
+    expect(report).toBeTruthy();
+    expect(report?.args).not.toHaveProperty("reviewableApps");
+    expect(Object.keys(report?.args ?? {})).toEqual(["sensitiveGrants"]);
+  });
 });
 
 describe("DeviceCareApp.svelte — storage overview", () => {
@@ -896,6 +1162,202 @@ describe("DeviceCareApp.svelte — storage overview", () => {
     await settle();
     expect(q(h, "devcare-storage-error")).toBeTruthy();
     expect(q(h, "devcare-storage-unknown")).toBeNull();
+  });
+
+  test("the wire word for 'no backend' is never printed", async () => {
+    // Rust spells it `none` (`BACKEND_NONE`), and a missing `backend` field normalizes
+    // to the same word — a machine code, not a name for a user to read.
+    installBridge({
+      storage: {
+        measured: false,
+        total_bytes: null,
+        used_bytes: null,
+        free_bytes: null,
+        used_pct: null,
+        backend: "none",
+        groups: [],
+        reclaimable_bytes: 0,
+        review_bytes: 0,
+      },
+    });
+    const h = render(DeviceCareApp);
+    await settle();
+    const backend = q(h, "devcare-storage-backend")?.textContent ?? "";
+    expect(backend).toContain("未知");
+    expect(backend).not.toContain("none");
+  });
+
+  test("a measured reading with an unread total renders '—', never 0 B", async () => {
+    // `measured: true` means the backend answered, not that it read every field:
+    // `StorageOut` carries each total as its own `Option`, so one can be `None`
+    // while the others are known.
+    installBridge({
+      storage: {
+        measured: true,
+        total_bytes: 100_000,
+        used_bytes: null,
+        free_bytes: null,
+        used_pct: null,
+        backend: "android",
+        groups: [],
+        reclaimable_bytes: 0,
+        review_bytes: 0,
+      },
+    });
+    const h = render(DeviceCareApp);
+    await settle();
+    expect(q(h, "devcare-storage-used")?.textContent).toContain("—");
+    expect(q(h, "devcare-storage-free")?.textContent).toContain("—");
+    expect(txt(h)).not.toContain("0 B");
+    // An unread percentage draws no bar at all: an empty track is the same claim
+    // as 「0%」, just quieter.
+    expect(q(h, "devcare-storage-bar")).toBeNull();
+  });
+});
+
+describe("DeviceCareApp.svelte — a failed scan is not an empty device", () => {
+  test("the overview count reads '—', not '0 项', when no scan landed", async () => {
+    installBridge({ scan: null });
+    const h = render(DeviceCareApp);
+    await settle();
+    expect(q(h, "devcare-junk-error")).toBeTruthy();
+    const items = q(h, "devcare-items")?.textContent ?? "";
+    expect(items).toContain("—");
+    expect(items).not.toContain("0");
+  });
+});
+
+describe("DeviceCareApp.svelte — a scan still in flight is not an empty device", () => {
+  // REQ-A1433 ∕ F-SH-691: `available` is a *capability* fact (the backend answered the
+  // status read), not an *observation* fact (a scan landed). The junk card is drawn off
+  // the capability, and its figure was read as `scan?.reclaimable_bytes ?? 0` — so for
+  // the whole window between "the backend is attached" and "the scan returned" (five
+  // device round-trips plus the scan itself), the card read 「可回收 0 B」 and
+  // 「没有可清理的垃圾」 over a device nothing had looked at yet. The overview's own
+  // item count two cards up already writes this rule (`scan ? … : "—"`, "No scan ⇒ no
+  // count"): the same fact answered two ways on one screen.
+  test("before the scan lands the junk card says unknown, never '0 B' / 'nothing to clean'", async () => {
+    installBridge({ hangOn: "devcare_scan" });
+    const h = render(DeviceCareApp);
+    await settle();
+
+    // The status read landed, so the junk card is on screen…
+    expect(q(h, "devcare-junk")).toBeTruthy();
+    // …but no scan has been observed, so the figure must be unknown — never a
+    // fabricated zero over a device nothing has looked at.
+    const junk = q(h, "devcare-junk")?.textContent ?? "";
+    expect(junk).toContain("—");
+    expect(junk).not.toContain("0 B");
+    // And it must not claim the device is clean: "nothing to clean" is a claim about
+    // an observation, and none has landed.
+    expect(q(h, "devcare-junk-empty")).toBeNull();
+    expect(q(h, "devcare-junk-error")).toBeNull();
+    // It says what it is actually doing instead.
+    expect(q(h, "devcare-junk-scanning")?.textContent).toContain("扫描中");
+    // The overview's item count makes the same honest answer.
+    expect(q(h, "devcare-items")?.textContent).toContain("—");
+  });
+
+  test("the scanning state gives way to the real figure once the scan lands", async () => {
+    // The pending command is the *report* read, which runs after the scan, so the scan
+    // itself still resolves and the card must end on the real sum — the guard is a
+    // state, not a permanent "—".
+    installBridge({ hangOn: "devcare_report" });
+    const h = render(DeviceCareApp);
+    await settle();
+    expect(q(h, "devcare-junk-scanning")).toBeNull();
+    expect(q(h, "devcare-junk")?.textContent).toContain("2 KB");
+    expect(q(h, "devcare-group-app_cache")).toBeTruthy();
+  });
+});
+
+describe("DeviceCareApp.svelte — the review-only share is disclosed, not folded into the headline", () => {
+  // The domain splits a scan's bytes in two: `JunkReport::reclaimable_bytes()` is the
+  // auto-cleanable half, `JunkReport::review_bytes()` the half that needs the explicit
+  // acknowledgement. `ScanOut` carries **both** on the reply root (F-SH-662), but only
+  // the first was read — so the card's headline「可清理 N」 totalled a filter while the
+  // list below offered rows from outside it, and the size of the acknowledgement the
+  // user is about to give (a `stale_download` they must tick 「需确认」 for) was nowhere
+  // on the screen. A figure the user trusts must not under-state what the button will do.
+  const REVIEW_SCAN = {
+    ...SCAN,
+    report: {
+      groups: [
+        { kind: "app_cache", count: 1, bytes: 1024 },
+        { kind: "stale_download", count: 1, bytes: 2048 },
+      ],
+      total_items: 2,
+      total_bytes: 3072,
+    },
+    auto_kinds: ["app_cache"],
+    review_kinds: ["stale_download"],
+    reclaimable_bytes: 1024,
+    review_bytes: 2048,
+  };
+
+  test("a scan with a review-only group names the review share next to the headline", async () => {
+    installBridge({ scan: REVIEW_SCAN });
+    const h = render(DeviceCareApp);
+    await settle();
+
+    const review = q(h, "devcare-junk-review");
+    expect(review).toBeTruthy();
+    expect(review?.textContent).toContain("需确认");
+    expect(review?.textContent).toContain("2 KB");
+  });
+
+  test("a scan with nothing to review shows only the headline total", async () => {
+    // The share is drawn from the host's own sum, so a scan with no review-only bytes
+    // must not sprout an empty 「需确认」 — a label with nothing behind it.
+    installBridge({ scan: SCAN });
+    const h = render(DeviceCareApp);
+    await settle();
+    expect(q(h, "devcare-junk-review")).toBeNull();
+  });
+});
+
+describe("DeviceCareApp.svelte — an un-audited clean must not name a cause it never established", () => {
+  test("an incomplete audit whose reason is 'no durable sink' does not claim the daemon is offline", async () => {
+    // The bridge folds a shortfall into `audit{recorded, attempted, reason}`. The
+    // two ordinary ways `recorded < attempted` happens both mean the daemon
+    // *answered*: `perm_record_audit` returning `Ok` with an `ingest.error`, or
+    // `Ok` with `recorded < total` because there is no durable sink
+    // (devcare.rs::record_audit). Only a transport `Err` is a connection failure
+    // — and even then the reason string carries the real diagnostic. So the
+    // rendered line must disclose the shortfall without asserting *why*.
+    installBridge({
+      trail: { records: [], durable: false },
+      clean: {
+        planned_items: 1,
+        planned_bytes: 10,
+        freed_bytes: 10,
+        removed: 1,
+        failed: 0,
+        partial: false,
+        failures: [],
+        audit: {
+          recorded: 0,
+          attempted: 1,
+          reason: "daemon has no durable audit sink (start it with AMOS_PRIVACY_PATH)",
+        },
+      },
+    });
+    const h = render(DeviceCareApp);
+    await settle();
+    await fireEvent.click(q(h, "devcare-clean")!);
+    await settle();
+
+    // The shortfall is still disclosed …
+    const audit = q(h, "devcare-audit")?.textContent ?? "";
+    expect(audit).toContain("审计未记录");
+    // … but not with a cause the bridge never established: this very fixture's
+    // reason says the daemon *answered* and merely has no sink.
+    expect(audit).not.toContain("未连接");
+    expect(audit).not.toContain("离线");
+    // The true reason still rides the title attribute, so nothing is hidden.
+    expect(q(h, "devcare-audit")?.getAttribute("title")).toContain("no durable audit sink");
+    // And the sibling surface on the same screen states the *established* cause.
+    expect(q(h, "devcare-trail-nosink")?.textContent).toContain("未启用持久审计");
   });
 });
 

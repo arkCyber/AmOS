@@ -58,7 +58,9 @@ pub mod types;
 pub mod android;
 
 pub use measure::{time, time_and};
-pub use power::{energy_joules, mean_power_mw, BatterySample, MockPowerSource, PowerSource};
+pub use power::{
+    energy_joules, mean_power_mw, BatterySample, MockPowerSource, PowerSource, VoltageSource,
+};
 pub use report::{fmt_opt, ProfileReport};
 pub use tracker::{safe_div, ProfileTracker};
 pub use types::{Phase, Record};

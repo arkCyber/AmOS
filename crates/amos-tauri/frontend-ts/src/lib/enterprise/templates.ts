@@ -14,9 +14,11 @@
  */
 
 import { readStoreValue, writeStoreValueChecked } from "../amosStore";
+import { resolveAuditIdentity } from "../buildIdentity";
 import { logger } from "./logger";
-import type { Shortcut } from "../shortcuts";
+import { createShortcut, deleteShortcut, loadShortcuts, type Shortcut } from "../shortcuts";
 import { mdmManager } from "./mdm";
+import { emitWebhookEvent } from "./webhooks";
 import { localId } from "../localId";
 
 // ============================================================================
@@ -151,19 +153,55 @@ export class TemplateManager {
   private templates: Map<string, EnterpriseTemplate> = new Map();
   private installations: Map<string, TemplateInstallation> = new Map();
   private categories: TemplateCategory[] = [];
+  /** `ensureInitialized()` 是否已经跑过（见那里为什么读写路径要自己把它叫起来）。 */
+  private initialized = false;
 
   /**
    * 初始化模板管理器
+   *
+   * **不要只靠它**——它唯一的调用者是 `enterprise/index.ts` 的 `initializeEnterprise()`，
+   * 而后者在生产里**零调用者**（同一事实 `audit.ts::ensureInitialized`（REQ-A897）、
+   * `mdm.ts::ensureInitialized`（REQ-A945）与 `webhooks.ts::ensureInitialized`（REQ-A980）
+   * 各记过一次）。见 {@link ensureInitialized}。
    */
   async initialize(): Promise<void> {
-    this.loadTemplates();
-    this.loadInstallations();
-    this.loadCategories();
-    
+    this.initialized = true;
+    this.bootstrap();
+
     // 检查更新
     if (mdmManager.isEnabled()) {
       await this.checkForUpdates();
     }
+  }
+
+  /**
+   * 引导「读回模板 / 安装记录 / 分类」，**幂等**，由使用者自己触发（REQ-A1320）。
+   *
+   * 为什么不能只依赖 `initialize()`：`initializeEnterprise()` 在生产里零调用者，于是
+   * `loadTemplates()` 从未在设备上跑过 —— `this.templates` 恒空，`TemplateLibrary.svelte`
+   * 永远画「暂无模板」空态。用户上一次会话落盘的模板、安装记录、自定义分类，重启后
+   * 没有任何人读回来。更坏的是写路径：`saveTemplates()` 写的是 `Array.from(this.templates.values())`，
+   * 所以在没有引导的情况下 `createTemplate()` 一落盘就会用**只有一条**的内存表覆盖整个目录。
+   *
+   * 所以把「我起来了」这句话系在**真正需要它的动作**上：读一次列表/详情/分类，或写一次
+   * （安装、卸载、创建、更新、删除、发布、同步）。任何一条被用到，流水线就先自己站起来。
+   * `initialized` 在**任何读取/重入之前**置位 —— `bootstrap()` 里的三步都在它之后跑，
+   * 顺序反了就是递归。
+   */
+  private ensureInitialized(): void {
+    if (this.initialized) return;
+    this.initialized = true;
+    this.bootstrap();
+  }
+
+  /**
+   * 「读回三张表」这一份，只有这一处（`initialize()` 与 `ensureInitialized()` 共用；
+   * 两份字节相同的引导正是上一轮在 `audit.ts` 修的形状）。
+   */
+  private bootstrap(): void {
+    this.loadTemplates();
+    this.loadInstallations();
+    this.loadCategories();
   }
 
   /**
@@ -189,12 +227,9 @@ export class TemplateManager {
    * 获取当前用户 ID
    */
   private getCurrentUserId(): string {
-    try {
-      const userId = readStoreValue("amos.user.id", "");
-      return userId || "user-default";
-    } catch {
-      return "user-default";
-    }
+    // 安装记录里的 `installedBy` 与审计同源：没有用户就如实写 `unattributed`，不留 `user-default`
+    // 这种会被读成真实账号的占位串（REQ-A695）。
+    return resolveAuditIdentity().userId;
   }
 
   /**
@@ -278,6 +313,7 @@ export class TemplateManager {
     status?: TemplatePublishStatus;
     search?: string;
   }): EnterpriseTemplate[] {
+    this.ensureInitialized();
     let templates = Array.from(this.templates.values());
 
     // 过滤
@@ -309,6 +345,7 @@ export class TemplateManager {
    * 获取模板详情
    */
   getTemplate(templateId: string): EnterpriseTemplate | null {
+    this.ensureInitialized();
     return this.templates.get(templateId) || null;
   }
 
@@ -316,6 +353,7 @@ export class TemplateManager {
    * 从服务器同步模板
    */
   async syncTemplates(): Promise<{ success: boolean; count: number; message?: string }> {
+    this.ensureInitialized();
     const mdmConfig = mdmManager.getConfig();
     if (!mdmConfig) {
       return { success: false, count: 0, message: "MDM 未启用" };
@@ -363,11 +401,21 @@ export class TemplateManager {
 
   /**
    * 安装模板
+   *
+   * `leftoverShortcutId` 只在**重装时收不掉上一条**（`deleteShortcut` 被企业策略拒绝）才出现：
+   * 回执仍是 `success`（新的那条确实建出来了），但库里现在有两条同名指令，`安装记录` 只认新的
+   * 那条，旧的那条既不在册也删不掉 —— 这句是唯一能让面板把这件事说出来的载体。
    */
   async installTemplate(
     templateId: string,
     parameterValues: Record<string, unknown>
-  ): Promise<{ success: boolean; shortcutId?: string; message?: string }> {
+  ): Promise<{
+    success: boolean;
+    shortcutId?: string;
+    leftoverShortcutId?: string;
+    message?: string;
+  }> {
+    this.ensureInitialized();
     const template = this.templates.get(templateId);
     if (!template) {
       return { success: false, message: "模板不存在" };
@@ -381,12 +429,44 @@ export class TemplateManager {
 
     try {
       // 应用参数到快捷指令
-      const shortcut = this.applyParameters(template.shortcutData, parameterValues);
-      
-      // 生成新的 ID
-      shortcut.id = localId("shortcut");
-      shortcut.createdAt = Date.now();
-      shortcut.updatedAt = Date.now();
+      const applied = this.applyParameters(template.shortcutData, parameterValues);
+
+      // 真的把它建出来（REQ-A1326）。修前这里只把返回值改了个 id 就回执成功 ——
+      // 那条快捷指令从来没有落过盘。走 `shortcuts.ts::createShortcut` 而不是自己 push：
+      // 那条路上有 MDM 的每用户上限（`checkCanCreate`，REQ-A842）、名字校验、
+      // `LIMITS.MAX_SHORTCUTS`、落盘判定，以及它自己的审计与 webhook；在这里另拼一份
+      // 会把这四道全绕过去，也就等于「模板安装是免策略的」。
+      const shortcut = createShortcut(applied.name, {
+        icon: applied.icon,
+        color: applied.color,
+        description: applied.description,
+        actions: applied.actions,
+        quickActions: applied.quickActions,
+        triggers: applied.triggers,
+        runOnLockScreen: applied.runOnLockScreen,
+        requiresConfirmation: applied.requiresConfirmation,
+        tags: applied.tags,
+      });
+      if (!shortcut) {
+        // `createShortcut` 把四种原因（策略拒绝 / 名字不合法 / 数量上限 / 落盘被拒）折进
+        // 同一个 `null`，所以这里如实只说「是这几条路之一」，不挑一个当成断言的答案。
+        return { success: false, message: "快捷指令创建失败（被企业策略或数量上限拒绝）" };
+      }
+
+      // 同一条模板重装（`updateInstalledTemplate` 走的就是这里）时把上一轮那条收掉，
+      // 否则一次「更新」会留下两条指令。删在**建成功之后**：建不出来就什么都不动。
+      const previousShortcutId = this.installations.get(templateId)?.shortcutId;
+      let leftoverShortcutId: string | undefined;
+      if (previousShortcutId && previousShortcutId !== shortcut.id) {
+        deleteShortcut(previousShortcutId);
+        // 判据与 `uninstallTemplate` 同一条：`deleteShortcut` 的 `false` 把「本来就不在」
+        // 与「被策略拒绝删除」折成同一个值，所以看的是删完之后**它还在不在**。这里不能
+        // 因为收不掉旧的就整单回失败 —— 新的那条已经建出来了，报失败又是一句谎；但也
+        // 不能沉默：留下的那条让库里多了一条同名指令，而记录只认新的那条。
+        if (loadShortcuts().some((s) => s.id === previousShortcutId)) {
+          leftoverShortcutId = previousShortcutId;
+        }
+      }
 
       // 记录安装
       const installation: TemplateInstallation = {
@@ -408,7 +488,17 @@ export class TemplateManager {
       template.successCount++;
       this.saveTemplates();
 
-      return { success: true, shortcutId: shortcut.id };
+      // 企业 webhook（REQ-A980）：**只在真的装出来之后**发。上面两条失败出口
+      // （模板不存在 / 参数不合法）与下面 `catch` 里的那条都不发 —— 面板上的
+      // `template_install` 说的是"装上了"，不是"有人试过"。
+      emitWebhookEvent("template_install", {
+        templateId: template.id,
+        templateVersion: template.version,
+        shortcutId: shortcut.id,
+        installedBy: installation.installedBy,
+      });
+
+      return { success: true, shortcutId: shortcut.id, leftoverShortcutId };
     } catch (err) {
       console.error("[Templates] 安装失败:", err);
       
@@ -427,6 +517,7 @@ export class TemplateManager {
    * 卸载模板
    */
   async uninstallTemplate(templateId: string): Promise<{ success: boolean; message?: string }> {
+    this.ensureInitialized();
     const installation = this.installations.get(templateId);
     if (!installation) {
       return { success: false, message: "未安装此模板" };
@@ -435,6 +526,15 @@ export class TemplateManager {
     const template = this.templates.get(templateId);
     if (template?.isForced) {
       return { success: false, message: "强制模板不可卸载" };
+    }
+
+    // 卸载的语义是「这条指令没了」，不是「把安装记录改个状态」（REQ-A1326）：
+    // 先把那条快捷指令真的删掉，删不掉就**不改记录**、如实回失败。
+    // 判据不能只用 `deleteShortcut` 的返回值 —— 它把「本来就不在」与「被策略拒绝删除」
+    // 折成同一个 `false`，而前者本来就已是目标状态。所以看的是删完之后**它还在不在**。
+    deleteShortcut(installation.shortcutId);
+    if (loadShortcuts().some((s) => s.id === installation.shortcutId)) {
+      return { success: false, message: "快捷指令删除被拒（企业策略）" };
     }
 
     // 更新状态
@@ -449,6 +549,7 @@ export class TemplateManager {
    * 检查模板更新
    */
   async checkForUpdates(): Promise<string[]> {
+    this.ensureInitialized();
     const updatableTemplates: string[] = [];
 
     for (const [templateId, installation] of this.installations.entries()) {
@@ -494,6 +595,7 @@ export class TemplateManager {
    * 获取已安装的模板
    */
   getInstalledTemplates(): TemplateInstallation[] {
+    this.ensureInitialized();
     return Array.from(this.installations.values()).filter(i => i.status === "active");
   }
 
@@ -501,6 +603,7 @@ export class TemplateManager {
    * 获取分类列表
    */
   getCategories(): TemplateCategory[] {
+    this.ensureInitialized();
     return [...this.categories].sort((a, b) => a.order - b.order);
   }
 
@@ -508,6 +611,7 @@ export class TemplateManager {
    * 创建模板
    */
   createTemplate(template: Omit<EnterpriseTemplate, "id" | "version" | "createdAt" | "updatedAt">): EnterpriseTemplate {
+    this.ensureInitialized();
     const newTemplate: EnterpriseTemplate = {
       ...template,
       id: localId("tpl"),
@@ -527,12 +631,13 @@ export class TemplateManager {
    * 更新模板
    */
   updateTemplate(templateId: string, updates: Partial<EnterpriseTemplate>): EnterpriseTemplate | null {
+    this.ensureInitialized();
     const template = this.templates.get(templateId);
     if (!template) {
       logger.warn("templates", `模板不存在: ${templateId}`);
       return null;
     }
-    
+
     // 更新版本号（如果有实质性修改）
     const oldVersion = template.version;
     const [major, minor, patch] = oldVersion.split(".").map(Number);
@@ -557,6 +662,7 @@ export class TemplateManager {
    * 删除模板
    */
   deleteTemplate(templateId: string): boolean {
+    this.ensureInitialized();
     const template = this.templates.get(templateId);
     if (!template) {
       logger.warn("templates", `模板不存在: ${templateId}`);
@@ -574,6 +680,7 @@ export class TemplateManager {
    * 发布模板（标记为已发布）
    */
   publishTemplate(templateId: string): EnterpriseTemplate | null {
+    this.ensureInitialized();
     const template = this.templates.get(templateId);
     if (!template) {
       logger.warn("templates", `模板不存在: ${templateId}`);
@@ -727,6 +834,20 @@ export class TemplateManager {
 
       await this.installTemplate(template.id, defaultValues);
     }
+  }
+
+  /**
+   * 测试专用：把管理器退回「从没起来过」并清空三张内存表（REQ-A1320）。
+   *
+   * 为什么需要：`templateManager` 是模块级单例，而 `ensureInitialized()` 只认第一次 ——
+   * 一个测试文件里连着播两次 localStorage，第二次不会再读回，用例之间就会互相串味。
+   * 生产代码**从不**调用它。
+   */
+  resetForTest(): void {
+    this.initialized = false;
+    this.templates = new Map();
+    this.installations = new Map();
+    this.categories = [];
   }
 }
 

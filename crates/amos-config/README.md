@@ -64,7 +64,7 @@ cargo run -p amos-config --example feature_flags
 | example | shows |
 |---|---|
 | `layered_resolve` | `explain()` printing every layer's contribution, then `get_typed::<u16>`; the documented `AMOS_AI_PORT` override actually taking effect |
-| `feature_flags` | a JSON file read through `from_file`; `percent` as a **stable** `fnv1a(install_id) % 100` bucket; an unknown key reading `false` |
+| `feature_flags` | a JSON file read through `from_file`; `percent` as a **stable** `fnv1a(install_id) % 100` bucket (withheld when the context carries no `install_id`); an unknown key reading `false` |
 
 ## Honest boundaries
 

@@ -6,6 +6,7 @@
   import { CAPABILITIES, grantedApps, loadLedger } from "../../lib/permissions";
   import type { Capability, PermissionLedger } from "../../lib/permissions";
   import { revokeCapability } from "../osPermissions";
+  import StoreErrorBar from "../StoreErrorBar.svelte";
   import {
     canonicalPath,
     mediaAvailableCollections,
@@ -16,6 +17,7 @@
     type StandardDir,
   } from "../../lib/media";
   import { isExtId, tileById } from "../../lib/storeApps";
+  import { appTitleKey } from "../../lib/appMeta";
   import { t } from "../locale.svelte";
   import { GROUP, LABEL } from "./kit";
   import { iconSvg } from "../../lib/sysIcons";
@@ -28,18 +30,6 @@
     storage: "🗂️",
     notifications: "🔔",
   };
-  /** built-in app id → i18n key (ext ids resolve through the store tile). */
-  const KNOWN: Record<string, string> = {
-    camera: "app.camera",
-    ai: "app.ai",
-    interpreter: "app.interpreter",
-    phone: "app.phone",
-    maps: "app.maps",
-    weather: "app.weather",
-    messages: "app.messages",
-    mail: "app.mail",
-    magnifier: "app.magnifier",
-  };
   const capKey = (c: Capability): string => {
     switch (c) {
       case "camera": return "perm.cap.camera";
@@ -51,17 +41,28 @@
       default: return "perm.cap.camera"; // exhaustive guard (never reached)
     }
   };
+  // The display name comes from `lib/appMeta` — the one table that owns it — instead of
+  // a hand-maintained copy here. That copy had no `vmemos`, so a default-on app rendered
+  // as the raw id (`vmemos` + microphone), the same drift `PermissionsApp` was fixed for.
   const nameOf = (id: string): string => {
     if (isExtId(id)) return tileById(id)?.name ?? id;
-    const key = KNOWN[id];
+    const key = appTitleKey(id);
     return key ? t(key) : id;
   };
 
   let ledger = $state<PermissionLedger>(loadLedger());
+  /** The last refused `amos.permissions` write, stated (see {@link revoke}). */
+  let storeErr = $state("");
   const revoke = (app: string, cap: Capability) => {
     // One seam for both sides (local ledger + daemon mirror), same as the other
     // capability prompts — see `svelte/osPermissions`.
-    ledger = revokeCapability(app, cap);
+    // `CapabilityWrite.ledger` is the **persisted** one: on a refused write the store still
+    // holds the grant, and that is what every gate in the OS reads back — so a revoke shown
+    // as done here would be undone by the next boot's `loadLedger`, silently. Same rule as
+    // the media revoke below ("reflect the real state again (never assume the revoke took)").
+    const res = revokeCapability(app, cap);
+    ledger = res.ledger;
+    storeErr = res.landed ? "" : t("common.storeWriteFailed");
   };
 
   // ---- System media access ------------------------------------------------
@@ -106,6 +107,7 @@
 </script>
 
 <div class="space-y-5">
+  <StoreErrorBar message={storeErr} />
   {#if held.length === 0}
     <section class={GROUP}>
       <div class="px-4 py-6">

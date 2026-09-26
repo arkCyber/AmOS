@@ -1,9 +1,11 @@
 //! A control loop that **measures its own cadence** instead of asserting one.
 //!
 //! [`amos_link::RobotBridge`] is one explicit step: it does not spawn a thread, and
-//! `docs/amos-link.md` §6 says so — "the frequency is the caller's (50–100 Hz in a real
-//! product)". This module is that caller, and its whole point is the difference between
-//! *running* at a period and *claiming* one:
+//! `docs/amos-link.md` §6 says so — that section is written in Chinese, and this is a
+//! **translation, not a quotation** (the sentence reads 「线程/频率由调用方（真实产品里是
+//! 50–100 Hz 的控制任务）决定」; an earlier revision put an English sentence in quotation marks
+//! that appears nowhere in that document). This module is that caller, and its whole point is
+//! the difference between *running* at a period and *claiming* one:
 //!
 //! | what the loop reports | why it is measured, not assumed |
 //! |---|---|
@@ -72,10 +74,15 @@ use amos_link::robot_hal::{BridgeEvent, RobotBridge, RobotHal};
 /// How many recent tick intervals the percentile window keeps.
 ///
 /// 1024 intervals at 100 Hz is ~10 s of history: long enough for a p99 to mean something at a
-/// control cadence, small enough that the window is 8 KiB of `Duration` rather than an
-/// unbounded `Vec` that grows with uptime (the same bounded-instrument rule the middleware's
-/// `SeqTracker` and rate tracker follow).
+/// control cadence, small enough that the window's ring buffer is fixed (16 KiB — `Duration`
+/// is 16 bytes on a 64-bit target) rather than an unbounded `Vec` that grows with uptime (the
+/// same bounded-instrument rule the middleware's `SeqTracker` and rate tracker follow).
 pub const MAX_CYCLE_SAMPLES: usize = 1_024;
+
+/// Default jitter tolerance, as a divisor of the period: a tick may start up to
+/// `period / 10` late and still count as on time. A 100 Hz loop on a busy general-purpose
+/// OS tolerates ~1 ms of scheduling jitter before it is worth reporting.
+const DEFAULT_SLACK_DIVISOR: u32 = 10;
 
 /// What one tick did with respect to its period.
 ///
@@ -83,7 +90,8 @@ pub const MAX_CYCLE_SAMPLES: usize = 1_024;
 /// time and overrun. Collapsing them into one enum would lose one of them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CycleVerdict {
-    /// How late this tick **started** relative to the period (saturating: early is `None`).
+    /// How late this tick **started** relative to `period + slack` (saturating: starting
+    /// early, or inside the slack window, is `None`).
     pub late_by: Option<Duration>,
     /// True when the work of this tick took longer than the period (the next tick is already
     /// behind, whatever the timer does).
@@ -91,7 +99,10 @@ pub struct CycleVerdict {
 }
 
 impl CycleVerdict {
-    /// True when the tick started within the slack window and finished inside its period.
+    /// True when the tick finished inside its period and there is no evidence it started
+    /// late. Note the asymmetry: `late_by == None` means "no lateness evidence", which
+    /// covers both an on-time start and the **first** tick of a loop (whose interval was
+    /// never measured) — so `is_clean` is `true` for that first tick.
     pub fn is_clean(&self) -> bool {
         self.late_by.is_none() && !self.overrun
     }
@@ -104,7 +115,13 @@ impl CycleVerdict {
 /// learn two words for the same shape.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CadenceHealth {
-    /// Fewer than two ticks: there is no interval yet, so there is nothing to conclude.
+    /// **No judged interval yet** (only the loop's first tick, whose interval was never
+    /// measured) and no overrun: there is no evidence yet, so there is nothing to conclude.
+    /// The threshold is one judged interval, *not* two: a single measured, on-time interval
+    /// is already evidence, so the second tick reads [`CadenceHealth::Held`] — the same rule
+    /// as the module table's "before the second tick". (An earlier revision of this doc said
+    /// "fewer than two judged ticks", which the code never did — `health()` tests
+    /// `judged == 0`.)
     Unknown,
     /// Every judged tick started inside the slack window and finished inside its period.
     Held,
@@ -261,8 +278,8 @@ impl CycleStats {
     }
 
     /// The `p`-th percentile of the **retained window** (nearest-rank), or `None` when the
-    /// window is empty. Read [`CycleStats::window_full`] to know whether that window is the
-    /// whole run.
+    /// window is empty. `p` is saturating: a value above `100` is read as `100`. Read
+    /// [`CycleStats::window_full`] to know whether that window is the whole run.
     pub fn recent_lateness_percentile(&self, p: u32) -> Option<Duration> {
         if self.recent.is_empty() {
             return None;
@@ -283,12 +300,21 @@ impl CycleStats {
         self.rolled
     }
 
-    /// The loop's verdict: `Unknown` until a second tick exists.
+    /// The loop's verdict: `Unknown` until there is evidence, `Slipping` once any tick was
+    /// late or overran.
+    ///
+    /// An **overrun is evidence even on the first tick**. The first tick has no interval to
+    /// judge (so `judged == 0`), but if its work exceeded the period that is a direct,
+    /// measured fact — reporting `Unknown` there would contradict [`CadenceHealth::Slipping`]'s
+    /// "late or overran" and hide a real problem behind a not-yet-enough-ticks verdict.
     pub fn health(&self) -> CadenceHealth {
+        if self.overruns > 0 {
+            return CadenceHealth::Slipping;
+        }
         if self.judged == 0 {
             return CadenceHealth::Unknown;
         }
-        if self.late == 0 && self.overruns == 0 {
+        if self.late == 0 {
             CadenceHealth::Held
         } else {
             CadenceHealth::Slipping
@@ -377,12 +403,14 @@ pub struct ControlLoop<H: RobotHal> {
     bridge: RobotBridge<H>,
     stats: CycleStats,
     last_tick: Option<tokio::time::Instant>,
+    pet: Option<crate::watchdog::PetCounter>,
 }
 
 impl<H: RobotHal> ControlLoop<H> {
-    /// A loop at `period`, tolerating a tenth of that as jitter before a tick counts as late.
+    /// A loop at `period`, tolerating a tenth of that as jitter before a tick counts as
+    /// late (the divisor is the private `DEFAULT_SLACK_DIVISOR`).
     pub fn new(bridge: RobotBridge<H>, period: Duration) -> Result<Self, LoopError> {
-        Self::with_slack(bridge, period, period / 10)
+        Self::with_slack(bridge, period, period / DEFAULT_SLACK_DIVISOR)
     }
 
     /// A loop with an explicit jitter tolerance.
@@ -402,7 +430,30 @@ impl<H: RobotHal> ControlLoop<H> {
             bridge,
             stats: CycleStats::new(period, slack),
             last_tick: None,
+            pet: None,
         })
+    }
+
+    /// Hand the loop a liveness token to pet on every tick, so an **external**
+    /// [`Watchdog`](crate::watchdog::Watchdog) watching the same token sees this loop's
+    /// ticks (see [`ControlLoop::tick`]).
+    ///
+    /// This is the join the in-loop [`SafetyMonitor`](crate::safety::SafetyMonitor) cannot
+    /// make: the monitor's `R1` owns no clock and only sees the gap the caller *reports*, so
+    /// a loop that stops calling in altogether is invisible to it. A supervisor holding a
+    /// `Watchdog` over the token the loop pets is the observer that sees a stopped loop —
+    /// and this method is what makes the loop the thing being observed.
+    ///
+    /// Additive and non-breaking: a loop without a token behaves exactly as before.
+    pub fn with_watchdog(mut self, counter: crate::watchdog::PetCounter) -> Self {
+        self.pet = Some(counter);
+        self
+    }
+
+    /// The liveness token this loop pets, if one was attached
+    /// ([`ControlLoop::with_watchdog`]).
+    pub fn pet_counter(&self) -> Option<&crate::watchdog::PetCounter> {
+        self.pet.as_ref()
     }
 
     /// The cadence instrument (whole-run counters + a bounded percentile window).
@@ -415,11 +466,18 @@ impl<H: RobotHal> ControlLoop<H> {
         &self.bridge
     }
 
-    /// One tick: measure, `step()`, measure, record.
+    /// One tick: measure, `step()`, measure, record, pet.
     ///
     /// The cadence fact is recorded **even when the step failed** — "the link broke at tick
     /// 412, 3 ms late" is two independent facts and the caller needs both. No pacing here:
     /// this is the shape for a caller that owns its own timer.
+    ///
+    /// If a token was attached ([`ControlLoop::with_watchdog`]) it is petted **after** the
+    /// step returns, on success *and* on failure: a tick that ran and reported an error is
+    /// still a live loop, and conflating "the link broke" with "the loop stopped" would make
+    /// the watchdog fire for the wrong reason. The pet is *after* the step on purpose: a step
+    /// that hangs never returns, so it never pets, and the watchdog expires — which is exactly
+    /// the hung-loop case the token exists to expose.
     pub async fn tick(&mut self) -> Result<BridgeEvent, LoopError> {
         let started = tokio::time::Instant::now();
         let interval = self
@@ -430,6 +488,9 @@ impl<H: RobotHal> ControlLoop<H> {
         let outcome = self.bridge.step().await;
         let work = started.elapsed();
         self.stats.record(interval, work);
+        if let Some(pet) = &self.pet {
+            pet.pet();
+        }
 
         outcome.map_err(LoopError::Link)
     }
@@ -526,6 +587,45 @@ mod tests {
         assert_eq!(stats.judged(), 0, "one tick has no interval to judge");
         assert_eq!(stats.health(), CadenceHealth::Unknown);
         assert_eq!(stats.late_ratio(), None, "no evidence is not 0%");
+    }
+
+    /// Where `Unknown` ends: after the loop's first tick, and nowhere else. One measured,
+    /// on-time interval is already evidence, so the **second** tick reads `Held` — this
+    /// pins `judged == 0` (not "fewer than two judged ticks", which the `CadenceHealth::Unknown`
+    /// doc used to claim and the code never did).
+    #[test]
+    fn the_second_tick_is_already_evidence_not_unknown() {
+        let mut stats = stats();
+        stats.record(None, Duration::from_micros(100));
+        assert_eq!(stats.judged(), 0);
+        assert_eq!(
+            stats.health(),
+            CadenceHealth::Unknown,
+            "the loop's first tick has no interval to judge"
+        );
+
+        let second = stats.record(Some(PERIOD), Duration::from_micros(200));
+        assert!(second.is_clean());
+        assert_eq!(stats.judged(), 1, "the second tick is the first judged one");
+        assert_eq!(stats.late_ratio(), Some(0.0));
+        assert_eq!(
+            stats.health(),
+            CadenceHealth::Held,
+            "one on-time interval is evidence; `Unknown` is the first tick only"
+        );
+    }
+
+    #[test]
+    fn a_first_tick_overrun_is_slipping_not_unknown() {
+        // The first tick has no interval to judge, but a work time beyond the period is
+        // direct evidence: the verdict must be Slipping, not the not-yet-enough-ticks
+        // Unknown.
+        let mut stats = stats();
+        let first = stats.record(None, PERIOD + Duration::from_millis(1));
+        assert!(first.overrun);
+        assert_eq!(stats.judged(), 0);
+        assert_eq!(stats.overruns(), 1);
+        assert_eq!(stats.health(), CadenceHealth::Slipping);
     }
 
     #[test]
@@ -772,6 +872,85 @@ mod tests {
         );
     }
 
+    /// The contrast the two entry points exist for: a **paced run** re-captures its
+    /// predecessor (so the caller's idle gap is not charged to the loop), but a **hand tick**
+    /// does not — every interval between [`ControlLoop::tick`] calls *is* an interval, whether
+    /// or not it followed a run. Asserted as a count, not a wall-clock lateness, so the CI
+    /// machine cannot decide the verdict.
+    #[tokio::test]
+    async fn a_hand_ticked_loop_judges_every_interval() {
+        let (bridge, publisher, _node) = fixture().await;
+        for _ in 0..8 {
+            publisher
+                .publish(&AgentAction::new(r#"{"action":"sit","speed":0.4}"#))
+                .await
+                .expect("publish");
+        }
+        let mut control = ControlLoop::new(bridge, PERIOD).expect("a loop");
+
+        control.run_ticks(3).await.expect("three paced ticks");
+        assert_eq!(
+            control.stats().judged(),
+            2,
+            "a paced run's first tick has no predecessor"
+        );
+
+        control.tick().await.expect("a hand tick");
+        assert_eq!(
+            control.stats().judged(),
+            3,
+            "a hand tick keeps the run's last tick as its predecessor, so the interval is judged"
+        );
+        control.tick().await.expect("another hand tick");
+        assert_eq!(control.stats().judged(), 4);
+    }
+
+    /// The join the watchdog module exists for: a **running** loop keeps an external
+    /// supervisor alive (the token advances), a **stopped** one expires it. Fed hand-picked
+    /// `now`s as the loop runs, so the verdicts are exact and no assertion reads a real clock.
+    #[tokio::test]
+    async fn a_stopped_loop_expires_an_external_watchdog() {
+        let (bridge, publisher, _node) = fixture().await;
+        for _ in 0..4 {
+            publisher
+                .publish(&AgentAction::new(r#"{"action":"sit","speed":0.4}"#))
+                .await
+                .expect("publish");
+        }
+        let counter = crate::watchdog::PetCounter::new();
+        let mut control = ControlLoop::new(bridge, PERIOD)
+            .expect("a loop")
+            .with_watchdog(counter.clone());
+
+        let t0 = tokio::time::Instant::now();
+        let mut watchdog =
+            crate::watchdog::Watchdog::new(counter.clone(), Duration::from_millis(50), t0)
+                .expect("a nonzero deadline");
+        control.run_ticks(4).await.expect("four ticks");
+        assert_eq!(counter.count(), 4, "the loop pets once per tick");
+        assert!(control.bridge().hal().applied() >= 13, "the bus was driven");
+
+        // The run's pets are seen; the poll re-arms on the advance.
+        let seen = watchdog.poll(t0 + Duration::from_millis(60));
+        assert!(!seen.is_expired(), "a live run is not expired: {seen:?}");
+        // The loop has stopped and the token is still: 51 ms of silence is past the 50 ms
+        // deadline, so the supervisor reports the stopped loop — the case `R1` cannot see.
+        let expired = watchdog.poll(t0 + Duration::from_millis(111));
+        assert!(
+            expired.is_expired(),
+            "a stopped loop must expire the external watchdog: {expired:?}"
+        );
+    }
+
+    /// Additive and non-breaking: a loop with no token attached pets nothing and reads back
+    /// no counter, exactly as before `with_watchdog` existed.
+    #[tokio::test]
+    async fn a_loop_without_a_token_has_no_counter() {
+        let (bridge, _publisher, _node) = fixture().await;
+        let control = ControlLoop::new(bridge, PERIOD).expect("a loop");
+        assert!(control.pet_counter().is_none());
+    }
+
     /// A robot and a commander on one in-process node (the same shape the middleware's own
     /// bridge test uses: the broker delivers to subscribers inside the node).
     async fn fixture() -> (
@@ -795,5 +974,73 @@ mod tests {
         let bridge =
             RobotBridge::with_watchdog(subscriber, MockRobotHal::new(), Duration::from_millis(250));
         (bridge, publisher, node)
+    }
+
+    /// The two constructors must agree: `new` is `with_slack(period, period/10)`, so the
+    /// slack a deployment reads back is observable and the policy is not hidden.
+    #[tokio::test]
+    async fn the_two_constructors_agree_on_the_slack_policy() {
+        let (bridge, _publisher, _node) = fixture().await;
+        let default = ControlLoop::new(bridge, PERIOD).expect("loop");
+        assert_eq!(default.stats().slack(), PERIOD / 10);
+
+        let (bridge, _publisher, _node) = fixture().await;
+        let explicit =
+            ControlLoop::with_slack(bridge, PERIOD, Duration::from_millis(3)).expect("loop");
+        assert_eq!(explicit.stats().slack(), Duration::from_millis(3));
+    }
+
+    #[tokio::test]
+    async fn with_slack_refuses_a_zero_period_too() {
+        let (bridge, _publisher, _node) = fixture().await;
+        assert!(matches!(
+            ControlLoop::with_slack(bridge, Duration::ZERO, Duration::from_millis(1)),
+            Err(LoopError::ZeroPeriod)
+        ));
+    }
+
+    /// The error's `Display` is what an operator reads and `source` is what a caller
+    /// chains on: a leaf says why, the wrapped link error stays reachable.
+    #[test]
+    fn the_loop_error_explains_itself_and_chains_the_link_error() {
+        use std::error::Error;
+
+        let zero = LoopError::ZeroPeriod;
+        assert!(
+            zero.to_string().contains("non-zero period"),
+            "zero-period message: {zero}"
+        );
+        assert!(zero.source().is_none(), "a leaf error has no source");
+
+        let link = LoopError::from(LinkError::Closed(String::from("test")));
+        assert!(
+            link.to_string().contains("control link failed"),
+            "link message: {link}"
+        );
+        assert!(
+            link.source().is_some(),
+            "the wrapped link error must stay reachable via source()"
+        );
+    }
+
+    /// The keys are log vocabulary; pinned literally so a rename cannot pass silently.
+    #[test]
+    fn cadence_health_keys_are_stable() {
+        assert_eq!(CadenceHealth::Unknown.key(), "unknown");
+        assert_eq!(CadenceHealth::Held.key(), "held");
+        assert_eq!(CadenceHealth::Slipping.key(), "slipping");
+    }
+
+    /// The documented first-tick asymmetry: `late_by == None` because the interval was
+    /// never measured, so `is_clean` is `true` even though nothing about the start was
+    /// judged. A tick that overran is *not* clean, first tick or not.
+    #[test]
+    fn the_first_tick_reads_clean_but_an_overrun_does_not() {
+        let mut stats = stats();
+        let first = stats.record(None, Duration::from_micros(100));
+        assert_eq!(first.late_by, None);
+        assert!(first.is_clean(), "the first tick has no lateness evidence");
+        let overran = stats.record(Some(PERIOD), PERIOD + Duration::from_millis(1));
+        assert!(!overran.is_clean(), "an overrun is never clean");
     }
 }

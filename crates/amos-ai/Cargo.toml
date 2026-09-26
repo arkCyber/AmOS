@@ -69,10 +69,14 @@ async-trait = "0.1"
 serde_json = "1.0"
 ureq = "2"
 
-# Compile-time switches for the native inference/ASR/accelerator backends. The
-# default build is lightweight (mock ASR); enabling `asr-sherpa` pulls the real
-# sherpa-onnx local recognizer into the daemon so the bidi `Payload::Audio`
-# channel runs genuine on-device speech recognition.
+# Compile-time switches for the native inference/ASR/accelerator backends.
+#
+# **`asr-sherpa` is ON by default (Gap 8 / F-ASR-001):** the device image ships a
+# bundled sherpa model and the daemon must run *real* on-device speech
+# recognition unless an operator deliberately opts out. Opt out of the native ASR
+# engine with `cargo build -p amos-ai --no-default-features` (the daemon then
+# logs an explicit warning before ever using the deterministic mock) or disable
+# voice at runtime with `AMOS_ASR_BACKEND=off`.
 #
 # Accelerator SDK seams (see `docs/qcom-mtk-bringup.md`): `qnn` and `neuropilot`
 # declare that the daemon was built against Qualcomm QNN / MediaTek NeuroPilot.
@@ -80,9 +84,28 @@ ureq = "2"
 # *claimed* when the matching SDK is actually linked. NNAPI/Vulkan/Metal are
 # runtime backends (no compile-time SDK) and need no feature.
 [features]
+default = ["asr-sherpa"]
 asr-sherpa = ["amos-asr/sherpa"]
 qnn = []
 neuropilot = []
+# Rockchip RK3588 NPU (RKNN runtime) seam — see `docs/rk3588-bringup.md`. Declares
+# the daemon was built against `librknnrt.so`; until the binding lands the
+# backend returns an honest `NotImplemented(...)` error rather than fabricating
+# success (with the feature *off* the same constructor answers `Provider(...)`,
+# naming the unlinked SDK).
+rknn = []
+# In-process llama.cpp LLM runtime (no `allama` subprocess). Seam only today: the
+# backend returns an honest `NotImplemented(...)` error until the binding is
+# written (with the feature off it answers `Provider(...)` instead).
+llama-cpp-inproc = []
+# Bundled on-device model seam (Gap 4 / TODO 4.2, F-AI-017). Default OFF: an
+# unset/`auto` `AMOS_BACKEND` then resolves to the honest `unconfigured` engine
+# and **never** the mock. A **device image** turns this on so the image can stage
+# a GGUF under the documented path (`bundled_model::bundled_model_resolver`) and
+# have the daemon serve real local inference with no operator knob. Gates
+# *resolution* only — no native dependency is linked, and the model file must
+# actually exist on disk, else the daemon still reports `unconfigured`.
+bundled-model = []
 # Pulls the amos-telemetry-spy domain core and the EgressMatch -> proto EgressHit
 # mapping / `TelemetrySpySvc::ingest_match` feed seam. Pure std (no pnet): the
 # seam is host-testable, so a capture producer only needs to open the NIC
@@ -105,3 +128,7 @@ hyper-util.workspace = true
 # The integration tests drive the daemon's real tracing writer (`TeeWriter`), so the
 # `MakeWriter` trait they call through must be nameable from `tests/`.
 tracing-subscriber.workspace = true
+# `is_deployment_unconfigured` tests share `std::env` (process-wide); concurrent
+# threads would race on the env values. `#[serial]` on those tests serialises
+# them. Used only inside the daemon's test module.
+serial_test = "3"

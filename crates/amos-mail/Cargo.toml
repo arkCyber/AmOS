@@ -27,7 +27,10 @@ lettre = { version = "0.11", optional = true, default-features = false, features
 
 # TLS for the IMAP reader (imap.gmail.com:993 etc.), optional + feature-gated.
 tokio-rustls = { version = "0.26", optional = true }
-rustls = { version = "0.23", optional = true }
+# Pinned >=0.23.45 to dodge RUSTSEC-2026-0285 (TLS 1.3 handshake messages
+# incorrectly accepted across encryption-level boundaries). A semver-patch
+# bump — the surrounding `tokio-rustls` 0.26 is also fine with it.
+rustls = { version = ">=0.23.45", optional = true }
 webpki-roots = { version = "0.26", optional = true }
 
 # Future real IMAP reading backend (imap-next) plugs in behind `live` too.

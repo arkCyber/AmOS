@@ -190,6 +190,14 @@
 - **Phase D — 前端消费真实媒体（Svelte/TS）**
   - `lib/photos.ts`/`FilesApp`/`CameraApp`/vmemos/store 接 Phase B 桥；真机集合与本地层合并；离线仍有 Mock 回退。
   - **验收**：`tsc clean`、`svelte-check 0/0`、vitest、`bun [bun-iso] OK`、`vite build`；新 DOM/纯逻辑用例补齐。
+  - **REQ-A517 的教训（写在消费阶段，因为坑就在这一层）**：`lib/media.ts::mediaStreamBase()` +
+    `lib/photoLibrary.ts::nativeStreamUrl()` 曾以**前端桩**的形式宣称这条流式缩略图链路存在，
+    而宿主**从未**有 `media_stream_base` 命令（`crates/amos-tauri` 里没有那个
+    `#[tauri::command]`，也不在 `lib.rs` 的 `generate_handler![]` 里）⇒ 整条链路一步也走不通，
+    且每次调用都在诊断台账里留下一条**假的** `command-failed`。三个桩已在 REQ-A517 删除，
+    并新增 `scripts/tauri-command-scan.mjs` 第 3 条检查（UI 的字面 `invoke` 必须在宿主注册表
+    中）守住"前端不能单方面发明命令"。恢复真缩略图时必须**先**做宿主半边（Phase B/C 的流式
+    端点 + 一条**注册**的 `media_stream_base`），再由消费端接上。
 
 - **Phase E — 真机 bring-up 与端到端验收**
   - 设备上验证：授权后相册列出原生 DCIM 照片、快门/录音/导出写入用户可见目录并可被系统图库看到、商店 APK 落 Download。

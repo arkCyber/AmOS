@@ -13,11 +13,32 @@
 
   let rows = $state(listQuarantined());
   let copied = $state("");
+  /**
+   * The row whose copy was **refused**, or `""`.
+   *
+   * `copySelection` returns `false` for "nothing was copied" and its own doc states the
+   * contract — "the caller must say so". Folding it into `copied = ""` left the button
+   * reading 「复制」 exactly as before the tap, which on this panel is indistinguishable
+   * from a broken button: copying these bytes out is the *only* thing the panel does, so a
+   * refusal with no words reads as "the rescue failed for no reason".
+   */
+  let copyErr = $state("");
 
   const copy = async (key: string) => {
     const raw = readQuarantine(key);
-    if (raw === null) return;
-    copied = (await copySelection(raw)) ? key : "";
+    if (raw === null) {
+      // The preserved copy is gone (another window cleared it, or the key was repaired):
+      // drop the stale row instead of leaving a button that can only ever do nothing.
+      rows = listQuarantined();
+      return;
+    }
+    if (await copySelection(raw)) {
+      copied = key;
+      copyErr = "";
+      return;
+    }
+    copied = "";
+    copyErr = key;
   };
 </script>
 
@@ -48,6 +69,9 @@
           {copied === r.key ? t("settings.quarantineCopied") : t("settings.quarantineCopy")}
         </button>
       </div>
+      {#if copyErr === r.key}
+        <p role="alert" class="px-4 pb-2 text-xs text-danger">{t("settings.quarantineCopyFailed")}</p>
+      {/if}
     {/each}
   </section>
 {/if}

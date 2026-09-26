@@ -19,6 +19,7 @@
  *    normalizer the real listener uses.
  */
 import { invoke } from "./backend";
+import { amosWarn } from "./debugLog";
 import {
   subscribeSensorData,
   toSensorData,
@@ -93,8 +94,37 @@ export function applySensorLive(s: SensorLiveState, ev: SensorDataEvent): Sensor
     n.prevMode = ev.prev_mode ?? s.prevMode;
   } else if (ev.kind === "cleared") {
     n.clearCount += 1;
+    // A producer cleared every stored sample (glue detach) — the Rust bus dropped its
+    // IMU/frame/vitals stores (`LiveSensorProvider::clear_samples`). Keeping the payloads
+    // here would make the card draw the pre-detach sample as the *current* one, the exact
+    // "serves stale pre-detach data as current" outcome the clearing exists to prevent.
+    // `reset()` already drops both, and `initialSensorLive()` starts with both null.
+    // (REQ-A1800 / F-SH-894 — this arm used to bump `clearCount` only.)
+    n.lastImu = null;
+    n.lastFrame = null;
   }
   return n;
+}
+
+/**
+ * The bit of the `sensor_host_snapshot` reply this module consumes (`sensor_host::SensorHostSnapshot`).
+ *
+ * Only the two fields below are declared, deliberately (REQ-A555): the reply also carries
+ * `cameras` / `gnss` / `imu` / `stream_gate` / `video_clips`, and a *seed* reader that named
+ * them would be claiming an understanding it does not use — the live feed (`sensor-data`) is
+ * where those arrive. Naming what we do read is what lets `scripts/tauri-reply-scan.mjs`
+ * compare this generic with the Rust struct; a host-side rename of `backend`/`mode` now fails
+ * a gate instead of silently leaving the seed empty (the reader falls back to the event feed,
+ * so the old failure mode was invisible).
+ *
+ * Not exported: nothing outside this module reads it (`unwired-scan` treats an unused export
+ * as a finding).
+ */
+interface SensorHostSeed {
+  /** `"android"` | `"host"` | `"none"` — which provider the host bound. */
+  backend: string;
+  /** The energy governor's current sensor mode. */
+  mode: string;
 }
 
 /** `{ backend, mode } | null` pulled from a `sensor_host_snapshot` raw payload. */
@@ -143,7 +173,7 @@ export function createSensorLive(): SensorLiveHandle {
   }
 
   function seedFromHost(): void {
-    invoke<unknown>("sensor_host_snapshot")
+    invoke<SensorHostSeed>("sensor_host_snapshot")
       .then((raw) => {
         const seed = toHostSeed(raw);
         if (seed) {
@@ -157,9 +187,19 @@ export function createSensorLive(): SensorLiveHandle {
 
   async function start(): Promise<() => void> {
     if (state.listening) return () => {};
-    set({ ...state, listening: true });
     seedFromHost();
     const unsubFeed = await subscribeSensorData((ev) => ingest(ev));
+    // REQ-A838: `listening` is documented as "whether the `sensor-data` listener is open", and
+    // the settings card renders it as a live pulse. A refused subscription must therefore leave
+    // it `false` — otherwise the card asserts that samples are flowing when nothing is on the
+    // wire, and the honest "waiting for live samples" state below becomes unreachable. The
+    // cleanup is a no-op either way: there is no listener to close.
+    if (unsubFeed === null) {
+      amosWarn("sensors", "sensor-data was not subscribed; the live feed stays closed");
+      return () => {};
+    }
+    // Only now is there a listener: claim it, and not before the await resolves.
+    set({ ...state, listening: true });
     return () => {
       set({ ...state, listening: false });
       unsubFeed();

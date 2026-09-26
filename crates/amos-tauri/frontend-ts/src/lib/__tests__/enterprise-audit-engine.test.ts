@@ -11,7 +11,7 @@
  */
 import { describe, test as it, expect, beforeAll, afterAll, beforeEach, afterEach } from "bun:test";
 import { AuditLogger, AUDIT_LOGS_KEY, AUDIT_CONFIG_KEY } from "../enterprise/audit";
-import { writeStoreValue } from "../amosStore";
+import { readStoreValue, writeStoreValue } from "../amosStore";
 import { mdmManager } from "../enterprise/mdm";
 import type { MDMConfig } from "../enterprise/mdm";
 
@@ -40,20 +40,37 @@ const mockStorage: Storage = {
   },
 };
 const globals = globalThis as Record<string, unknown>;
-const prevWindow = globals.window;
-const prevNavigator = globals.navigator;
+const prevWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+const prevNavigator = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+
+/**
+ * 装一个全局**属性**，而不是赋值。
+ *
+ * 为什么（2026-09-22）：`enterprise.test.ts` 在同一个 pure 批次里先跑，它注册
+ * happy-dom，于是 `globalThis.navigator` 变成**只读访问器**；这里原来写的是
+ * `globals.navigator = {...}`，在那种顺序下**抛 TypeError**（赋值给只读属性），
+ * 而 `beforeAll` 抛错会让 bun 把本文件最前面的 7 条测成失败 —— 桩根本没人装，
+ * 文件的存储缝也没生效。`Object.defineProperty` 不受只读访问器影响，
+ * 所以桩在任何文件顺序下都真的装得上；`afterAll` 按描述符原样还原。
+ */
+const installGlobal = (key: string, value: unknown): void => {
+  Object.defineProperty(globalThis, key, { value, writable: true, configurable: true });
+};
 
 beforeAll(() => {
-  globals.window = { localStorage: mockStorage, dispatchEvent: () => true };
+  installGlobal("window", { localStorage: mockStorage, dispatchEvent: () => true });
   // navigator 缝：`collectMetadata` 读取 platform/userAgent。
-  globals.navigator = { platform: "test-platform", userAgent: "test-agent/1.0" };
+  installGlobal("navigator", { platform: "test-platform", userAgent: "test-agent/1.0" });
 });
 
 afterAll(() => {
-  if (prevWindow === undefined) delete globals.window;
-  else globals.window = prevWindow;
-  if (prevNavigator === undefined) delete globals.navigator;
-  else globals.navigator = prevNavigator;
+  for (const [key, prev] of [
+    ["window", prevWindow],
+    ["navigator", prevNavigator],
+  ] as const) {
+    if (prev) Object.defineProperty(globalThis, key, prev);
+    else delete globals[key];
+  }
 });
 
 function mdmTestConfig(): MDMConfig {
@@ -228,6 +245,29 @@ describe("审计查询 / 统计 / 导出", () => {
     expect(page[0]!.level).toBe("error");
   });
 
+  it('sortBy: "result" 是声明的第三个维度，不能静默空转（REQ-A1542 ∕ F-SH-782）', async () => {
+    await seed();
+    // `seed` 的插入顺序（也是时间戳顺序）是 success, failure, blocked, success；按结果
+    // **升序严重度**期望 success, success, failure, blocked。两者不同，所以「比较器里没有
+    // result 分支、每一对都返回 0」的旧形状下，`sort` 会稳定地原样返回输入序 —— 这一行必红。
+    const asc = logger.query({ sortBy: "result", sortOrder: "asc" });
+    expect(asc.map((l) => l.result)).toEqual(["success", "success", "failure", "blocked"]);
+    // 反面控：换方向必须是精确倒序，挡开「只把 error/failure 挪到前面」这类半吊子实现。
+    expect(logger.query({ sortBy: "result", sortOrder: "desc" }).map((l) => l.result)).toEqual([
+      "blocked",
+      "failure",
+      "success",
+      "success",
+    ]);
+    // 负控：结果序必须与时间序**不同** —— 旧形状下 asc 恰好就是时间序，这条把「其实没排」
+    // 和「其实按了时间」一并挡在外面（与上面第一条互为独立判据）。
+    expect(asc.map((l) => l.result)).not.toEqual(
+      logger.query({ sortBy: "timestamp", sortOrder: "asc" }).map((l) => l.result),
+    );
+    // 正控：兄弟维度 `level` 没被这次改动碰坏。
+    expect(logger.query({ sortBy: "level", sortOrder: "desc" })[0]!.level).toBe("error");
+  });
+
   it("getStatistics 聚合结果/类型/时长", async () => {
     await seed();
     const s = logger.getStatistics();
@@ -240,10 +280,26 @@ describe("审计查询 / 统计 / 导出", () => {
     expect(s.avgDuration).toBe(20); // (30 + 10) / 2
     expect(s.maxDuration).toBe(30);
     expect(s.minDuration).toBe(10);
-    // 时间窗过滤：落在时间轴之后 → 空；覆盖全部时间 → 4 条
+    // 时间窗过滤：落在时间轴之后 → 空；覆盖全部时间 → 4 条。
+    // （REQ-A1495 起 `getStatistics` 收整份 `AuditLogQuery`，与 `query` ∕ `exportLogs` 同一契约。）
     const now = Date.now();
-    expect(logger.getStatistics(now + 1e6).totalLogs).toBe(0);
-    expect(logger.getStatistics(now - 1e6, now + 1e6).totalLogs).toBe(4);
+    expect(logger.getStatistics({ startTime: now + 1e6 }).totalLogs).toBe(0);
+    expect(logger.getStatistics({ startTime: now - 1e6, endTime: now + 1e6 }).totalLogs).toBe(4);
+  });
+
+  it("getStatistics 与 query 读同一份查询，不只是同一个时间窗（REQ-A1495 / F-SH-736）", async () => {
+    await seed();
+    // 统计卡必须描述**列表正在显示的那个集合**：列表 ∕ 导出 ∕ 统计三者共用同一条 `filterLogs`。
+    // 修前 `getStatistics(startTime?, endTime?)` 收不到 `results` 这类维度，于是筛「失败」时
+    // 列表只剩 1 行，统计卡照旧印整窗的 4 条 —— 两个和，同一屏。
+    const rows = logger.query({ results: ["failure"] });
+    const s = logger.getStatistics({ results: ["failure"] });
+    expect(rows.length).toBe(1);
+    expect(s.totalLogs).toBe(rows.length);
+    expect(s.failureCount).toBe(1);
+    expect(s.successCount).toBe(0);
+    // 同一个判据的另一面：空集查询下统计卡的四格全 0，而不是时间窗的分布。
+    expect(logger.getStatistics({ results: ["failure"], levels: ["debug"] }).totalLogs).toBe(0);
   });
 
   it("exportLogs：JSON 原样导出，CSV 带表头与行", async () => {
@@ -259,20 +315,36 @@ describe("审计查询 / 统计 / 导出", () => {
 });
 
 describe("审计初始化 / 落盘 / 同步", () => {
-  it("缓冲区满自动落盘到日志", async () => {
+  /**
+   * 缓冲区是私有字段：`flushBuffer()` 的语义是**移动**（buffer → logs），而公开的
+   * `query()` 读的是两者的**并集**（REQ-A897），所以公开面看不见「搬没搬」。
+   * 这两条测的恰恰是搬运，才需要直接读它。
+   */
+  const buffered = () => (logger as unknown as { buffer: unknown[] }).buffer.length;
+
+  it("缓冲区满自动落盘到日志（而写下来的行一路都看得见）", async () => {
     logger.updateConfig({ bufferSize: 2 });
     await logger.log({ eventType: "system_start", eventCategory: "system", eventDescription: "1" });
-    expect(logger.query({}).length).toBe(0); // 仍在缓冲
+    // REQ-A897：写下来的就看得见，不必先刷新 —— 从前这里断言的是 0（「仍在缓冲」），
+    // 也就是把缺陷本身写成了契约。
+    expect(logger.query({}).length).toBe(1);
+    expect(buffered()).toBe(1); // 还没满，没搬
+
     await logger.log({ eventType: "system_start", eventCategory: "system", eventDescription: "2" });
-    await logger.flushBuffer();
+    // 满 2 条 ⇒ 自动落盘：行从缓冲搬进主数组，一条不少、也不重复。
+    expect(buffered()).toBe(0);
     expect(logger.query({}).length).toBe(2);
   });
 
-  it("initialize 记录 system_start，shutdown 把 system_stop 留在缓冲（刷新后可见）", async () => {
+  it("shutdown 把收尾条目留在缓冲里 —— 但它已经可读（REQ-A897）", async () => {
     await logger.initialize();
     await logger.shutdown();
-    // shutdown 后的收尾条目先进缓冲区 —— 这是模块的既定语义
-    expect(logger.query({ eventTypes: ["system_stop"] }).length).toBe(0);
+    // shutdown 后的收尾条目先进缓冲区 —— 这是模块的既定语义（不额外落盘）。
+    expect(buffered()).toBeGreaterThan(0);
+    // 而「留在缓冲」不等于「看不见」：审计查看器读的是并集。
+    const stops = logger.query({ eventTypes: ["system_stop"] });
+    expect(stops.length).toBe(1);
+
     await logger.flushBuffer();
     const kinds = logger.query({ eventTypes: ["system_start", "system_stop"] }).map((l) => l.eventType);
     expect(kinds).toContain("system_start");
@@ -284,7 +356,10 @@ describe("审计初始化 / 落盘 / 同步", () => {
     mockStorage.setItem(AUDIT_LOGS_KEY, "[broken");
     await logger.initialize();
     expect(logger.getConfig().minLevel).toBe("info");
-    expect(logger.query({}).length).toBe(0);
+    // 坏掉的日志不该漏进结果里：`initialize()` 自己会记一条 system_start，
+    // 除此之外必须什么都没有。
+    const kinds = new Set(logger.query({}).map((l) => l.eventType));
+    expect([...kinds]).toEqual(["system_start"]);
     await logger.shutdown();
   });
 
@@ -307,6 +382,81 @@ describe("审计初始化 / 落盘 / 同步", () => {
     expect(ids).toContain("recent");
     expect(ids).not.toContain("old-synced");
     await logger.shutdown();
+  });
+});
+
+/**
+ * 保留期的**生产入口**（REQ-A982 / F-SH-309）。
+ *
+ * 上面那条「过期清理」用例经 `initialize()` 驱动保留期，而 `initialize()` 的唯一调用者
+ * 是 `enterprise/index.ts` 的 `initializeEnterprise()` —— 那个函数在生产里**零调用者**
+ * （它自己也在 `scripts/unwired-baseline.json` 里）。设备上真正会跑到的引导是
+ * `ensureInitialized()`，它由 `log()` / `query()` / `getStatistics()` 自己叫起来。
+ * 所以这里的用例**不碰** `initialize()`：驱动它的正是审计查看器读日志时用的那个调用。
+ *
+ * 形状即 `project_test_on_helper_not_the_seam`：把 `bootstrap()` 里那行
+ * `this.cleanupExpiredLogs()` 删掉（其余一字不动），上面那条用例**仍然全绿**，本组才红。
+ */
+describe("审计保留期由生产入口执行", () => {
+  const DAY = 24 * 60 * 60 * 1000;
+  const base = {
+    level: "info",
+    result: "success",
+    eventType: "system_start",
+    eventCategory: "system",
+    userId: "u",
+    userName: "n",
+    userEmail: "e",
+    deviceId: "d",
+    organizationId: "o",
+    metadata: { tags: [] },
+  };
+  const rows = (now: number) => [
+    { ...base, id: "old-synced", timestamp: now - 400 * DAY, synced: true, eventDescription: "old synced" },
+    { ...base, id: "old-unsynced", timestamp: now - 400 * DAY, synced: false, eventDescription: "old unsynced" },
+    { ...base, id: "recent", timestamp: now, synced: true, eventDescription: "recent" },
+  ];
+  /** 与 `saveLogs` 的写法不同（缩进过），所以「有没有被重写」是可观测的。 */
+  const seedPretty = (value: unknown) => writeStoreValue(AUDIT_LOGS_KEY, JSON.stringify(value, null, 2));
+
+  it("query() 引导时就执行保留期：过期且已同步的行被删掉", () => {
+    const now = Date.now();
+    seedPretty(rows(now));
+    // 审计查看器读日志走的就是这一句 —— 没有任何 `initialize()`。
+    const ids = logger.query({}).map((l) => l.id);
+    expect(ids).not.toContain("old-synced");
+    // 两侧都钉住：未同步的过期行必须留下（删了就是永久丢失），新鲜的一行必须留下。
+    expect(ids).toContain("old-unsynced");
+    expect(ids).toContain("recent");
+  });
+
+  it("getStatistics() 引导时同样执行保留期（保留期不挂在某一个入口上）", () => {
+    const now = Date.now();
+    seedPretty(rows(now));
+    // `getStatistics` 是审计查看器开页面时的第二个调用，且它**不**经过 `query()`。
+    expect(logger.getStatistics().totalLogs).toBe(2);
+  });
+
+  it("没有过期行时不重写日志存储", () => {
+    const pretty = JSON.stringify([{ ...base, id: "fresh", timestamp: Date.now(), synced: true, eventDescription: "fresh" }], null, 2);
+    writeStoreValue(AUDIT_LOGS_KEY, pretty);
+    logger.query({});
+    // 存储里还是那份缩进过的文本 ⇒ `saveLogs()` 没被调用过。缩进只是探针：
+    // 真正要钉的是「引导不产生一次空写」（配额紧张时，空写挤掉的是别的键）。
+    const raw = readStoreValue<string>(AUDIT_LOGS_KEY, "");
+    expect(raw).toBe(pretty);
+  });
+
+  it("保留期用的是存储里那份配置，不是编译期默认值", () => {
+    const now = Date.now();
+    // retentionDays=1：只留一天。存储里那份配置没被读到时，默认 90 天会留下全部三行。
+    writeStoreValue(AUDIT_CONFIG_KEY, JSON.stringify({ retentionDays: 1 }));
+    seedPretty([
+      { ...base, id: "two-days", timestamp: now - 2 * DAY, synced: true, eventDescription: "two days" },
+      { ...base, id: "today", timestamp: now, synced: true, eventDescription: "today" },
+    ]);
+    const ids = logger.query({}).map((l) => l.id);
+    expect(ids).toEqual(["today"]);
   });
 });
 

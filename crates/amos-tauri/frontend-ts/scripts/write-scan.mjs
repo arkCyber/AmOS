@@ -21,13 +21,27 @@
  * they carry no claim about the user's content. Allow-list entries that no longer
  * match a site are reported as `[stale]` so the list cannot rot.
  *
+ * **What "content" means here** (stated, not left to be inferred): the keys in
+ * `lib/cloud.ts`'s `SYNC_STORES` — the stores the back-up promises. Everything else is
+ * configuration or derived, and `store-scan` is the gate that makes that call
+ * explicit, one key at a time, each with a reason in `store-allowlist.json`. A key that
+ * is neither backed up nor allow-listed fails *that* gate, so nothing falls between the
+ * two by accident.
+ *
+ * **Key names are resolved per file, never from one corpus-wide table.** A name is
+ * resolved through the module that declares it (see `buildScopes`), because the answer
+ * decides the classification above: `SETTINGS_KEY` is `amos.settings` in
+ * `lib/settings.ts` and `amos.webman.settings` in `lib/webman.ts`, and reading those
+ * through a flat last-wins table classified every settings page against the browser's
+ * key. See REQ-A812.
+ *
  * Usage (from frontend-ts):
  *   node scripts/write-scan.mjs              # gate
  *   node scripts/write-scan.mjs --json       # machine-readable
  *   node scripts/write-scan.mjs --selftest   # pin the extractor
  */
 import { readFileSync, readdirSync, existsSync } from "node:fs";
-import { join, dirname, relative } from "node:path";
+import { join, dirname, relative, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -73,6 +87,88 @@ export function keyConstants(sources) {
     }
   }
   return out;
+}
+
+/** The `const X_KEY = "amos.…"` declarations of ONE file: `Map(name → key)`. */
+export function localKeyConstants(src) {
+  const out = new Map();
+  for (const m of stripComments(src).matchAll(
+    /(?:export\s+)?const ([A-Z0-9_]*KEY[A-Z0-9_]*)\s*=\s*"((?:amos|amos-ui)\.[^"]*)"/g,
+  )) {
+    out.set(m[1], m[2]);
+  }
+  return out;
+}
+
+/**
+ * Named imports of ONE file: `Map(localName → { spec, name })`, where `name` is what the
+ * module exports (`import { A as B }` binds `B` locally to the module's `A`).
+ */
+export function importBindings(src) {
+  const out = new Map();
+  for (const m of stripComments(src).matchAll(/import\s*(?:type\s*)?\{([^}]*)\}\s*from\s*"([^"]+)"/g)) {
+    for (const part of m[1].split(",")) {
+      const t = part.trim();
+      if (!t) continue;
+      const as = /^([A-Za-z0-9_$]+)\s+as\s+([A-Za-z0-9_$]+)$/.exec(t);
+      out.set(as ? as[2] : t, { spec: m[2], name: as ? as[1] : t });
+    }
+  }
+  return out;
+}
+
+/** `src/lib/settings.ts` → `src/lib/settings`; the identity of a module by import path. */
+export function moduleId(file) {
+  return file.replace(/\.(ts|svelte|js)$/, "");
+}
+
+/** Resolve a relative import specifier against the importing file's directory. */
+export function resolveSpecifier(fromFile, spec) {
+  if (!spec.startsWith(".")) return null; // a bare specifier is not one of ours
+  const dir = fromFile.slice(0, fromFile.lastIndexOf("/"));
+  return moduleId(normalize(join(dir, spec)));
+}
+
+/**
+ * The key table **in scope at each file**, built once from the module graph rather than
+ * from one flat name→key map. A file's scope is: every name the corpus declares with a
+ * single agreed value, then the bindings the file actually imports (each read out of the
+ * module that declares it), then the file's own declarations — which win, because those
+ * are the ones the call site lexically sees.
+ *
+ * `keyConstants`'s flat table is why this exists: `SETTINGS_KEY` is `amos.settings` in
+ * `lib/settings.ts` and `lib/cloud.ts` but `amos.webman.settings` in `lib/webman.ts`, and
+ * a flat last-wins map silently resolved **every** `SETTINGS_KEY` call site — the settings
+ * pages included — to whichever file the directory walk happened to reach last. Scope is
+ * not a detail here: this table decides which store key a write is about, and therefore
+ * whether the write is the user's content or configuration.
+ */
+export function buildScopes(sources) {
+  const byModule = new Map(); // moduleId -> Map(name → key) declared there
+  const seen = new Map(); // name -> Set(keys) across the corpus
+  for (const { file, src } of sources) {
+    const local = localKeyConstants(src);
+    byModule.set(moduleId(file), local);
+    for (const [name, key] of local) {
+      if (!seen.has(name)) seen.set(name, new Set());
+      seen.get(name).add(key);
+    }
+  }
+  const unambiguous = new Map();
+  for (const [name, keys] of seen) if (keys.size === 1) unambiguous.set(name, [...keys][0]);
+
+  const scopes = new Map();
+  for (const { file, src } of sources) {
+    const scope = new Map(unambiguous);
+    for (const [local, binding] of importBindings(src)) {
+      const id = resolveSpecifier(file, binding.spec);
+      const mod = id && byModule.get(id);
+      if (mod && mod.has(binding.name)) scope.set(local, mod.get(binding.name));
+    }
+    for (const [name, key] of localKeyConstants(src)) scope.set(name, key);
+    scopes.set(file, scope);
+  }
+  return scopes;
 }
 
 /** The argument expression of a call whose `(` is at `open` (index of `(`). */
@@ -121,6 +217,81 @@ export function callEnd(src, open) {
     }
   }
   return -1;
+}
+
+
+/**
+ * Balance braces from `open` to its close; `-1` when unbalanced. Comment-stripped input is assumed,
+ * and braces inside string literals are not modelled — the functions this reads are write helpers,
+ * not template-heavy renderers.
+ */
+export function blockEnd(src, open) {
+  let depth = 0;
+  for (let i = open; i < src.length; i += 1) {
+    if (src[i] === "{") depth += 1;
+    else if (src[i] === "}") {
+      depth -= 1;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+/**
+ * The names of functions declared `: boolean` whose body returns a **write's own answer**
+ * (`writeStoreValueChecked`, or another name from this set — e.g. `writeKeyboardConfig` returns it,
+ * and `resetKeyboardConfig` returns *that*). Their return value exists so a caller can act on it, so
+ * a call whose result is thrown away is the F-SH-043 shape: the screen asked whether the write landed
+ * and then ignored the answer. (The gate already gated the `writeStoreValue*` names themselves; a
+ * *wrapper* was invisible to it, which is how the page shipped a green 「已保存」 over a refused write.)
+ */
+export function writeAnswerFns(sources) {
+  const decls = [];
+  for (const { file, src } of sources) {
+    const clean = stripComments(src);
+    const re = /export\s+function\s+([A-Za-z0-9_]+)\s*\([^)]*\)\s*:\s*boolean\s*\{/g;
+    for (const m of clean.matchAll(re)) {
+      const open = clean.indexOf("{", m.index + m[0].length - 1);
+      const end = blockEnd(clean, open);
+      decls.push({ name: m[1], body: clean.slice(open, end < 0 ? clean.length : end + 1) });
+    }
+  }
+  // Two passes: a wrapper of a wrapper resolves in the second (writeKeyboardConfig ← checked write,
+  // resetKeyboardConfig ← writeKeyboardConfig).
+  const names = new Set();
+  for (let pass = 0; pass < 2; pass += 1) {
+    for (const d of decls) {
+      const returnsChecked = /\breturn\s+writeStoreValueChecked\s*\(/.test(d.body);
+      const returnsKnown = [...names].some((n) =>
+        new RegExp(`\\breturn\\s+${n}\\s*\\(`).test(d.body),
+      );
+      if (returnsChecked || returnsKnown) names.add(d.name);
+    }
+  }
+  return names;
+}
+
+/**
+ * Calls to a write-answer function whose result is **thrown away** (`f(x);`, `void f(x);`).
+ * Consuming shapes are deliberately not flagged: `if (!f(x))`, `const ok = f(x)`, `return f(x)`,
+ * `ok: f(x)` and `(key, value) => f(key, value)` all pass the answer on (the predicate is the same
+ * `resultDiscarded` the checked-write rule uses, so the two cannot drift).
+ */
+export function discardedWriteAnswers(sources, names) {
+  const out = [];
+  for (const { file, src } of sources) {
+    const clean = stripComments(src);
+    for (const name of names) {
+      for (const m of clean.matchAll(new RegExp(`\\b${name}\\s*\\(`, "g"))) {
+        const before = clean.slice(Math.max(0, m.index - 30), m.index);
+        if (/(\bfunction\s+|\bconst\s+|\blet\s+|\bvar\s+)$/.test(before)) continue; // declaration
+        const open = m.index + m[0].length - 1;
+        if (!resultDiscarded(clean, m.index, open)) continue;
+        out.push({ file, line: clean.slice(0, m.index).split("\n").length, fn: name });
+      }
+    }
+  }
+  return out;
 }
 
 /**
@@ -186,8 +357,13 @@ export function directLocalWrites(sources) {
   return out;
 }
 
-export function resolveKey(arg, consts) {
-  const byName = new Map(consts.map((c) => [c.name, c.key]));
+/**
+ * The store key an argument expression names, or `null` when it cannot be resolved
+ * statically. `scope` is the name→key table in scope at the call site: a `Map` (from
+ * `buildScopes`) or, for callers holding the corpus-wide table, a `[{ name, key }]` list.
+ */
+export function resolveKey(arg, scope) {
+  const byName = scope instanceof Map ? scope : new Map(scope.map((c) => [c.name, c.key]));
   const a = arg.trim();
   const lit = /^"((?:amos|amos-ui)\.[^"]*)"$/.exec(a);
   if (lit) return lit[1];
@@ -202,7 +378,7 @@ export function syncStores(cloudSrc, consts) {
   const open = clean.indexOf("[", start);
   const close = clean.indexOf("]", open);
   if (start < 0 || open < 0 || close < 0) return [];
-  const byName = new Map(consts.map((c) => [c.name, c.key]));
+  const byName = consts instanceof Map ? consts : new Map(consts.map((c) => [c.name, c.key]));
   return clean
     .slice(open + 1, close)
     .split(",")
@@ -238,6 +414,39 @@ export function classify(site, content, consts) {
   return { ...site, key, kind, needsEntry };
 }
 
+/**
+ * The second dimension of an allow-list: a `kind` that no entry references.
+ *
+ * A stale **site** is reported by the scan (`stale`) and shrunk with a reason, but a
+ * `kind` whose last member left was invisible: `kinds` is read only as a lookup table
+ * for the sites, so an entry nothing points at stayed on file holding a reason that
+ * described code no longer shaped that way — and *that reason is the permission a
+ * future site leans on*. The live instance: `derived-tick` described `lib/alarmCore.ts`'s
+ * `amos.alarms` write ("a rejected write only degrades the ring UI until the next tick
+ * recomputes it") long after that write became `writeStoreValueChecked` whose verdict
+ * bounds the day marker (REQ-A1392) — the site entry shrank, the kind did not.
+ *
+ * So a memberless kind has to declare *itself*: the retire/defer reason is the only thing
+ * left to read, and "no members and no explanation" is indistinguishable from rot. Accepted
+ * spellings: a reason beginning `RETIRED` (the classification lost its last member) or
+ * `UNUSED` ∕ `KEPT` (it never had one, kept so adding the first is an explicit act), or a
+ * non-empty `note` on an object-shaped kind (the spelling `void-cmd-allowlist.json` and
+ * `perf-budget-allowlist.json` already use).
+ */
+export function memberlessKinds(kinds, referenced) {
+  const refs = new Set(referenced);
+  return Object.keys(kinds ?? {})
+    .filter((k) => !refs.has(k) && !declaresMemberless(kinds[k]))
+    .sort();
+}
+
+function declaresMemberless(spec) {
+  if (spec && typeof spec === "object") {
+    return typeof spec.note === "string" && spec.note.trim() !== "";
+  }
+  return /^(RETIRED|UNUSED|KEPT)\b/.test(String(spec ?? "").trim());
+}
+
 // --- selftest ---------------------------------------------------------------
 export function runSelftest() {
   const checks = [];
@@ -262,6 +471,55 @@ export function runSelftest() {
       ].join("\n"),
     },
   ];
+  // --- the write-answer rule (REQ-A492) --------------------------------------
+  // The negative control is the **historical shape** that shipped: a screen calls a wrapper that
+  // returns "did it land?" in statement position. Every consuming form must stay clean, or the rule
+  // would push callers to write the answer into a dummy variable to satisfy it.
+  const answerSources = [
+    {
+      file: "lib/writes.ts",
+      src: [
+        "export function writeThing(t: Thing): boolean {",
+        "  return writeStoreValueChecked(T_KEY, t);",
+        "}",
+        "export function resetThing(): boolean {",
+        "  return writeThing({});",
+        "}",
+        "export function notAWrite(t: Thing): boolean {",
+        "  return t !== undefined;",
+        "}",
+      ].join("\n"),
+    },
+    {
+      file: "svelte/Historical.svelte",
+      src: [
+        "  writeThing(thing);",
+        "  void resetThing();",
+        "  const ok = writeThing(thing);",
+        "  if (ok) {}",
+        "  ok: writeThing(thing),",
+        "  return writeThing(thing);",
+        "  notAWrite(thing);",
+      ].join("\n"),
+    },
+  ];
+  {
+    const names = writeAnswerFns(answerSources);
+    const found = discardedWriteAnswers(answerSources, names);
+    ok("a wrapper of a checked write is a write-answer function", names.has("writeThing"));
+    ok("…and so is a wrapper of a wrapper", names.has("resetThing"));
+    ok("a boolean function that never writes is not", !names.has("notAWrite"));
+    ok(
+      "the historical shape (a discarded answer) is reported",
+      found.some((f) => f.file.endsWith("Historical.svelte") && f.fn === "writeThing"),
+    );
+    ok("`void f(x);` counts as discarding too", found.some((f) => f.fn === "resetThing"));
+    ok(
+      "consuming forms are not reported",
+      found.length === 2,
+    );
+  }
+
   const consts = keyConstants(sources);
   const content = new Set(["amos.notes", "amos.photos"]);
 
@@ -287,6 +545,49 @@ export function runSelftest() {
   ok("resolves a constant argument", resolveKey("NOTES_KEY", consts) === "amos.notes");
   ok("resolves a literal argument", resolveKey('"amos.photos"', consts) === "amos.photos");
   ok("a parameter is not statically resolvable", resolveKey("key", consts) === null);
+
+  // --- a key name reused by two modules (REQ-A812) ---------------------------
+  // Scope, not a corpus-wide table: `K_KEY` is `amos.alpha` in `lib/a.ts` and `amos.beta`
+  // in `lib/b.ts`. A flat last-wins table answers one of those two for BOTH, so whichever
+  // file the walk reached last decides what every call site is about — and the answer
+  // decides content-vs-configuration. Each file must be read through its own bindings.
+  const collided = [
+    { file: "lib/a.ts", src: 'export const K_KEY = "amos.alpha";\n' },
+    { file: "lib/b.ts", src: 'export const K_KEY = "amos.beta";\n' },
+    {
+      file: "lib/importer.ts",
+      src: 'import { K_KEY } from "./a";\nwriteStoreValue(K_KEY, x);\n',
+    },
+    {
+      file: "lib/renamer.ts",
+      src: 'import { K_KEY as RENAMED } from "./b";\nwriteStoreValue(RENAMED, y);\n',
+    },
+    { file: "lib/local.ts", src: 'const K_KEY = "amos.beta";\nwriteStoreValue(K_KEY, z);\n' },
+  ];
+  const cs = buildScopes(collided);
+  ok(
+    "a colliding name resolves through the file's import",
+    resolveKey("K_KEY", cs.get("lib/importer.ts")) === "amos.alpha",
+  );
+  ok("an `as`-renamed import resolves too", resolveKey("RENAMED", cs.get("lib/renamer.ts")) === "amos.beta");
+  ok(
+    "a local declaration outranks the corpus",
+    resolveKey("K_KEY", cs.get("lib/local.ts")) === "amos.beta",
+  );
+  ok(
+    "the flat corpus table cannot tell them apart (why scope is required)",
+    new Map(collided.flatMap((c) => [...localKeyConstants(c.src)])).get("K_KEY") === "amos.beta" &&
+      resolveKey("K_KEY", collided.flatMap((c) => [...localKeyConstants(c.src)].map(([name, key]) => ({ name, key })))) ===
+        "amos.beta",
+  );
+  ok(
+    "an imported name shadows an unambiguous corpus name",
+    resolveKey(
+      "K_KEY",
+      buildScopes([{ file: "lib/a.ts", src: 'export const K_KEY = "amos.alpha";' },
+        { file: "lib/i.ts", src: 'import { K_KEY } from "./a";' }]).get("lib/i.ts"),
+    ) === "amos.alpha",
+  );
 
   const cls = Object.fromEntries(
     sites.map((s) => [`${s.fn}:${s.arg}`, classify(s, content, consts)]),
@@ -335,6 +636,32 @@ export function runSelftest() {
   const cloud = 'export const SYNC_STORES = [NOTES_KEY, "amos.photos"] as const;';
   ok("SYNC_STORES is read, not copied", syncStores(cloud, consts).includes("amos.notes"));
 
+  // The content set is resolved through the same table, so it inherits the same hazard —
+  // and this is the one where a collision costs something the user can see. `cloud.ts`
+  // imports each back-up name from the module that owns the store; resolve it through a
+  // flat corpus table instead and a second `NOTES_KEY` anywhere in the tree silently
+  // swaps the user's notes out of the back-up set — and the gate still reports OK.
+  {
+    const cloudSrc = [
+      'import { NOTES_KEY } from "./notes";',
+      "export const SYNC_STORES = [NOTES_KEY] as const;",
+    ].join("\n");
+    const corpus = [
+      { file: "lib/notes.ts", src: 'export const NOTES_KEY = "amos.notes";' },
+      { file: "lib/cloud.ts", src: cloudSrc },
+      { file: "lib/scratch.ts", src: 'export const NOTES_KEY = "amos.scratch";' },
+    ];
+    const scopes = buildScopes(corpus);
+    ok(
+      "SYNC_STORES resolves through the importing module, not the corpus",
+      syncStores(cloudSrc, scopes.get("lib/cloud.ts"))[0] === "amos.notes",
+    );
+    ok(
+      "the flat table would have swapped the notes out of the content set",
+      syncStores(cloudSrc, keyConstants(corpus))[0] === "amos.scratch",
+    );
+  }
+
   const direct = directLocalWrites([
     {
       file: "lib/x.ts",
@@ -354,6 +681,48 @@ export function runSelftest() {
   ok(
     "invokedDirectly only matches this script",
     invokedDirectly(invoked, "/x/write-scan.mjs") && !invokedDirectly(invoked, "/x/other.mjs"),
+  );
+
+  // --- the allow-list's second dimension: a kind with no members (REQ-A1492) ----
+  // A stale *site* is reported; a kind whose last member left was not, so `derived-tick`
+  // described `alarmCore`'s `amos.alarms` write two rounds after it became a checked write.
+  // The rule has to accept each declared-memberless spelling without teaching authors to
+  // append a magic word to a live kind — hence the referenced-kind control.
+  ok(
+    "a kind a site references is covered",
+    memberlessKinds({ "demo-seed": "why" }, ["demo-seed"]).length === 0,
+  );
+  ok(
+    "a kind only a direct-localStorage file references is covered",
+    memberlessKinds({ "store-seam": "why" }, ["store-seam"]).length === 0,
+  );
+  ok(
+    "a memberless kind that explains nothing is reported",
+    memberlessKinds({ "derived-tick": "Derived, self-healing state …" }, []).length === 1,
+  );
+  ok(
+    "a RETIRED memberless kind is accepted",
+    memberlessKinds({ x: "RETIRED (REQ-A1392, round N). …" }, []).length === 0,
+  );
+  ok(
+    "an UNUSED memberless kind is accepted",
+    memberlessKinds({ x: "UNUSED — never had a member; kept so the first is an explicit act." }, []).length === 0,
+  );
+  ok(
+    "a KEPT memberless kind is accepted",
+    memberlessKinds({ x: "KEPT — no member today." }, []).length === 0,
+  );
+  ok(
+    "an object kind with a note is accepted",
+    memberlessKinds({ x: { reason: "why", note: "kept deliberately" } }, []).length === 0,
+  );
+  ok(
+    "an object kind with a blank note is reported",
+    memberlessKinds({ x: { reason: "why", note: "   " } }, []).length === 1,
+  );
+  ok(
+    "a `RETIREDLY` prefix is not the RETIRED marker",
+    memberlessKinds({ x: "RETIREDLY…" }, []).length === 1,
   );
 
   let failed = 0;
@@ -379,9 +748,12 @@ function runScan() {
     .filter((f) => !/\/i18n\/locales\//.test(f))
     .map((f) => ({ file: relative(root, f), src: readFileSync(f, "utf8") }));
 
-  const consts = keyConstants(sources);
-  const cloudSrc = sources.find((s) => s.file.endsWith("lib/cloud.ts"))?.src ?? "";
-  const content = new Set(syncStores(cloudSrc, consts).filter((k) => !k.startsWith("<")));
+  const scopes = buildScopes(sources);
+  const cloudFile = sources.find((s) => s.file.endsWith("lib/cloud.ts"))?.file ?? "";
+  const cloudSrc = sources.find((s) => s.file === cloudFile)?.src ?? "";
+  const content = new Set(
+    syncStores(cloudSrc, scopes.get(cloudFile) ?? new Map()).filter((k) => !k.startsWith("<")),
+  );
 
   let allow;
   try {
@@ -401,7 +773,9 @@ function runScan() {
     (allow.sites ?? []).map((s) => [`${s.file}::${s.key ?? "<unresolved>"}`, s.kind]),
   );
 
-  const sites = writeSites(sources).map((s) => classify(s, content, consts));
+  const sites = writeSites(sources).map((s) =>
+    classify(s, content, scopes.get(s.file) ?? new Map()),
+  );
   const needing = sites.filter((s) => s.needsEntry);
   const used = new Set();
   const unclassified = [];
@@ -444,13 +818,49 @@ function runScan() {
   }
   const staleIgnored = [...ignoredList.keys()].filter((id) => !usedIgnored.has(id)).sort();
 
+  // --- a write helper's answer thrown away (F-SH-043) --------------------------
+  // The rule above covers `writeStoreValueChecked` itself; this one covers the **wrappers** that
+  // return its answer (`writeKeyboardConfig`, `resetKeyboardConfig`, …). The keyboard page's green
+  // 「已保存」 over a refused write is exactly this shape, and the gate could not see it.
+  const prod = sources.filter((s) => !TEST_RE.test(s.file));
+  const answerFns = writeAnswerFns(prod);
+  const answersList = new Map(
+    (allow.answeredResults ?? []).map((s) => [`${s.file}::${s.fn}`, s.kind]),
+  );
+  const discardedAnswers = discardedWriteAnswers(prod, answerFns);
+  const badAnswers = [];
+  const usedAnswers = new Set();
+  for (const a of discardedAnswers) {
+    const id = `${a.file}::${a.fn}`;
+    const kind = answersList.get(id);
+    if (kind === undefined || !kinds[kind]) {
+      badAnswers.push(a);
+      continue;
+    }
+    usedAnswers.add(id);
+  }
+  const staleAnswers = [...answersList.keys()].filter((id) => !usedAnswers.has(id)).sort();
+
+  // --- a kind nothing references (see memberlessKinds) -------------------------
+  // Every dimension that can name an entry counts as a reference: the classified sites,
+  // the direct-localStorage files, and the two discarded-answer lists.
+  const memberless = memberlessKinds(kinds, [
+    ...listed.values(),
+    ...localKind.values(),
+    ...ignoredList.values(),
+    ...answersList.values(),
+  ]);
+
   const failures =
     unclassified.length +
     stale.length +
     badLocal.length +
     staleLocal.length +
     badIgnored.length +
-    staleIgnored.length;
+    staleIgnored.length +
+    badAnswers.length +
+    staleAnswers.length +
+    memberless.length;
 
   if (process.argv.includes("--json")) {
     console.log(
@@ -464,6 +874,9 @@ function runScan() {
           staleLocalWrites: staleLocal,
           ignoredResults: badIgnored,
           staleIgnoredResults: staleIgnored,
+          discardedWriteAnswers: badAnswers,
+          staleWriteAnswers: staleAnswers,
+          memberlessKinds: memberless,
           kinds,
         },
         null,
@@ -494,6 +907,19 @@ function runScan() {
           "not listed in scripts/write-allowlist.json `localWrites`",
       );
     }
+    for (const a of badAnswers) {
+      console.error(
+        `[write-scan] FAIL — ${a.file}:${a.line} calls \`${a.fn}()\` and throws its answer away. ` +
+          "The function returns whether the write landed, so the caller must act on it " +
+          "(report the failure, or re-read the store) — or list it in " +
+          "scripts/write-allowlist.json `answeredResults` with a reason",
+      );
+    }
+    for (const id of staleAnswers) {
+      console.log(
+        `[write-scan] allow-list: stale answeredResults entry (no such call site) — shrink it: ${id}`,
+      );
+    }
     for (const f of staleLocal) {
       console.log(
         `[write-scan] allow-list: stale localWrite entry (no direct write there) — shrink it: ${f}`,
@@ -510,11 +936,23 @@ function runScan() {
         `[write-scan] allow-list: stale ignored-result entry (nothing discards there) — shrink it: ${id}`,
       );
     }
+    for (const k of memberless) {
+      console.error(
+        `[write-scan] FAIL — allow-list kind \`${k}\` is referenced by no entry and does not say ` +
+          "why it is kept. Retire it (reason begins `RETIRED`), declare it unused (`UNUSED` ∕ `KEPT`), " +
+          "or drop it — a kind with neither members nor an explanation is rot, and its reason is what " +
+          "a future site will lean on",
+      );
+    }
     console.log(
       `[write-scan] ${direct.size} file(s) write localStorage directly (${localKind.size} classified).`,
     );
     console.log(
       `[write-scan] ${ignored.length} verified write(s) discard their answer (${ignoredList.size} allow-listed).`,
+    );
+    console.log(
+      `[write-scan] ${discardedAnswers.length} write-answer call(s) discard their answer ` +
+        `(${answersList.size} allow-listed); ${answerFns.size} function(s) return a write's answer.`,
     );
     if (failures === 0) {
       console.log(

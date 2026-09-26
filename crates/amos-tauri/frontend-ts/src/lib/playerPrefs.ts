@@ -9,7 +9,7 @@
  * The playhead is persisted *coarsely* (see [`shouldSavePosition`]) so a 4-minute
  * song does not write the store 240 times.
  */
-import { readStoreValue, writeStoreValue } from "./amosStore";
+import { readStoreValue, writeStoreValueChecked } from "./amosStore";
 import type { RepeatMode } from "./player";
 
 export const PLAYER_PREFS_KEY = "amos.player";
@@ -71,9 +71,17 @@ export function loadPlayerPrefs(): PlayerPrefs {
   return normalizePlayerPrefs(readStoreValue<unknown>(PLAYER_PREFS_KEY, null));
 }
 
-/** Persist a session (normalized first, so the store never holds garbage). */
-export function savePlayerPrefs(p: PlayerPrefs): void {
-  writeStoreValue(PLAYER_PREFS_KEY, normalizePlayerPrefs(p));
+/**
+ * Persist a session (normalized first, so the store never holds garbage), returning the
+ * **store's own verdict**.
+ *
+ * Every field is the user's own choice — which track is playing, where in it, volume /
+ * mute / repeat / shuffle — so a caller must not leave the controls claiming a session
+ * the store refused: this doc's promise is that these "survive a remount", and on a
+ * refused write the next launch comes back on the defaults. REQ-A1421.
+ */
+export function savePlayerPrefs(p: PlayerPrefs): boolean {
+  return writeStoreValueChecked(PLAYER_PREFS_KEY, normalizePlayerPrefs(p));
 }
 
 /**

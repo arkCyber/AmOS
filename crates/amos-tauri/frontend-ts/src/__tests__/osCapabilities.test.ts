@@ -139,16 +139,18 @@ describe("osCapabilities (REQ-A380): boot-time default-on seed", () => {
     try {
       const ledger = seedDefaultCapabilities();
       await new Promise<void>((r) => setTimeout(r, 0));
-      // All entries from the matrix are present (camera + vmemos re-asserted,
-      // ai + interpreter were already held).
+      // All entries from the matrix are present (camera + vmemos + contacts
+      // re-asserted, ai + interpreter were already held).
       expect(capSet(ledger, "camera", "camera")).toBe(true);
       expect(capSet(ledger, "vmemos", "microphone")).toBe(true);
       expect(capSet(ledger, "ai", "microphone")).toBe(true);
       expect(capSet(ledger, "interpreter", "microphone")).toBe(true);
+      expect(capSet(ledger, "contacts", "contacts")).toBe(true);
       // Held caps never fire the mirror; only the missing pairs did.
       expect(calls).toEqual([
         { appId: "camera", cap: "camera" },
         { appId: "vmemos", cap: "microphone" },
+        { appId: "contacts", cap: "contacts" },
       ]);
     } finally {
       goOffline();
@@ -167,14 +169,19 @@ describe("osCapabilities (REQ-A380): boot-time default-on seed", () => {
   test("defaultAppsFor lists the apps that default-on for a given capability", () => {
     expect(defaultAppsFor("camera")).toEqual(["camera"]);
     expect(defaultAppsFor("microphone").sort()).toEqual(["ai", "interpreter", "vmemos"]);
+    // The Contacts screen is the app whose headline function is the `contacts`
+    // resource, so it holds it like the Camera screen holds `camera` (REQ-A1807:
+    // P1-C1 — the capability was declared OS-wide but no app ever held it).
+    expect(defaultAppsFor("contacts")).toEqual(["contacts"]);
     // A capability the OS does not default-on returns an empty list.
     expect(defaultAppsFor("location")).toEqual([]);
-    expect(defaultAppsFor("contacts")).toEqual([]);
+    expect(defaultAppsFor("storage")).toEqual([]);
   });
 
   test("DEFAULT_ON_CAPABILITIES drives the dashboard badge invariant", () => {
     expect(DEFAULT_ON_CAPABILITIES.includes("camera")).toBe(true);
     expect(DEFAULT_ON_CAPABILITIES.includes("microphone")).toBe(true);
+    expect(DEFAULT_ON_CAPABILITIES.includes("contacts")).toBe(true);
     expect(DEFAULT_ON_CAPABILITIES.includes("location")).toBe(false);
     expect(defaultCapabilitiesInvariant()).toBe(true);
   });

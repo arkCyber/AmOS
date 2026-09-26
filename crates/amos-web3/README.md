@@ -11,7 +11,10 @@ with no node connection. Part of **[Amos](../../README.md)**. Design record:
 ## What it is
 
 - `secp.rs`: a key from a seed is **deterministic** (same seed → same key → same address),
-  which is what makes recovery and tests reproducible; a malformed seed is refused.
+  which is what makes recovery and tests reproducible; a malformed seed is refused. Signatures
+  are emitted canonical **low-s**, but the parse path accepts either valid encoding (the
+  low-`s` form and its high-`s` malleable twin), as `ecrecover` does — so a signature from
+  another tool still verifies.
 - `hash.rs`: keccak256 (the EVM hash, not SHA3-256 — a distinction this crate gets right and
   documents, because getting it wrong silently produces wrong addresses).
 - `eip191.rs` / `eip712.rs`: the two signing hashes apps actually require. EIP-712 builds the

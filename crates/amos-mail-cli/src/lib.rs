@@ -29,6 +29,7 @@
     deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
 )]
 
+use std::io::BufRead;
 use std::path::PathBuf;
 
 use amos_mail::{Account, Address, MailClient, MailProvider, MockMailProvider, INBOX};
@@ -49,12 +50,20 @@ SUBCOMMANDS:
                               Search by sender/recipient/subject/body, newest first
     read  <ID> [--mailbox M]  Fetch a message and mark it read
     read-all [--mailbox M]    Mark every message in a mailbox as read
-    imap-unseen --host H [--port N] --user U --pass P [--tls]
-                              Report unseen count on a live IMAP server (--features live)
+    imap-unseen --host H [--port N] --user U --pass-env V | --pass-stdin [--tls]
+                              Report unseen count on a live IMAP server (--features live).
+                              The password comes from $V or one line on stdin — a value
+                              on the command line is visible in `ps` and shell history,
+                              so --pass <VALUE> is refused.
     show  <ID> [--mailbox M]  Fetch a message without changing read state
     send  --to <ADDR> [--to ...] [--cc ...] --subject S --body B
                               Compose and send (default sender: Amos Demo <me@amos.local>)
                               [--from <EMAIL>] [--attach <PATH>]...
+                              [--smtp HOST:PORT [--smtp-user U
+                              [--smtp-pass-env V | --smtp-pass-stdin]] [--smtp-tls]]
+                              With --smtp, deliver over a real SMTP relay instead of the
+                              offline store; requires --features live (a default build
+                              refuses it loudly rather than falling back to the store)
     star  <ID> on|off         Star / unstar a message
     archive <ID> [--mailbox M] Move a message into Archive
     trash  <ID> [--mailbox M] Move a message into Trash (recoverable)
@@ -68,6 +77,15 @@ OPTIONS:
     --store <PATH>            Persist the mailbox store to this JSON file (can appear
                               anywhere before/after the subcommand). Without it mail is
                               ephemeral (reset each run). Also honors $AMOS_MAIL_STORE.
+    --smtp <HOST:PORT>        With send: deliver over this real SMTP relay instead of the
+                              offline store. Requires --features live.
+    --smtp-user <USER>        With --smtp: AUTH username (password from --smtp-pass-env
+                              or --smtp-pass-stdin)
+    --smtp-pass-env <VAR>     With --smtp-user: read the AUTH password from $VAR
+    --smtp-pass-stdin         With --smtp-user: read the AUTH password from one stdin line
+    --pass-env <VAR>          With imap-unseen: read the password from $VAR
+    --pass-stdin              With imap-unseen: read the password from one stdin line
+    --smtp-tls                With --smtp: upgrade the relay connection to TLS
 ";
 
 /// One CLI operation, fully parsed and ready to execute against a client.
@@ -117,9 +135,57 @@ pub enum Op {
         host: String,
         port: u16,
         user: String,
-        pass: String,
+        pass: SecretSource,
         tls: bool,
     },
+}
+
+/// Where an AUTH password comes from.
+///
+/// Deliberately **not** a bare `String` read off the command line: the whole
+/// argv is readable by every user through `ps` and lands verbatim in the shell's
+/// history file, so `--pass <VALUE>` / `--smtp-pass <VALUE>` are **refused by
+/// name** rather than accepted-with-a-warning — the same "a refusal, not a silent
+/// fallback" rule this CLI already applies to `send --smtp` on a non-`live`
+/// build (audit PH-P2-01 / REQ-A1787).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SecretSource {
+    /// `--pass-env <VAR>` / `--smtp-pass-env <VAR>`: read that variable when the
+    /// command runs (an unset variable is an error, never an empty password).
+    Env(String),
+    /// `--pass-stdin` / `--smtp-pass-stdin`: read one line from standard input
+    /// when the command runs.
+    Stdin,
+}
+
+impl SecretSource {
+    /// Resolve the secret. `input` is only consumed by [`SecretSource::Stdin`].
+    ///
+    /// Exactly one trailing newline is stripped (`\n` or `\r\n`). Trailing
+    /// *spaces* are kept: a password is an opaque byte string, and trimming it
+    /// would silently change the credential and produce an authentication
+    /// failure that names the wrong cause.
+    pub fn resolve(&self, input: &mut impl BufRead) -> Result<String> {
+        match self {
+            SecretSource::Env(var) => std::env::var(var)
+                .map_err(|_| anyhow!("--pass-env {var}: that environment variable is not set")),
+            SecretSource::Stdin => {
+                let mut line = String::new();
+                let n = input
+                    .read_line(&mut line)
+                    .context("--pass-stdin: could not read standard input")?;
+                if n == 0 {
+                    return Err(anyhow!(
+                        "--pass-stdin: standard input ended before a password was read"
+                    ));
+                }
+                if let Some(rest) = line.strip_suffix('\n') {
+                    line = rest.strip_suffix('\r').unwrap_or(rest).to_string();
+                }
+                Ok(line)
+            }
+        }
+    }
 }
 
 /// Parsed `send` arguments (raw email/path strings — validated at execution).
@@ -138,8 +204,9 @@ pub struct SendArgs {
     pub smtp: Option<String>,
     /// Optional SMTP AUTH username.
     pub smtp_user: Option<String>,
-    /// Optional SMTP AUTH password.
-    pub smtp_pass: Option<String>,
+    /// Optional SMTP AUTH password source (never a value off argv — see
+    /// [`SecretSource`]).
+    pub smtp_pass: Option<SecretSource>,
     /// Use STARTTLS (for real relays such as Gmail).
     pub smtp_tls: bool,
 }
@@ -322,7 +389,17 @@ fn parse_imap_unseen<'a>(it: &mut impl Iterator<Item = &'a String>) -> Result<Op
                     .map_err(|_| anyhow!("--port must be a number, got {raw:?}"))?;
             }
             "--user" => user = Some(need(it, "--user")?),
-            "--pass" => pass = Some(need(it, "--pass")?),
+            // Refused by name, not accepted-and-warned: argv is world-readable
+            // through `ps` and is written verbatim into the shell history.
+            "--pass" => {
+                return Err(anyhow!(
+                    "imap-unseen: refusing --pass <VALUE> — a password on the command line \
+                     is visible to every user via `ps` and lands in the shell history; \
+                     use --pass-env <VAR> or --pass-stdin"
+                ))
+            }
+            "--pass-env" => pass = Some(SecretSource::Env(need(it, "--pass-env")?)),
+            "--pass-stdin" => pass = Some(SecretSource::Stdin),
             "--tls" => tls = true,
             "-h" | "--help" => return Ok(Op::Help),
             other => return Err(anyhow!("imap-unseen: unknown option {other:?}")),
@@ -330,7 +407,7 @@ fn parse_imap_unseen<'a>(it: &mut impl Iterator<Item = &'a String>) -> Result<Op
     }
     let host = host.ok_or_else(|| anyhow!("imap-unseen needs --host <HOST>"))?;
     let user = user.ok_or_else(|| anyhow!("imap-unseen needs --user <USER>"))?;
-    let pass = pass.ok_or_else(|| anyhow!("imap-unseen needs --pass <PASS>"))?;
+    let pass = pass.ok_or_else(|| anyhow!("imap-unseen needs --pass-env <VAR> or --pass-stdin"))?;
     Ok(Op::ImapUnseen {
         host,
         port,
@@ -352,7 +429,18 @@ fn parse_send<'a>(it: &mut impl Iterator<Item = &'a String>) -> Result<Op> {
             "--from" => args.from = Some(need(it, "--from")?),
             "--smtp" => args.smtp = Some(need(it, "--smtp")?),
             "--smtp-user" => args.smtp_user = Some(need(it, "--smtp-user")?),
-            "--smtp-pass" => args.smtp_pass = Some(need(it, "--smtp-pass")?),
+            // Same refusal as `imap-unseen --pass` (see `SecretSource`).
+            "--smtp-pass" => {
+                return Err(anyhow!(
+                    "send: refusing --smtp-pass <VALUE> — a password on the command line \
+                     is visible to every user via `ps` and lands in the shell history; \
+                     use --smtp-pass-env <VAR> or --smtp-pass-stdin"
+                ))
+            }
+            "--smtp-pass-env" => {
+                args.smtp_pass = Some(SecretSource::Env(need(it, "--smtp-pass-env")?))
+            }
+            "--smtp-pass-stdin" => args.smtp_pass = Some(SecretSource::Stdin),
             "--smtp-tls" => args.smtp_tls = true,
             "--attach" => args.attachments.push(PathBuf::from(need(it, "--attach")?)),
             "-h" | "--help" => return Ok(Op::Help),
@@ -575,7 +663,7 @@ pub async fn dispatch<P: MailProvider>(client: &MailClient<P>, op: Op) -> Result
         Op::Send(args) => {
             #[cfg(feature = "live")]
             if args.smtp.is_some() {
-                return smtp_send_lines(client, &args);
+                return smtp_send_lines(client, &args).await;
             }
             #[cfg(not(feature = "live"))]
             if args.smtp.is_some() {
@@ -583,7 +671,17 @@ pub async fn dispatch<P: MailProvider>(client: &MailClient<P>, op: Op) -> Result
             }
             let draft = build_draft(client, &args)?;
             let receipt = client.send(draft).await?;
-            Ok(vec![format!("sent as {} (stored in Sent)", receipt.id)])
+            // The offline mock files a copy in `Sent` and delivers nothing, so
+            // the receipt's `delivered` flag decides the wording: printing
+            // "sent" here is the same lie the UI used to print (F-SH-824).
+            Ok(vec![if receipt.delivered {
+                format!("delivered as {}", receipt.id)
+            } else {
+                format!(
+                    "stored in Sent as {} (not delivered — offline mock)",
+                    receipt.id
+                )
+            }])
         }
         Op::Star { mailbox, id, on } => {
             client.set_flagged(&mailbox, &id, on).await?;
@@ -617,14 +715,19 @@ fn build_draft<P: MailProvider>(
     if let Some(from) = &a.from {
         draft.from = Some(Address::bare(from)?);
     }
-    for raw in a.to.iter().chain(a.cc.iter()) {
-        let addr = Address::bare(raw).context("invalid recipient address")?;
-        let is_cc = a.cc.iter().any(|c| c == raw);
-        if is_cc {
-            draft.cc.push(addr);
-        } else {
-            draft.to.push(addr);
-        }
+    // Classify by which flag the address came from, not by list membership: a
+    // `--to` address that also appears in `--cc` is a To recipient (and vice
+    // versa), so each list is built on its own. A membership test would drop
+    // the `--to` copy and push the address into Cc twice.
+    for raw in &a.to {
+        draft
+            .to
+            .push(Address::bare(raw).context("invalid recipient address")?);
+    }
+    for raw in &a.cc {
+        draft
+            .cc
+            .push(Address::bare(raw).context("invalid recipient address")?);
     }
     for path in &a.attachments {
         let data = std::fs::read(path)
@@ -645,7 +748,10 @@ fn build_draft<P: MailProvider>(
 
 /// Send a draft over real SMTP (only built with the `live` feature).
 #[cfg(feature = "live")]
-fn smtp_send_lines<P: MailProvider>(client: &MailClient<P>, a: &SendArgs) -> Result<Vec<String>> {
+async fn smtp_send_lines<P: MailProvider>(
+    client: &MailClient<P>,
+    a: &SendArgs,
+) -> Result<Vec<String>> {
     let target = a
         .smtp
         .as_ref()
@@ -662,11 +768,27 @@ fn smtp_send_lines<P: MailProvider>(client: &MailClient<P>, a: &SendArgs) -> Res
         cfg = cfg.tls();
     }
     if let Some(user) = &a.smtp_user {
-        cfg = cfg.credentials(user.clone(), a.smtp_pass.clone().unwrap_or_default());
+        // No source given keeps the pre-existing empty password (the relay will
+        // refuse it); a source that *cannot* be read is an error, never folded
+        // into an empty password that fails authentication for the wrong reason.
+        let pass = match &a.smtp_pass {
+            Some(src) => src.resolve(&mut std::io::stdin().lock())?,
+            None => String::new(),
+        };
+        cfg = cfg.credentials(user.clone(), pass);
     }
+    // Deliver through the provider seam, not `smtp::send` directly: a live send
+    // is the same `MailProvider::send` the UI reaches through `MailClient`, so
+    // the CLI exercises the one path a live account actually uses (REQ-A1770).
+    let provider = amos_mail::live::ImapSmtpProvider::send_only(cfg);
+    let live_client = MailClient::new(provider, client.account().clone());
     let draft = build_draft(client, a)?;
-    let rcpt = amos_mail::live::smtp::send(&cfg, &draft)?;
-    Ok(vec![format!("sent via SMTP {host}:{port} as {}", rcpt.id)])
+    let rcpt = live_client.send(draft).await?;
+    Ok(vec![if rcpt.delivered {
+        format!("sent via SMTP {host}:{port} as {}", rcpt.id)
+    } else {
+        format!("stored as {} (not delivered)", rcpt.id)
+    }])
 }
 
 fn guess_mime(filename: &str) -> String {
@@ -786,12 +908,9 @@ pub async fn run(args: &[String]) -> Result<Vec<String>> {
                 tls,
             } = &op
             {
-                let mut cfg = amos_mail::live::ImapConfig::new(
-                    host.clone(),
-                    *port,
-                    user.clone(),
-                    pass.clone(),
-                );
+                let secret = pass.resolve(&mut std::io::stdin().lock())?;
+                let mut cfg =
+                    amos_mail::live::ImapConfig::new(host.clone(), *port, user.clone(), secret);
                 if *tls {
                     cfg = cfg.tls();
                 }
@@ -929,6 +1048,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn to_and_cc_are_classified_by_flag_not_by_membership() {
+        // An address named in both --to and --cc is a To recipient once and a Cc
+        // recipient once. Classifying by "is it in cc?" instead drops the To copy
+        // and pushes the address into Cc a second time.
+        let client = seeded_client();
+        let draft = build_draft(
+            &client,
+            &SendArgs {
+                to: vec!["ada@x.io".to_string(), "bob@x.io".to_string()],
+                cc: vec!["ada@x.io".to_string(), "carol@x.io".to_string()],
+                subject: "s".to_string(),
+                body: "b".to_string(),
+                ..SendArgs::default()
+            },
+        )
+        .unwrap();
+        let emails = |v: &[Address]| v.iter().map(|a| a.email.clone()).collect::<Vec<_>>();
+        assert_eq!(emails(&draft.to), vec!["ada@x.io", "bob@x.io"]);
+        assert_eq!(emails(&draft.cc), vec!["ada@x.io", "carol@x.io"]);
+    }
+
+    #[tokio::test]
     async fn dispatch_send_puts_copy_in_sent() {
         let client = seeded_client();
         let lines = dispatch(
@@ -942,7 +1083,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(lines[0].starts_with("sent as m"), "{lines:?}");
+        // The offline mock delivers nothing, so the report must not say "sent"
+        // (F-SH-824). This assertion used to pin the old lie.
+        assert!(lines[0].starts_with("stored in Sent as m"), "{lines:?}");
+        assert!(lines[0].contains("not delivered"), "{lines:?}");
 
         let sent = client.list(SENT, None).await.unwrap();
         assert_eq!(sent.len(), 1);
@@ -956,7 +1100,7 @@ mod tests {
         assert!(joined.contains("INBOX"));
         assert!(joined.contains("read first message"));
         assert!(joined.contains("Shipping the CLI today"));
-        assert!(joined.contains("sent as m"));
+        assert!(joined.contains("stored in Sent as m"));
     }
 
     #[tokio::test]
@@ -972,6 +1116,178 @@ mod tests {
         assert_eq!(guess_mime("a.txt"), "text/plain");
         assert_eq!(guess_mime("pic.PNG"), "image/png");
         assert_eq!(guess_mime("blob"), "application/octet-stream");
+    }
+
+    #[test]
+    fn usage_documents_the_smtp_delivery_flags() {
+        // The `--smtp*` flags are parsed by `parse_send` and drive the real SMTP
+        // route in `smtp_send_lines`, but the help text — the CLI's only discovery
+        // surface — used to omit them entirely: an implemented capability reachable
+        // only by guessing the flag name. Pin every one of them, and pin that the
+        // non-live behaviour is described as a *refusal*, not a silent fallback to
+        // the offline store.
+        //
+        // The password flags are pinned in their **non-argv** spelling
+        // (`--smtp-pass-env` / `--smtp-pass-stdin`, REQ-A1787): the help text is
+        // where a user learns which channel to use, so advertising the argv form
+        // here would send them straight back to the exposure.
+        for flag in [
+            "--smtp <HOST:PORT>",
+            "--smtp-user <USER>",
+            "--smtp-pass-env <VAR>",
+            "--smtp-pass-stdin",
+            "--smtp-tls",
+        ] {
+            assert!(
+                USAGE.contains(flag),
+                "USAGE does not document {flag}:\n{USAGE}"
+            );
+        }
+        assert!(
+            USAGE.contains("requires --features live"),
+            "USAGE must say the SMTP route needs a live build:\n{USAGE}"
+        );
+        assert!(
+            USAGE.contains("refuses it loudly rather than falling back to the store"),
+            "USAGE must describe the non-live behaviour as a loud refusal:\n{USAGE}"
+        );
+    }
+
+    /// An AUTH password must never travel on argv: `--pass <VALUE>` is refused by
+    /// name, and the refusal must tell the caller which safe channel to switch to
+    /// (a refusal that does not name the alternative just moves the user to another
+    /// unsafe habit). REQ-A1787 / audit PH-P2-01.
+    #[tokio::test]
+    async fn imap_unseen_refuses_a_password_on_argv_and_names_the_safe_channels() {
+        let err = run(&s(&[
+            "imap-unseen",
+            "--host",
+            "h",
+            "--user",
+            "u",
+            "--pass",
+            "hunter2",
+        ]))
+        .await
+        .expect_err("--pass <VALUE> must be refused, not parsed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--pass"),
+            "refusal must name the offending flag: {msg}"
+        );
+        assert!(
+            msg.contains("--pass-env"),
+            "refusal must name --pass-env: {msg}"
+        );
+        assert!(
+            msg.contains("--pass-stdin"),
+            "refusal must name --pass-stdin: {msg}"
+        );
+    }
+
+    /// The SMTP sibling of the same refusal (`--smtp-pass <VALUE>`), so a future
+    /// change cannot close one channel and leave the other world-readable.
+    #[tokio::test]
+    async fn send_refuses_a_smtp_password_on_argv_and_names_the_safe_channels() {
+        let err = run(&s(&[
+            "send",
+            "--to",
+            "them@x.io",
+            "--subject",
+            "s",
+            "--body",
+            "b",
+            "--smtp",
+            "127.0.0.1:2525",
+            "--smtp-user",
+            "u",
+            "--smtp-pass",
+            "hunter2",
+        ]))
+        .await
+        .expect_err("--smtp-pass <VALUE> must be refused, not parsed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--smtp-pass <VALUE>"),
+            "refusal must name the offending flag: {msg}"
+        );
+        assert!(
+            msg.contains("--smtp-pass-env"),
+            "refusal must name --smtp-pass-env: {msg}"
+        );
+        assert!(
+            msg.contains("--smtp-pass-stdin"),
+            "refusal must name --smtp-pass-stdin: {msg}"
+        );
+    }
+
+    /// `--pass-env` reads the variable when the command runs; an unset variable is
+    /// an error, never an empty password (an empty credential would be reported as
+    /// an authentication failure naming the wrong cause).
+    #[test]
+    fn secret_source_env_reads_the_variable_and_errors_when_unset() {
+        let var = format!("AMOS_MAIL_CLI_TEST_RESOLVE_{}", std::process::id());
+        std::env::set_var(&var, "s3cret");
+        let mut empty = std::io::empty();
+        assert_eq!(
+            SecretSource::Env(var.clone()).resolve(&mut empty).unwrap(),
+            "s3cret"
+        );
+        std::env::remove_var(&var);
+        let err = SecretSource::Env(var.clone())
+            .resolve(&mut empty)
+            .expect_err("an unset variable is an error");
+        assert!(err.to_string().contains(&var), "{err}");
+    }
+
+    /// `--pass-stdin` strips exactly one line terminator. Trailing *spaces* are part
+    /// of the password and must survive; EOF before any byte is an error, never `""`.
+    #[test]
+    fn secret_source_stdin_strips_one_newline_and_keeps_spaces() {
+        assert_eq!(
+            SecretSource::Stdin.resolve(&mut &b"hunter2\n"[..]).unwrap(),
+            "hunter2"
+        );
+        assert_eq!(
+            SecretSource::Stdin
+                .resolve(&mut &b"hunter2\r\n"[..])
+                .unwrap(),
+            "hunter2"
+        );
+        // A trailing space is a different credential; trimming it would fail auth
+        // for a reason the error text does not name.
+        assert_eq!(
+            SecretSource::Stdin
+                .resolve(&mut &b"hunter2 \n"[..])
+                .unwrap(),
+            "hunter2 "
+        );
+        let err = SecretSource::Stdin
+            .resolve(&mut &b""[..])
+            .expect_err("EOF is an error, not an empty password");
+        assert!(err.to_string().contains("ended"), "{err}");
+    }
+
+    /// A default (no `live`) build must *refuse* `send --smtp` loudly, never quietly
+    /// deliver to the offline store — the behaviour `USAGE` now describes.
+    #[cfg(not(feature = "live"))]
+    #[tokio::test]
+    async fn send_with_smtp_refuses_loudly_without_the_live_feature() {
+        let err = run(&s(&[
+            "send",
+            "--to",
+            "them@x.io",
+            "--subject",
+            "no relay",
+            "--body",
+            "hi",
+            "--smtp",
+            "127.0.0.1:2525",
+        ]))
+        .await
+        .expect_err("a default build refuses --smtp");
+        let msg = err.to_string();
+        assert!(msg.contains("live"), "unexpected refusal: {msg}");
     }
 
     #[tokio::test]
@@ -1000,7 +1316,7 @@ mod tests {
         ]))
         .await
         .unwrap();
-        assert!(out.join("\n").contains("sent as m1"), "{out:?}");
+        assert!(out.join("\n").contains("stored in Sent as m1"), "{out:?}");
 
         // 2. A *separate* invocation lists the same store → message survived.
         let listed = run(&s(&["list", "--mailbox", "Sent", "--store", &path]))
@@ -1260,6 +1576,11 @@ mod tests {
             }
         });
 
+        // The password reaches the CLI through the environment, never argv (REQ-A1787):
+        // `--pass <VALUE>` is now a hard refusal. The var name is unique per test so a
+        // concurrently running test cannot observe this one's value.
+        let var = format!("AMOS_MAIL_CLI_TEST_IMAP_PASS_{port}");
+        std::env::set_var(&var, "p");
         let out = run(&s(&[
             "imap-unseen",
             "--host",
@@ -1268,11 +1589,12 @@ mod tests {
             &port.to_string(),
             "--user",
             "u",
-            "--pass",
-            "p",
+            "--pass-env",
+            &var,
         ]))
         .await
         .unwrap();
+        std::env::remove_var(&var);
         assert!(out.join("\n").contains("2 unseen"), "{out:?}");
     }
 }

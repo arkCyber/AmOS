@@ -172,11 +172,43 @@ mod tests {
         );
     }
 
+    /// `SENSITIVE_RESOURCES` declares itself "1:1 with the host
+    /// `PrivacyManager::Resource::key()`" — but nothing bound the two: this test used to
+    /// compare the literal against an identical literal, so a resource added or renamed on
+    /// the host side (the *authority*, `crates/amos-ai/src/privacy.rs`) left the container
+    /// ledger silently disagreeing. A container policy hook would then reject a key the host
+    /// honours, or — the fail-open direction — accept one the host no longer recognises.
+    /// Read the authority's `key()` arms from source and require the exact same set
+    /// (REQ-A653 / F-SH-120).
     #[test]
     fn resource_keys_align_with_the_host_wire_keys() {
+        const HOST: &str = include_str!("../../amos-ai/src/privacy.rs");
+        let at = HOST
+            .find("pub const fn key(self)")
+            .expect("host Resource::key() not found");
+        let rest = &HOST[at..];
+        let body = &rest[..rest.find("\n    }").expect("key() body not found")];
+        let mut host: Vec<&str> = body
+            .match_indices("=> \"")
+            .map(|(i, _)| {
+                let after = &body[i + 4..];
+                &after[..after.find('"').expect("unterminated key literal")]
+            })
+            .collect();
+        // Vacuity guard: a rewrite that moves the arms out of the scanned window must fail
+        // loudly rather than compare an empty list.
         assert_eq!(
-            SENSITIVE_RESOURCES,
-            ["microphone", "camera", "contacts", "location", "storage"]
+            host.len(),
+            5,
+            "expected five host resource keys, parsed {host:?}"
+        );
+        host.sort_unstable();
+
+        let mut ours = SENSITIVE_RESOURCES.to_vec();
+        ours.sort_unstable();
+        assert_eq!(
+            ours, host,
+            "container capability keys must equal the host PrivacyManager::Resource::key() set"
         );
         for k in SENSITIVE_RESOURCES {
             assert!(valid_resource_key(k));

@@ -12,16 +12,23 @@
   import { iconSvg, radioIcon } from "../../lib/sysIcons";
   import { statusIcons } from "../../lib/netStatus";
   import { SETTINGS_KEY, normalizeQuick } from "../../lib/settings";
+  import { WIFI_KEY, normalizeWifi } from "../../lib/wifi";
   import { createStoreValue } from "../store";
   import { t } from "../locale.svelte";
   import { CHROME_STATUS_GLYPH, CHROME_TEXT_SHADOW } from "../../lib/shellChrome";
 
   const settingsStore = createStoreValue<unknown>(SETTINGS_KEY, {});
+  const wifiStore = createStoreValue<unknown>(WIFI_KEY, {});
   let quickRaw = $state<unknown>({});
+  let wifiRaw = $state<unknown>({});
   let online = $state(typeof navigator !== "undefined" ? navigator.onLine : true);
 
   $effect(() => {
     const un = settingsStore.subscribe((v) => (quickRaw = v));
+    return un;
+  });
+  $effect(() => {
+    const un = wifiStore.subscribe((v) => (wifiRaw = v));
     return un;
   });
   $effect(() => {
@@ -36,9 +43,13 @@
   });
 
   const quick = $derived(normalizeQuick(quickRaw));
-  const icons = $derived(
-    statusIcons(quick, online, typeof quick.wifi === "string" ? quick.wifi : null),
-  );
+  const wifi = $derived(normalizeWifi(wifiRaw));
+  // The joined SSID comes from `amos.wifi` (`WifiCfg.current`), never from the quick
+  // settings bit: `normalizeQuick` keeps only booleans, so the old
+  // `typeof quick.wifi === "string"` was always false and this bar could never name
+  // the network the phone's status bar names (REQ-A1123). Same argument the phone bar
+  // passes (`StatusBar.svelte`), so both read the one rule in `lib/netStatus.ts`.
+  const icons = $derived(statusIcons(quick, online, wifi.current));
 
   /** 规范化 title 为字符串（i18n key 可能返回 undefined） */
   function titleOrUndef(s: unknown): string | undefined {

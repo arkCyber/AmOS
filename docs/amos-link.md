@@ -73,6 +73,20 @@ ROS 的本质不是操作系统，而是三件事：**发布/订阅**、**消息
 队列满、一次性槽被更新帧顶掉、以及**消费者在发布中途消失**（关闭或锁中毒）——**REQ-A247 修掉了最后一条**：
 `Reliable` 的一次性槽拒绝路径此前只进 `PublishReport`/`metrics`，**没有**记进该订阅自己的计数器，
 于是 `sub.stats().dropped` 会对一个丢帧的订阅报 0（"计数器由知道事实的那一层写"这句话，当时对这条路径不成立）。
+**REQ-A247 只修了 `Reliable` 那一半** —— 上面的断言是写给**全部**路径的，而"消费者在发布中途消失"里的
+**关闭**那一支在 `LatestSlot::offer`（best-effort 一次性槽）上仍然为假：`Drop for Subscription` 会
+`slot.close()`，但注册表条目要等下一次发布的存活清扫才被摘掉，清扫与派发之间关闭的订阅其槽仍被写入、
+`offer` 仍返回 `true`，于是 broker 记 `delivered`、`metrics.delivered` 同增，而该订阅的双零让"这一帧去哪了"
+没有答案 —— **REQ-A1144 把这一半补上**（`offer` 顶部与 `offer_blocking` 同一条 `is_closed()` 拒绝，
+在槽自己那层计数）。可达性只在"清扫与派发之间"那条竞态窗口里，所以规则钉在**槽**上（计数器所在处，
+可确定性测试），broker 级路径仍是竞态。**同一形状的另两处（同一轮一并修，REQ-A1144）**：`--features zenoh`
+的转发任务里，`forward_samples!` 的 best-effort 分支把 `Err(TrySendError::Closed)` 与 `Full` 并进同一个
+`relay.lost()`，`forward_latest!` 的 best-effort 分支直接 `slot.offer(ingress)` 从不问关闭 —— 两处都忘了
+"转发任务拥有自己的 Zenoh 订阅者"，于是消费者走后任务既不 `return`（孤儿）又按帧累加节点级 `dropped`，
+随会话寿命无界（宏文档 `zenoh.rs` 的"无孤儿"比代码更强）。修法：`Closed` 从 `Full` 里分出来并 `return`；
+最新帧那支把 `slot.is_closed()` 提到 `offer` **之前**（否则 `offer` 会替同一帧在订阅侧再记一次 drop），
+为此 `LatestSlot::is_closed` 由私有放宽到 `pub(crate)`。**仍是边界**：`--features zenoh` 非默认档，两条新用例
+确实在 `--features zenoh --lib` 下跑真 Zenoh 会话，但**不是**跨主机真链路 —— 那是本文档的仪器。
 
 ### 3.1 安全语义（`RobotBridge`，这是产品级机器人的最低要求）
 
@@ -80,6 +94,7 @@ ROS 的本质不是操作系统，而是三件事：**发布/订阅**、**消息
 |---|---|---|
 | **闩锁急停** | 收到 `estop` 后**所有运动指令被拒**（`BridgeEvent::Refused`），只有显式 `{"action":"arm"}` 才解锁 | 队列里可能还躺着一条陈旧的 `trot`；机器人不能因为一条迟到指令自己复活 |
 | **死手看门狗** | `with_watchdog(period)`：静默超过 `period` ⇒ 桥**自己**切扭矩并报 `EstopReason::Watchdog` | 「Wi-Fi 中途断了」必须停机，而不是让最后一条指令一直跑 |
+| **总线故障闩锁** | `RobotHal::apply` 在**批次中途**失败（半批帧已进驱动器）⇒ 桥写剖面声明的停机批次、闩锁为 `EstopReason::BusFault`、**并照常上报**（`step` 在返回 `Err` 前先上报）；切扭矩本身也写不进去时计数为 `0`（真值），闩锁与上报不因此免除；解锁仍是一次显式 `arm` | 桥刚证明这条总线不执行帧，下一条运动指令不能再写进去。旧形状里 `?` 把错误直接短路出去 ⇒ 既不闩锁也不上报，大脑继续读到故障前的 `armed: true` + 旧步态，而机器人停在混合位姿（`docs/robot-autonomy.md` §65） |
 | **`arm` 只上电不运动** | `plan(arm)` = 每关节一帧 `Enable`，**没有**任何 `SetPosition` | 复位是一个需要被明确请求的动作，不能顺手带出一次运动 |
 | **畸形意图不进总线** | JSON 解析/限位失败 ⇒ `BridgeEvent::Refused`（**不是** `Err`，也不是默认姿态） | 「大模型说胡话」是常态；它不该让控制环崩溃，也不该变成一个静默的默认动作 |
 | **控制流不会被静默降级** | `Qos::for_channel(Control)` 恒为 `Reliable`；订阅模式自称 channel 时 CLI 默认采用它并**打印档位来源**（`--qos` 或 channel 或 default），认不出 channel 才退回文档默认 | 「订阅 `amos/*/control/*` 却用 best-effort」会让急停/步态指令被静默丢掉 —— 这是最贵的一类配置错误。策略表只有一处（`Qos::for_channel`），且选择过程可被打印 |
@@ -1280,8 +1295,9 @@ mission layer: decel wrote 3 frame(s), the halt batch wrote 3 (brake=100000, thr
 安全论证定值"，但 `Platform` 的字段是私有的、六个剖面是 `const` —— 产品**只能改这个 crate 的文件**。
 ⇒ 新增 `Platform::from_parts(kind, actuators, actions, envelope, arm_on_motion)` + `Platform::validate()`：
 部署自己写的机器（6 轴 ±120° 机械臂、八旋翼、不同制动执行器）现在**是一份数据**，且被**内置剖面同一条规则**
-逐条校验（18 条规则：序号连续且在帧参数空间内、名字唯一、恰好一个 `Arm` 与一个 `Halt`、位姿长度与行程、
-非运动动作的位姿必须惰性、参数名唯一且区间有序、`min_params` 可满足、包线可排程）。
+逐条校验（19 条规则：序号连续且在帧参数空间内、名字唯一、恰好一个 `Arm` 与一个 `Halt`、位姿长度与行程、
+非运动动作的位姿必须惰性、参数名唯一且区间有序、`min_params` 可满足、包线可排程、
+包线对 kind 的交叉校验（不可停机的机器不得把「停」当作失联答案，REQ-A852））。
 这条规则同时被集成测试跑在六个内置剖面上 —— **一条规则，两个调用方**，手写剖面不可能带着自相矛盾的词表上线。
 
 **实测（本轮的负数控制 5/5，每次都逐字节还原，`cmp` 证明）**：
@@ -1351,7 +1367,7 @@ zenoh = { version = "1.10", default-features = false,
 | `ListTopics` | 传输见过流量的话题清单 | 网络传输回答「不知道」（`Vec::new()`），不伪造空列表。清单与**它的完整性**一起返回（`TopicList.complete`，§3.8）：调用方不在那条传输上，「这些就是全部」与「这是这台节点恰好看到的」只能靠这个字段区分——CLI 远端因此也打印 `(inventory complete\|incomplete …)` |
 | `Publish` | 由非 Rust 节点注入原始负载 | daemon 用自己的 peer id、独立序号与（已校准的）时钟封装成真正的 `Envelope`，因此**类型化订阅者照样能解** |
 | `StreamHeartbeats` | 服务端流式心跳 | 直接把 `amos/*/telemetry/beat`（**每个** peer 的心跳，含自己）的订阅转发给 gRPC 客户端——传输的是链路上**真的收到过**的帧，不是合成计数器；「到底谁在线」由 `GetStatus` 的对端表回答。**心跳按 `Subscriber::recv_beat` 读取**（§3.9）：载荷自称的 peer 必须等于帧头的 publisher，否则**拒绝并计入 `decode_errors`**，绝不送进客户端 —— 这条流**就是**「哪些机器人活着」的答案，一帧两个身份会把载荷的自称摆到每个操作员面前。**「含自己」是实装的**：`LinkService::with_heartbeat`（`mock_server()` 用的就是这个形状）会为挂载的节点起心跳任务，所以 daemon 自己也真的在 `amos/amos-daemon/telemetry/beat` 上打拍——否则这条流**一帧都发不出来**，而「没有证据」与「链路健康但安静」在流上长得一模一样（证据：`crates/amos-ai/tests/link_rpc_e2e.rs::the_daemon_link_node_beats…`） |
-| `ListActuations` | **回程**：每个机器人自报的 `armed`/`estopped`(+原因)/`gait`/最近一次拒绝 | 数据面在 `amos/<robot>/state/actuation`，控制面**订阅并折叠**它们（`LinkService::with_heartbeat` 起的 watcher），让**不在链路上**的调用方（System UI、CLI）也能读到。三个诚实点：**(a) 按帧头 `publisher` 归属**（谁发布谁是机器人），不信负载自称；**(b) 一张快照表，按 id 排序**，同一机器人后来的报告覆盖旧的；**(c) 没上报过的机器人是「不在列表里」，不是「空闲」**——`mock_server` 刚起来时它是空的，而空 ≠ 全员空闲 |
+| `ListActuations` | **回程**：每个机器人自报的 `armed`/`estopped`(+原因)/`gait`/最近一次拒绝 | 数据面在 `amos/<robot>/state/actuation`，控制面**订阅并折叠**它们（watcher 由 `LinkService::new` 起，因此**每个**构造器都有它——见下条），让**不在链路上**的调用方（System UI、CLI）也能读到。四个诚实点：**(a) 按帧头 `publisher` 归属**（谁发布谁是机器人），不信负载自称；**(b) 一张快照表，按 id 排序**，同一机器人后来的报告覆盖旧的；**(c) 没上报过的机器人是「不在列表里」，不是「空闲」**——`mock_server` 刚起来时它是空的，而空 ≠ 全员空闲；**(d) 这个 watcher 不是可选项（REQ-A890 / F-LK-031）**：曾经只有 `with_heartbeat` 起它，`server(node)` 走的是 `LinkService::new`，于是「自带时钟/自带传输」的部署——正是本文档推荐 `server` 的那一类——会拿到一个永远回「没有机器人上报过」的 `ListActuations`，而它的文档写着「只把**存活**留给调用方」。现在每个构造器都经 `LinkService::new`，回程与存活彻底分开：`server` 仍然不打拍（存活归调用方），但一定会折叠回程 |
 
 挂载点：`amos-ai/src/server.rs` 的 `serve()` 里 `.add_service(amos_link::service::mock_server())`，
 与 AiAgent/Sensor/Telephony 同一条 UDS；证据是 `crates/amos-ai/tests/link_rpc_e2e.rs`（真 UDS 往返）。
@@ -1406,8 +1422,18 @@ zenoh = { version = "1.10", default-features = false,
    设置页 `frontend-ts/src/svelte/settings/LinkPage.svelte`（经 `SettingsApp` 的「机器人链路」行进入）+
    `lib/link.ts`（纯函数 + 离线契约）+ en/zh 文案 +
    两份用例（`svelte-tests/link-page.svelte.test.ts`、`src/__tests__/link.test.ts`）。
-   **它只读、不指挥**（发布是 CLI/工具的事），并且**原样带出守护进程的判定**：`unknown`（暂无证据）**不等于**
+   **这一页只读**（它只观察；发指令是另一个界面的事——见下一段），并且**原样带出守护进程的判定**：`unknown`（暂无证据）**不等于**
    `healthy`，时钟未校准会明确说"延迟只是上界"，计数器标明是自启动累计。
+   **（REQ-A896 更正）** 上一句原先把**整个链路界面**写成只观察、把发布说成 CLI 独占的事——**当时就已经不成立**
+   （原句逐字留档见 `CHANGELOG.md` 的 REQ-A896 条；本节只描述今天的实情，不复述那句假话）：
+   同一个 `link.rs` 除了 `link_status` 还挂了 `link_publish` / `link_topics` /
+   `link_watch_heartbeats` / `link_stop_heartbeats` 四条命令，System UI 里也有了它们的界面——
+   **机器人指挥台**（`RobotApp.svelte`，app 图标 🦿，i18n `app.robot`／`robot.*`）：选一台机器人后下发
+   `arm` / `estop` / 步态（`stand`/`trot`/`walk`/`sit` + 速度滑杆），走 `link_publish` 发到
+   `amos/<robot>/control/action`。所以"发布是 CLI 独有的事"是错的（CLI 仍是唯一**不在 UI 里**的发布者）。
+   指挥台的**回执 ≠ 生效**这条纪律写在 `lib/robot.ts` 与界面文案里：回执是传输层对"这节帧交给了总线"
+   的记账（`matched`/`delivered` 只数**本节点**看得见的订阅者，网络传输答 `0` = 「不知道」而**不是**「没有」），
+   扭矩有没有真的动，只从上面那一栏**回程自报**读回来。`estop` 是短路动作，界面上**不加确认、不做前置校验**。
    **（本轮补全）它现在也读"回程"**：`link_status` 同时调 `ListActuations`（§5），所以「机器人链路」页在
    实时的对端表之下还列出**每台机器人自报的状态**——armed / 已切扭矩(+原因) / 当前步态 / 最近一次被拒绝的指令
    （连"怎么恢复"都带出来）。这一栏的诚实点写进了界面文案：**没上报过的机器人不在列表里（那不是"空闲"）**，

@@ -6,11 +6,20 @@
   // (offline → hidden). The former React body was removed in the subtraction
   // phase — this is the only implementation, mounted by `appRegistry`.
   import { bridged } from "../lib/backend";
-  import { CAPABILITIES, capSet, grantedApps, grantedCaps, loadLedger } from "../lib/permissions";
+  import { CAPABILITIES, PERMISSIONS_KEY, capSet, grantedApps, grantedCaps, loadLedger, normalizeLedger } from "../lib/permissions";
   import type { Capability, PermissionLedger } from "../lib/permissions";
   import { capForWire, daemonGrantsAll, daemonRecentAudit, toAuditViews } from "../lib/privacyBackend";
   import type { AuditView, DaemonGrantRow } from "../lib/privacyBackend";
-  import { daemonVerdict, grantCapability, revokeCapability } from "./osPermissions";
+  import {
+  daemonVerdict,
+  grantCapability,
+  mirrorRefused,
+  onMirrorVerdict,
+  revokeCapability,
+} from "./osPermissions";
+  import type { CapabilityWrite } from "./osPermissions";
+  import { createStoreValue } from "./store";
+  import StoreErrorBar from "./StoreErrorBar.svelte";
   import { defaultAppsFor, isDefaultOnGrant } from "./osCapabilities";
   import { appTitleKey } from "../lib/appMeta";
   import { isExtId, tileById } from "../lib/storeApps";
@@ -31,7 +40,7 @@
     camera: ["camera"],
     microphone: ["ai", "interpreter", "phone"],
     location: ["maps", "weather"],
-    contacts: [],
+    contacts: ["contacts"],
     storage: [],
     notifications: ["messages", "mail"],
   };
@@ -44,7 +53,21 @@
     notifications: "🔔",
   };
 
+  // （REQ-A1467 ∕ F-SH-738）`amos.permissions` 的写入者不止本页。相机在挂载时就自动授权
+  // （`CameraApp:92`），地图 ∕ 语音备忘录 ∕ 同传的运行时授权、三个麦克风按钮也都写这枚键
+  // （`svelte/osPermissions.grantCapability`）。平板上本页与它们同台（Slide Over 面板或分屏的
+  // 另一格），一次授权写完这枚键，本页不会重挂 —— 「只读一次」的代价是**审查面**说谎：`地图`
+  // 对一个真的被授着的能力仍写「拒绝」，另一处撤销掉的能力仍留着绿芯片（还带着 ★ ∕ ⛔ 承诺）。
+  // 用 `createStoreValue` 订阅：回退值取当前读数，挂载时同步投递的那次与初始值一致；本页自己的
+  // 写入仍照旧读裁决并 `adopt`（订阅是幂等的）。
+  const ledgerStore = createStoreValue<unknown>(PERMISSIONS_KEY, loadLedger());
   let ledger = $state<PermissionLedger>(loadLedger());
+  $effect(() => {
+    const un = ledgerStore.subscribe((v) => (ledger = normalizeLedger(v)));
+    return un;
+  });
+  /** The last refused `amos.permissions` write, stated (see {@link adopt}). */
+  let storeErr = $state("");
   // Daemon "recent access" audit (only fetched when online). null = no record yet.
   let audit = $state<AuditView[]>([]);
   let auditOnline = $state(false);
@@ -132,7 +155,7 @@
   );
   /** Revoke a daemon-only grant at the authority (it is not in the local ledger). */
   const revokeDaemonOnly = (app: string, cap: Capability) => {
-    ledger = revokeCapability(app, cap);
+    adopt(revokeCapability(app, cap));
     // Re-read the authority instead of assuming the write landed.
     void daemonGrantsAll().then((rows) => {
       if (rows !== null) daemonRows = rows;
@@ -142,11 +165,28 @@
   const capNameOf = (res: string): string =>
     (CAPABILITIES as readonly string[]).includes(res) ? capLabel[res as Capability] : res;
 
+  /**
+   * Show what the store holds, and say when it holds something else.
+   *
+   * `CapabilityWrite.ledger` is the **persisted** ledger: every gate in the OS reads it back
+   * through `loadLedger` (`capSet` in the apps, the daemon's own mirror), so adopting the
+   * attempted value instead would draw a revoke that never took effect — the switch moves, the
+   * holder chip disappears, and the next boot finds the capability granted again with nothing
+   * having said a word. A refused write is the one case this page can prove locally
+   * (`writeStoreValueChecked` → `false`), so it is stated rather than swallowed.
+   */
+  function adopt(res: CapabilityWrite): void {
+    ledger = res.ledger;
+    storeErr = res.landed ? "" : t("common.storeWriteFailed");
+    // The ⛔ marks read `ledger`; recompute them for the ledger actually adopted.
+    collectMirrorRefusals();
+  }
+
   const toggle = (app: string, cap: Capability) => {
     const on = capSet(ledger, app, cap);
     // One seam for both sides: the local ledger (display cache, works offline) and
     // the daemon's authoritative, audited store (best-effort, offline no-op).
-    ledger = on ? revokeCapability(app, cap) : grantCapability(app, cap);
+    adopt(on ? revokeCapability(app, cap) : grantCapability(app, cap));
   };
 
   // Drift between the local ledger and the daemon's authoritative store: the local
@@ -172,8 +212,35 @@
       alive = false;
     };
   });
+
+  /**
+   * A mirror write the daemon **refused** — the one failure the app can prove locally. The
+   * drift block above *asks the daemon*, so it goes silent exactly when the write failed
+   * because the daemon is unreachable (`perm_authorize` fails too, and `null` means "no
+   * claim"). This reads the verdict of the write the user's own action made, so a grant
+   * that never reached the authoritative store is not shown as a clean green grant. Kept
+   * apart from `drift` because the cause differs: that one is "the daemon denies it", this
+   * is "the daemon never confirmed it".
+   */
+  let mirrorRefusals = $state<Record<string, true>>({});
+  function collectMirrorRefusals(): void {
+    const next: Record<string, true> = {};
+    for (const cap of CAPABILITIES) {
+      for (const app of grantedApps(ledger, cap)) {
+        if (mirrorRefused(app, cap)) next[`${app}|${cap}`] = true;
+      }
+    }
+    mirrorRefusals = next;
+  }
+  $effect(() => {
+    // 对**当前这份**账本先算一次 —— 订阅送来的外部写入可能带来一个「最后一次镜像已被拒」的
+    // 配对（那次写入的判决早就记在 `mirrorRefused` 里，只是本页还没有这份账本去看见它）。
+    collectMirrorRefusals();
+    return onMirrorVerdict(() => collectMirrorRefusals());
+  });
 </script>
 <div class="space-y-3 p-4">
+  <StoreErrorBar message={storeErr} />
   <p class="rounded-2xl bg-white/50 px-3 py-2 text-xs leading-relaxed opacity-60 ring-1 ring-black/5 dark:bg-white/[0.06] dark:ring-white/10">
     {t("perm.hint")}
   </p>
@@ -273,6 +340,15 @@
                   title={t("perm.defaultOn")}
                   class="text-blue-500"
                 >★</span>
+              {/if}
+              {#if mirrorRefusals[`${app}|${cap}`]}
+                <span
+                  data-testid={`perm-mirror-${app}-${cap}`}
+                  aria-label={t("perm.mirrorRefused")}
+                  title={t("perm.mirrorRefused")}
+                  class="text-red-500"
+                  >⛔</span
+                >
               {/if}
               {#if drift[`${app}|${cap}`]}
                 <span

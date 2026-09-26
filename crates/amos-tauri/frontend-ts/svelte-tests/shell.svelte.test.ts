@@ -13,11 +13,18 @@ import Shell from "../src/svelte/Shell.svelte";
 import { resetPropsChannels, propsChannel } from "../src/svelte/propsBus";
 import {
   applyLayout,
+  closeSysInk,
   enterEdit,
+  enterSplit,
+  exitSplit,
+  hideSlideOver,
+  openSlideOver,
+  slideOver,
   goHome,
   lock,
   ncOpen,
   open,
+  openSysInk,
   recentsOpen,
   resetShellState,
   setNc,
@@ -26,14 +33,19 @@ import {
   spotOpen,
   layout,
   pulseId,
+  surface,
   unlock,
 } from "../src/svelte/shellState.svelte";
 import { moveBefore, readStoreValue, writeStoreValue, RECENTS_KEY, LAYOUT_KEY } from "../src/lib/amosStore";
 import { CONTACTS_KEY } from "../src/lib/contacts";
 import { NOTIF_KEY } from "../src/lib/settings";
 import { LAYOUT_CHANGED_EVENT, type LayoutSnapshot } from "../src/lib/wm";
-import { WAKE_HOME_MIN_MS } from "../src/lib/display";
-import { setFormFactor } from "../src/lib/desktopApps";
+import { SPLIT_KEY } from "../src/lib/splitPersist";
+import { SLIDE_PERCENT_DEFAULT } from "../src/lib/slideOver";
+import { AUTOOFF_STORE_KEY, WAKE_HOME_MIN_MS } from "../src/lib/display";
+import { setFormFactor } from "../src/lib/formAuthority.svelte";
+import { BRIGHTNESS_KEY } from "../src/lib/brightness";
+import { setStoreTiles } from "../src/lib/storeApps";
 import { zh } from "../src/i18n/locales/zh";
 
 /** A host snapshot of the class under test (the shape `wm_layout_snapshot` returns). */
@@ -56,14 +68,16 @@ type Listener = (e: { payload: unknown }) => void;
  * *what* the shell asked for, not merely that it asked. */
 let bridgeCalls: Array<{ cmd: string; args?: Record<string, unknown> }>;
 
-/** Install a fake host so the shell's own class-dependent chrome can be driven. */
-function installHost(answer: () => unknown) {
+/** Install a fake host so the shell's own class-dependent chrome can be driven.
+ * `extra` answers boot commands beyond the snapshot (e.g. `appstore_installed`). */
+function installHost(answer: () => unknown, extra: Record<string, unknown> = {}) {
   const listeners = new Map<string, Listener>();
   (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
     invoke: async (cmd: string, args?: Record<string, unknown>) => {
       bridgeCalls.push({ cmd, args });
       if (cmd === "wm_layout_snapshot") return answer();
       if (cmd === "wm_set_shell_title") return (args?.title as string | null) ?? "Amos";
+      if (cmd in extra) return extra[cmd];
       return null;
     },
     listen: async (channel: string, handler: Listener) => {
@@ -99,10 +113,66 @@ describe("Shell.svelte (surface decision tree)", () => {
     unlock();
   });
 
+  // REQ-A1401: the idle watcher is started once (in `onMount`) and the sleep it
+  // triggers is a surface change inside this same component — so the *wiring* has to
+  // hand it the lock state it produced, or 「自动息屏」 fires once per app launch and
+  // the display then stays lit forever after the first unlock.
+  test("idle auto-off fires again after a wake, not only once per launch (REQ-A1401)", async () => {
+    vi.useFakeTimers();
+    try {
+      writeStoreValue(AUTOOFF_STORE_KEY, 15);
+      render(Shell);
+      await tick();
+
+      await vi.advanceTimersByTimeAsync(16_000);
+      await tick();
+      expect(surface().kind).toBe("lock");
+
+      // The user unlocks; the next idle period must sleep the display again.
+      unlock();
+      await tick();
+      expect(surface().kind).toBe("home");
+
+      await vi.advanceTimersByTimeAsync(16_000);
+      await tick();
+      expect(surface().kind).toBe("lock");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   test("home surface renders the Svelte HomeDock", async () => {
     const { container } = render(Shell);
     await tick();
     expect(container.querySelector('[data-testid="home-grid"]')).toBeTruthy();
+  });
+
+  test("a refused home-layout write keeps the grid and says so on screen (REQ-A1378)", async () => {
+    const { container } = render(Shell);
+    await tick();
+    expect(container.querySelector('[data-testid="home-grid"]')).toBeTruthy();
+    const before = layout();
+
+    const spy = vi.spyOn(window.localStorage, "setItem").mockImplementation(() => {
+      throw new Error("QuotaExceededError");
+    });
+    try {
+      applyLayout({ page: ["clock"], dock: [], hidden: ["notes"] });
+      await tick();
+    } finally {
+      spy.mockRestore();
+    }
+
+    // The icon the user dragged is still where it was — the screen backs up the store.
+    expect(layout()).toEqual(before);
+    expect(container.querySelector('[data-testid="store-write-error"]')?.textContent).toContain(
+      zh["common.storeWriteFailed"],
+    );
+
+    // And a later accepted write clears the line.
+    applyLayout({ page: ["notes"], dock: ["phone"], hidden: [] });
+    await tick();
+    expect(container.querySelector('[data-testid="store-write-error"]')).toBeNull();
   });
 
   test("unmount disposes the channels the shell owns (no stale snapshot on remount)", async () => {
@@ -127,6 +197,20 @@ describe("Shell.svelte (surface decision tree)", () => {
       (b.className ?? "").includes("bg-accent"),
     );
     expect(done).toBeTruthy();
+  });
+
+  test("the home screen's long-press 'edit' action reaches the Edit surface", async () => {
+    // HomeDock emits `edit` over the "home" channel when an icon is held; the shell
+    // must translate it into the surface change (it handled open/move/search/library
+    // only, so the action was a no-op end-to-end).
+    const { container } = render(Shell);
+    await tick();
+    expect(container.querySelector('[data-testid="home-grid"]')).toBeTruthy();
+
+    propsChannel<Record<string, unknown>>("home").emit("edit");
+    await tick();
+    expect(surface()).toEqual({ kind: "edit" });
+    expect(container.querySelector('[data-testid="home-grid"]')).toBeNull();
   });
 
   test("app surface shows chrome + Back returns home", async () => {
@@ -253,8 +337,35 @@ describe("Shell.svelte (surface decision tree)", () => {
     expect(dock).toBeTruthy();
   });
 
-  test("a desktop APP window renders the app it addresses, not a second desktop (REQ-A416)", async () => {
-    // `wm_open(label)` builds a real `WebviewWindow` at `index.html#window=<label>`
+  test("a store app installed at boot reaches the desktop Dock (REQ-A1179 wiring)", async () => {
+    // The push chain — `Shell` (the only component that loads the tiles) → `DesktopShell` →
+    // `SHELL_CHROME_API.storeTiles` — is the half no other test can see: the
+    // `desktop-shell.svelte.test.ts` cases render `DesktopShell` directly and pass `ext` as a
+    // prop, so they stay green even if `Shell` stops forwarding it. Here the *real* host
+    // answers `appstore_installed`, the shell's own loader fills `ext`, and the assertion is
+    // on the Dock's rendered label — i.e. on the whole chain, not on a prop.
+    installHost(() => snap({ form: "desktop" }), {
+      appstore_installed: [{ manifest: { id: "org.amos.demo", name: "Demo" } }],
+    });
+    writeStoreValue(LAYOUT_KEY, {
+      page: [],
+      dock: ["clock", "store:org.amos.demo"],
+      hidden: [],
+    });
+    const { container } = render(Shell);
+    await tick();
+    await new Promise((r) => setTimeout(r, 80));
+
+    const labels = [...container.querySelectorAll("button[aria-label]")].map((b) =>
+      b.getAttribute("aria-label"),
+    );
+    expect(labels).toContain("Demo");
+    expect(labels).not.toContain("store:org.amos.demo");
+    // The built-in beside it is untouched — the filter widened, it did not replace.
+    expect(labels).toContain(zh["app.clock"]);
+  });
+
+  test("a desktop APP window renders the app it addresses, not a second desktop (REQ-A416)", async () => {    // `wm_open(label)` builds a real `WebviewWindow` at `index.html#window=<label>`
     // (crates/amos-tauri/src/wm.rs) and `shell-entry.ts` turns that fragment into
     // `open(label)`. Before this round the desktop branch rendered `DesktopShell` for
     // **every** window, so on a PC every "app window" was another copy of the desktop
@@ -276,9 +387,39 @@ describe("Shell.svelte (surface decision tree)", () => {
     ).toBeNull();
     // The app itself really mounted (Settings has a screen in this build), so this is
     // not merely "a wrapper div appeared".
-    await vi.waitFor(() => {
-      expect(container.textContent ?? "").toContain(zh["settings.dock.title"]);
+    // The bound is explicit because the verdict this waits on is a **lazy dynamic
+    // import** (`svelteAppLoader`), not a tick: `vi.waitFor`'s 1 s default is measured
+    // against a cold vite transform of `SettingsApp.svelte`, which the file has grown
+    // past (24.8 KB at HEAD → 34.9 KB) — measured 2026-09-22: this case reddened in
+    // ~2 of 3 full-file runs, at ~2.3 s, green alone. Waiting on the app's own words
+    // is right; the default ceiling was just below the work it was waiting for.
+    await vi.waitFor(
+      () => {
+        expect(container.textContent ?? "").toContain(zh["settings.dock.title"]);
+      },
+      { timeout: 5000 },
+    );
+  });
+
+  test("a desktop window of an INSTALLED app is named by the store registry (REQ-A1185 wiring)", async () => {
+    // The `ext` half of the same chain the REQ-A1179 wiring test above covers: `Shell` loads
+    // the tiles and hands them to `DesktopAppWindow` — which, unlike `DesktopShell`'s
+    // surfaces, is *not* inside the `SHELL_CHROME_API` context (REQ-A416 routes app windows
+    // around the shell), so the list can only reach it as a prop. The dedicated
+    // `store-app-window-name.svelte.test.ts` passes `ext` directly and therefore stays green
+    // even if `Shell` stops forwarding it; this case renders the whole chain instead.
+    installHost(() => snap({ form: "desktop" }), {
+      appstore_installed: [{ manifest: { id: "org.amos.demo", name: "Demo" } }],
     });
+    await open("store:org.amos.demo");
+    const { container } = render(Shell);
+    await tick();
+    await new Promise((r) => setTimeout(r, 80));
+
+    const title = container.querySelector('[data-testid="app-window-title"]');
+    expect(title, "the store app's window must mount").toBeTruthy();
+    expect(title?.textContent?.trim()).toBe("Demo");
+    expect(container.textContent).not.toContain("store:org.amos.demo");
   });
 
   test("a desktop APP window does not navigate itself home on a wake (REQ-A429)", async () => {
@@ -311,6 +452,29 @@ describe("Shell.svelte (surface decision tree)", () => {
       "an app window must not turn itself into the desktop on a wake",
     ).toBeTruthy();
     expect(container.querySelector('[aria-label="底部 Dock"], [aria-label="Dock"]')).toBeNull();
+  });
+
+  test("the desktop form renders the system ink layer when it is raised (REQ-A1590)", async () => {
+    // The desktop Control Center (`control-center-panel` → `ControlCenter.svelte`) carries the
+    // 系统级手写 button, whose `onclick` is `openSysInk()`. That button lives on the *desktop*
+    // branch and `SystemInkLayer` used to be mounted only on the touch branch — so on a PC the
+    // button set `_sysInkOpen` and nothing drew. This case mounts the real launcher window and
+    // drives the same `openSysInk()` the button calls: the layer must exist in this window.
+    installHost(() => snap({ form: "desktop" }));
+    const { container } = render(Shell);
+    await tick();
+    await new Promise((r) => setTimeout(r, 80));
+
+    // The desktop window is up (Control Center reaches this window) ...
+    expect(container.querySelector('[aria-label="底部 Dock"], [aria-label="Dock"]')).toBeTruthy();
+    // ... and nothing has raised the layer yet (the negative control: the mount is not
+    // unconditional — a closed layer renders nothing).
+    expect(container.querySelector('[data-testid="system-ink-layer"]')).toBeNull();
+
+    openSysInk();
+    await tick();
+    expect(container.querySelector('[data-testid="system-ink-layer"]')).toBeTruthy();
+    closeSysInk();
   });
 
   test("a touch class STILL returns home on a wake (the guard is not global) (REQ-A429)", async () => {
@@ -351,6 +515,23 @@ describe("Shell.svelte (surface decision tree)", () => {
     await tick();
     expect(container.querySelector('button[data-testid="home-indicator"]')).toBeNull();
     expect(container.querySelector('[data-testid="dynamic-island"]')).toBeNull();
+  });
+
+  test("the brightness dim layer rides the touch shell, not the desktop one (G-β-1)", async () => {
+    // The desktop form draws this layer inside DesktopShell (see its own test); the
+    // phone/tablet branch must draw its own, or the slider just added to the phone
+    // Control Center would move a number nothing on screen honours.
+    installHost(() => snap({ form: "phone", screen_w: 480, screen_h: 820 }));
+    const { container } = render(Shell);
+    await tick();
+    // pct=100 (the default) = no dimming = no layer at all.
+    expect(container.querySelector('[data-testid="brightness-overlay"]')).toBeNull();
+
+    writeStoreValue(BRIGHTNESS_KEY, { pct: 30 });
+    await tick();
+    const overlay = container.querySelector('[data-testid="brightness-overlay"]');
+    expect(overlay).toBeTruthy();
+    expect(overlay?.getAttribute("data-brightness-pct")).toBe("30");
   });
   test("the window's name follows what is on screen (REQ-A250)", async () => {
     // The defect this pins: the shell window carried the configured title for every
@@ -411,10 +592,11 @@ describe("Shell.svelte (surface decision tree)", () => {
       container.textContent ?? "",
       "the window must explain why there is no dialer",
     ).toContain(zh["app.screenMissing"].replace("{id}", "phone"));
-    // The sentence above can only be rendered by the `{:else}` branch of the app
-    // surface, i.e. when no app component was mounted — so it *is* the negative control
-    // for "PhoneApp never started" (a `[data-testid]` on PhoneApp would be a weaker,
-    // copy-pasted assertion).
+    // The sentence above can only be rendered by the app surface's terminal branch
+    // (`{:else if noScreen}` — the loader answered "none" and no component was mounted) —
+    // so it *is* the negative control for "PhoneApp never started" (a `[data-testid]` on
+    // PhoneApp would be a weaker, copy-pasted assertion). The `{:else}` below it is the
+    // loading state and deliberately never reaches this sentence.
   });
 
 
@@ -561,6 +743,94 @@ describe("Shell.svelte (surface decision tree)", () => {
     expect(pulseId()).toBe("clock"); // soft-launch pulse set
   });
 
+  test("a hidden app picked from Spotlight opens instead of pulsing nowhere (REQ-A1362)", async () => {
+    // Spotlight offers every built-in, including one the user hid from EditHome — home
+    // draws only `layout.page` + `layout.dock`, so a "pulse the icon" launch had no
+    // icon: the sheet closed, the shell stayed home and the screen did not change, i.e.
+    // the pick looked like it had failed. With nowhere to pulse, it opens the app.
+    applyLayout({ page: ["notes", "photos"], dock: ["phone", "ai", "interpreter"], hidden: ["clock"] });
+    setSpot(true);
+    const { container } = render(Shell);
+    await tick();
+    await fireEvent.input(container.querySelector("input") as HTMLInputElement, {
+      target: { value: "clock" },
+    });
+    await tick();
+    const result = container.querySelector<HTMLButtonElement>('[data-testid="spot-app-clock"]');
+    expect(result, "Spotlight must still offer an installed app").toBeTruthy();
+    await fireEvent.click(result!);
+    await tick();
+    expect(container.querySelector('[data-testid="app-surface"]')).not.toBeNull();
+    expect(pulseId()).toBeNull(); // nothing was pulsed that nobody can see
+  });
+
+  test("a soft launch of an app on a later home page turns the grid to it (REQ-A1361)", async () => {
+    setSpot(true);
+    const { container } = render(Shell);
+    await tick();
+    // The seeded layout puts all 33 non-dock built-ins on the page and home opens on
+    // page 1, so an app from further down the registry has no tile on screen at all.
+    // Pre-fix the pulse was set on a tile nobody could see: the sheet closed, the shell
+    // stayed home, and the screen did not change — the pick looked like it failed.
+    const tile = () =>
+      container.querySelector<HTMLElement>(
+        `[data-testid="home-grid"] button[aria-label="${zh["app.webman"]}"]`,
+      );
+    expect(tile()).toBeNull();
+    await fireEvent.input(container.querySelector("input") as HTMLInputElement, {
+      target: { value: "webman" },
+    });
+    await tick();
+    const result = container.querySelector<HTMLButtonElement>('[data-testid="spot-app-webman"]');
+    expect(result, "Spotlight must offer the app it is being asked to launch").toBeTruthy();
+    await fireEvent.click(result!);
+    await tick();
+    expect(container.querySelector('[data-testid="app-surface"]')).toBeNull();
+    expect(pulseId()).toBe("webman");
+    // …and the grid is now showing the page that holds it.
+    expect(tile()?.innerHTML).toContain("animate-pulse");
+  });
+
+  test("picking the SAME Spotlight result again still turns the grid to it (REQ-A1361)", async () => {
+    // The second pick re-states an id the shell already holds. Svelte compares runes by
+    // value, so nothing in the pushed payload changes — the soft launch is an event, and
+    // only the launch counter makes the shell re-push for it. Without that, a user who
+    // swiped away from the revealed tile and searched the same app again saw nothing at
+    // all: the same silent no-op, one pick later.
+    setSpot(true);
+    const { container } = render(Shell);
+    await tick();
+    const tile = () =>
+      container.querySelector<HTMLElement>(
+        `[data-testid="home-grid"] button[aria-label="${zh["app.webman"]}"]`,
+      );
+    const openSpotlight = async () => {
+      setSpot(true);
+      await tick();
+      await fireEvent.input(container.querySelector("input") as HTMLInputElement, {
+        target: { value: "webman" },
+      });
+      await tick();
+      const row = container.querySelector<HTMLButtonElement>('[data-testid="spot-app-webman"]');
+      expect(row).toBeTruthy();
+      await fireEvent.click(row!);
+      await tick();
+    };
+
+    await openSpotlight();
+    expect(tile()).toBeTruthy();
+
+    // The user pages home back themselves (page dots), the way a swipe does.
+    const dots = [...container.querySelectorAll<HTMLButtonElement>('[data-testid="home-dot"]')];
+    expect(dots.length).toBeGreaterThan(1);
+    await fireEvent.click(dots[0]);
+    expect(tile()).toBeNull();
+
+    await openSpotlight();
+    expect(pulseId()).toBe("webman"); // the same id, re-stated
+    expect(tile()?.innerHTML).toContain("animate-pulse");
+  });
+
   test("App Library entry routes Shell into the library surface and back home", async () => {
     const { container } = render(Shell);
     await tick();
@@ -630,7 +900,7 @@ describe("Shell.svelte (surface decision tree)", () => {
  */
 import DesktopShell from "../src/svelte/DesktopShell.svelte";
 import { resetDesktopFeaturesForTest } from "../src/lib/desktopFeatures";
-import { setFormFactor as setFormFactorLib } from "../src/lib/desktopApps";
+import { setFormFactor as setFormFactorLib } from "../src/lib/formAuthority.svelte";
 
 const DESKTOP_SNAPSHOT = {
   screen_w: 1496,
@@ -914,6 +1184,7 @@ describe("Shell.svelte (screen-state reporting)", () => {
 describe("Shell.svelte (store tiles)", () => {
   afterEach(() => {
     delete (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+    setStoreTiles([]); // the tile cache is module-global — don't leak it to the next test
   });
 
   /** Bridge that reports one installed store app, with a runnable web bundle. */
@@ -959,6 +1230,28 @@ describe("Shell.svelte (store tiles)", () => {
     await vi.waitFor(() => {
       expect(host.container.textContent ?? "").toContain("Demo");
     });
+  });
+
+  test("a store app placed on the dock survives the next launch", async () => {
+    bridgeWithInstalled();
+    // A real boot reaches the tile cache *cold*: `loadStoreTiles` is async and only
+    // `Shell` starts it, so the layout repair at init cannot yet see the installed app.
+    setStoreTiles([]);
+    // Last session's App Library "add to dock" wrote this.
+    window.localStorage.setItem(
+      LAYOUT_KEY,
+      JSON.stringify({ page: ["clock"], dock: ["phone", "store:org.amos.demo"], hidden: [] }),
+    );
+    resetShellState(); // the boot seed, with the cache still cold
+    const host = render(Shell);
+    // The shell re-derives the layout once the tiles arrive, so the placement the user
+    // already made is restored rather than filtered out as a ghost.
+    await vi.waitFor(() => {
+      expect(layout().dock).toContain("store:org.amos.demo");
+    });
+    // …and the dock actually draws it (a dock tile carries its name as the accessible
+    // name — the bar itself is icon-only).
+    expect(host.container.querySelector('[aria-label="Demo"]')).toBeTruthy();
   });
 
   test("opening a store tile runs its bundle at the app's own origin", async () => {
@@ -1232,3 +1525,239 @@ describe("Shell.svelte — system back pushes one history entry per level (REQ-A
   });
 });
 
+
+describe("Shell.svelte — the tablet split entry (REQ-A512)", () => {
+  // The control for the whole feature: a phone offers **no** split control at all (its
+  // measured `columns` is 1 — a control that could never work is worse than none), and a
+  // tablet's entry leads to a real split surface through `enterSplit`, whose gate is the
+  // same `columns >= 2` that decided the button was drawn.
+  const settle = () => new Promise((r) => setTimeout(r, 80));
+
+  test("a tablet app surface offers the split entry; a phone's does not", async () => {
+    installHost(() => snap({ form: "tablet", columns: 2, multi_window: false, free_resize: false }));
+    await open("settings");
+    const tablet = render(Shell);
+    await tick();
+    await settle();
+    expect(tablet.container.querySelector('[data-testid="split-enter"]')).toBeTruthy();
+    tablet.unmount();
+
+    installHost(() =>
+      snap({ form: "phone", columns: 1, screen_w: 420, screen_h: 820, multi_window: false, free_resize: false }),
+    );
+    await open("settings");
+    const phone = render(Shell);
+    await tick();
+    await settle();
+    expect(phone.container.querySelector('[data-testid="split-enter"]')).toBeNull();
+  });
+
+  test("picking a second app from the entry's sheet enters the split surface", async () => {
+    installHost(() => snap({ form: "tablet", columns: 2, multi_window: false, free_resize: false }));
+    await open("phone"); // a recent, so the picker has a candidate
+    await open("settings"); // the primary pane
+    const { container } = render(Shell);
+    await tick();
+    await settle();
+
+    const entry = container.querySelector<HTMLButtonElement>('[data-testid="split-enter"]');
+    expect(entry).toBeTruthy();
+    await fireEvent.click(entry!);
+    await tick();
+
+    // The sheet says what it is for, and the primary app is not offered against itself.
+    expect(container.textContent ?? "").toContain(zh["split.pickSecond"]);
+    const candidate = [...container.querySelectorAll<HTMLButtonElement>("button")].find(
+      (b) => b.getAttribute("aria-label") === zh["app.phone"],
+    );
+    expect(candidate, "the picker must offer the other recent app").toBeTruthy();
+    await fireEvent.click(candidate!);
+    await tick();
+
+    const state = surface();
+    expect(state.kind).toBe("split");
+    if (state.kind === "split") {
+      expect(state.primary).toBe("settings");
+      expect(state.secondary).toBe("phone");
+    }
+    // The single-app surface is gone; the split surface (with its own status bar) is up.
+    // No pane is painted here because this host answers no geometry — that is the
+    // honest-failure rule, covered in `split-surface.svelte.test.ts`.
+    expect(container.querySelector('[data-testid="app-surface"]')).toBeNull();
+  });
+
+  test("a split closed on an installed store app comes back on the next launch", async () => {
+    // The tablet's real boot race: the layout snapshot (`restoreSplit`'s caller) and the
+    // async store-tile load are two independent host round-trips. Here the tile load is
+    // deliberately slower, so the restore genuinely runs with a **cold** cache — the case
+    // where a store pane read as a ghost and the whole split was dropped.
+    installHost(() => snap({ form: "tablet", columns: 2, multi_window: false, free_resize: false }));
+    const internals = (window as unknown as { __TAURI_INTERNALS__: { invoke: (c: string, a?: Record<string, unknown>) => Promise<unknown> } }).__TAURI_INTERNALS__;
+    const plain = internals.invoke.bind(internals);
+    internals.invoke = async (cmd, args) => {
+      if (cmd === "appstore_installed") {
+        await new Promise((r) => setTimeout(r, 40)); // resolve *after* the snapshot
+        return [
+          {
+            manifest: {
+              id: "org.amos.demo",
+              name: "Demo",
+              summary: "",
+              author: "",
+              version: { major: 1, minor: 0, patch: 0 },
+              category: "utility",
+              package: { url: "", sha256: "" },
+            },
+            installed_at: 1,
+          },
+        ];
+      }
+      // Two panes for a 1024×720 tablet split, so the surface actually paints them.
+      if (cmd === "wm_pane_rects")
+        return [
+          { label: "primary", x: 0, y: 0, width: 508, height: 720 },
+          { label: "secondary", x: 516, y: 0, width: 508, height: 720 },
+        ];
+      return plain(cmd, args);
+    };
+
+    setStoreTiles([]); // cold: only loadStoreTiles() populates the cache
+    resetShellState(); // the boot surface, before the host has answered anything
+    // Last session's split, closed with an installed store app in the second pane.
+    // Written *after* the reset: `resetShellState` drops the intent on purpose (a reset
+    // must not leave a stored split a later boot would restore into a disowned state).
+    writeStoreValue(SPLIT_KEY, {
+      primary: "notes",
+      secondary: "store:org.amos.demo",
+      axis: "vertical",
+      percent: 50,
+    });
+
+    // happy-dom reports every element as 0×0: give the pane host a real size and make the
+    // observer fire once on observe, exactly as a real one does on first measurement.
+    // Each override is *restored*, never deleted: happy-dom defines all three on the
+    // shared prototypes, so removing them would strip the capability from every later
+    // test in this file (measured: the following case died with `ResizeObserver is not
+    // defined` once this test's `finally` had run).
+    const saved = {
+      w: Object.getOwnPropertyDescriptor(HTMLElement.prototype, "clientWidth"),
+      h: Object.getOwnPropertyDescriptor(HTMLElement.prototype, "clientHeight"),
+      ro: (globalThis as unknown as Record<string, unknown>).ResizeObserver,
+    };
+    Object.defineProperty(HTMLElement.prototype, "clientWidth", { configurable: true, get: () => 1024 });
+    Object.defineProperty(HTMLElement.prototype, "clientHeight", { configurable: true, get: () => 720 });
+    (globalThis as unknown as Record<string, unknown>).ResizeObserver = class {
+      constructor(private cb: () => void) {}
+      observe(): void {
+        this.cb();
+      }
+      disconnect(): void {}
+      unobserve(): void {}
+    };
+    try {
+      const host = render(Shell);
+      await vi.waitFor(() => {
+        expect(surface().kind).toBe("split");
+      });
+      // …and the store app really is painted in the second pane — its own accessible
+      // name, through the same `AppPane` → `ExtAppHost` route any app uses.
+      await vi.waitFor(() => {
+        expect(host.container.querySelector('[data-pane-app="store:org.amos.demo"]')).toBeTruthy();
+      });
+      expect(host.container.textContent ?? "").toContain("Demo");
+    } finally {
+      if (saved.w) Object.defineProperty(HTMLElement.prototype, "clientWidth", saved.w);
+      if (saved.h) Object.defineProperty(HTMLElement.prototype, "clientHeight", saved.h);
+      (globalThis as unknown as Record<string, unknown>).ResizeObserver = saved.ro;
+      setStoreTiles([]);
+    }
+  });
+
+  test("an installed store app can be picked as the second pane (and as a Slide Over panel) (REQ-A1137)", async () => {
+    // The picker drew its candidates from `amos.recents`, which `open()` fills for
+    // built-ins only — so an installed store app was never *offered*, even though the
+    // door behind the picker (`enterSplit` / `openSlideOver`), the persisted-split
+    // validation and `AppPane`'s ext host all accept a `store:` pane. The chooser must
+    // therefore offer the shell's installed-tile list as well.
+    installHost(() => snap({ form: "tablet", columns: 2, multi_window: false, free_resize: false }));
+    const internals = (window as unknown as { __TAURI_INTERNALS__: { invoke: (c: string, a?: Record<string, unknown>) => Promise<unknown> } }).__TAURI_INTERNALS__;
+    const plain = internals.invoke.bind(internals);
+    internals.invoke = async (cmd, args) => {
+      if (cmd === "appstore_installed") {
+        return [
+          {
+            manifest: {
+              id: "org.amos.demo",
+              name: "Demo",
+              summary: "",
+              author: "",
+              version: { major: 1, minor: 0, patch: 0 },
+              category: "utility",
+              package: { url: "", sha256: "" },
+            },
+            installed_at: 1,
+          },
+        ];
+      }
+      return plain(cmd, args);
+    };
+    setStoreTiles([]); // cold: only the shell's own load populates the list
+    await open("settings"); // the primary pane (a built-in, so the picker excludes it)
+
+    try {
+      const { container } = render(Shell);
+      await tick();
+      const entry = await vi.waitFor(() => {
+        const e = container.querySelector<HTMLButtonElement>('[data-testid="split-enter"]');
+        expect(e).toBeTruthy();
+        return e!;
+      });
+      await fireEvent.click(entry);
+      await tick();
+
+      // The sheet offers the installed store app beside the recents, under its own
+      // manifest name — proof the shell pushed the tile list, not just recents.
+      const demo = await vi.waitFor(() => {
+        const b = [...container.querySelectorAll<HTMLButtonElement>("button")].find(
+          (x) => x.getAttribute("aria-label") === "Demo",
+        );
+        expect(b, "the picker must offer the installed store app").toBeTruthy();
+        return b!;
+      });
+      await fireEvent.click(demo);
+      await tick();
+
+      const state = surface();
+      expect(state.kind).toBe("split");
+      if (state.kind === "split") {
+        expect(state.primary).toBe("settings");
+        expect(state.secondary).toBe("store:org.amos.demo");
+      }
+      // …and the same pick is accepted as the floating Slide Over panel.
+      exitSplit();
+      await open("settings");
+      await tick();
+      expect(openSlideOver("store:org.amos.demo")).toBe(true);
+      expect(slideOver()).toEqual({ id: "store:org.amos.demo", axis: "auto", percent: SLIDE_PERCENT_DEFAULT, hidden: false });
+    } finally {
+      setStoreTiles([]);
+      hideSlideOver();
+    }
+  });
+
+  test("back leaves a split one level at a time: split → primary app → home", async () => {
+    installHost(() => snap({ form: "tablet", columns: 2, multi_window: false, free_resize: false }));
+    await open("settings");
+    render(Shell);
+    await tick();
+    await settle();
+    enterSplit("settings", "phone", "auto");
+    await tick();
+
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    await tick();
+    // The pure decision (`backNav`) maps the split surface to `exit-split`, i.e. collapse
+    // to the primary app — not straight home (that would lose the app the user was in).
+    expect(surface()).toEqual({ kind: "app", id: "settings" });
+  });
+});

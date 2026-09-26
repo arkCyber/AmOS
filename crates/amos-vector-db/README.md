@@ -15,8 +15,8 @@ serves tests, the host and the device. Part of **[Amos](../../README.md)**. Desi
 - **Validation is upfront**: a vector whose dimension differs from the index's, or that
   contains a non-finite component (`NaN`/`inf`), is refused at insert time — the failure mode
   this prevents is a similarity score that silently becomes `NaN` and ranks everything.
-- `Metric` (cosine / dot / euclidean as configured) is explicit; the index never guesses
-  which one a caller meant.
+- `Metric` (cosine / dot as configured — those are the only two variants) is explicit; the
+  index never guesses which one a caller meant.
 - `Embedder` / `MockEmbedder`: retrieval is testable without a model, and the real path
   (local embeddings) is a seam.
 - Search cost is linear by design; the crate's value is *correct* local retrieval in a

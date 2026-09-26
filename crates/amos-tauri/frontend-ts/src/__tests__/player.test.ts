@@ -10,6 +10,8 @@ import {
   fmtSeconds,
   formatRate,
   indexOfTrackId,
+  isObjectUrl,
+  isStreamUrl,
   isTooLarge,
   kindFromName,
   mergeTracks,
@@ -318,6 +320,23 @@ describe("player: real-world files (names/metadata from the acceptance probe)", 
     expect(
       trackFromItem(item({ name: "ReleaseNotes.pdf", mime: "application/pdf", kind: "file" })),
     ).toBeNull();
+  });
+
+  // The revoke guard: a large item resolves to a **stream** URL the host owns, so the
+  // cleanup must not release it (and must still release the blobs it made itself).
+  it("isObjectUrl separates the URLs we made from the ones the host did", () => {
+    expect(isObjectUrl("blob:tauri://localhost/9f1e")).toBe(true);
+    expect(isObjectUrl("amos-media://movies/content%3A%2F%2Fv%2F1")).toBe(false);
+    expect(isObjectUrl("http://amos-media.localhost/movies/x.mp4")).toBe(false);
+    expect(isObjectUrl("")).toBe(false);
+  });
+
+  it("isStreamUrl is true only for a resolved, non-blob URL", () => {
+    expect(isStreamUrl("amos-media://camera/IMG_1.jpg")).toBe(true);
+    expect(isStreamUrl("http://amos-media.localhost/camera/IMG_1.jpg")).toBe(true);
+    expect(isStreamUrl("blob:tauri://localhost/9f1e")).toBe(false);
+    // Unresolved ("" = nothing to play) is not "streaming" — the two states differ.
+    expect(isStreamUrl("")).toBe(false);
   });
 });
 

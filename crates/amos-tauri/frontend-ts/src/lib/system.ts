@@ -8,6 +8,8 @@
  * Wire shape: crates/amos-tauri/src/system.rs `SystemStatus`. Option fields are
  * JSON `null` == "unknown" (never a fabricated reading).
  */
+import { invoke } from "./backend";
+
 export interface SystemStatus {
   sampler: string;
   cpu_busy_pct: number | null;
@@ -128,30 +130,21 @@ export function liveProcesses(s: SystemStatus): number {
   return s.running + s.cached;
 }
 
-interface Bridge {
-  invoke(command: string, args?: Record<string, unknown>): Promise<unknown>;
-}
-
-function bridge(): Bridge | null {
-  const w = window as unknown as { __TAURI_INTERNALS__?: Bridge };
-  return w && typeof w.__TAURI_INTERNALS__ === "object"
-    ? (w.__TAURI_INTERNALS__ as Bridge)
-    : null;
-}
-
-async function call<T>(command: string): Promise<T | null> {
-  const b = bridge();
-  if (!b) return null;
-  try {
-    return (await b.invoke(command)) as T;
-  } catch {
-    return null;
-  }
-}
-
-/** Read the OS system working status in one round-trip (null offline). */
+/**
+ * Read the OS system working status in one round-trip.
+ *
+ * `null` means **either** "no Tauri bridge" **or** "the command failed" — the two are told
+ * apart by the diagnostic ledger, `bridgeDiag("system_health")` (`{kind:"not-bridged"}` vs
+ * `{kind:"command-failed", detail}`), which is written because this now routes through
+ * `backend.invoke` — the single source that records *why* a call failed (REQ-A220).
+ *
+ * It used to carry a private `bridge()`/`call<T>` pair with a bare `try {} catch { return
+ * null }`: the refusal was swallowed **before** anything recorded it, so the ledger slot a
+ * consumer reads (`SystemPanel` reads `bridgeDiag("system_health")`) had no writer and could
+ * never report `command-failed` — a read of a diagnosis that was never written.
+ */
 export function systemHealth(): Promise<SystemStatus | null> {
-  return call<SystemStatus>("system_health");
+  return invoke<SystemStatus>("system_health");
 }
 
 /** The desktop host's own OS battery, read via the Tauri `system_host_battery`
@@ -164,7 +157,7 @@ export interface HostBatteryStatus {
 }
 
 export function hostBattery(): Promise<HostBatteryStatus | null> {
-  return call<HostBatteryStatus>("system_host_battery");
+  return invoke<HostBatteryStatus>("system_host_battery");
 }
 
 /**

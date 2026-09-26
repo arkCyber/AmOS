@@ -5,13 +5,28 @@
  * we verify: seeded rows render, inline rename commits, and deleting all reaches
  * the empty state (persisted through the shared amos.vmemos store).
  */
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { cleanup, fireEvent, render } from "@testing-library/svelte";
 import VoiceMemosApp from "../src/svelte/VoiceMemosApp.svelte";
 import { readStoreValue } from "../src/lib/amosStore";
+import { defaultMediaStore } from "../src/lib/mediaStore";
 import { zh } from "../src/i18n/locales/zh";
 
 afterEach(cleanup);
+
+// Recording is the one path this file cannot reach through the DOM (it needs a real
+// mic + MediaRecorder), so the two seams are doubled: the capture engine, and the id
+// mint — the id is load-bearing here, because it is the MediaStore key the bytes are
+// written under, and the test must be able to ask for *that* blob afterwards.
+const rec = vi.hoisted(() => ({ start: vi.fn(), id: "rec-fresh" }));
+vi.mock("../src/lib/voiceRecorder", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/lib/voiceRecorder")>();
+  return { ...actual, startVoiceRecording: rec.start };
+});
+vi.mock("../src/lib/voiceMemos", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/lib/voiceMemos")>();
+  return { ...actual, makeVoiceId: () => rec.id };
+});
 
 const txt = (h: { container: HTMLElement }) => h.container.textContent ?? "";
 const buttonsByAria = (h: { container: HTMLElement }, aria: string) =>
@@ -88,6 +103,126 @@ describe("VoiceMemosApp.svelte (list surface)", () => {
     await fireEvent.input(input, { target: { value: "我的会议" } });
     await fireEvent.keyDown(input, { key: "Enter" });
     expect(txt(host)).toContain("我的会议");
+  });
+
+  // REQ-A1263 / F-SH-541: `deleteMemo` discarded `persist`'s verdict and deleted the memo's
+  // bytes unconditionally. A refused index write therefore left a **listed-but-unplayable**
+  // memo: the row survives (correctly) into the next boot, but its audio is gone. The sibling
+  // `removeVideoCapture` (lib/cameraCapture.ts) already applies the rule this file broke — the
+  // bytes are removed only once the index no longer lists the item.
+  test("a refused delete must not remove the memo's bytes (REQ-A1263)", async () => {
+    const rec = {
+      id: "rec1",
+      title: "会议记录",
+      createdAt: 1,
+      durationMs: 3000,
+      audio: { kind: "recorded" },
+      sizeBytes: 3,
+      mime: "audio/ogg",
+    };
+    window.localStorage.setItem("amos.vmemos", JSON.stringify([rec]));
+    await defaultMediaStore().put("rec1", new Blob([new Uint8Array([1, 2, 3])]));
+
+    const restore = failWritesFor("amos.vmemos");
+    try {
+      const host = render(VoiceMemosApp);
+      await fireEvent.click(buttonsByAria(host, "删除")[0]!);
+      await new Promise((r) => setTimeout(r, 20));
+
+      // The index still lists the memo (the write was refused)…
+      const rows = readStoreValue<Array<{ id: string }>>("amos.vmemos", []);
+      expect(rows.map((r) => r.id)).toContain("rec1");
+      // …so its bytes must still be there — deleting them orphans the row.
+      expect(await defaultMediaStore().get("rec1")).not.toBeNull();
+      // …and the refusal is reported rather than the row silently vanishing.
+      expect(txt(host)).toContain("本机存储写入失败");
+    } finally {
+      restore();
+    }
+  });
+
+  // Companion leaf: the guard above must not have been bought by never deleting anything.
+  // On a write that lands, the bytes go with the row.
+  test("a successful delete removes the memo's bytes too (REQ-A1263)", async () => {
+    const rec = {
+      id: "rec9",
+      title: "会议记录",
+      createdAt: 1,
+      durationMs: 3000,
+      audio: { kind: "recorded" },
+      sizeBytes: 3,
+      mime: "audio/ogg",
+    };
+    window.localStorage.setItem("amos.vmemos", JSON.stringify([rec]));
+    await defaultMediaStore().put("rec9", new Blob([new Uint8Array([1, 2, 3])]));
+
+    const host = render(VoiceMemosApp);
+    await fireEvent.click(buttonsByAria(host, "删除")[0]!);
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(readStoreValue<Array<{ id: string }>>("amos.vmemos", [])).toHaveLength(0);
+    expect(await defaultMediaStore().get("rec9")).toBeNull();
+  });
+
+  // REQ-A1264 / F-SH-542 — the other half of the same ordering rule the two cases above
+  // pin. `stop()` writes the recording's bytes to the MediaStore and *then* the index row;
+  // `persist`'s verdict was discarded, so a refused index write left the bytes behind with
+  // no row naming them — an unreachable copy of the user's voice sitting in the store
+  // forever. The twins that get this right are all three of `persistVideoCapture` (it
+  // deletes the blob it just put when the index refuses), `removeVideoCapture`, and this
+  // file's own `saveTrim` — `stop` was the writer the sweep did not reach.
+  describe("a refused index write after a recording (REQ-A1264)", () => {
+    afterEach(async () => {
+      await defaultMediaStore().del(rec.id);
+      rec.start.mockReset();
+      rec.id = "rec-fresh";
+    });
+
+    /** Drive a record → stop round-trip with the capture engine doubled. */
+    const recordAndStop = async (host: { container: HTMLElement }) => {
+      rec.start.mockResolvedValue({
+        stop: async () => ({ blob: new Blob([new Uint8Array([1, 2, 3])]), mime: "audio/webm" }),
+      });
+      await fireEvent.click(buttonsByAria(host, "开始录音")[0]!);
+      await vi.waitFor(() => expect(buttonsByAria(host, "停止").length).toBe(1));
+      await fireEvent.click(buttonsByAria(host, "停止")[0]!);
+    };
+
+    test("the bytes do not outlive the row that names them", async () => {
+      rec.id = "rec-orphan";
+      window.localStorage.setItem("amos.vmemos", "[]");
+      const restore = failWritesFor("amos.vmemos");
+      let host: ReturnType<typeof render>;
+      try {
+        host = render(VoiceMemosApp);
+        await recordAndStop(host);
+        // The refusal is reported (persist's own job)…
+        await vi.waitFor(() => expect(txt(host)).toContain(zh["common.storeWriteFailed"]!));
+      } finally {
+        restore();
+      }
+      // …the index never listed it…
+      expect(readStoreValue<unknown[]>("amos.vmemos", [])).toHaveLength(0);
+      // …so nothing should be holding the user's voice: no row names this blob, so no
+      // screen in the app could ever play it back or delete it again.
+      expect(
+        await defaultMediaStore().get("rec-orphan"),
+        "被拒绝的索引写入不得把录音的字节留在库里",
+      ).toBeNull();
+    });
+
+    // Companion leaf: the guard must not have been bought by dropping the bytes on every
+    // save. On an index write that lands, the bytes stay and the row plays.
+    test("a recording whose index write lands keeps its bytes", async () => {
+      rec.id = "rec-kept";
+      window.localStorage.setItem("amos.vmemos", "[]");
+      const host = render(VoiceMemosApp);
+      await recordAndStop(host);
+      await vi.waitFor(() =>
+        expect(readStoreValue<unknown[]>("amos.vmemos", [])).toHaveLength(1),
+      );
+      expect(await defaultMediaStore().get("rec-kept")).not.toBeNull();
+    });
   });
 
   test("deleting every memo reaches the empty state", async () => {
@@ -288,3 +423,118 @@ describe("VoiceMemosApp.svelte — ASR transcript (REQ-A353)", () => {
   });
 });
 
+
+/**
+ * REQ-A1464 / F-SH-717 — one fact, two faces, two sources, and the write's verdict between them.
+ *
+ * The ASR panel drew its transcript from `asrState`, while the memo row drew `m.transcript` — the
+ * thing `amos.vmemos` actually holds. `startTranscribe` called `persist(...)` and dropped the
+ * verdict, so a refused attach left the panel claiming a transcript the store never accepted: the
+ * row (the same fact's other face) showed no 「已转写」 badge, the panel's 「清除」 acted on
+ * something that was not stored, and the text vanished silently on the next selection. This same
+ * file already reads that verdict for its delete (`if (!persist(removeMemo(...))) return;`) and its
+ * rename (`if (!persist(renameMemo(...))) return;`).
+ */
+describe("VoiceMemosApp.svelte — a transcript the store refused (REQ-A1464)", () => {
+  const REC = {
+    id: "rec-asr",
+    title: "会议记录",
+    createdAt: 1,
+    durationMs: 3000,
+    audio: { kind: "recorded" },
+    sizeBytes: 3,
+    mime: "audio/ogg",
+  } as const;
+  const TXT = "你好世界";
+  const UNSAVED = '[data-testid="vm-transcript-unsaved"]';
+
+  function installAsrHost(reply: unknown) {
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string) => (cmd === "transcribe_audio" ? reply : null),
+      listen: async () => () => {},
+    };
+  }
+  afterEach(() => {
+    delete (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+    void defaultMediaStore().del(REC.id);
+  });
+
+  async function seed() {
+    window.localStorage.setItem("amos.vmemos", JSON.stringify([REC]));
+    await defaultMediaStore().put(REC.id, new Blob([new Uint8Array([1, 2, 3])]));
+  }
+  async function selectAndTranscribe(host: { container: HTMLElement }) {
+    await fireEvent.click(
+      host.container.querySelector(`button[aria-label="${REC.title}"]`) as HTMLButtonElement,
+    );
+    await fireEvent.click(buttonsByAria(host, zh["vm.transcribe"]!)[0]!);
+    await vi.waitFor(() => expect(txt(host)).toContain(TXT));
+  }
+
+  test("a refused attach is not drawn as an attached transcript", async () => {
+    await seed();
+    installAsrHost({ text: TXT, recognized: true });
+    const restore = failWritesFor("amos.vmemos");
+    try {
+      const host = render(VoiceMemosApp);
+      await selectAndTranscribe(host);
+      // The transcription happened and is kept on screen — it is not thrown away…
+      expect(txt(host)).toContain(TXT);
+      // …but it must not be dressed as an *attached* transcript: the store never took it.
+      expect(host.container.querySelector(UNSAVED)).toBeTruthy();
+      // The row's face agrees with the store — no 「已转写」 badge on a memo with no transcript.
+      expect(txt(host)).not.toContain(zh["vm.hasTranscript"]!);
+      expect(txt(host)).toContain(zh["common.storeWriteFailed"]!);
+      const stored = readStoreValue<Array<{ transcript?: unknown }>>("amos.vmemos", []);
+      expect(stored[0]?.transcript).toBeUndefined();
+    } finally {
+      restore();
+    }
+  });
+
+  // Companion leaf: the marker must not be bought by tagging every transcript as unsaved.
+  test("a landed attach carries no unsaved marker and the row badge appears", async () => {
+    await seed();
+    installAsrHost({ text: TXT, recognized: true });
+    const host = render(VoiceMemosApp);
+    await selectAndTranscribe(host);
+    expect(host.container.querySelector(UNSAVED)).toBeNull();
+    expect(txt(host)).not.toContain(zh["common.storeWriteFailed"]!);
+    expect(txt(host)).toContain(zh["vm.hasTranscript"]!);
+    const stored = readStoreValue<Array<{ transcript?: { text?: string } }>>("amos.vmemos", []);
+    expect(stored[0]?.transcript?.text).toBe(TXT);
+  });
+
+  test("a refused clear keeps the transcript on screen (matching the row)", async () => {
+    await seed();
+    installAsrHost({ text: TXT, recognized: true });
+    const host = render(VoiceMemosApp);
+    await selectAndTranscribe(host);
+    const restore = failWritesFor("amos.vmemos");
+    try {
+      await fireEvent.click(buttonsByAria(host, zh["vm.clearTranscript"]!)[0]!);
+      // Still stored ⇒ the panel must still be in its "done" face. (Not `toContain(TXT)`: the
+      // row preview draws `m.transcript.text` too, so the text alone cannot tell the two apart.)
+      expect(buttonsByAria(host, zh["vm.transcribe"]!).length).toBe(0);
+      expect(buttonsByAria(host, zh["vm.clearTranscript"]!).length).toBeGreaterThan(0);
+      expect(txt(host)).toContain(zh["vm.hasTranscript"]!);
+      expect(txt(host)).toContain(zh["common.storeWriteFailed"]!);
+      const stored = readStoreValue<Array<{ transcript?: unknown }>>("amos.vmemos", []);
+      expect(stored[0]?.transcript).toBeDefined();
+    } finally {
+      restore();
+    }
+  });
+
+  test("a landed clear removes the transcript from the store and the panel", async () => {
+    await seed();
+    installAsrHost({ text: TXT, recognized: true });
+    const host = render(VoiceMemosApp);
+    await selectAndTranscribe(host);
+    await fireEvent.click(buttonsByAria(host, zh["vm.clearTranscript"]!)[0]!);
+    await vi.waitFor(() => expect(txt(host)).not.toContain(TXT));
+    expect(txt(host)).not.toContain(zh["vm.hasTranscript"]!);
+    const stored = readStoreValue<Array<{ transcript?: unknown }>>("amos.vmemos", []);
+    expect(stored[0]?.transcript).toBeUndefined();
+  });
+});

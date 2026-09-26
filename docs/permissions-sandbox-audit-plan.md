@@ -252,6 +252,15 @@
   文档 `docs/appstore.md` 同步「三方敏感能力申请」小节。
 - 验收：前端新纯函数单测全绿（请求→裁决→审计映射正确、非法资源拒绝）；`tsc` clean。诚实边界写明「真 origin
   宿主接线在设备/协议阶段」。
+- **P3.2 宿主接线落地（REQ-A721，2026-09-20）**：此前 P3.2 只交了**纯裁决**那半边（`sandboxBridge.ts`），
+  「宿主接线」一直写在诚实边界里推迟。本轮把**实时的那一半**接上：新增 `frontend-ts/src/lib/sandboxCapabilityHost.ts`
+  （`installSandboxCapabilityHost` + `bundleFrameSeam`），并只在 `ExtAppHost.svelte` 一处安装——iframe 一挂载
+  （`load.kind === "ready"`）即装 `message` 监听、组件卸载即拆。三条规则：以 `event.source`（窗口对象身份）认帧、
+  不以 `event.origin` 认；守护进程唯一权威、仅字面 `true` 放行（`null` = 离线/未知即拒）；畸形帧不回话。审计仍走
+  `perm_authorize` 这一条受审卡点（`lib/privacyBackend` → `crates/amos-tauri/src/privacy_client.rs`）。**诚实边界
+  （更新后）**：真 `amos-app://` origin 的**服务**由 Rust `serve_bundle` 提供（本就在），本轮接的是**监听器**；
+  **设备侧能力后端**（真像素/真音频/真定位，Phase 5）仍未建——放行与否由守护进程策略决定，本桥只保证请求**会抵达**
+  裁决点、且默认拒绝是**政策**而非**无人应答**。
 
 ### Phase 4 —— 运行时安全审计统一、落盘、可导出（改动 amos-ai security/privacy + 导出）
 

@@ -13,6 +13,7 @@
  *        • `camera`     → app `camera` (the Camera screen itself).
  *        • `microphone` → apps `vmemos`, `ai` (the resident voice mic),
  *                         `interpreter` (the Interp screen).
+ *        • `contacts`   → app `contacts` (the Contacts screen itself).
  *      (Magnifier and others still do an in-app allow — they pre-date the
  *      default-on rule and are outside the headline camera/voice path.)
  *   2. Seeds them in the local ledger **once** (`amos.permissions` is only
@@ -46,6 +47,13 @@ import { grantCapability } from "./osPermissions";
  *                  rarely the first place a user touches the camera).
  * * `microphone` → vmemos (Voice Memos recorder), ai (resident voice mic),
  *                  interpreter (the Interp screen).
+ * * `contacts`   → the Contacts screen itself — the app whose headline function
+ *                  *is* the `contacts` resource, exactly as `camera` is the
+ *                  Camera screen's. `contacts` is a daemon-mirrored wire key
+ *                  (`amos-ai::privacy::Resource`), so leaving it out of every
+ *                  app's grant left the declaration decorative: the dashboard
+ *                  showed no holder and the daemon never heard of one.
+ *                  (REQ-A1807 / F-SH-897.)
  */
 export const DEFAULT_CAPABILITIES: Readonly<Record<string, ReadonlyArray<Capability>>> = Object.freeze(
   {
@@ -53,6 +61,7 @@ export const DEFAULT_CAPABILITIES: Readonly<Record<string, ReadonlyArray<Capabil
     vmemos: ["microphone"],
     ai: ["microphone"],
     interpreter: ["microphone"],
+    contacts: ["contacts"],
   },
 );
 
@@ -63,6 +72,7 @@ export const DEFAULT_CAPABILITIES: Readonly<Record<string, ReadonlyArray<Capabil
 export const DEFAULT_ON_CAPABILITIES: ReadonlyArray<Capability> = Object.freeze([
   "camera",
   "microphone",
+  "contacts",
 ]);
 
 /**
@@ -95,7 +105,9 @@ export function seedDefaultCapabilities(): PermissionLedger {
   let ledger = loadLedger();
   for (const [appId, caps] of Object.entries(DEFAULT_CAPABILITIES)) {
     for (const cap of caps) {
-      ledger = grantCapability(appId, cap);
+      // `.ledger`, not the object: a refused write leaves the store where it was, and this
+      // returned ledger is what callers render.
+      ledger = grantCapability(appId, cap).ledger;
     }
   }
   return ledger;

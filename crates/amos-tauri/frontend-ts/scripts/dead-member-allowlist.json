@@ -1,0 +1,158 @@
+[
+  {
+    "path": "src/lib/enterprise/mdm.ts",
+    "cls": "MDMManager",
+    "name": "isActionDisabled",
+    "reason": "**本轮改写后的状态**：它现在是 `checkActionAllowed(category, actionId)` 的**布尔适配器**（一行转发），不再是那份逐字重复的实现 —— 原来那份的两个 `.includes` 与活的那份一字不差，而形参顺序相反（`(actionId, category)`），两个参数都是字符串所以接错顺序能编译能跑、只是问了另一个问题。生产里仍零调用者：执行路径走 `firstDisabledAction → checkActionAllowed`（`shortcuts.ts:1709`），而 `checkActionAllowed` 的返回值带理由，正是用户看得见的那一句。留着的理由是它是公开 API 的一部分、有 6 处测试引用，且已标 `@deprecated` 指向无歧义的那一个。删它是下一轮的产品决定。"
+  },
+  {
+    "path": "src/lib/enterprise/mdm.ts",
+    "cls": "MDMManager",
+    "name": "setConfigForTest",
+    "reason": "**测试缝，按设计如此**：名字以 ForTest 结尾（`setConfigForTest`），105 处测试引用，生产不该调用它。白名单里最名副其实的一条。"
+  },
+  {
+    "path": "src/lib/enterprise/mdm.ts",
+    "cls": "MDMManager",
+    "name": "clearConfigForTest",
+    "reason": "同 setConfigForTest：清理用的测试缝（11 处测试引用）。"
+  },
+  {
+    "path": "src/lib/enterprise/templates.ts",
+    "cls": "TemplateManager",
+    "name": "resetForTest",
+    "reason": "**测试缝，按设计如此**：名字以 ForTest 结尾，生产不该调用它。`templateManager` 是模块级单例（不像 `webhooks.ts` 那样把类导出、让测试自己 `new`），而 `ensureInitialized()` 只认第一次 —— 所以用例之间必须能把它退回「从没起来过」，否则同一文件里第二次播种不会再被读回。引用在 `src/lib/__tests__/enterprise-templates.test.ts`（2 处）与 `svelte-tests/template-library-catalogue.svelte.test.ts`（2 处；**这个目录不在本扫描的语料里** —— `scanRepo(ts, SRC)` 只走 `src/`，所以报告里的「测试引用」只数到前者）。"
+  },
+  {
+    "path": "src/lib/enterprise/mdm.ts",
+    "cls": "MDMManager",
+    "name": "addPolicy",
+    "reason": "**设备本地的限制项编辑器没有界面宿主**（不是「没有生产者」：控制台侧的 `/api/admin/policies` 四条路由在 `crates/amos-mdm/src/lib.rs:86-89` 上真实存在，但那是**控制台**客户端打的；设备端这几个方法改的是自己那份本地配置。原理由里的「先要有生产者（MDM 服务器/设备管理器入口）」有一半是假的 —— REQ-A945 更正）。`MDMPanel` 今天只**读**限制（`getRestrictions()`），没有逐项编辑器。零生产调用者。"
+  },
+  {
+    "path": "src/lib/enterprise/mdm.ts",
+    "cls": "MDMManager",
+    "name": "getPolicy",
+    "reason": "**设备本地的限制项编辑器没有界面宿主**（不是「没有生产者」：控制台侧的 `/api/admin/policies` 四条路由在 `crates/amos-mdm/src/lib.rs:86-89` 上真实存在，但那是**控制台**客户端打的；设备端这几个方法改的是自己那份本地配置。原理由里的「先要有生产者（MDM 服务器/设备管理器入口）」有一半是假的 —— REQ-A945 更正）。`MDMPanel` 今天只**读**限制（`getRestrictions()`），没有逐项编辑器。零生产调用者。"
+  },
+  {
+    "path": "src/lib/enterprise/mdm.ts",
+    "cls": "MDMManager",
+    "name": "getPolicies",
+    "reason": "**设备本地的限制项编辑器没有界面宿主**（不是「没有生产者」：控制台侧的 `/api/admin/policies` 四条路由在 `crates/amos-mdm/src/lib.rs:86-89` 上真实存在，但那是**控制台**客户端打的；设备端这几个方法改的是自己那份本地配置。原理由里的「先要有生产者（MDM 服务器/设备管理器入口）」有一半是假的 —— REQ-A945 更正）。`MDMPanel` 今天只**读**限制（`getRestrictions()`），没有逐项编辑器。零生产调用者。"
+  },
+  {
+    "path": "src/lib/enterprise/mdm.ts",
+    "cls": "MDMManager",
+    "name": "deletePolicy",
+    "reason": "**设备本地的限制项编辑器没有界面宿主**（不是「没有生产者」：控制台侧的 `/api/admin/policies` 四条路由在 `crates/amos-mdm/src/lib.rs:86-89` 上真实存在，但那是**控制台**客户端打的；设备端这几个方法改的是自己那份本地配置。原理由里的「先要有生产者（MDM 服务器/设备管理器入口）」有一半是假的 —— REQ-A945 更正）。`MDMPanel` 今天只**读**限制（`getRestrictions()`），没有逐项编辑器。零生产调用者。"
+  },
+  {
+    "path": "src/lib/enterprise/mdm.ts",
+    "cls": "MDMManager",
+    "name": "getRestrictionPolicies",
+    "reason": "**设备本地的限制项编辑器没有界面宿主**（不是「没有生产者」：控制台侧的 `/api/admin/policies` 四条路由在 `crates/amos-mdm/src/lib.rs:86-89` 上真实存在，但那是**控制台**客户端打的；设备端这几个方法改的是自己那份本地配置。原理由里的「先要有生产者（MDM 服务器/设备管理器入口）」有一半是假的 —— REQ-A945 更正）。`MDMPanel` 今天只**读**限制（`getRestrictions()`），没有逐项编辑器。零生产调用者。"
+  },
+  {
+    "path": "src/lib/enterprise/mdm.ts",
+    "cls": "MDMManager",
+    "name": "enrollDevice",
+    "reason": "**设备注册面 —— 缺的是界面，不是服务器**（本条目原写着「`crates/amos-tauri` 没有设备管理 RPC……等于让用户「注册」一个不存在的服务器」，那句是**错的**：`POST /api/mdm/enroll` 真挂在 `crates/amos-mdm/src/lib.rs:62` 上，而 `MDMPanel.svelte` 早就在跟同一台服务器说话 —— `checkConnection()` 探 `GET /health`、`syncWithServer()` 打 `POST /api/mdm/sync`。REQ-A945 更正）。真实缺口只剩**界面**：面板有连通性与同步，却没有注册/注销这一对。零生产调用者（3 处测试引用）。"
+  },
+  {
+    "path": "src/lib/enterprise/mdm.ts",
+    "cls": "MDMManager",
+    "name": "unenrollDevice",
+    "reason": "同上：注册的对称面（`POST /api/mdm/unenroll`，`crates/amos-mdm/src/lib.rs:66`），缺的是同一处界面。零生产调用者（3 处测试引用）。"
+  },
+  {
+    "path": "src/lib/enterprise/templates.ts",
+    "cls": "TemplateManager",
+    "name": "createTemplate",
+    "reason": "未集成的企业模板面：`TemplateManager` 的增删改查全族零生产调用者（`TemplateLibrary.svelte` 未挂载，见 `unwired-allowlist.json`）。注意 `syncTemplates` 也在这份清单里 —— 也就是这一族**连数据源都没有**，先要有生产者。"
+  },
+  {
+    "path": "src/lib/enterprise/templates.ts",
+    "cls": "TemplateManager",
+    "name": "getTemplate",
+    "reason": "同上：单条读取（11 处测试引用，是本族测试覆盖最厚的一条，也仍然零生产调用者）。"
+  },
+  {
+    "path": "src/lib/enterprise/templates.ts",
+    "cls": "TemplateManager",
+    "name": "getCategories",
+    "reason": "同上：类别枚举（3 处测试引用）。"
+  },
+  {
+    "path": "src/lib/enterprise/templates.ts",
+    "cls": "TemplateManager",
+    "name": "updateTemplate",
+    "reason": "同上：改（3 处测试引用）。"
+  },
+  {
+    "path": "src/lib/enterprise/templates.ts",
+    "cls": "TemplateManager",
+    "name": "deleteTemplate",
+    "reason": "同上：删（4 处测试引用）。"
+  },
+  {
+    "path": "src/lib/enterprise/templates.ts",
+    "cls": "TemplateManager",
+    "name": "updateInstalledTemplate",
+    "reason": "同上：已安装项就地更新（2 处测试引用）。"
+  },
+  {
+    "path": "src/lib/enterprise/templates.ts",
+    "cls": "TemplateManager",
+    "name": "publishTemplate",
+    "reason": "同上：发布（2 处测试引用）。它设 `published`/`publishedAt` 两个字段，而这两个字段在生产里没有读者 —— 所以本条不是「一个函数没人调」，是**一套状态没有消费者**。"
+  },
+  {
+    "path": "src/lib/enterprise/templates.ts",
+    "cls": "TemplateManager",
+    "name": "syncTemplates",
+    "reason": "同上，且这条是**缺口的位置**：它是模板目录的唯一数据源，零生产调用者 —— 所以 `TemplateLibrary.svelte` 即使今天挂上也是永久空屏（`unwired-allowlist.json` 里那条白名单的理由与此相同）。它要有生产者，才有上面那一族的意义。"
+  },
+  {
+    "path": "src/lib/enterprise/webhooks.ts",
+    "cls": "WebhookManager",
+    "name": "getWebhook",
+    "reason": "未集成的 webhook 面：**单条**读取，**仍是零生产调用者**（14 处测试引用 —— 测试很厚、界面没有；面板 `APISettings.svelte` 用的是列表 `getWebhooks()`）。**口径第二次订正（REQ-A980 / F-DEV-125）**：第一次订正（REQ-A945 / F-DEV-121）写下的那句「真正的入队入口 `trigger` 在生产里**同样零调用者**，所以整条投递链缺生产者」**已不实** —— 发射侧与自举都补上了（`emitWebhookEvent` 七处生产发射点 + `ensureInitialized()` 挂在 `trigger`／`getWebhooks` 上 + 一拍清空队列），`trigger` → `processEventQueue` → `sendWebhook` 这条链在生产里**会跑**。本条目说的是 `getWebhook`（单条读取）没有生产读者，与 `trigger` 是否被调用无关，故条目**保留**、只改口径。"
+  },
+  {
+    "path": "src/lib/cloudSync.ts",
+    "cls": "CloudSyncScheduler",
+    "name": "getMetrics",
+    "reason": "与 `unwired-allowlist.json` 里整个 `cloudSync.ts` 同一条理由：传输不存在（`proto/` 与 `crates/amos-tauri` 都不暴露任何云同步 RPC），所以 `getMetrics` 报的 `totalBytesSynced` 会是**一个没发生过的传输的数字**。整模块白名单在 unwired-scan 那边，这里是它的成员面。"
+  },
+  {
+    "path": "src/lib/cloudSync.ts",
+    "cls": "CloudSyncScheduler",
+    "name": "onStatusChange",
+    "reason": "同上：订阅状态变化，而没有任何界面订阅 —— 零生产调用者即零读者（5 处测试引用）。"
+  },
+  {
+    "path": "src/lib/cloudSync.ts",
+    "cls": "CloudSyncScheduler",
+    "name": "resetMetrics",
+    "reason": "同上：清零指标（2 处测试引用）。"
+  },
+  {
+    "path": "src/lib/enterprise/audit.ts",
+    "cls": "AuditLogger",
+    "name": "clearAllLogs",
+    "reason": "审计日志的「清空」入口，零生产调用者（4 处测试引用）。**按设计是一处刻意的缺口**：审计日志面里 `AuditLogViewer` 只有查询/导出，没有清空按钮 —— 这可能是对的（审计记录不该由一个界面按钮抹掉），但今天它是**沉默**的：既没有按钮，也没有文档说明为什么没有。要么接一个需要二次确认的入口，要么在 `AuditLogViewer` 上写明「审计记录不可在此清除」。属下一轮的产品决定，不是静默改动。"
+  },
+  {
+    "path": "src/lib/enterprise/audit.ts",
+    "cls": "AuditLogger",
+    "name": "verifySignature",
+    "reason": "**生产者没有消费者**：`log()` 在配了 `signatureKey` 时**真的**写下签名（audit.ts:427 `log.signature = this.signLog(log)`），而唯一的校验者就是本条 —— 私有、零调用者。源码自己写着 `@ts-expect-error - Reserved for future cryptographic signature verification`，所以这是**有意预留**，不是遗漏；但它的现状要说清楚：今天这些签名字段是**只写不验**的完整性装饰。它也是 `private` 却逃过了 `tsc`（TS 不报未使用的私有方法）与 `unwired-scan`（单位是模块导出）的活例子 —— 本闸门存在的理由。"
+  },
+  {
+    "path": "src/lib/enterprise/api.ts",
+    "cls": "APIClient",
+    "name": "post",
+    "reason": "通用门 `request()` 是生产里唯一被用到的入口（`APISettings.svelte` 的两处探活），动词助手 `get`/`post`/`put`/`delete` 全部零生产调用者。`post` 是这一族里**唯一没被撞名**所以报得出来的那个（`get`/`delete` 在内建名表里、`put` 被 `mediaStore.put` 撞掉）。所以本条代表的其实是 4 条。接法：`APISettings` 的「测试连接」只探活，若要做真正的 API 调用面，应当由调用方直接给 `request()` —— 也就是说这 4 个助手可能是**多余的 API 面**，该删而不是该接。属下一轮的决定。"
+  }
+]

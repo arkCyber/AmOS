@@ -22,6 +22,7 @@ import {
   afInit,
   afTap,
   afCaption,
+  classifyTap,
   type CamFlash,
 } from "../lib/camera";
 
@@ -184,5 +185,29 @@ describe("camera tap-to-focus / AE-AF lock", () => {
     // tapping elsewhere re-aims & unlocks
     const reaimed = afTap(locked, { x: 0.1, y: 0.9 });
     expect(reaimed).toEqual({ x: 0.1, y: 0.9, locked: false });
+  });
+
+  test("classifyTap: a lone tap is a focus tap", () => {
+    const r = classifyTap(null, 1000);
+    expect(r.kind).toBe("focus");
+    expect(r.lastTapMs).toBe(1000); // arms the clock for a possible second tap
+  });
+
+  test("classifyTap: a second tap inside the window is the double (zoom) gesture", () => {
+    const r = classifyTap(1000, 1200); // 200 ms < 300 ms window
+    expect(r.kind).toBe("double");
+    expect(r.lastTapMs).toBeNull(); // consumed → a third tap starts fresh, not a chain
+  });
+
+  test("classifyTap: taps at/after the window are two separate focus taps", () => {
+    expect(classifyTap(1000, 1300).kind).toBe("focus"); // exactly 300 ms is not a double
+    expect(classifyTap(1000, 1400).kind).toBe("focus");
+  });
+
+  test("classifyTap: window is configurable and a third tap does not chain", () => {
+    expect(classifyTap(1000, 1100, 50).kind).toBe("focus"); // outside a 50 ms window
+    // after a double consumed the clock, the next tap is a fresh focus tap
+    const afterDouble = classifyTap(1000, 1050).lastTapMs;
+    expect(classifyTap(afterDouble, 1060).kind).toBe("focus");
   });
 });

@@ -67,7 +67,7 @@ export interface LinkActuation {
   frames: number;
   armed: boolean;
   estopped: boolean;
-  /** `"commanded"` | `"watchdog"` | `null` (none, or a reason this build does not know). */
+  /** `"commanded"` | `"watchdog"` | `"bus-fault"` | `null` (none, or a reason this build does not know). */
   estop_reason: string | null;
   /** The deadman period the robot runs under; `null` = no watchdog configured. */
   watchdog_ms: number | null;
@@ -119,7 +119,14 @@ export async function linkStatus(): Promise<LinkStatus | null> {
  */
 export type LinkLevel = "unknown" | "healthy" | "degraded" | "offline";
 
-/** Classify a status (or its absence) into a display level (pure, unit-tested). */
+/**
+ * Classify a status (or its absence) into a display level (pure, unit-tested).
+ *
+ * The two *verdicts* it names (`"healthy"`, `"degraded"`) are the bridge's own tokens
+ * (`link.rs::health_str`) — this is the mirror, not the authority — and `declaredMirrors.test.ts`
+ * reads that function's arms and binds them here, so a re-spelling on the bridge cannot silently
+ * fold a degraded link into 「unknown」.
+ */
 export function linkLevel(s: LinkStatus | null): LinkLevel {
   if (!s) return "offline";
   if (s.health === "healthy") return "healthy";
@@ -161,6 +168,19 @@ export function formatUptime(ms: number): string {
 /** One-line peer summary: `dog1 (robot), mini-brain (brain)` (pure, order-stable). */
 export function peerSummary(peers: LinkPeer[]): string {
   return peers.map((p) => `${p.id} (${p.kind})`).join(", ");
+}
+
+/**
+ * Whether a peer was **declared by hand** rather than heard on the wire (pure).
+ *
+ * `beacons === 0` is the one beacon count that means something different *in kind*: every other
+ * value is a peer that announced itself and will TTL-expire when it stops, while a zero-count
+ * entry was configured statically and never expires (`discovery.rs` — 「declared by hand (static,
+ * never TTL-expired)」). A surface that offers peers as the things you can command has to say so,
+ * or a hand-written entry that has never been seen is indistinguishable from a live robot.
+ */
+export function peerDeclared(p: LinkPeer): boolean {
+  return p.beacons === 0;
 }
 
 /**
@@ -231,6 +251,42 @@ export function robotLevelKey(level: RobotLevel): string {
   }
 }
 
+/**
+ * The i18n key for a robot's **e-stop reason**, or `null` when there is nothing to show (pure).
+ *
+ * A latched e-stop and *why* it latched are two facts: `estopped: true` says torque was cut,
+ * this says whether the operator cut it, the robot's own watchdog did (a lost link), or the
+ * **bus itself** failed mid-batch (`bus-fault`, which latches rather than let the next motion be
+ * written into a bus that just refused a batch). Without it the row cannot answer the first
+ * question a stopped robot raises. The token is the robot's own vocabulary (`EstopReason::key()`,
+ * `crates/amos-link/src/robot_hal.rs`); the bridge already drops tokens this build does not know
+ * (`link.rs::actuation_out`), so what reaches us is one of the three keys or `null` — never a
+ * value to guess at. Bound to those Rust arms by `robotVocab.test.ts`, so a re-spelling cannot
+ * silently stop matching. The CLI prints the same fact as `estopped=true(watchdog)`.
+ */
+export function estopReasonKey(reason: string | null): string | null {
+  switch (reason) {
+    case "commanded":
+      return "link.estopReasonCommanded";
+    case "watchdog":
+      return "link.estopReasonWatchdog";
+    case "bus-fault":
+      return "link.estopReasonBusFault";
+    default:
+      return null;
+  }
+}
+
+/**
+ * The deadman period as text: `1000ms`, or `-` when the robot runs without a watchdog (pure).
+ *
+ * `null` is the bridge's 「no watchdog configured」 (the proto's `0` sentinel, already folded
+ * away), so it must not print as `0ms` — that would describe a watchdog nobody set.
+ */
+export function watchdogText(ms: number | null): string {
+  return ms !== null && Number.isFinite(ms) && ms > 0 ? `${ms}ms` : "-";
+}
+
 /** A one-line description of what a robot is doing, for the panel's row (pure). */
 export function robotSummary(a: LinkActuation): string {
   const mode = a.gait ?? "-";
@@ -270,7 +326,9 @@ export function reportAgeKey(ageMs: number | null): string {
  * A report's age as text: `250ms`, `2s`, `2m 05s`, `3h 04m`, `2d 03h`.
  *
  * The same shapes the CLI's `format_age_ms` prints, so a terminal and this panel describe an age
- * alike (and the same shapes as {@link formatUptime}: an age *is* a duration).
+ * alike (and the same shapes as {@link formatUptime}: an age *is* a duration). That agreement used
+ * to be a doc claim on both sides with nothing binding it; `declaredMirrors.test.ts` now reads the
+ * CLI's `format!` templates and checks these shapes against them.
  */
 export function reportAgeText(ageMs: number): string {
   if (!Number.isFinite(ageMs) || ageMs < 0) return formatUptime(0);

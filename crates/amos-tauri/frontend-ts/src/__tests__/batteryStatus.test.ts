@@ -1,5 +1,6 @@
 import { describe, expect, test, afterEach } from "bun:test";
 import {
+  batteryReadout,
   clampPct,
   batteryTone,
   firstBattery,
@@ -38,6 +39,27 @@ describe("batteryStatus", () => {
     expect(batteryTone({ levelPct: 3, charging: true })).toBe("charging");
     expect(batteryTone({ levelPct: 80, charging: true })).toBe("charging");
     expect(batteryTone({ levelPct: null, charging: true })).toBe("unknown");
+  });
+
+  test("batteryReadout names the state and rounds the level; null when unknown", () => {
+    // Unknown must stay unknown: `null` is what makes a surface fall back to its own
+    // honest "no reading" name instead of inventing a percentage.
+    expect(batteryReadout({ levelPct: null, charging: null })).toBeNull();
+    expect(batteryReadout({ levelPct: null, charging: true })).toBeNull();
+
+    expect(batteryReadout({ levelPct: 80, charging: false })).toEqual({
+      key: "a11y.battery",
+      pct: "80%",
+    });
+    expect(batteryReadout({ levelPct: 64, charging: true })).toEqual({
+      key: "a11y.batteryCharging",
+      pct: "64%",
+    });
+    // A level with the charging bit unread is a level, not a charging report.
+    expect(batteryReadout({ levelPct: 42, charging: null })?.key).toBe("a11y.battery");
+    // Rounded once, here, so the name and the drawn text cannot disagree.
+    expect(batteryReadout({ levelPct: 79.6, charging: false })?.pct).toBe("80%");
+    expect(batteryReadout({ levelPct: 79.4, charging: false })?.pct).toBe("79%");
   });
 
   test("normalizeSample coerces a loose raw object and clamps level", () => {
@@ -136,5 +158,53 @@ describe("watchHostBattery", () => {
     manager.level = 0.9;
     listeners.get("levelchange")?.();
     expect(seen.length).toBe(2); // stopped → no further samples
+  });
+
+  test("`stop()` really detaches both listeners from the page-singleton manager", async () => {
+    // `BatteryManager` is a page singleton, so "stop" must mean *remove*, not
+    // merely "stop calling `cb`": a muted-but-attached listener still pins `cb`
+    // (and everything it closes over) for the life of the document, and every
+    // mount/unmount cycle would stack two more. The test above cannot see this —
+    // it keeps its own reference to the callback and invokes it directly, so it
+    // passes whether or not the listener was ever removed.
+    const attached = new Set<string>();
+    const manager = {
+      level: 0.5,
+      charging: false,
+      addEventListener: (t: string) => attached.add(t),
+      removeEventListener: (t: string) => attached.delete(t),
+    };
+    Object.defineProperty(navigator, "getBattery", {
+      configurable: true,
+      value: () => Promise.resolve(manager),
+    });
+    const stop = watchHostBattery(() => {});
+    await new Promise((r) => setTimeout(r, 5));
+    expect([...attached].sort()).toEqual(["chargingchange", "levelchange"]);
+
+    stop?.();
+    expect(attached.size).toBe(0); // both listeners detached, not merely muted
+  });
+
+  test("`stop()` before the API resolves subscribes nothing", async () => {
+    // The promise may resolve after the owner is already gone (a Svelte app that
+    // unmounted in the same tick). Attaching then would leak into a dead owner.
+    const attached = new Set<string>();
+    const manager = {
+      level: 0.5,
+      charging: false,
+      addEventListener: (t: string) => attached.add(t),
+      removeEventListener: (t: string) => attached.delete(t),
+    };
+    Object.defineProperty(navigator, "getBattery", {
+      configurable: true,
+      value: () => Promise.resolve(manager),
+    });
+    const seen: BatterySample[] = [];
+    const stop = watchHostBattery((s) => seen.push(s));
+    stop?.(); // detach synchronously, before the promise settles
+    await new Promise((r) => setTimeout(r, 5));
+    expect(attached.size).toBe(0);
+    expect(seen).toEqual([]); // and no initial sample either
   });
 });

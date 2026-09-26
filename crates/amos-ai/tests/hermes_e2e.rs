@@ -36,16 +36,23 @@ async fn connect(
     Ok(AiAgentClient::new(channel))
 }
 
-async fn wait_for_socket(path: &std::path::Path) {
-    // Under parallel `make test` the spawned amos-ai binary can be slow to bind
-    // (large binary, CPU contention), so wait generously and verify it is
-    // actually connectable rather than just that the file exists.
-    for _ in 0..150 {
+/// True once the daemon at `path` accepts a connection.
+///
+/// Under parallel `make test` the spawned amos-ai binary can be slow to bind
+/// (large binary, CPU contention), so wait generously and verify it is
+/// actually connectable rather than just that the file exists. Measured cold
+/// starts range from ~1 s to ~10 s under load, so the budget is well past
+/// that. The result is *returned* rather than swallowed: a caller that
+/// ignored a timeout would then blame the next step (`connect`) for a
+/// failure that was really readiness.
+async fn wait_for_socket(path: &std::path::Path) -> bool {
+    for _ in 0..300 {
         if UnixStream::connect(path).await.is_ok() {
-            return;
+            return true;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
+    false
 }
 
 fn prompt(p: &str) -> ClientMessage {
@@ -217,7 +224,12 @@ async fn hermes_backend_streams_tokens_and_semantic_cards() {
         .stderr(std::process::Stdio::null())
         .spawn()
         .expect("spawn amos-ai");
-    wait_for_socket(&path).await;
+    assert!(
+        wait_for_socket(&path).await,
+        "the amos-ai daemon at {path:?} never accepted a connection within 30 s \
+         (readiness timed out — this is a startup failure or extreme load, not a \
+         connect failure)"
+    );
 
     let mut client = connect(&path).await.expect("connect");
     let (tx, rx) = mpsc::channel(64);

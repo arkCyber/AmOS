@@ -125,7 +125,11 @@ class TestLinkNode(unittest.TestCase):
         self.assertGreaterEqual(metrics.published, 0)
         self.assertGreaterEqual(metrics.delivered, 0)
         self.assertGreaterEqual(metrics.dropped, 0)
-        self.assertGreaterEqual(metrics.errors, 0)
+        # A brand-new node has failed nothing, so exactly zero — not merely ">= 0",
+        # which a getter that always returns 0 would also satisfy. The non-zero case
+        # is covered by the Rust unit test, which can call record_decode_error (a
+        # fault that cannot be induced from pure Python).
+        self.assertEqual(metrics.errors, 0)
     
     def test_node_repr(self):
         """Verify LinkNode has string representation."""

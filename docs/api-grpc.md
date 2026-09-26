@@ -5,7 +5,7 @@
 > contract and this page cannot drift apart.
 
 The daemon serves all of these over **one shared Unix Domain Socket** (default $AMOS_SOCKET).
-11 services · 64 RPCs · 130 messages · 19 enums,
+11 services · 68 RPCs · 136 messages · 20 enums,
 across 10 `.proto` files.
 
 ## Index
@@ -15,12 +15,12 @@ across 10 `.proto` files.
 | [`ai_agent.proto`](#ai_agentproto) | `ai_agent` | 2 | 11 | 41 | 0 |
 | [`android_compat.proto`](#android_compatproto) | `android_compat` | 1 | 9 | 18 | 4 |
 | [`governor.proto`](#governorproto) | `amos_governor` | 1 | 6 | 9 | 2 |
-| [`netguard.proto`](#netguardproto) | `amos_netguard` | 1 | 3 | 7 | 1 |
+| [`netguard.proto`](#netguardproto) | `amos_netguard` | 1 | 5 | 11 | 1 |
 | [`privacy.proto`](#privacyproto) | `amos_privacy` | 1 | 9 | 12 | 0 |
 | [`robot_link.proto`](#robot_linkproto) | `amos_link` | 1 | 5 | 10 | 1 |
 | [`sensor.proto`](#sensorproto) | `amos_sensor` | 1 | 7 | 12 | 4 |
 | [`telemetry_spy.proto`](#telemetry_spyproto) | `amos_telemetry_spy` | 1 | 2 | 3 | 3 |
-| [`telephony.proto`](#telephonyproto) | `amos_telephony` | 1 | 8 | 10 | 4 |
+| [`telephony.proto`](#telephonyproto) | `amos_telephony` | 1 | 10 | 12 | 5 |
 | [`translate.proto`](#translateproto) | `translate` | 1 | 4 | 8 | 0 |
 
 ## `ai_agent.proto`
@@ -113,7 +113,7 @@ RAG retrieval service: offline local vector search over the daemon's indexed not
 | `running` | `bool` | 1 | is the inference daemon alive & ready |
 | `model` | `string` | 2 | active model identifier |
 | `uptime_seconds` | `int64` | 3 | daemon uptime |
-| `gpu_util` | `uint32` | 4 | rough GPU/NPU utilisation percent |
+| `gpu_util` | `uint32` | 4 | optional · GPU/NPU utilisation percent; ABSENT = no metrics instrumented (a bare 0 would be a fabricated reading) |
 | `active_sessions` | `uint32` | 5 | number of live agent sessions |
 | `rpc_total` | `int64` | 6 | RPCs seen at the gRPC boundary (monitoring) |
 | `heartbeats` | `int64` | 7 | periodic self-health ticks emitted (monitoring) |
@@ -409,7 +409,7 @@ RAG retrieval service: offline local vector search over the daemon's indexed not
 | Field | Type | # | Notes |
 |---|---|---|---|
 | `indexed` | `uint64` | 1 | passages currently indexed |
-| `dimension` | `uint32` | 2 | 0 when nothing indexed yet (dimension unknown) |
+| `dimension` | `uint32` | 2 | optional · The index's vector dimension, **absent** until the first ingest — a reader must not read a missing dimension as `0`, which is not a dimension any embedder can have (`amos-vector-db` refuses `ZeroDimension`). Was a bare `uint32` whose `0` meant "unknown"; widening to `optional` carries the presence instead. |
 | `embedder` | `string` | 3 | "mock" \| "ollama" (honest backend label) |
 
 ## `android_compat.proto`
@@ -720,7 +720,7 @@ Resource-governor service exposed by the OS daemon (amos-ai), backed by the amos
 
 Package: `amos_netguard`
 
-Honest boundaries (docs/anti-telemetry-egress-guard.md): * This gates and audits the Android **userspace / app data plane** only. It cannot reach the modem/baseband (a separate processor/trust domain), so "arm the guard" never claims to block the SoC's own backhaul. * `StatusReply.enforced` is true ONLY when a real backend (Android VpnService on a non-rooted device, or nftables in an AOSP/rooted build) is actually enforcing. On the default host build the backend is the in-process Mock and `enforced` is false — arming records intent, never a fabricated "blocked".
+Honest boundaries (docs/anti-telemetry-egress-guard.md): * This gates and audits the Android **userspace / app data plane** only. It cannot reach the modem/baseband (a separate processor/trust domain), so "arm the guard" never claims to block the SoC's own backhaul. * `StatusReply.enforced` is true ONLY when a real backend (Android VpnService on a non-rooted device, or nftables in an AOSP/rooted build) is actually enforcing. On the default host build the backend is the in-process Mock and `enforced` is false — arming records intent, never a fabricated "blocked". * `SetAppEgress` records an app's declared egress. A grant is a *declaration* held by the daemon; it becomes an enforceable rule only for an app with its own `uid`. A shared-uid hosted bundle is recorded (`declared_apps`) but contributes no rule — this seam never pretends a shared uid was isolated.
 
 ### Services
 
@@ -730,6 +730,8 @@ Honest boundaries (docs/anti-telemetry-egress-guard.md): * This gates and audits
 |---|---|---|---|---|
 | `Toggle` | `ToggleRequest` | `ToggleReply` | unary | Arm or disarm the egress guard. |
 | `Status` | `StatusRequest` | `StatusReply` | unary | Current armed state + backend + small audit summary. |
+| `SetAppEgress` | `SetAppEgressRequest` | `SetAppEgressReply` | unary | Record (or replace) one app's declared egress. Idempotent per app id; a currently-armed guard is re-applied so the change takes effect immediately, and a backend that refuses to apply rolls the declaration back (the reported state never drifts from what the guard actually holds). |
+| `RevokeAppEgress` | `RevokeAppEgressRequest` | `RevokeAppEgressReply` | unary | Drop one app's declared egress (the uninstall counterpart). |
 | `NoteEgress` | `NoteEgressRequest` | `NoteEgressReply` | unary | TEST/INJECTION: fold one metadata egress event into the audit counter so `Status.top_egress` reflects a feed. Served ONLY when the process opts in via `AMOS_NETGUARD_ALLOW_INJECT=1` (off on every production boot, mirroring the telemetry-spy `SimulateHit` gate); otherwise PermissionDenied. A real device producer (VpnService / nftables observability) feeds the same counter directly and needs no RPC. |
 
 ### Messages
@@ -763,10 +765,11 @@ Honest boundaries (docs/anti-telemetry-egress-guard.md): * This gates and audits
 | Field | Type | # | Notes |
 |---|---|---|---|
 | `enabled` | `bool` | 1 | User intent: is the guard armed? |
-| `backend` | `string` | 2 | The enforcement backend in use: "mock" (default host) \| "vpn" \| "nftables". |
-| `enforced` | `bool` | 3 | True ONLY when a real backend is actually enforcing on this device. |
-| `policy_rules` | `uint64` | 4 | Number of egress policy rules the guard holds. |
+| `backend` | `string` | 2 | The enforcement backend in use: "mock" (default host) \| "vpn" \| "nftables". This names the guard backend the daemon actually holds (its `NetworkGuard::enforces` claim backs `enforced` below), not a free label. |
+| `enforced` | `bool` | 3 | True ONLY when a real backend is actually enforcing on this device. Derived from the held backend's own enforcement claim, so the default mock reports false. |
+| `policy_rules` | `uint64` | 4 | Number of egress policy rules the guard holds — the *configured* count, populated by `SetAppEgress` / `RevokeAppEgress` (an app with a non-zero uid contributes one rule per declared host). Read it as "rules configured", never as "rules enforced" (that is `enforced`, and it needs a real backend). |
 | `top_egress` | repeated `EgressSample` | 5 | Top domains by bytes in the current audit window (empty when no data). |
+| `declared_apps` | `uint64` | 6 | Number of apps holding a declared egress set (the registry size). An app whose `uid` is 0 is counted here but contributes no `policy_rules` — see `SetAppEgressRequest.uid`. |
 
 **`NoteEgressRequest`** — One metadata egress signal to fold into the guard's rolling audit counter that backs `StatusReply.top_egress`. Carries destination domain / SNI + bytes only — never payload contents (docs/anti-telemetry-egress-guard.md §3.2).
 
@@ -782,6 +785,34 @@ Honest boundaries (docs/anti-telemetry-egress-guard.md): * This gates and audits
 **`NoteEgressReply`**
 
 *(no fields)*
+
+**`SetAppEgressRequest`** — One app's declared egress allow-list: the hosts an installed app says it may reach (a hosted web bundle's `allowed_domains`, a PWA manifest's `[permissions.network].allowed_domains`). Held by the daemon as that app's *declaration*; when `uid` is non-zero it is also emitted as a uid-keyed allow rule for the guard to apply. Re-sending the same `app_id` **replaces** its set (idempotent) — it never appends. An empty `allow_domains` is a valid declaration ("this app declares no egress").
+
+| Field | Type | # | Notes |
+|---|---|---|---|
+| `app_id` | `string` | 1 | Stable app id (the store / index id). Must be non-empty, bounded, and free of control characters — the daemon refuses anything else. |
+| `uid` | `uint32` | 2 | The app's Android uid. `0` means "no uid" (e.g. a hosted web bundle that shares the shell's uid): the declaration is still recorded and counted in `declared_apps`, but no packet-level rule is emitted, because the guard's `Policy` is uid-scoped and one shared uid cannot isolate one bundle from another (docs/anti-telemetry-egress-guard.md §2.3). |
+| `allow_domains` | repeated `string` | 3 | Declared egress hosts, in the same grammar as the manifest `allowed_domains` (fully-qualified lowercase ASCII host, no wildcard). Malformed / over-long entries are **refused**, never silently dropped. |
+
+**`SetAppEgressReply`**
+
+| Field | Type | # | Notes |
+|---|---|---|---|
+| `policy_rules` | `uint64` | 1 | Total configured rules across all apps after this upsert. |
+| `declared_apps` | `uint64` | 2 | Registry size after this upsert. |
+
+**`RevokeAppEgressRequest`** — Drop one app's declared egress (its uninstall counterpart). Removing an absent app is a no-op that still reports the current totals.
+
+| Field | Type | # | Notes |
+|---|---|---|---|
+| `app_id` | `string` | 1 | — |
+
+**`RevokeAppEgressReply`**
+
+| Field | Type | # | Notes |
+|---|---|---|---|
+| `policy_rules` | `uint64` | 1 | Total configured rules across all apps after the removal. |
+| `declared_apps` | `uint64` | 2 | Registry size after the removal. |
 
 ### Enums
 
@@ -1007,7 +1038,7 @@ The AmOS-Link control plane exposed by the daemon (amos-ai mounts it beside AiAg
 | `frames` | `uint32` | 4 | frames written to the bus for that action |
 | `armed` | `bool` | 5 | drivers energized (read from the bus, not inferred) |
 | `estopped` | `bool` | 6 | torque cut and latched until an explicit arm |
-| `estop_reason` | `string` | 7 | "" \| "commanded" \| "watchdog" (why torque was cut) |
+| `estop_reason` | `string` | 7 | "" \| "commanded" \| "watchdog" \| "bus-fault" (why torque was cut) |
 | `watchdog_ms` | `uint64` | 8 | deadman period; 0 = none configured |
 | `last_refusal_seq` | `uint64` | 9 | 0 = nothing refused |
 | `last_refusal` | `string` | 10 | "" = nothing refused (else: why it was refused) |
@@ -1120,8 +1151,8 @@ Device-sensor service exposed by the OS daemon (amos-ai), backed by the amos-sen
 | `timestamp_ms` | `uint64` | 1 | — |
 | `accel_m_s2` | `Vec3` | 2 | — |
 | `gyro_rad_s` | `Vec3` | 3 | — |
-| `temperature_c` | `float` | 4 | — |
-| `rate_hz` | `uint32` | 5 | — |
+| `temperature_c` | `float` | 4 | Die temperature in °C. No field presence (proto3 scalar without `optional`), so `0` is this message's "not reported" sentinel — a device with no die-temperature source has no value to send. Consumers must read `0` as unknown, never as a measured 0 °C; see `amos-sensor`'s `ImuSample.temperature_c` (an `Option`) and the same discipline on `GnssReply.accuracy_m` / `sats_in_view`. |
+| `rate_hz` | `uint32` | 5 | Negotiated report rate in Hz; `0` = not negotiated yet (same sentinel rule). |
 
 **`SetModeRequest`**
 
@@ -1267,7 +1298,7 @@ Transport: the same Unix Domain Socket as ai_agent / android_compat (single UDS 
 
 #### `Telephony`
 
-Dial/Answer/End are unary; Status lists live calls; Watch streams the signalling events the UI (and AI assistant) need to react to (incoming call, connected, remote hangup). StartRecording/StopRecording toggle call recording (only legal while a call is ACTIVE + non-emergency) and return the authoritative snapshot so the UI can reflect the recording state without a round-trip.
+Dial/Answer/End are unary; Status lists live calls; Watch streams the signalling events the UI (and AI assistant) need to react to (incoming call, connected, remote hangup). StartRecording/StopRecording toggle call recording (only legal while a call is ACTIVE + non-emergency) and return the authoritative snapshot so the UI can reflect the recording state without a round-trip. SetMuted carries the call's mute flag the same way (legal on any live call, emergency included — muting your own mic on a 110 call is the caller's decision, unlike recording it, which is a hard legal rule).
 
 | Method | Request | Reply | Kind | Notes |
 |---|---|---|---|---|
@@ -1276,8 +1307,10 @@ Dial/Answer/End are unary; Status lists live calls; Watch streams the signalling
 | `End` | `EndRequest` | `CallIdMsg` | unary | — |
 | `StartRecording` | `CallIdMsg` | `CallSnapshot` | unary | — |
 | `StopRecording` | `CallIdMsg` | `CallSnapshot` | unary | — |
+| `SetMuted` | `MuteRequest` | `CallSnapshot` | unary | — |
 | `SimulateIncoming` | `SimulateIncomingRequest` | `CallIdMsg` | unary | — |
 | `Status` | `StatusRequest` | `CallList` | unary | — |
+| `GetBackend` | `StatusRequest` | `BackendStatus` | unary | Honest backend identity: whether `Dial` reaches the platform or simulates it. |
 | `Watch` | `WatchRequest` | `CallStateEvent` | server streaming | — |
 
 ### Messages
@@ -1313,6 +1346,13 @@ Dial/Answer/End are unary; Status lists live calls; Watch streams the signalling
 |---|---|---|---|
 | `call` | `CallIdMsg` | 1 | — |
 
+**`MuteRequest`** — Set the call's mute flag. `muted` is the desired state, not a toggle, so a retried or deduplicated request can never flip a call the user did not touch.
+
+| Field | Type | # | Notes |
+|---|---|---|---|
+| `call` | `CallIdMsg` | 1 | — |
+| `muted` | `bool` | 2 | — |
+
 **`StatusRequest`**
 
 *(no fields)*
@@ -1320,6 +1360,13 @@ Dial/Answer/End are unary; Status lists live calls; Watch streams the signalling
 **`WatchRequest`**
 
 *(no fields)*
+
+**`BackendStatus`**
+
+| Field | Type | # | Notes |
+|---|---|---|---|
+| `kind` | `BackendKind` | 1 | — |
+| `detail` | `string` | 2 | The backend's own words: why it is a mock, or why nothing is wired. |
 
 **`CallSnapshot`**
 
@@ -1332,6 +1379,7 @@ Dial/Answer/End are unary; Status lists live calls; Watch streams the signalling
 | `end_reason` | `EndReason` | 5 | — |
 | `emergency` | `bool` | 6 | — |
 | `recording` | `RecordingState` | 7 | — |
+| `muted` | `bool` | 8 | Whether this call's outbound audio is muted. Always false once the call has ENDED (mute cannot outlive the call it applies to, like `recording`). |
 
 **`CallList`**
 
@@ -1380,6 +1428,15 @@ Dial/Answer/End are unary; Status lists live calls; Watch streams the signalling
 | `RECORDING_OFF` | 0 | — |
 | `RECORDING_ON` | 1 | — |
 | `RECORDING_FAILED` | 2 | — |
+
+**`BackendKind`** — The UI asks this so it never draws a *simulated* call as a real one. The load-bearing case is MOCK: `Dial` then does NOT reach the platform telephony stack, so a caller that needs a real call (above all an emergency number) must take a path that can actually place one instead of accepting the mock's fabricated success.
+
+| Value | # | Notes |
+|---|---|---|
+| `BACKEND_UNSPECIFIED` | 0 | — |
+| `BACKEND_MOCK` | 1 | In-process simulation: no SIM, no Telecom, no network. Dev/demo only. |
+| `BACKEND_ANDROID` | 2 | Real platform telephony over the Android stack. |
+| `BACKEND_UNCONFIGURED` | 3 | No provider wired: `Dial` is refused honestly rather than simulated. |
 
 ## `translate.proto`
 

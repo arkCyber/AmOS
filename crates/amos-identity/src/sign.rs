@@ -202,6 +202,55 @@ mod tests {
         assert!(!verify_statement(&other.did().unwrap(), statement, &sig));
     }
 
+    /// A valid secp256k1 signature has two encodings — low-s `(r,s,v)` and its
+    /// malleable twin `(r, n-s, v⊕1)` — and Ethereum's `ecrecover` accepts both.
+    /// A third party (a wallet that emits the twin) must still verify against
+    /// the DID; before `amos-web3` normalised the twin at parse time, this
+    /// returned `false` for a genuinely valid signature.
+    #[test]
+    fn high_s_twin_still_verifies_against_the_did() {
+        fn twin(sig: &[u8; 65]) -> [u8; 65] {
+            let n = amos_web3::secp::SECP256K1_ORDER;
+            let mut s = [0u8; 32];
+            s.copy_from_slice(&sig[32..64]);
+            let mut high = [0u8; 32];
+            let mut borrow = 0i16;
+            for i in (0..32).rev() {
+                let mut d = n[i] as i16 - s[i] as i16 - borrow;
+                if d < 0 {
+                    d += 256;
+                    borrow = 1;
+                } else {
+                    borrow = 0;
+                }
+                high[i] = d as u8;
+            }
+            let mut out = *sig;
+            out[32..64].copy_from_slice(&high);
+            out[64] = if sig[64] == 27 { 28 } else { 27 };
+            out
+        }
+
+        let key = IdentityKey::from_seed(Curve::Secp256k1, [42u8; 32]).unwrap();
+        let did_str = key.did().unwrap();
+        let statement = b"authorize transfer of 1 ETH";
+        let sig = sign_statement(&key, statement);
+        assert!(verify_statement(&did_str, statement, &sig));
+
+        let mut raw = [0u8; 65];
+        raw.copy_from_slice(&sig.bytes);
+        let twin_bytes = twin(&raw);
+        assert_ne!(twin_bytes, raw, "the twin is a different encoding");
+        let twin_sig = StatementSignature {
+            curve: Curve::Secp256k1,
+            bytes: twin_bytes.to_vec(),
+        };
+        assert!(
+            verify_statement(&did_str, statement, &twin_sig),
+            "a valid high-s twin must still verify against its DID"
+        );
+    }
+
     #[test]
     fn sign_and_verify_typed_data_wallet_path() {
         fn permit() -> TypedData {

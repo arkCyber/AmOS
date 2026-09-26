@@ -28,6 +28,7 @@
     type CustomGroup,
   } from "../lib/customGroups";
   import { propsChannel } from "./propsBus";
+  import StoreErrorBar from "./StoreErrorBar.svelte";
   import { appLibraryColumns } from "../lib/formLayout";
   import type { FormFactor } from "../lib/wm";
   import AppIcon from "./AppIcon.svelte";
@@ -149,6 +150,24 @@
   // ---- User-created groups ----
   let customGroups = $state<CustomGroup[]>(getCustomGroups());
   let nameError = $state("");
+  /**
+   * A custom group is authored by the user and read back only by `getCustomGroups()` —
+   * i.e. the next mount — so a refused write must be said out loud *and* must not move
+   * `customGroups`: drawing a folder the store never took would have it vanish on the
+   * next launch. REQ-A1430.
+   */
+  let storeErr = $state("");
+
+  /** Apply a mutator's result: adopt the new list only when the store took it. */
+  function apply(w: { groups: CustomGroup[]; ok: boolean }): boolean {
+    if (!w.ok) {
+      storeErr = t("common.storeWriteFailed");
+      return false;
+    }
+    storeErr = "";
+    customGroups = w.groups;
+    return true;
+  }
 
   // Name dedup (case-insensitive) so two groups never share a label.
   function hasName(name: string, exceptId?: string): boolean {
@@ -164,7 +183,9 @@
     let name = base;
     for (let n = 2; hasName(name); n++) name = `${base} ${n}`;
     const res = addCustomGroup(customGroups, name);
-    customGroups = res.groups;
+    // Refused ⇒ do not open the folder either: it is not on disk, so it would be gone
+    // after a relaunch — an opened folder the next launch loses is the same lie.
+    if (!apply(res)) return;
     const created = res.created;
     openGroup = { id: created.id, name: created.name, apps: [], icon: undefined };
     editingMembers = false;
@@ -209,7 +230,7 @@
       return;
     }
     nameError = "";
-    customGroups = renameCustomGroup(customGroups, g.id, trimmed);
+    if (!apply(renameCustomGroup(customGroups, g.id, trimmed))) return;
     openGroup = { ...g, name: trimmed };
     renaming = false;
   }
@@ -223,7 +244,7 @@
   function chooseIcon(icon: string | undefined): void {
     const g = openGroup;
     if (!g) return;
-    customGroups = setGroupIcon(customGroups, g.id, icon);
+    if (!apply(setGroupIcon(customGroups, g.id, icon))) return;
     openGroup = { ...g, icon: icon ? icon : undefined };
     pickingIcon = false;
   }
@@ -231,12 +252,23 @@
   function openCustomGroup(id: string): void {
     const g = customGroups.find((x) => x.id === id);
     if (!g) return;
-    const apps = g.apps.filter((a) => knownIds.has(a));
-    if (apps.length !== g.apps.length) {
-      // Some members no longer exist — reconcile the stored group.
-      customGroups = setGroupApps(customGroups, g.id, apps);
-    }
-    openGroup = { id: g.id, name: g.name, apps: [...apps], icon: g.icon };
+    // **Opening a group is a read; it must not write.** This used to reconcile the stored
+    // group against `knownIds` and persist the result, on the theory that a member which no
+    // longer exists should be cleaned out. But `knownIds` is built from the **host-pushed**
+    // `ext` tiles (`const knownIds = $derived(new Set([...appIds(), ...ext.map(...)]))`), and
+    // the tile list is loaded **asynchronously** (`lib/storeApps.loadStoreTiles`, the one
+    // writer of that cache; `Shell.refreshStoreTiles` / `DesktopShell`'s `ext = []` default).
+    // At boot the cache is cold, so every `store:*` member read as a ghost — and this call
+    // then **deleted it from the store**, permanently: unlike the home layout, the split and
+    // the Slide Over panel (all three re-derived by `Shell.refreshStoreTiles` once the tiles
+    // arrive), the custom-group membership has no re-seat, so nothing could ever put the
+    // member back. A user who opened their folder after a relaunch, before the tiles landed,
+    // silently lost every installed app from it. REQ-A1393 / F-SH-652.
+    //
+    // The member list is kept **whole** in `openGroup.apps` (so an edit below persists exactly
+    // what the store holds, ghosts included) and only the *view* is filtered, via
+    // `visibleMembers` — the same "never draw a ghost" result, without destroying content.
+    openGroup = { id: g.id, name: g.name, apps: [...g.apps], icon: g.icon };
     editingMembers = false;
     renaming = false;
     pickingIcon = false;
@@ -254,19 +286,27 @@
     if (!g) return;
     const has = g.apps.includes(id);
     const apps = has ? g.apps.filter((x) => x !== id) : [...g.apps, id];
-    customGroups = setGroupApps(customGroups, g.id, apps);
+    if (!apply(setGroupApps(customGroups, g.id, apps))) return;
     openGroup = { ...g, apps };
   }
   function deleteOpenGroup(): void {
     if (!openGroup) return;
-    customGroups = removeCustomGroup(customGroups, openGroup.id);
+    // Refused ⇒ keep the folder open on screen rather than closing into a home that
+    // still draws it (the store still holds it).
+    if (!apply(removeCustomGroup(customGroups, openGroup.id))) return;
     closeCustomGroup();
   }
 
   // Snapshot helpers so the template never needs to narrow openGroup itself.
   const openGroupName = $derived(openGroup?.name ?? "");
   const openGroupIcon = $derived(openGroup?.icon ?? "📁");
+  /** The stored member list, **whole** — what an edit persists. See `openCustomGroup`. */
   const memberApps = $derived(openGroup?.apps ?? []);
+  // The **view** of that list: a member whose app is not currently known (a `store:*` tile the
+  // host has not delivered yet — see the cold-cache note in `openCustomGroup`) is not drawn. This
+  // filter is why opening a group never needs to write: hiding a ghost and deleting it are not the
+  // same act, and only the first is reversible. REQ-A1393 / F-SH-652.
+  const visibleMembers = $derived(memberApps.filter((id) => knownIds.has(id)));
   const memberSet = $derived(new Set(openGroup?.apps ?? []));
 
   // ---- Member drag-to-reorder (fine-pointer): move one member before another ----
@@ -286,19 +326,23 @@
   }
   // Touch-friendly micro-reorder (works regardless of pointer type).
   let sorting = $state(false);
-  const sortable = $derived(memberApps.length > 1);
-  function shiftMember(index: number, dir: -1 | 1): void {
+  const sortable = $derived(visibleMembers.length > 1);
+  // `from` is a **visible** index (`vi`), the same coordinate the buttons' `disabled` guards use.
+  // Swapping the two *stored* slots that those two visible members sit in is what makes the move
+  // land on screen; swapping `apps[from]`/`apps[from + dir]` would instead swap a member with a
+  // ghost whenever one sits between them — an enabled button that moves nothing (REQ-A1572 ∕ F-SH-798).
+  function shiftMember(from: number, dir: -1 | 1): void {
     const g = openGroup;
     if (!g) return;
-    const to = index + dir;
-    if (to < 0 || to >= g.apps.length) return;
+    const to = from + dir;
+    if (to < 0 || to >= visibleMembers.length) return;
     const apps = [...g.apps];
-    const a = apps[index];
-    const b = apps[to];
-    if (a === undefined || b === undefined) return;
-    apps[index] = b;
-    apps[to] = a;
-    customGroups = setGroupApps(customGroups, g.id, apps);
+    const a = apps.indexOf(visibleMembers[from]!);
+    const b = apps.indexOf(visibleMembers[to]!);
+    if (a < 0 || b < 0) return;
+    apps[a] = visibleMembers[to]!;
+    apps[b] = visibleMembers[from]!;
+    if (!apply(setGroupApps(customGroups, g.id, apps))) return;
     openGroup = { ...g, apps };
   }
   function memberDragOver(e: DragEvent): void {
@@ -314,8 +358,8 @@
     dragMember = null;
     if (g && d && d !== over && g.apps.includes(d) && g.apps.includes(over)) {
       const apps = moveAppBefore([...g.apps], d, over);
-      customGroups = setGroupApps(customGroups, g.id, apps);
-      openGroup = { ...g, apps };
+      // No early return: the stray-tap guard below must still arm after a refused drop.
+      if (apply(setGroupApps(customGroups, g.id, apps))) openGroup = { ...g, apps };
     }
     ignoreTapUntil = Date.now() + 400;
   }
@@ -347,6 +391,7 @@
   });
 </script>
 <div class="fx-fade flex h-full flex-col" data-testid="app-library">
+  <StoreErrorBar message={storeErr} />
   <!-- Library home -->
   {#if openGroup !== null}
     {#if editingMembers}
@@ -378,8 +423,8 @@
                 class={
                   "shrink-0 rounded-full px-2.5 py-0.5 text-[11px] font-medium " +
                   (memberSet.has(id)
-                    ? "bg-danger/15 text-danger"
-                    : "bg-accent/15 text-accent")
+                    ? "bg-danger/8 text-danger"
+                    : "bg-accent/10 text-accent")
                 }
               >{memberSet.has(id) ? t("appLibrary.remove") : t("appLibrary.add")}</span>
             </button>
@@ -486,11 +531,11 @@
           </div>
         {/if}
         <div class="mt-3 min-h-0 flex-1 overflow-y-auto">
-          {#if memberApps.length === 0}
+          {#if visibleMembers.length === 0}
             <p class="px-1 pt-14 text-center text-sm opacity-60">{t("appLibrary.emptyMembers")}</p>
           {:else}
             <div class="grid gap-y-5" style={`grid-template-columns: repeat(${libraryCols}, minmax(0, 1fr));`}>
-              {#each memberApps as id, index (id)}
+              {#each visibleMembers as id, vi (id)}
                 {#if sorting}
                   <div class="flex w-full flex-col items-center gap-0.5">
                     <AppIcon
@@ -505,16 +550,16 @@
                         type="button"
                         aria-label={`${labelOf(id)} ${t("appLibrary.moveUp")}`}
                         data-testid="app-library-member-up"
-                        onclick={() => shiftMember(index, -1)}
-                        disabled={index === 0}
+                        onclick={() => shiftMember(vi, -1)}
+                        disabled={vi === 0}
                         class="grid h-11 w-11 -my-1 cursor-pointer place-items-center rounded-full bg-neutral-200/80 text-sm text-neutral-700 transition active:scale-90 disabled:cursor-default disabled:opacity-30 dark:bg-white/10 dark:text-neutral-200"
                       >▲</button>
                       <button
                         type="button"
                         aria-label={`${labelOf(id)} ${t("appLibrary.moveDown")}`}
                         data-testid="app-library-member-down"
-                        onclick={() => shiftMember(index, 1)}
-                        disabled={index === memberApps.length - 1}
+                        onclick={() => shiftMember(vi, 1)}
+                        disabled={vi === visibleMembers.length - 1}
                         class="grid h-11 w-11 -my-1 cursor-pointer place-items-center rounded-full bg-neutral-200/80 text-sm text-neutral-700 transition active:scale-90 disabled:cursor-default disabled:opacity-30 dark:bg-white/10 dark:text-neutral-200"
                       >▼</button>
                     </span>
@@ -544,7 +589,7 @@
             </div>
           {/if}
         </div>
-          {#if memberApps.length > 0}
+          {#if visibleMembers.length > 0}
             <div class="mt-2 flex justify-center">
               <button
                 type="button"

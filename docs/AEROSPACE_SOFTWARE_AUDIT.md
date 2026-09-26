@@ -92,7 +92,7 @@
 ### P0 — 必须整改（安全/正确性）
 - **P0-1 Rust panic 面过大**：生产 `src` 中 `unwrap/expect/panic!/unreachable!` 经 P0-1 闭环后从 ≈230 降到 **52**（含 `#[allow]` 标注），53 个 crate 根 deny（`scripts/rust-panic-scan.mjs` 守门）。样例（已修）：`amos-tauri/src/wm.rs:489`、`amos-tauri/src/tts.rs:118-124`、`amos-wm/src/lib.rs:252`。**整改**：`Result` 显式传播、把 `unwrap` 收敛到进程边界，在非测试 crate 顶层开 `#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]`（测试模块例外），使 panic 面由 lint 强制可见。
 - **P0-2 跨进程/桥接错误被收敛为 `null`**：`frontend-ts/src/lib/backend.ts:26-29` 把所有 IPC 失败降级为 `null`，调用方难以区分“未连接/命令失败/内部错误”。虽有利于降级 UI，但**丢失了根因**。**整改**：返回结构化 `{ok, error}` 或带分类的枚举，UI 只负责展示，分类信息同时进日志。
-- **P0-3 遥测真实性（数据完整性）**：`amos-ai/src/inference/real.rs:162` 用 `TODO: Query actual GPU stats` 返回 `gpu_utilization_percent: 0`。若被上游消费，等于**用伪造数据驱动状态**，违反“数据真实、可审计”的安全原则。**整改**：要么实现真实采集，要么把该字段标记为 `Option`/“未提供”，禁止填 0 充当有效值。
+- **P0-3 遥测真实性（数据完整性）**：`amos-ai/src/inference/real.rs:162` 用 `TODO: Query actual GPU stats` 返回 `gpu_utilization_percent: 0`。若被上游消费，等于**用伪造数据驱动状态**，违反“数据真实、可审计”的安全原则。**整改**：要么实现真实采集，要么把该字段标记为 `Option`/“未提供”，禁止填 0 充当有效值。**已完成（2026-09-26，REQ-A1853）**：domain 字段早已是 `Option<u32>`（`real.rs:75`，并有测试 `real.rs:2053` 钉住“未知 ≠ 0”），但**上游链仍填 0**——`proto/ai_agent.proto` 的 `StatusReply.gpu_util` 是裸 `uint32`，daemon `server.rs::get_status` 恒写 `0`，`amos-tauri` 的 `DaemonStatus.gpu_util: u32` 原样透传给前端。本轮按本条的整改口径一次修好三段：proto 改 `optional uint32`（缺省 = 未采集）、`server.rs` 写 `None`、`ai_bridge.rs` 字段改 `Option<u32>`；红先在 `ai_bridge`（含 `gpu_util=0`）后绿，并以两个不相交负对照（生产者折 `Some(0)`／桥内折 `unwrap_or(0)`）各证一红（如实边界：目前无 UI 渲染 `gpu_util`，本轮只堵住 wire/桥上的伪造 0，未新增展示）。
 
 ### P1 — 强烈建议（稳健/防御）
 - **P1-1 静默数据损坏不告警**：`lib/amosStore.ts:31-33` 的 `readJson` 把 JSON 解析失败静默回退默认值，损坏的 `amos.*` 数据会被悄悄覆盖而用户无感知。**整改**：解析失败时 `console.warn` + 保留坏档副本，避免覆盖丢数据。
@@ -107,6 +107,7 @@
 - **P2-1 覆盖率门禁**：在 CI 增加 `cargo llvm-cov` / `bun --coverage` 阈值（如核心 `lib/*` 达 90%），并把 `amos-*` 纯逻辑模块纳入。
 - **P2-2 可追溯矩阵**：给 README/docs 功能条目分配 `REQ-xxx`，建立“需求→代码路径→测试”表格（本审计可作为起始草稿）。
 - **P2-3 移除/收敛代码内 TODO 遗留**（除 `real.rs:162` 外，文档层若干），确保无“假装完成”的实现。
+  - **P2-3 续（2026-09-20，8 缺口加固后登记）——三处“已声明未接线”的诚实 seam，一律类型化拒绝、绝不伪造成功**：① **RKNN / in-process llama.cpp（Gap 7）**：`inference/rknn.rs`、`inference/llama_cpp.rs` 是 **seam 不是 binding**——无 feature 时答 `BackendError::Provider(...)`、feature 开但 FFI 未写时答 `NotImplemented(...)`，**绝不**回退 mock；`Accel::Rk3588Npu::compiled_in()` = `cfg!(feature = "rknn")` 是唯一可用性判据，生产路径仍走 `ggml` 子进程不变（详见 `docs/rk3588-bringup.md`）。② **远程 PWA opener（Gap 6）**：`open_remote_pwa` 只取回并安装**运维允许清单内**的 `https` manifest（无通配符、无 `http://`、`eval_js` 拒绝、256 KiB / 10 s 上限），**不打开**远程 origin（详见 `docs/pwa-index.md` §4「远程 opener」）。③ **通话录音宿主半（Gap 1）**：`RecordingChange` 只如实呈现 `Off`/`On`/`Failed`/`Unknown`，仅默认拨号器 + 前台窗口可切；`InCallService` 的设备半**编译已验证、真机未验证**（详见 `docs/telephony.md` §10.5）。三者与 P0-3 同一条纪律：未接线即如实拒绝，不"假装完成"。
 - **P2-4 适航性免责声明**：仓库顶部/发布说明明确“非审定软件”，防止被误用于真实飞行/医疗等 DAL A 场景。
 
 ---

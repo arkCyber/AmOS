@@ -26,7 +26,7 @@
 //!
 //! * [`spec`] — sensor descriptors + sample types: [`SensorKind`], [`SensorMode`],
 //!   [`CameraConfig`] / [`CameraFrame`], [`GeoFix`] / [`FixMode`], [`ImuSample`],
-//!   and the PowerSave / hardware rate ceilings.
+//!   [`VitalsSample`], and the PowerSave / hardware rate ceilings.
 //! * [`error`] — [`SensorError`], the single error type.
 //! * [`provider`] — the [`SensorProvider`] seam (a dumb read register) + a
 //!   deterministic [`MockSensorProvider`].
@@ -57,6 +57,7 @@ pub mod error;
 pub mod manager;
 pub mod provider;
 pub mod service;
+pub mod sim;
 pub mod spec;
 pub mod stream;
 
@@ -67,12 +68,15 @@ pub use error::{Result, SensorError};
 pub use manager::SensorManager;
 pub use provider::{MockSensorProvider, SensorProvider};
 pub use service::{mock_server, server, SensorService};
+pub use sim::{checkerboard, deterministic_motion, SimHarness, GLUE_MAX_FRAME_BYTES};
 pub use spec::{
     frame_bytes_len, CameraConfig, CameraFrame, CameraId, FixMode, GeoFix, ImuSample, PixelFormat,
-    Resolution, SensorKind, SensorMode, Vec3, CAMERA_SAVE_MAX_FPS, GNSS_SAVE_MAX_HZ,
+    Resolution, SensorKind, SensorMode, Vec3, VitalsSample, CAMERA_SAVE_MAX_FPS, GNSS_SAVE_MAX_HZ,
     IMU_SAVE_MAX_HZ, MAX_FRAME_BYTES,
 };
-pub use stream::{FrameLatest, ImuLatest, LiveSensorProvider, SharedLiveProvider, StreamChange};
+pub use stream::{
+    FrameLatest, ImuLatest, LiveSensorProvider, SharedLiveProvider, StreamChange, VitalsLatest,
+};
 
 #[cfg(feature = "android")]
 pub use android::AndroidSensorProvider;

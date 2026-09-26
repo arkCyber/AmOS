@@ -54,6 +54,11 @@ describe("android LMK surface bridge (pure helpers)", () => {
 const W = (label: string): WmWindowInfo => ({
   id: 0,
   label,
+  // REQ-A473: the identity the host reports for a window (`""`/0 = "shows no app").
+  // These fixtures only exercise label/kind/external, so the identity is derived the same
+  // way `normalizeWindows` derives it: a `legacy:` surface shows no app.
+  app: label.startsWith("legacy:") ? "" : label,
+  instance: label.startsWith("legacy:") ? 0 : 1,
   kind: label.startsWith("legacy:") ? "System" : "App",
   state: "Shown",
   focused: false,
@@ -251,6 +256,22 @@ describe("lmk 桥接路径：宿主说不清的时候不许动手（REQ-A407）"
     expect(closed()).toEqual([]);
   });
 
+  test("对账：宿主**拒绝**了 wm_close ⇒ 计数只算真的关掉的（命令照发）(REQ-A845)", async () => {
+    // REQ-A845 / F-SH-271: `wm_close` 答 unit，`invoke` 从不 reject，拒绝与成功都到手是
+    // `null` —— 所以 `stale.length` 数的是**尝试**，文档却说"关掉了几个"。这里让宿主拒绝，
+    // 那条使唤照样要发出去（该关的还是得关），但**计数必须是 0**：屏幕上一个面都没少。
+    respond = (cmd) => {
+      if (cmd === "android_lmk_tasks") return [];
+      if (cmd === "wm_windows") {
+        return { windows: [W("legacy:waydroid_0"), W("legacy:waydroid_1")] };
+      }
+      if (cmd === "wm_close") throw new Error("wm core is locked");
+      return { ok: true };
+    };
+    await expect(reconcileLegacySurfaces()).resolves.toBe(0);
+    expect(closed()).toEqual(["legacy:waydroid_0", "legacy:waydroid_1"]);
+  });
+
   test("对账：宿主回了一个**不是数组**的 tasks ⇒ 0，不抛（守卫要对形状负责）", async () => {
     respond = (cmd) =>
       cmd === "android_lmk_tasks" ? { nope: "not an array" } : { windows: [W("legacy:x")] };
@@ -279,6 +300,7 @@ describe("lmk 事件驱动与定时对账（REQ-A407）", () => {
   test("lmk-surface 事件：要拆的面被关掉，并且顺手对账一次", async () => {
     respond = (cmd) => (cmd === "android_lmk_tasks" ? [T("waydroid_0")] : { windows: [] });
     const stop = await startLmkSurfaceWatcher();
+    expect(stop, "桥在，监听就该成立（否则下面的断言全都测不到东西）").not.toBeNull();
     listeners["lmk-surface"]!({ payload: RECLAIMED });
     await Promise.resolve(); // 让 void 出去的 promise 跑完
     expect(closed()).toEqual(["legacy:waydroid_0"]);
@@ -290,15 +312,15 @@ describe("lmk 事件驱动与定时对账（REQ-A407）", () => {
     expect(closed()).toEqual([]); // 冻结不拆
     expect(calls.some((c) => c.command === "android_lmk_tasks")).toBe(true); // 但对账照做
 
-    stop();
+    stop!();
     expect(listeners["lmk-surface"]).toBeUndefined();
   });
 
-  test("未桥接：watcher 退化成 no-op 的退订函数（不抛）", async () => {
+  test("未桥接：watcher 明确报告「没有订阅」（null），而不是一个可信的空退订（REQ-A838）", async () => {
     delete (globalThis as { window?: unknown }).window;
-    const stop = await startLmkSurfaceWatcher();
-    expect(typeof stop).toBe("function");
-    expect(() => stop()).not.toThrow();
+    // 旧契约在这里返回 `() => {}`，与"订阅成功、只是暂时没有事件"在调用方看来一模一样：
+    // 容器回收了界面却永远不拆，而壳层以为自己正在监听。现在"没在听"是可读的。
+    expect(await startLmkSurfaceWatcher()).toBeNull();
   });
 
   test("定时对账：立刻跑一次、按 intervalMs 挂表、stop() 真的清掉（不许泄漏）", async () => {

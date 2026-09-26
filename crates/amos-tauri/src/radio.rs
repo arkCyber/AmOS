@@ -18,7 +18,7 @@ use std::sync::{Arc, OnceLock};
 use crate::store::SharedStore;
 use amos_radio::{
     MockRadioProvider, RadioControl, RadioError, RadioManager, RadioMode, RadioProvider,
-    RadioSnapshot, SwitchableProvider,
+    RadioSnapshot, SwitchableProvider, SystemSurface,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -30,15 +30,16 @@ use crate::error::{AmosError, ErrorCode};
 /// renaming a variant is a wire break. Kept alongside the constants so callers
 /// can refer to the wire string without re-typing it.
 pub mod codes {
+    use crate::error::ErrorCode;
     /// Caller passed a radio key (`wifi` / `bluetooth` / …) the bridge does not know.
-    pub const UNKNOWN_KEY: &str = "amos.radio.unknown_key";
+    pub const UNKNOWN_KEY: &str = ErrorCode::RadioUnknownKey.as_str();
     /// The Bluetooth MAC address passed to `bluetooth_pair` is empty or too long.
-    pub const ADDRESS_INVALID: &str = "amos.radio.address_invalid";
+    pub const ADDRESS_INVALID: &str = ErrorCode::RadioAddressInvalid.as_str();
     /// Any radio / Bluetooth provider call failed (Mock refused; Android provider missing).
-    pub const RPC_FAILED: &str = "amos.radio.rpc_failed";
+    pub const RPC_FAILED: &str = ErrorCode::RadioRpcFailed.as_str();
     /// `radio_open_settings` was asked for a switch this app owns — there is no
     /// system surface to hand the user to.
-    pub const NO_SYSTEM_SURFACE: &str = "amos.radio.no_system_surface";
+    pub const NO_SYSTEM_SURFACE: &str = ErrorCode::RadioNoSystemSurface.as_str();
 }
 
 /// The provider every command goes through, and the seed the Mock was built from.
@@ -534,8 +535,15 @@ pub struct RadioRefusalPayload {
     /// refused, not the radio that was asked. `None` when only the detail is known:
     /// a guess is not a fact.
     pub radio: Option<String>,
-    /// For `platform_managed`: the system surface that owns the switch (same token
+    /// The system surface where the user can still work the switch by hand (same token
     /// space as `radio_control`), so the screen can offer the way out right here.
+    ///
+    /// Set for `platform_managed` (the switch is not the app's), and for a refused AP
+    /// attempt: the Wi-Fi AP is driven through `TetheringGlue`, whose call a normal
+    /// installs' `TETHER_PRIVILEGED`-less build can be refused — the refusal names no
+    /// cause (privilege, no upstream and no public tethering API are all possible), but
+    /// the system's tethering settings is where the user can still start it, so that
+    /// route is offered rather than a dead end (REQ-A1456).
     pub surface: Option<String>,
     /// For `platform_managed`: why the switch is not the app's (`switch_removed`, …).
     pub reason: Option<String>,
@@ -544,12 +552,20 @@ pub struct RadioRefusalPayload {
 }
 
 impl RadioRefusalPayload {
-    fn from_error(err: &RadioError) -> Self {
+    fn from_error(requested: RadioMode, err: &RadioError) -> Self {
         Self {
             kind: err.kind().to_string(),
             radio: err.radio().map(|r| r.key().to_string()),
             surface: match err {
                 RadioError::PlatformManaged { surface, .. } => Some(surface.key().to_string()),
+                // A refused *attempt* on the AP: the error carries no cause (the device
+                // could have refused for lack of `TETHER_PRIVILEGED`, for no upstream, or
+                // for no public tethering API), so no reason is claimed — but the AP is
+                // the one switch whose manual home is a system screen the user can reach,
+                // and leaving it a dead end is the defect this closes (REQ-A1456).
+                RadioError::Provider(_) if requested == RadioMode::Hotspot => {
+                    Some(SystemSurface::WirelessSettings.key().to_string())
+                }
                 _ => None,
             },
             reason: match err {
@@ -603,7 +619,7 @@ impl RadioSetPayload {
             requested,
             applied: false,
             state: state.map(Into::into),
-            refusal: Some(RadioRefusalPayload::from_error(&err)),
+            refusal: Some(RadioRefusalPayload::from_error(radio, &err)),
         }
     }
 }
@@ -632,8 +648,10 @@ pub async fn radio_control(
 /// Open the system surface that owns a platform-managed switch (REQ-A202).
 ///
 /// Resolves `true` when an Activity was started. A switch this app *can* flip has no
-/// system surface ("use `radio_set`"), and a platform that refuses the surface is an
-/// error — the screen never claims it handed the user somewhere.
+/// system surface ("use `radio_set`") — except the Wi-Fi AP, whose tethering call can be
+/// refused on a normal install and whose settings screen is therefore always offered —
+/// and a platform that refuses the surface is an error: the screen never claims it handed
+/// the user somewhere.
 #[tauri::command]
 pub async fn radio_open_settings(
     bridge: State<'_, RadioBridge>,
@@ -646,6 +664,17 @@ pub async fn radio_open_settings(
         )
     })?;
     match bridge.manager.control(radio).await {
+        // The AP is the one switch with a manual home even when this app *can* attempt
+        // it: a normal install's `TetheringGlue.setWifiTethering` call can be refused
+        // (no `TETHER_PRIVILEGED`, no upstream, no public tethering API), so the screen
+        // must be able to hand the user to the system's tethering settings instead of a
+        // dead end (REQ-A1456). Every other app-controlled radio has no such screen.
+        RadioControl::AppControlled if radio == RadioMode::Hotspot => bridge
+            .manager
+            .open_system_surface(SystemSurface::WirelessSettings)
+            .await
+            .map(|()| true)
+            .map_err(|e| AmosError::with_cause(ErrorCode::RadioRpcFailed, codes::RPC_FAILED, e)),
         RadioControl::AppControlled => Err(AmosError::new(
             ErrorCode::RadioNoSystemSurface,
             format!(
@@ -856,6 +885,37 @@ mod tests {
             "{:?}",
             refusal.detail
         );
+    }
+
+    #[test]
+    fn a_refused_ap_attempt_carries_the_tethering_settings_surface() {
+        // The AP is the one switch a normal install can *attempt* (through
+        // `TetheringGlue`) and be refused — no `TETHER_PRIVILEGED`, no upstream, or no
+        // public tethering API below Android 36. The error names none of those, so no
+        // reason may be claimed, but the user can still start it in the system's
+        // tethering settings; leaving that a dead end is the defect (REQ-A1456).
+        let p = RadioSetPayload::refused(
+            RadioMode::Hotspot,
+            true,
+            RadioError::Provider(
+                "the device refused to start Wi-Fi tethering (no TETHER_PRIVILEGED, no \
+                 upstream, or no public tethering API below Android 36)"
+                    .into(),
+            ),
+            Some(RadioSnapshot::default()),
+        );
+        let refusal = p.refusal.expect("a refusal rides with a refused set");
+        assert_eq!(refusal.kind, "provider_refused");
+        assert_eq!(
+            refusal.surface.as_deref(),
+            Some("wireless_settings"),
+            "the AP's refusal must offer the screen where it can still be switched"
+        );
+        assert_eq!(
+            refusal.reason, None,
+            "the refusal names no cause, so none may be claimed"
+        );
+        assert_eq!(p.radio, "hotspot");
     }
 
     #[test]

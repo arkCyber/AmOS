@@ -186,10 +186,15 @@ impl Translator for TranslatorService {
                                 // ASR wired: transcribe the audio frame to text and
                                 // stream it back (the client can then translate it).
                                 match r.transcribe(&audio, "", "").await {
-                                    Ok(text) if !text.is_empty() => {
-                                        // The consumer-gone rule lives in `deliver` — this branch
-                                        // used to discard the answer and keep running ASR for a
-                                        // client that had already left.
+                                    // Exactly **one** reply per inbound frame: `GrpcPipeline::
+                                    // feed_audio` pairs one read with each audio write, so an
+                                    // empty transcription (silence — routine in continuous
+                                    // interpretation) must still be answered, or the client hangs
+                                    // until its response timeout and tears the stream down. The
+                                    // consumer-gone rule lives in `deliver` — this branch used to
+                                    // discard the answer and keep running ASR for a client that
+                                    // had already left. (REQ-A592 / F-TR-001)
+                                    Ok(text) => {
                                         if !deliver(
                                             &tx,
                                             TranslateOut {
@@ -202,7 +207,6 @@ impl Translator for TranslatorService {
                                             break;
                                         }
                                     }
-                                    Ok(_) => {}
                                     Err(e) => {
                                         // Nobody left to tell if this fails — the same documented
                                         // case as the text branch above; the `break` is the point.

@@ -6,7 +6,7 @@
  */
 import { describe, expect, test } from "vitest";
 import { matchesShortcut } from "../keyboardConfigHook.svelte";
-import type { ShellShortcut } from "../shellModule";
+import { shortcutMatches, type ShellShortcut } from "../shellModule";
 
 /**
  * Minimal `KeyboardEvent` substitute — `matchesShortcut` only ever reads
@@ -51,4 +51,50 @@ describe("matchesShortcut", () => {
     const s: ShellShortcut = { key: "Escape", meta: true };
     expect(matchesShortcut(s, fakeKey("Escape") as KeyboardEvent)).toBe(false);
   });
+
+  /*
+   * The modifier truth table. `keyboardConfigHook.matchesShortcut` used to implement its
+   * own version of this, which drifted from `shellModule.shortcutMatches` (the bar's
+   * `shortcutAria`/the native accelerator path read that one). Two matchers for one
+   * registry is the silent-defect shape: a user binds ⌘W, the bar renders ⌘W, and the
+   * key never fires. The fix made them one table; these cases pin the table **and** the
+   * parity, so a future edit to either alone fails here.
+   */
+  const TABLE: Array<[ShellShortcut, Parameters<typeof fakeKey>[0], Parameters<typeof fakeKey>[1], boolean]> = [
+    // ── implicit Ctrl-as-⌘: a Meta binding also accepts the physical Ctrl key ──
+    [{ key: "W", meta: true }, "w", { metaKey: true }, true],
+    [{ key: "W", meta: true }, "w", { ctrlKey: true }, true],
+    [{ key: "W", meta: true }, "w", {}, false],
+    // ── `ctrl: true` beside `meta`: **both** physical modifiers (REQ-A1568) ──
+    // This row used to be named "Ctrl AND ⌘" while matching ⌘ alone, so writing `ctrl` only
+    // disabled the implicit Ctrl-as-⌘ fold. A binding that names both is the one shape that
+    // can reach a chord the ⌘ family does not already own, and accepting ⌘ alone would both
+    // ignore the user's ⌃ and steal the app's ⌘ chord (`lib/stageKeys.ts`'s ⌃⌘S).
+    [{ key: "W", meta: true, ctrl: true }, "w", { metaKey: true }, false],
+    [{ key: "W", meta: true, ctrl: true }, "w", { ctrlKey: true }, false],
+    [{ key: "W", meta: true, ctrl: true }, "w", { metaKey: true, ctrlKey: true }, true],
+    // ── pure Ctrl: the physical Ctrl key, and ⌘ must not be down ──
+    [{ key: "ArrowUp", ctrl: true }, "ArrowUp", { ctrlKey: true }, true],
+    [{ key: "ArrowUp", ctrl: true }, "ArrowUp", { metaKey: true }, false],
+    [{ key: "ArrowUp", ctrl: true }, "ArrowUp", { metaKey: true, ctrlKey: true }, false],
+    [{ key: "ArrowUp", ctrl: true }, "ArrowUp", {}, false],
+    // ── no modifier: Meta or Ctrl belongs to a more specific binding ──
+    [{ key: "Escape" }, "Escape", {}, true],
+    [{ key: "Escape" }, "Escape", { metaKey: true }, false],
+    [{ key: "Escape" }, "Escape", { ctrlKey: true }, false],
+  ];
+
+  for (const [s, key, mods, want] of TABLE) {
+    const label = `${JSON.stringify(s)} + ${key}${JSON.stringify(mods)}`;
+    test(`matchesShortcut: ${label} → ${want}`, () => {
+      expect(matchesShortcut(s, fakeKey(key, mods) as KeyboardEvent)).toBe(want);
+    });
+    test(`parity with shellModule.shortcutMatches: ${label}`, () => {
+      // Same registry, two call sites (shell chrome vs. the bar/accelerator path) — the
+      // two matchers must agree on every row or one of them is lying about the binding.
+      expect(matchesShortcut(s, fakeKey(key, mods) as KeyboardEvent)).toBe(
+        shortcutMatches(fakeKey(key, mods), s),
+      );
+    });
+  }
 });

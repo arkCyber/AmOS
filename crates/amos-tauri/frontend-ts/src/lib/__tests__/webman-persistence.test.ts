@@ -47,7 +47,7 @@ import {
   saveTabs,
   createTab,
   closeTab,
-  formatTime,
+  timeLabel,
   formatFileSize,
   applySafeSearch,
   type Bookmark,
@@ -56,10 +56,17 @@ import {
   type Tab,
 } from "../webman";
 import { readQuarantine } from "../amosStore";
+import { STATUSES } from "../webmanDownloads";
 
 // ── 内存 localStorage（+ 可切换的写失败 + 一次性"另一个窗口先写了一步"）──────────
 const memory = new Map<string, string>();
 let failWrites = false;
+
+/**
+ * 只拒**若干次**，之后恢复。用来验「调用方的重试循环真的还在跑」——
+ * 一个把写盘裁决丢掉的写者会把自己的重试循环在第 1 次之后就短路掉（REQ-A1329）。
+ */
+let failWritesTimes = 0;
 
 /**
  * 纯批次是**单进程**，所以"读 → 校验版本 → 写"之间没有真正的并发。乐观锁的**冲突**
@@ -92,6 +99,10 @@ const stub = {
       return memory.has(key) ? memory.get(key)! : null;
     },
     setItem: (key: string, value: string) => {
+      if (failWritesTimes > 0) {
+        failWritesTimes--;
+        throw new Error("QuotaExceededError");
+      }
       if (failWrites) throw new Error("QuotaExceededError");
       memory.set(key, String(value));
     },
@@ -120,6 +131,7 @@ afterAll(() => {
 beforeEach(() => {
   memory.clear();
   failWrites = false;
+  failWritesTimes = 0;
   interleave = null; // 一个用例没消费掉的钩子不许漏给下一个用例
 });
 
@@ -258,7 +270,7 @@ describe("历史持久化", () => {
     expect(read(HISTORY_KEY)).toEqual({ version: 0, data: [] });
   });
 
-  test("searchHistory：空查询给最近 20 条、命中 url 或 title、大小写不敏感、null 回空", () => {
+  test("searchHistory：空查询给整段历史、命中 url 或 title、大小写不敏感、null 回空", () => {
     seed(
       HISTORY_KEY,
       Array.from({ length: 25 }, (_, i) => ({
@@ -267,8 +279,11 @@ describe("历史持久化", () => {
         visitedAt: 100 - i,
       })) as HistoryEntry[],
     );
-    expect(searchHistory("")).toHaveLength(20);
-    expect(searchHistory("   ")).toHaveLength(20); // 纯空白与空串同义（本轮修的矛盾）
+    // 不再截到 20 条（REQ-A1292）：历史面板把它当作「历史记录」画出来，上方就是清空
+    // **全部**的那颗按钮 —— 一个看不见边界的窗口会让用户以为 20 条就是全部。
+    expect(loadHistory()).toHaveLength(25);
+    expect(searchHistory("")).toEqual(loadHistory());
+    expect(searchHistory("   ")).toEqual(loadHistory()); // 纯空白与空串同义（本轮修的矛盾）
     expect(searchHistory(null as any)).toEqual([]);
     expect(searchHistory("needle").map((h) => h.title)).toEqual(["Needle"]);
     expect(searchHistory("SITE7").map((h) => h.url)).toEqual(["https://site7.example/"]);
@@ -331,6 +346,23 @@ describe("下载持久化", () => {
     expect(updateDownload("", 10)).toBe(false);
   });
 
+  test("未知总量存成 null 而不是 0，且读回来仍在（REQ-A1613 / F-SH-822）", () => {
+    const added = addDownload("https://example.com/stream")!;
+    // 分块响应（无 Content-Length）：宿主报 `total: null` ⇒ 百分比**说不出来** ⇒ 存 `null`，
+    // 而不是把行里那个 `0` 当成进度。把未知折成 `0` 会让进度条与标签印「0%」（见
+    // `WebManApp.svelte`），而同一张卡的字节行此刻正不印总数。
+    expect(updateDownload(added.id, null, "downloading")).toBe(true);
+    const row = loadDownloads()[0]!;
+    expect(row.progress).toBeNull();
+    expect(row.status).toBe("downloading");
+    // 读侧的验证器必须**放行** `null` —— 否则这条正在下载的行会在下次加载时整行消失
+    // （正是 `updateDownload` 里那条 `NaN` 注释警告的形状）。
+    expect(loadDownloads()).toHaveLength(1);
+    // 反向半边：`null` 合法不等于"什么都收" —— `NaN` 仍被拒（REQ-A405 不被削弱）。
+    expect(updateDownload(added.id, Number.NaN)).toBe(false);
+    expect(updateDownload(added.id, 150)).toBe(false);
+  });
+
   test("removeDownload 删除；未知 id 回 false", () => {
     const added = addDownload("https://example.com/f")!;
     expect(removeDownload(added.id)).toBe(true);
@@ -353,6 +385,32 @@ describe("下载持久化", () => {
       { id: "bad-progress", url: OK_URL, filename: "f", progress: 200, status: "pending", createdAt: 3 },
     ] as Download[]);
     expect(loadDownloads().map((d) => d.id)).toEqual(["ok"]);
+  });
+
+  test("store 认得的下载状态恰好是桥声明的那些（REQ-A659）", () => {
+    // The bridge's `STATUSES` is the single declaration, bound to the Rust `DownloadStatus`
+    // enum by `vocabMirror.test.ts`. Before REQ-A659 the store re-typed its own list next to
+    // it, so a status Rust/bridge added could be accepted on one side and silently dropped by
+    // `loadDownloadStore` on the other — the exact data loss REQ-A405 fixed, one file over.
+    expect(STATUSES.length).toBeGreaterThan(0);
+    seed(
+      DOWNLOADS_KEY,
+      STATUSES.map((status, i) => ({
+        id: `s${i}`,
+        url: OK_URL,
+        filename: "f",
+        progress: 0,
+        status,
+        createdAt: i,
+      })) as Download[],
+    );
+    // Read side: every status the bridge declares survives a reload (none is filtered out).
+    expect(loadDownloads().map((d) => d.status)).toEqual([...STATUSES]);
+    // Write side: every one is accepted, so no row the UI keeps is un-persistable.
+    for (const status of STATUSES) {
+      const row = addDownload(OK_URL)!;
+      expect(updateDownload(row.id, 10, status), status).toBe(true);
+    }
   });
 
   test("达到上限后拒绝新增", () => {
@@ -446,13 +504,45 @@ describe("标签页持久化", () => {
   });
 });
 
+// ── 「正在加载」不是会话状态（REQ-A1376 / FMEA F-SH-640）────────────────────────
+describe("盘上带着 `loading: true` 回来的标签页，读侧必须把它归零", () => {
+  // 「加载完」是由 `WebManApp::markLoading` 排的一枚 800ms 定时器宣布的，而那枚定时器挂在
+  // 组件的生命周期上。一次在那 800ms 窗口里结束的会话（关窗 ∕ 崩溃 ∕ 断电）会在盘上留下
+  // `loading: true`，而下一个组件里**没有任何东西**能熄掉它 —— 标签条永远转圈，地址栏左端
+  // 那个字形（隐私模式的唯一那一面）被永久盖住。这里钉住读侧的那一次归零。
+  test("读侧把 `loading: true` 归一化成 `false`", () => {
+    seed(TABS_KEY, [
+      { id: "tab-1", url: OK_URL, title: "t", loading: true, scrollY: 0, pinned: false },
+    ] as Tab[]);
+    expect(loadTabs().map((t) => t.loading)).toEqual([false]);
+  });
+
+  test("对照组：本来就 `false` 的照旧是 `false`，往返一次也不变", () => {
+    seed(TABS_KEY, [
+      { id: "tab-1", url: OK_URL, title: "t", loading: false, scrollY: 0, pinned: false },
+    ] as Tab[]);
+    expect(loadTabs().map((t) => t.loading)).toEqual([false]);
+    saveTabs(loadTabs());
+    expect(loadTabs().map((t) => t.loading)).toEqual([false]);
+  });
+
+  test("落盘的那一行仍**带着** `loading` 这个布尔字段（读侧的必填过滤看得见它）", () => {
+    // 负控方向：顺手把字段从写侧删掉会让 `typeof t.loading === 'boolean'` 失败 ⇒
+    // **整行标签页**被读侧的过滤丢掉。字段必须在，只是值只能是 `false`。
+    saveTabs([createTab(OK_URL)]);
+    const row = read(TABS_KEY).data[0];
+    expect(typeof row.loading).toBe("boolean");
+    expect(row.loading).toBe(false);
+  });
+});
+
 // ── 安全搜索的域名边界（本轮修复的缺陷回归）───────────────────────────────────
 describe("version 不是数字的 store 仍然可写（REQ-A404）", () => {
   // 读侧把非数字 version 归一化为 0（`loadXStore`），写侧却拿**原值**比对
   // （`current.version !== expectedVersion`）⇒ `undefined !== 0`，于是每一次写都失败、
-  // 重试 3 次后放弃：**这份 store 永远写不进去**，而 `addToHistory` 的返回值是 void
-  // ⇒ 用户看不到任何提示。一个"有行、没 version"的 store（旧版本/导入器/手工编辑）
-  // 一次加载即可复现，不需要任何并发。
+  // 重试 3 次后放弃：**这份 store 永远写不进去**，而当时 `addToHistory` 签 void
+  // ⇒ 用户看不到任何提示（REQ-A1357 已让它回报裁决）。一个"有行、没 version"的 store
+  // （旧版本/导入器/手工编辑）一次加载即可复现，不需要任何并发。
   test("播种 `{ data: [] }`（无 version）后 addToHistory 仍能落盘", () => {
     memory.set(HISTORY_KEY, JSON.stringify({ data: [] }));
     addToHistory(OK_URL, "标题");
@@ -538,12 +628,20 @@ describe("store 形状不对 ⇒ 读侧重置，不崩（REQ-A405）", () => {
 
 
 describe("写入被存储拒绝 ⇒ 重试 3 次后如实放弃（REQ-A405）", () => {
-  test("历史：addToHistory 是 void，但**一条都没落盘**（失败不得被读成成功）", () => {
-    addToHistory(OK_URL, "写不进去");
+  test("历史：拒写 ⇒ addToHistory 回报 false，且**一条都没落盘**（失败不得被读成成功）", () => {
+    expect(addToHistory(OK_URL, "写得进去")).toBe(true);
     expect(loadHistory()).toHaveLength(1); // 先证明这条路径平时是通的
     failWrites = true;
-    addToHistory("https://example.com/second", "写不进去");
+    expect(addToHistory("https://example.com/second", "写不进去")).toBe(false);
     expect(loadHistory().map((h) => h.url)).toEqual([OK_URL]); // 没有半条记录
+  });
+
+  test("历史：隐私模式**有意不记** ⇒ 也回 false，但盘上没有半条（与拒写区分在调用方）", () => {
+    expect(addToHistory(OK_URL, "隐私", true)).toBe(false);
+    expect(loadHistory()).toHaveLength(0);
+    // 存储是好的：一个非隐私的写立刻进得去 —— 证明上面那个 false 不是拒写。
+    expect(addToHistory(OK_URL, "公开")).toBe(true);
+    expect(loadHistory().map((h) => h.url)).toEqual([OK_URL]);
   });
 
   test("书签 removeBookmark：删除被拒 ⇒ false，条目还在；好起来之后能删掉", () => {
@@ -561,25 +659,72 @@ describe("写入被存储拒绝 ⇒ 重试 3 次后如实放弃（REQ-A405）", 
     failWrites = true;
     expect(updateDownload(d.id, 42)).toBe(false);
     expect(removeDownload(d.id)).toBe(false);
-    clearCompletedDownloads(); // void：只能验"没落盘"
+    expect(clearCompletedDownloads()).toBe(false); // 拒写 ⇒ 判定为 false，而不是无从知道
     expect(loadDownloads().map((x) => x.id)).toEqual([d.id]);
     expect(loadDownloads()[0]?.progress).toBe(0);
     failWrites = false;
     expect(updateDownload(d.id, 42, "downloading")).toBe(true);
     expect(loadDownloads()[0]).toMatchObject({ progress: 42, status: "downloading" });
-    clearCompletedDownloads();
+    expect(clearCompletedDownloads()).toBe(true); // 没有可清的 ⇒ 写入仍落盘，判定成功
     expect(loadDownloads()).toHaveLength(1); // 未完成的还在
     expect(updateDownload(d.id, 100, "completed")).toBe(true);
-    clearCompletedDownloads();
+    expect(clearCompletedDownloads()).toBe(true);
     expect(loadDownloads()).toEqual([]);
   });
 
-  test("标签页：saveTabs 是 void，但失败时读回来还是旧内容", () => {
-    saveTabs([createTab("https://example.com")]);
+  test("标签页：saveTabs 如实回报裁决（拒写 ⇒ false 且读回来还是旧内容；能写 ⇒ true）", () => {
+    // 修前这一条叫「saveTabs 是 void，但失败时读回来还是旧内容」—— 它把「调用方收不到
+    // 裁决」当成背景条件钉了下来。REQ-A1350 / FMEA F-SH-613 之后这句话不再是事实
+    // （`saveTabs` 问过存储才作答），标题与断言一起改。
+    expect(saveTabs([createTab("https://example.com")])).toBe(true);
     const before = loadTabs();
     failWrites = true;
-    saveTabs(before.map((t) => ({ ...t, scrollY: 99 })));
+    expect(saveTabs(before.map((t) => ({ ...t, scrollY: 99 })))).toBe(false);
     expect(loadTabs().map((t) => t.scrollY)).toEqual(before.map((t) => t.scrollY));
+    failWrites = false;
+    expect(saveTabs(before.map((t) => ({ ...t, scrollY: 99 })))).toBe(true);
+    expect(loadTabs().map((t) => t.scrollY)).toEqual([99]);
+  });
+
+  test("历史：addToHistory 的**第一次**写被拒 ⇒ 那条记录（重试后）仍然落盘", () => {
+    addToHistory(OK_URL, "第一");
+    expect(loadHistory()).toHaveLength(1); // 先证明这条路径平时是通的
+    failWritesTimes = 1; // 只拒一次：配额瞬满 / 桥抖一下，下一次就能写
+    addToHistory("https://example.com/second", "第二");
+    // 两条都在（顺序不钉：同一毫秒内 `visitedAt` 相等，排序是并列的）。
+    expect(loadHistory().map((h) => h.url).sort()).toEqual([
+      "https://example.com/page",
+      "https://example.com/second",
+    ]);
+  });
+
+  test("标签页：saveTabs 的**第一次**写被拒 ⇒ 新的滚动位置（重试后）仍然落盘", () => {
+    saveTabs([createTab("https://example.com")]);
+    const before = loadTabs();
+    failWritesTimes = 1;
+    saveTabs(before.map((t) => ({ ...t, scrollY: 99 })));
+    expect(loadTabs().map((t) => t.scrollY)).toEqual([99]);
+  });
+
+  test("历史：clearHistory 问过存储才作答（拒写 ⇒ false 且记录还在；能写 ⇒ true）", () => {
+    addToHistory(OK_URL, "还在");
+    failWrites = true;
+    expect(clearHistory()).toBe(false); // 不再是 void：调用方知道这次没清掉
+    expect(loadHistory()).toHaveLength(1);
+    failWrites = false;
+    expect(clearHistory()).toBe(true);
+    expect(loadHistory()).toEqual([]);
+  });
+
+  test("设置：saveSettings 问过存储才作答（拒写 ⇒ false 且读回来还是旧值）", () => {
+    saveSettings({ homepage: "https://example.com/home" });
+    expect(loadSettings().homepage).toBe("https://example.com/home");
+    failWrites = true;
+    expect(saveSettings({ homepage: "https://example.com/other" })).toBe(false);
+    expect(loadSettings().homepage).toBe("https://example.com/home");
+    failWrites = false;
+    expect(saveSettings({ homepage: "https://example.com/other" })).toBe(true);
+    expect(loadSettings().homepage).toBe("https://example.com/other");
   });
 });
 
@@ -644,7 +789,7 @@ describe("输入校验：标题 / ID / 进度（REQ-A405）", () => {
   });
 });
 
-describe("closeTab / formatTime / formatFileSize 的边界（REQ-A405）", () => {
+describe("closeTab / timeLabel / formatFileSize 的边界（REQ-A405）", () => {
   test("closeTab：空 id 原样返回；id 不存在原样返回（不得丢掉用户的标签）", () => {
     const tabs = [createTab("https://a.com"), createTab("https://b.com")];
     expect(closeTab(tabs, "")).toBe(tabs);
@@ -660,24 +805,30 @@ describe("closeTab / formatTime / formatFileSize 的边界（REQ-A405）", () =>
     expect(after[0]!.url).toBe("");
   });
 
-  test("formatTime：非法 / 越界时间戳回「未知时间」而不是 Invalid Date", () => {
-    expect(formatTime(-1)).toBe("未知时间");
-    expect(formatTime(NaN)).toBe("未知时间");
-    expect(formatTime(Infinity)).toBe("未知时间");
-    expect(formatTime(1e20)).toBe("未知时间"); // Number.isFinite 通过，但 Date 已越界
-    expect(formatTime("123" as unknown as number)).toBe("未知时间");
+  test("timeLabel：非法 / 越界时间戳回 unknown，而不是 Invalid Date", () => {
+    expect(timeLabel(-1).kind).toBe("unknown");
+    expect(timeLabel(NaN).kind).toBe("unknown");
+    expect(timeLabel(Infinity).kind).toBe("unknown");
+    expect(timeLabel(1e20).kind).toBe("unknown"); // Number.isFinite 通过，但 Date 已越界
+    expect(timeLabel("123" as unknown as number).kind).toBe("unknown");
   });
 
-  test("formatTime：今天给时刻、昨天给「昨天」、一周内给星期、更早给月日", () => {
+  test("timeLabel：今天给时刻、昨天给 yesterday、一周内给星期、更早给月日", () => {
     const now = Date.now();
-    expect(formatTime(now)).toMatch(/\d/);
-    expect(formatTime(now - 86400000)).toBe("昨天");
-    expect(["周日", "周一", "周二", "周三", "周四", "周五", "周六"]).toContain(
-      formatTime(now - 3 * 86400000),
-    );
-    const old = formatTime(now - 30 * 86400000);
-    expect(old).not.toBe("未知时间");
-    expect(old).not.toBe("昨天");
+    const today = timeLabel(now);
+    expect(today.kind).toBe("clock");
+    expect(today.kind === "clock" && today.text).toMatch(/\d/);
+    expect(timeLabel(now - 86400000).kind).toBe("yesterday");
+    expect(timeLabel(now - 3 * 86400000).kind).toBe("weekday");
+    // 更早：给日期，不是 yesterday/unknown
+    expect(timeLabel(now - 30 * 86400000).kind).toBe("date");
+  });
+
+  test("timeLabel：clock/weekday/date 的文本跟随 locale（英文界面不出现中文）", () => {
+    const now = Date.now();
+    const d = timeLabel(now - 3 * 86400000, "en");
+    expect(d.kind).toBe("weekday");
+    expect(d.kind === "weekday" && /[一-鿿]/.test(d.text)).toBe(false);
   });
 
   test("formatFileSize：单位台阶与非法值", () => {
@@ -713,6 +864,17 @@ describe("logger.debug 只在 DEV 打开（生产构建里不进日志）（REQ-
       if (previous === undefined) delete env.DEV;
       else env.DEV = previous;
     }
+  });
+});
+
+// ── `canceled` 是一个新的终态：真实下载管线（lib/webmanDownloads.ts）会写它。
+//    这里钉住存储契约的读侧——写进去的行必须能读回来（REQ-A405 那一类"写了读不回"）。
+describe("canceled 状态可落盘且可读回", () => {
+  test("canceled 行不会被读侧当成协议外状态丢掉", () => {
+    const d = addDownload(OK_URL, "a.bin")!;
+    updateDownload(d.id, 30, "downloading");
+    expect(updateDownload(d.id, 0, "canceled")).toBe(true);
+    expect(loadDownloads()[0]).toMatchObject({ progress: 0, status: "canceled" });
   });
 });
 

@@ -23,6 +23,7 @@
 //! than one `false`. A host without `AlarmManager` answers `host_only` instead of pretending.
 //! While the process is alive, a poll thread can still sleep until `next_at`, then `poll`.
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -52,6 +53,28 @@ pub const MAX_ALARM_ID_BYTES: usize = 256;
 /// cap counts distinct ids, not calls.
 pub const MAX_ALARM_ENTRIES: usize = 256;
 
+/// How far into the future an alarm may be set (one year, in ms).
+///
+/// `setExactAndAllowWhileIdle` with an absurd `atMs` is *accepted* by the platform and then
+/// never fires in any horizon the UI can render (a `u64::MAX`-ish instant is ~584 million
+/// years away) — an alarm the user believes is armed but which is effectively unreachable
+/// (F-ALM-002). One year is far beyond any real alarm (the longest real case is a yearly
+/// reminder) and is refused as an honest `DeviceOutcome::Unknown` rather than rounded up to
+/// "scheduled".
+pub const MAX_ALARM_HORIZON_MS: u64 = 366 * 24 * 60 * 60 * 1_000;
+
+/// Per-id re-register window (ms) inside which an identical `(id, atMs)` registration is
+/// treated as idempotent at the JNI seam.
+///
+/// The WebView re-arms on every state reconciliation, so the same `(id, atMs)` can arrive
+/// twice in a frame. The ledger already coalesces it (`ExactAlarmClock::register` replaces),
+/// but the **device** path did not: each call crossed JNI and called
+/// `AlarmManager.setExactAndAllowWhileIdle` again. 250 ms is longer than any realistic double
+/// dispatch (a frame is ≤16 ms on a phone, ≤50 ms on a slow first paint) and far shorter than
+/// any real "arm, then edit, then re-arm" gesture — so a genuine edit (a new `atMs`) is never
+/// swallowed by the window.
+pub const ARM_IDEMPOTENT_WINDOW_MS: u64 = 250;
+
 /// Wall-clock epoch (ms) now, never panicking / never negative.
 fn now_ms() -> u64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
@@ -60,9 +83,27 @@ fn now_ms() -> u64 {
     }
 }
 
+/// What the last device arm for one id observed, so a re-register inside
+/// [`ARM_IDEMPOTENT_WINDOW_MS`] can be answered without a second JNI call.
+#[derive(Clone, Debug)]
+struct ArmRecord {
+    at_ms: u64,
+    /// Wall-clock ms of the arm that produced `outcome`.
+    at: u64,
+    outcome: DeviceOutcome,
+}
+
 /// Process-shared exact-alarm ledger the three commands operate on.
 pub struct AlarmSchedState {
     inner: Mutex<ExactAlarmClock>,
+    /// Last device-arm observation per id (the idempotency window). Kept alongside the
+    /// ledger because it is a statement about the **OS** call, not about the ledger — but its
+    /// **lifetime is tied to the ledger row it describes**: only an arm the ledger kept is
+    /// recorded, and the observation is dropped wherever the row is (a cancel, a poll that
+    /// fires it). An observation that outlives its row suppresses a duplicate from an arm
+    /// nobody holds — the answer says `scheduled` while the alarm is in neither half — and the
+    /// map grows with every id the caller ever used (REQ-A1265).
+    device: Mutex<HashMap<String, ArmRecord>>,
 }
 
 impl Default for AlarmSchedState {
@@ -75,6 +116,7 @@ impl AlarmSchedState {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(ExactAlarmClock::new()),
+            device: Mutex::new(HashMap::new()),
         }
     }
 
@@ -85,16 +127,26 @@ impl AlarmSchedState {
 
     /// Cancel a pending alarm; returns whether it was present.
     pub fn cancel(&self, id: &str) -> bool {
-        self.lock().cancel(&JobId::new(id))
+        let removed = self.lock().cancel(&JobId::new(id));
+        // The row is gone, so the observation that described it is gone too (REQ-A1265).
+        self.forget_observation(id);
+        removed
     }
 
     /// Fire & return the ids whose time has arrived by `now`.
     pub fn poll(&self, now: u64) -> Vec<String> {
-        self.lock()
+        let fired: Vec<String> = self
+            .lock()
             .due(now)
             .into_iter()
             .map(|id| id.as_str().to_owned())
-            .collect()
+            .collect();
+        // A fired alarm is no longer outstanding either — same rule as `cancel`, and what keeps
+        // the observation map bounded by the ledger rather than by history (REQ-A1265).
+        for id in &fired {
+            self.forget_observation(id);
+        }
+        fired
     }
 
     /// Earliest future wake instant (feeds an OS exact-wake / poll sleep).
@@ -121,6 +173,44 @@ impl AlarmSchedState {
     fn lock(&self) -> std::sync::MutexGuard<'_, ExactAlarmClock> {
         // Poison-recover: a panicked writer must never deadlock the commands.
         self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// The cached device observation for `(id, at_ms)`, when a previous arm happened inside the
+    /// idempotency window. A different `atMs` is a genuine edit, never a duplicate.
+    ///
+    /// There is no need to re-ask the ledger here: an entry exists only for an arm the ledger
+    /// **kept**, and every way a row goes away ([`Self::cancel`], a poll that fires it) drops the
+    /// observation with it — so a hit is always a duplicate of an arm that is still outstanding
+    /// (REQ-A1265).
+    fn cached_arm(&self, id: &str, at_ms: u64, now: u64) -> Option<DeviceOutcome> {
+        let device = self.device.lock().unwrap_or_else(|p| p.into_inner());
+        let rec = device.get(id)?;
+        if rec.at_ms == at_ms && now.saturating_sub(rec.at) < ARM_IDEMPOTENT_WINDOW_MS {
+            Some(rec.outcome.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Drop the cached observation for `id` — the companion of dropping its ledger row.
+    fn forget_observation(&self, id: &str) {
+        let mut device = self.device.lock().unwrap_or_else(|p| p.into_inner());
+        device.remove(id);
+    }
+
+    /// Remember what the device answered for `(id, at_ms)` — the input to the next
+    /// `cached_arm` within the window. Called **only** for an arm the ledger kept, so the map's
+    /// keys are a subset of the ledger's (and it is bounded by [`MAX_ALARM_ENTRIES`] with them).
+    fn record_arm(&self, id: &str, at_ms: u64, now: u64, outcome: &DeviceOutcome) {
+        let mut device = self.device.lock().unwrap_or_else(|p| p.into_inner());
+        device.insert(
+            id.to_string(),
+            ArmRecord {
+                at_ms,
+                at: now,
+                outcome: outcome.clone(),
+            },
+        );
     }
 }
 
@@ -151,6 +241,20 @@ pub enum DeviceOutcome {
     Denied,
     /// The glue's own words when they are none of the above — surfaced verbatim, never rounded up.
     Unknown(String),
+}
+
+impl DeviceOutcome {
+    /// Whether this outcome means the alarm is (or can be) really held.
+    ///
+    /// The ledger may only keep an entry for an alarm the OS accepted (`Scheduled`) or for a
+    /// host where the ledger *is* the whole mechanism (`HostOnly`). Every other state —
+    /// `Disallowed`, `Denied`, `Unavailable`, `Unattached`, `Unknown(…)`, and the `atMs`
+    /// refusals which surface as `Unknown` — means **the OS does not hold this alarm**, and an
+    /// entry that stays in the ledger would make the WebView's poll fire a reminder for a phone
+    /// that was never woken (the exact lie F-ALM-001 is about).
+    fn keeps_ledger(&self) -> bool {
+        matches!(self, DeviceOutcome::Scheduled | DeviceOutcome::HostOnly)
+    }
 }
 
 /// Map one `AlarmGlue.STATUS_*` string onto the typed outcome.
@@ -210,11 +314,73 @@ pub fn scheduler_alarm_register(
     id: String,
     at_ms: u64,
 ) -> Result<AlarmArmed, String> {
-    check_alarm_id(&id)?;
-    check_alarm_capacity(&state, &id)?;
-    state.register(id.clone(), at_ms);
-    let device = arm_device(&id, at_ms);
-    Ok(AlarmArmed { id, at_ms, device })
+    register_with(&state, &id, at_ms, now_ms(), arm_device)
+}
+
+/// The whole register decision, factored out of the command so it is testable without a Tauri
+/// `State` **and with an injectable device arm**: the caller passes the function that performs
+/// the OS half (`arm_device` in production; a counting stub in the tests). That is what lets the
+/// ledger-rollback and idempotency rules be pinned on a host with no `AlarmManager`.
+///
+/// Order matters and is deliberate:
+/// 1. the id and the ledger cap are command-seam refusals (an `Err`, nothing happened);
+/// 2. `atMs` is validated **before** the device call and answered as a `DeviceOutcome::Unknown`
+///    (a state the UI can render), with the ledger rolled back so a refused instant cannot hide
+///    behind an older entry;
+/// 3. an identical `(id, atMs)` inside [`ARM_IDEMPOTENT_WINDOW_MS`] **for an alarm the ledger
+///    still holds** returns the last observed outcome without a second JNI call;
+/// 4. otherwise the device is asked, and the ledger keeps the entry **only** when the outcome is
+///    `Scheduled`/`HostOnly` ([`DeviceOutcome::keeps_ledger`]) — every refusal removes it, and
+///    only a kept arm is cached (a refusal has nothing to suppress, and it is a state the user
+///    can change in Settings, so the next register must ask again rather than replay a verdict).
+fn register_with<S>(
+    state: &AlarmSchedState,
+    id: &str,
+    at_ms: u64,
+    now: u64,
+    arm: S,
+) -> Result<AlarmArmed, String>
+where
+    S: FnOnce(&str, u64) -> DeviceOutcome,
+{
+    check_alarm_id(id)?;
+    check_alarm_capacity(state, id)?;
+
+    if let Err(reason) = check_alarm_at_ms(at_ms, now) {
+        // An instant we refuse must not sit in the ledger pretending to be armed: drop any
+        // previous entry for this id, then answer with the honest device state.
+        state.cancel(id);
+        return Ok(AlarmArmed {
+            id: id.to_string(),
+            at_ms,
+            device: DeviceOutcome::Unknown(reason),
+        });
+    }
+
+    if let Some(cached) = state.cached_arm(id, at_ms, now) {
+        return Ok(AlarmArmed {
+            id: id.to_string(),
+            at_ms,
+            device: cached,
+        });
+    }
+
+    let device = arm(id, at_ms);
+    if device.keeps_ledger() {
+        state.register(id.to_string(), at_ms);
+        // Cached for the next identical register — and only here, so the observation map is
+        // keyed by the ids the ledger holds and can never answer for one it does not (REQ-A1265).
+        state.record_arm(id, at_ms, now, &device);
+    } else {
+        // The OS did not take it: roll the ledger back so the poll cannot fire a reminder for a
+        // phone that was never armed (F-ALM-001).
+        state.cancel(id);
+    }
+    Ok(AlarmArmed {
+        id: id.to_string(),
+        at_ms,
+        device,
+    })
 }
 
 /// Cancel a pending alarm: the ledger answer (`was_registered`, the old return value)
@@ -261,24 +427,42 @@ fn open_device_settings() -> Result<bool, String> {
 
 #[cfg(feature = "android")]
 pub(crate) fn arm_device(id: &str, at_ms: u64) -> DeviceOutcome {
+    // Re-validate at the **device seam**, not only at the command: this is the last code before
+    // the id becomes a JNI `jstring` / a `PendingIntent` data URI, and an invalid id reaching
+    // either is a bug the command seam would have caught only if every caller went through it.
+    if let Err(reason) = check_alarm_id(id) {
+        return DeviceOutcome::Unknown(format!("refused at the device seam: {reason}"));
+    }
     android::schedule(id, at_ms)
 }
 
 /// Desktop / CI: there is no `AlarmManager` here, and saying so is the answer.
+///
+/// The id is still checked so the *host* path answers exactly what the device seam would for a
+/// malformed id — otherwise desktop and device would disagree about which inputs are legal.
 #[cfg(not(feature = "android"))]
-pub(crate) fn arm_device(_id: &str, _at_ms: u64) -> DeviceOutcome {
+pub(crate) fn arm_device(id: &str, _at_ms: u64) -> DeviceOutcome {
+    if let Err(reason) = check_alarm_id(id) {
+        return DeviceOutcome::Unknown(format!("refused at the device seam: {reason}"));
+    }
     DeviceOutcome::HostOnly
 }
 
 /// Hand one cancellation to the OS exact-wake binding (feature `android`).
 #[cfg(feature = "android")]
 pub(crate) fn cancel_device(id: &str) -> DeviceOutcome {
+    if let Err(reason) = check_alarm_id(id) {
+        return DeviceOutcome::Unknown(format!("refused at the device seam: {reason}"));
+    }
     android::cancel(id)
 }
 
 /// Desktop / CI: nothing to cancel outside the ledger.
 #[cfg(not(feature = "android"))]
-pub(crate) fn cancel_device(_id: &str) -> DeviceOutcome {
+pub(crate) fn cancel_device(id: &str) -> DeviceOutcome {
+    if let Err(reason) = check_alarm_id(id) {
+        return DeviceOutcome::Unknown(format!("refused at the device seam: {reason}"));
+    }
     DeviceOutcome::HostOnly
 }
 
@@ -311,6 +495,35 @@ fn check_alarm_id(id: &str) -> Result<(), String> {
     }
     if id.chars().any(|c| c.is_control() || c == '\0') {
         return Err("scheduler alarm id contains control characters".to_string());
+    }
+    Ok(())
+}
+
+/// Refuse an `atMs` that would produce a surprising wake-time (F-ALM-002).
+///
+/// Two instants are refused at the seam, as an honest `DeviceOutcome::Unknown(reason)`:
+/// * `0` — the epoch, which is what an uninitialised `Date`/`Option` collapses to. Passing it to
+///   `setExactAndAllowWhileIdle` arms an alarm in 1970: the platform fires it immediately and the
+///   user sees a ring for an alarm they never set. Treated as a sentinel, not a real instant.
+/// * anything past `now + MAX_ALARM_HORIZON_MS` (one year) — accepted by `AlarmManager` and then
+///   effectively unreachable, the "armed at OS ≠ will ring" trap this whole module exists to
+///   close.
+///
+/// A caller meaning "as soon as possible" must send `now` (or `now + 1`), which is a real instant
+/// and is accepted.
+fn check_alarm_at_ms(at_ms: u64, now: u64) -> Result<(), String> {
+    if at_ms == 0 {
+        return Err(
+            "epoch-zero is a possible sentinel; refused at the device seam (send the real instant)"
+                .to_string(),
+        );
+    }
+    let horizon = now.saturating_add(MAX_ALARM_HORIZON_MS);
+    if at_ms > horizon {
+        return Err(format!(
+            "atMs is far in the future ({} ms past now, max horizon {MAX_ALARM_HORIZON_MS} ms / 1 year); refusing",
+            at_ms.saturating_sub(now)
+        ));
     }
     Ok(())
 }
@@ -672,6 +885,308 @@ mod tests {
         assert_eq!(json["device"]["state"], "disallowed");
         // A refusal must not be serialisable as a bare `true`.
         assert!(json["device"].is_object());
+    }
+
+    // ---- REQ-A369 follow-up: device-seam validation, rollback, idempotency ------
+
+    /// Drive `register_with` with a device arm that answers `status`, counting how many times
+    /// the OS half was actually reached (the analogue of a JNI call count).
+    fn register_with_status(
+        state: &AlarmSchedState,
+        id: &str,
+        at_ms: u64,
+        now: u64,
+        status: &str,
+        calls: &std::cell::Cell<usize>,
+    ) -> Result<AlarmArmed, String> {
+        register_with(state, id, at_ms, now, |_id, _at| {
+            calls.set(calls.get() + 1);
+            device_outcome_from_status(status)
+        })
+    }
+
+    /// Each `AlarmGlue.STATUS_*` word reaches the caller as the matching typed outcome — the
+    /// success and the four refusal states are distinct, never collapsed into one `false`.
+    #[test]
+    fn register_then_arm_returns_device_outcome() {
+        let cases = [
+            ("scheduled", DeviceOutcome::Scheduled),
+            ("disallowed", DeviceOutcome::Disallowed),
+            ("unavailable", DeviceOutcome::Unavailable),
+            ("denied", DeviceOutcome::Denied),
+        ];
+        for (status, expected) in cases {
+            let s = state();
+            let calls = std::cell::Cell::new(0usize);
+            let armed = register_with_status(&s, "wake", 10_000, 1_000, status, &calls)
+                .expect("a device status is not a command error");
+            assert_eq!(armed.device, expected, "status {status:?}");
+            assert_eq!(calls.get(), 1, "the device half runs exactly once");
+        }
+    }
+
+    /// F-ALM-001: when the OS did not take the alarm, it must **not** stay in the ledger —
+    /// otherwise the poll fires a reminder for a phone that was never woken.
+    #[test]
+    fn refused_register_rolls_back_ledger() {
+        for status in ["denied", "disallowed", "unavailable", ""] {
+            let s = state();
+            let calls = std::cell::Cell::new(0usize);
+            // Seed the id so the rollback has something to remove.
+            s.register("wake".to_string(), 10_000);
+            assert!(s.contains("wake"), "seeded");
+            let armed = register_with_status(&s, "wake", 10_000, 1_000, status, &calls)
+                .expect("not a command error");
+            assert!(
+                !s.contains("wake"),
+                "status {status:?} must roll the ledger back (device={:?})",
+                armed.device
+            );
+            assert!(s.is_empty(), "and the ledger is empty for {status:?}");
+        }
+
+        // The success path keeps it (the contrast that makes the rollback meaningful).
+        let s = state();
+        let calls = std::cell::Cell::new(0usize);
+        register_with_status(&s, "wake", 10_000, 1_000, "scheduled", &calls).expect("ok");
+        assert!(s.contains("wake"), "a scheduled alarm stays in the ledger");
+    }
+
+    /// The epoch is a sentinel, not an instant: it is refused *before* the device is touched and
+    /// surfaced as an honest `Unknown` rather than arming a 1970 alarm.
+    #[test]
+    fn at_ms_zero_is_refused_honestly() {
+        let s = state();
+        let calls = std::cell::Cell::new(0usize);
+        let armed = register_with_status(&s, "wake", 0, 1_000, "scheduled", &calls).expect("ok");
+        match &armed.device {
+            DeviceOutcome::Unknown(reason) => {
+                assert!(reason.contains("epoch-zero"), "{reason}");
+            }
+            other => panic!("epoch-zero must be Unknown, got {other:?}"),
+        }
+        assert_eq!(
+            calls.get(),
+            0,
+            "the device must not be called for a refused instant"
+        );
+        assert!(s.is_empty(), "and nothing sits in the ledger");
+    }
+
+    /// An instant beyond the one-year horizon is accepted by `AlarmManager` and then unreachable;
+    /// the seam refuses it as `Unknown` and the boundary just inside is allowed.
+    #[test]
+    fn at_ms_far_future_is_refused() {
+        let now = 1_000_000u64;
+        let s = state();
+        let calls = std::cell::Cell::new(0usize);
+        let far = now + MAX_ALARM_HORIZON_MS + 1;
+        let armed = register_with_status(&s, "wake", far, now, "scheduled", &calls).expect("ok");
+        match &armed.device {
+            DeviceOutcome::Unknown(reason) => {
+                assert!(reason.contains("far in the future"), "{reason}");
+            }
+            other => panic!("far-future must be Unknown, got {other:?}"),
+        }
+        assert_eq!(calls.get(), 0, "the device must not be called");
+        assert!(s.is_empty());
+
+        // Exactly one year is still legal.
+        let edge = now + MAX_ALARM_HORIZON_MS;
+        let s2 = state();
+        let calls2 = std::cell::Cell::new(0usize);
+        let armed = register_with_status(&s2, "wake", edge, now, "scheduled", &calls2).expect("ok");
+        assert_eq!(
+            armed.device,
+            DeviceOutcome::Scheduled,
+            "the horizon edge is legal"
+        );
+        assert!(s2.contains("wake"));
+    }
+
+    /// The WebView re-arms on every reconciliation: an identical `(id, atMs)` inside the window
+    /// must not cross JNI twice, and a **new** instant (a real edit) must.
+    #[test]
+    fn re_register_within_idempotent_window_does_not_call_jni_twice() {
+        let s = state();
+        let calls = std::cell::Cell::new(0usize);
+        let now = 1_000_000u64;
+        let at = now + 60_000;
+
+        let first = register_with_status(&s, "wake", at, now, "scheduled", &calls).expect("ok");
+        assert_eq!(first.device, DeviceOutcome::Scheduled);
+
+        // The same instant 100 ms later: answered from the cached observation, no device call.
+        let second =
+            register_with_status(&s, "wake", at, now + 100, "scheduled", &calls).expect("ok");
+        assert_eq!(second.device, DeviceOutcome::Scheduled);
+        assert_eq!(calls.get(), 1, "the duplicate did not reach the device");
+
+        // A genuine edit (a different instant) always reaches the device.
+        let third =
+            register_with_status(&s, "wake", at + 1, now + 150, "scheduled", &calls).expect("ok");
+        assert_eq!(third.device, DeviceOutcome::Scheduled);
+        assert_eq!(calls.get(), 2, "a new instant is not idempotent");
+
+        // Past the window the same instant is a fresh arm again.
+        let fourth = register_with_status(
+            &s,
+            "wake",
+            at + 1,
+            now + 150 + ARM_IDEMPOTENT_WINDOW_MS,
+            "scheduled",
+            &calls,
+        )
+        .expect("ok");
+        assert_eq!(fourth.device, DeviceOutcome::Scheduled);
+        assert_eq!(calls.get(), 3, "outside the window it re-arms");
+    }
+
+    /// The idempotency cache exists to suppress a duplicate of an arm that is **still
+    /// outstanding**. A cancel between two identical arms empties the ledger, so the cached
+    /// `scheduled` observation no longer describes anything anybody holds: answering the second
+    /// arm from it leaves the alarm in neither the ledger nor the OS, while the reply says
+    /// `scheduled`. (Red before REQ-A1265.)
+    #[test]
+    fn a_cancel_between_two_identical_arms_re_arms_the_device_and_the_ledger() {
+        let s = state();
+        let calls = std::cell::Cell::new(0usize);
+        let now = 1_000_000u64;
+        let at = now + 60_000;
+
+        register_with_status(&s, "wake", at, now, "scheduled", &calls).expect("ok");
+        assert!(s.contains("wake"), "the first arm is in the ledger");
+        assert!(s.cancel("wake"), "the off half of a fast toggle");
+        assert!(!s.contains("wake"));
+
+        let again =
+            register_with_status(&s, "wake", at, now + 100, "scheduled", &calls).expect("ok");
+        assert_eq!(again.device, DeviceOutcome::Scheduled);
+        assert!(
+            s.contains("wake"),
+            "the back-on half must be in the ledger, not answered from a cancelled arm"
+        );
+        assert_eq!(
+            calls.get(),
+            2,
+            "the OS half must be re-armed after a cancel, not answered from the cache"
+        );
+    }
+
+    /// The observation cache is keyed by the ids the ledger holds, so it is bounded by
+    /// [`MAX_ALARM_ENTRIES`] with them (REQ-A374's rule, applied to the map added beside the
+    /// ledger). **Both** ways a row goes away — a cancel and a poll that fires it — must take the
+    /// observation with them; otherwise a register/churn loop grows the map without limit while
+    /// the ledger stays at zero. (Red before REQ-A1265.)
+    #[test]
+    fn the_observation_cache_cannot_outgrow_the_ledger() {
+        let s = state();
+        let calls = std::cell::Cell::new(0usize);
+        let now = 1_000_000u64;
+        let at = now + 1;
+        for i in 0..(MAX_ALARM_ENTRIES * 2) {
+            let id = format!("churn:{i}");
+            register_with_status(&s, &id, at, now, "scheduled", &calls).expect("ok");
+            if i % 2 == 0 {
+                assert!(s.cancel(&id));
+            } else {
+                assert_eq!(s.poll(at), vec![id.clone()], "the armed alarm fires");
+            }
+            let cached = s.device.lock().unwrap_or_else(|p| p.into_inner()).len();
+            assert_eq!(
+                cached, 0,
+                "{id} left an observation behind with no ledger row to describe"
+            );
+        }
+        assert!(s.is_empty(), "the ledger stays empty across the loop");
+    }
+
+    /// A refusal is **not** cached: the observation map is keyed by the ids the ledger kept, so a
+    /// refused arm leaves nothing behind for the next register to replay. The refusal is also a
+    /// state the user can change in Settings (`scheduler_alarm_open_settings` exists for exactly
+    /// that), so re-asking is the honest behaviour rather than replaying a ≤250 ms-old verdict.
+    /// (Red before REQ-A1265.)
+    #[test]
+    fn a_refused_arm_leaves_no_observation_to_replay() {
+        let s = state();
+        let calls = std::cell::Cell::new(0usize);
+        register_with_status(&s, "wake", 10_000, 1_000, "disallowed", &calls).expect("ok");
+        assert!(s.is_empty(), "the ledger does not hold a refused alarm");
+        let cached = s.device.lock().unwrap_or_else(|p| p.into_inner()).len();
+        assert_eq!(cached, 0, "a refusal is not an outstanding arm to suppress");
+
+        // The user grants exact alarms, and the same register arrives again inside the window.
+        let again =
+            register_with_status(&s, "wake", 10_000, 1_050, "scheduled", &calls).expect("ok");
+        assert_eq!(
+            calls.get(),
+            2,
+            "a refusal must not be replayed as the answer"
+        );
+        assert_eq!(again.device, DeviceOutcome::Scheduled);
+        assert!(s.contains("wake"));
+    }
+
+    /// An **invalid** id is refused at the device seam too, and never reaches the OS half — the
+    /// last check before the id becomes a `jstring` / a `PendingIntent` data URI.
+    #[test]
+    fn the_device_seam_refuses_an_invalid_id() {
+        for bad in ["", "wake\0", "wake\n"] {
+            let out = arm_device(bad, 10_000);
+            match out {
+                DeviceOutcome::Unknown(reason) => {
+                    assert!(reason.contains("device seam"), "id {bad:?}: {reason}");
+                }
+                other => panic!("id {bad:?} must be refused, got {other:?}"),
+            }
+            assert_eq!(
+                cancel_device(bad),
+                arm_device(bad, 10_000),
+                "both directions agree"
+            );
+        }
+    }
+
+    /// The Kotlin `STATUS_*` spellings are a cross-language contract with **no compiler**: a
+    /// rename on the Kotlin side would silently turn every answer into `Unknown` (or worse,
+    /// drift a refusal into a success). This pins the Rust map to the Kotlin source, so the
+    /// "change a Kotlin constant and watch the test fail" negative control is a host test.
+    ///
+    /// The predicate reads the **assignment**, not merely the presence of the literal. It used
+    /// to be `KOTLIN.contains("\"word\"")`, which was green for a rename of
+    /// `STATUS_SCHEDULED` because the file's own prose quotes `"scheduled"` (measured,
+    /// REQ-A805) — a check that cannot fail is not coverage. Which *constant* holds which word
+    /// (the swap, the worse direction) is pinned across all five at once in
+    /// `tests/alarm_device_binding_e2e.rs`, which is the authoritative binder; this one keeps
+    /// the Rust-side classification of each word honest on its own.
+    #[test]
+    fn the_glue_status_words_are_pinned_to_the_kotlin_source() {
+        const KOTLIN: &str = include_str!("../android-glue/com/amos/ai/glue/AlarmGlue.kt");
+        for word in [
+            "scheduled",
+            "cancelled",
+            "disallowed",
+            "unavailable",
+            "denied",
+        ] {
+            // A `const val … = "word"` **assignment** — a prose mention is not one.
+            let assigned = KOTLIN.lines().any(|l| {
+                l.find("const val ").is_some_and(|p| {
+                    l[p + "const val ".len()..]
+                        .split_once('=')
+                        .is_some_and(|(_, v)| v.trim().trim_matches('"') == word)
+                })
+            });
+            assert!(
+                assigned,
+                "AlarmGlue.kt no longer assigns {word:?} to a STATUS_* constant — the Rust map has drifted"
+            );
+            assert_ne!(
+                device_outcome_from_status(word),
+                DeviceOutcome::Unknown(word.to_string()),
+                "{word:?} must be a classified state, not Unknown"
+            );
+        }
     }
 
     /// reaching the ledger; a paste-sized id would inflate `next_at` and `poll`

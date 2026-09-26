@@ -39,21 +39,25 @@
    * `performMiniaturize:` / `zoom:`）。第一版纯装饰，避免与宿主冲突
    * （FMEA F-SH-001："装饰控件假装能做"同族）。
    *
-   * 边界：双击 = 派 `wm_maximize(id)`，与 Window 菜单 Zoom 同源；
+   * 边界：双击 = 派 `wm_maximize(id)`，与 Window 菜单 Zoom 同源（宿主同一个
+   * `window_toggle_zoom`）；宿主拒了会报出来（REQ-A764）。
    * 红绿灯装饰属性、宿主失焦变灰等观感项登记为后续 PC。
    */
   import { onMount } from "svelte";
   import { svelteAppLoader } from "./appRegistry";
-  import { appTitleKey, isKnownApp } from "../lib/appMeta";
-  import { isExtId, midOf } from "../lib/storeApps";
+  import { isKnownApp } from "../lib/appMeta";
+  import { isExtId, midOf, type StoreTile } from "../lib/storeApps";
   import { loadDesktopFeatures } from "../lib/desktopFeatures";
-  import { t } from "./locale.svelte";
+  import { splitWindowLabel } from "../lib/windowRoute";
+  import { t, windowName } from "./locale.svelte";
   import ExtAppHost from "./ExtAppHost.svelte";
   import DesktopWindowKeys from "./modules/DesktopWindowKeys.svelte";
   import { wmMaximize } from "../lib/wm";
+  import { bridgeDiag } from "../lib/backend";
+  import { amosWarn } from "../lib/debugLog";
   import { APP_WINDOW_TITLEBAR_HEIGHT, APP_WINDOW_TITLEBAR_INSET } from "../lib/desktopLayout";
 
-  let { id }: { id: string } = $props();
+  let { id, ext = [] }: { id: string; ext?: readonly StoreTile[] } = $props();
 
   /**
    * REQ-A453 — the app window asks the host which capabilities the operator switched off.
@@ -83,17 +87,58 @@
   });
 
   // The same localized name the window title uses, so the two cannot disagree.
-  const name = $derived(appTitleKey(id) ? t(appTitleKey(id)!) : id);
+  //
+  // REQ-A473: `id` is a **window label**, which for every window after the first is not an
+  // app id (`files_2`). Both facts — the app to load and the name to show — come from the
+  // one shared resolver (`windowName`), so the app screen that loads, the accessible name,
+  // the test hooks and the title bar all speak about the same app; a `appTitleKey("files_2")`
+  // lookup would find nothing and print the raw label.
+  const parts = $derived(splitWindowLabel(id));
+  const appId = $derived(parts?.app ?? id);
+  const instance = $derived(parts?.instance ?? 1);
+  const shown = $derived(windowName(id, null, ext));
 
   // 双击标题栏 = 派 wm_maximize(id)（macOS 行为）。
   // 我们**不**用原生 dblclick —— 测试用 happy-dom 派 click 事件可移植且行为稳定；
   // 真实浏览器会把两次 click 在 300 ms 内合成 dblclick，但浏览器之间的"合成时机"
   // 不一致（Chromium ~500 ms，Safari ~300 ms），把契约收口在 JS 层就是一行定时器。
+  /**
+   * Say so when the host refuses the title-bar double-click's `wm_maximize` (REQ-A764).
+   *
+   * The gesture dropped the boolean (`void wmMaximize(id)`), so a refusal was silent — while its
+   * sibling (Window ▸ Zoom, the **same** host implementation `window_toggle_zoom`) reports one
+   * through `DesktopShell.windowMenuAction`. A host that refuses (a split pane owns its rectangle;
+   * a label stale from the 5 s `wm_windows` poll names a window that was closed) left the user
+   * double-clicking a title bar that does nothing — indistinguishable from a broken gesture, the
+   * rule every other focused-window surface here follows. `lib/wm.ts::wmMaximize`'s doc claimed
+   * the refusal "is recorded in `bridgeDiag("wm_maximize")`, not swallowed" — but nothing read
+   * that slot, so it was swallowed.
+   *
+   * A refused `wm_*` resolves to `false` over a live bridge (`invoke` records `ok` for a
+   * non-throwing reply), so the ledger's last word on the command is usually "fine": say what is
+   * actually known instead of inventing a code we did not observe — the same branch
+   * `windowMenuAction` takes for zoom / full screen.
+   */
+  function reportMaximizeRefusal(): void {
+    const diag = bridgeDiag("wm_maximize");
+    if (diag.ok) {
+      amosWarn("wm", `the host refused to maximize \`${id}\``, { reason: "host-refused" });
+      return;
+    }
+    const code =
+      diag.kind === "command-failed" && diag.detail && typeof diag.detail === "object"
+        ? (diag.detail as { code?: string }).code
+        : undefined;
+    amosWarn("wm", `the host refused to maximize \`${id}\``, { reason: code ?? diag.kind });
+  }
+
   let lastTitleClickTs = 0;
   function onTitleClick() {
     const now = Date.now();
     if (now - lastTitleClickTs < 300) {
-      void wmMaximize(id);
+      void wmMaximize(id).then((ok) => {
+        if (!ok) reportMaximizeRefusal();
+      });
       lastTitleClickTs = 0;
       return;
     }
@@ -107,20 +152,44 @@
     }
   }
 
-  // Lazy, cancellable load — the same shape `Shell.svelte`'s mounted effect uses
-  // (`$state<any>` holding the *component*, so `<AppComp />` is the one dynamic-mount
-  // form Svelte 5 accepts). The `alive` guard matters because a slow import must not
-  // land after the window switched to another app.
+  // Lazy, cancellable load — the same shape `AppPane.svelte` uses (`$state<any>` holding the
+  // *component*, so `<AppComp />` is the one dynamic-mount form Svelte 5 accepts). The `alive`
+  // guard matters because a slow import must not land after the window switched to another app.
+  //
+  // Three states, and conflating any two is a defect: a component for **this** app, the loader
+  // settled **without** one (`noScreen`), or a chunk still in flight. The old shape had one
+  // `AppComp` for the last two, so `AppComp === null` read as "this build has no such screen"
+  // for the whole duration of every cold load — the window asserted `app.screenMissing` about an
+  // app whose screen was merely not here yet.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let AppComp = $state<any>(null);
+  /** The loader for the current `appId` has settled **without** a component (no loader for this
+   * id/form factor, a rejected import, or a module with no default export). Only then may the
+   * window claim there is no screen — and only then is it not still loading. */
+  let noScreen = $state(false);
   $effect(() => {
-    let alive = true;
+    const which = appId;
+    // Nothing from a previous id survives this pass, however slow this id's chunk is.
     AppComp = null;
-    const load = svelteAppLoader(id);
-    if (!load) return;
-    void load().then((m) => {
-      if (alive) AppComp = m.default;
-    });
+    noScreen = false;
+    const load = svelteAppLoader(which);
+    if (!load) {
+      noScreen = true;
+      return;
+    }
+    let alive = true;
+    void load().then(
+      (m) => {
+        if (!alive) return;
+        // A module with no default export is not a screen: "missing" is a truer answer than
+        // waiting forever on a promise that has already settled.
+        if (m.default) AppComp = m.default;
+        else noScreen = true;
+      },
+      () => {
+        if (alive) noScreen = true;
+      },
+    );
     return () => {
       alive = false;
     };
@@ -136,7 +205,9 @@
 <div
   class="flex h-full min-h-0 flex-col overflow-hidden bg-white text-neutral-900 dark:bg-neutral-950 dark:text-neutral-100"
   data-testid="app-surface"
-  data-window-app={id}
+  data-window-app={appId}
+  data-window-label={id}
+  data-window-instance={instance}
 >
   <!-- G-α: macOS Overlay 标题栏（**可拖区** + 居中标题）。
        高度来自 APP_WINDOW_TITLEBAR_HEIGHT（lib/desktopLayout.ts 唯一真源）。
@@ -158,7 +229,7 @@
   <div
     role="button"
     tabindex="0"
-    aria-label={name}
+    aria-label={shown.text}
     class="grid shrink-0 select-none items-center border-b border-black/5 dark:border-white/5"
     style="height: {APP_WINDOW_TITLEBAR_HEIGHT}px; grid-template-columns: {APP_WINDOW_TITLEBAR_INSET}px 1fr {APP_WINDOW_TITLEBAR_INSET}px;"
     data-testid="app-window-titlebar"
@@ -175,13 +246,16 @@
       data-tauri-drag-region
     ></div>
 
-    <!-- 居中标题：与 wmSetShellTitle(name) 同源 —— 名字只有一份。 -->
+    <!-- 居中标题：与 `wmset_shell_title` 同源 —— 名字只有一份（`windowName`）。
+         REQ-A473：第二个及以后的窗口在标题后面带实例号（"文件 — 2"），因为 macOS 的
+         窗口菜单/⌘` 需要让人分清是哪一扇窗；第一个窗口不带（`windowName` 在实例 1 时
+         只给应用名）。 -->
     <h1
       class="truncate justify-self-center text-[12px] font-semibold text-neutral-700 dark:text-neutral-200"
       data-testid="app-window-title"
       data-tauri-drag-region
     >
-      {name}
+      {shown.text}
     </h1>
 
     <!-- 右侧等宽留白：让标题真正居中（未来放窗口动作）—— 也是拖区。 -->
@@ -199,21 +273,39 @@
   <DesktopWindowKeys label={id} />
   <div class="min-h-0 flex-1 overflow-y-auto overscroll-contain">
     {#key id}
-      {#if isExtId(id)}
-        <!-- A store-installed app runs its own bundle at its own origin (see ExtAppHost). -->
-        <ExtAppHost mid={midOf(id)} {name} />
+      {#if isExtId(appId)}
+        <!-- A store-installed app runs its own bundle at its own origin (see ExtAppHost).
+             The **app's** name (no instance marker) — a bundle's own chrome is about the
+             application, not about which of its windows this is. -->
+        <ExtAppHost mid={midOf(appId)} name={shown.app || shown.text} />
       {:else if AppComp}
         <AppComp />
-      {:else}
+      {:else if noScreen}
         <!-- An id with no screen in this build (a built-in the loader dropped for this
              form factor, e.g. `phone` on desktop, or an unknown id from a link): never a
-             blank frame, and never a fabricated app. Same wording the touch shell uses. -->
-        <div class="flex h-full flex-col items-center justify-center gap-2 px-8 text-center">
+             blank frame, and never a fabricated app. Same wording the touch shell uses.
+             Only once the loader has settled **without** a component — while it is still
+             fetching, the branch below says *that*. -->
+        <div
+          data-testid="app-unavailable"
+          class="flex h-full flex-col items-center justify-center gap-2 px-8 text-center"
+        >
           <span class="text-3xl" aria-hidden="true">❓</span>
-          <p class="text-sm font-semibold">{name}</p>
+          <p class="text-sm font-semibold">{shown.app || shown.text}</p>
           <p class="text-xs opacity-60">
-            {isKnownApp(id) ? t("app.screenMissing", { id }) : t("app.unknown", { id })}
+            {isKnownApp(appId) ? t("app.screenMissing", { id: appId }) : t("app.unknown", { id: appId })}
           </p>
+        </div>
+      {:else}
+        <!-- A loader exists for this id and its chunk has not landed yet — not the same fact
+             as "there is no screen". See `AppPane.svelte`. -->
+        <div
+          data-testid="app-loading"
+          role="status"
+          class="flex h-full flex-col items-center justify-center gap-2 px-8 text-center"
+        >
+          <span class="text-2xl opacity-60" aria-hidden="true">⋯</span>
+          <p class="text-xs opacity-60">{t("app.loading")}</p>
         </div>
       {/if}
     {/key}

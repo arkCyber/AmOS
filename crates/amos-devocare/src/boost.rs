@@ -84,6 +84,77 @@ mod tests {
         }
     }
 
+    /// `RECLAIMABLE_STATES` is documented as "the two reclaimable tiers of
+    /// `docs/app-lifecycle.md`", but the tiers are owned in code by the lifecycle
+    /// kernel `amos-applife` (`AppState::is_reclaimable()` over the wire keys from
+    /// `AppState::key()`). Nothing bound the two: the test above only compared the
+    /// constant against its own literals, so a tier renamed or split on the kernel
+    /// side left the boost policy silently disagreeing — reclaiming a tier the
+    /// kernel protects, or refusing one it frees. Read the authority's source and
+    /// require the exact same key set (REQ-A655 / F-SH-122).
+    #[test]
+    fn reclaimable_states_equal_the_app_lifecycle_kernel_tiers() {
+        const SPEC: &str = include_str!("../../amos-applife/src/spec.rs");
+
+        // 1. The `AppState::key()` wire keys: variant name → stable key.
+        let at = SPEC
+            .find("pub fn key(self) -> &'static str {")
+            .expect("AppState::key() not found");
+        let rest = &SPEC[at..];
+        let key_body = &rest[..rest.find("\n    }").expect("key() body not closed")];
+        let mut key_of: std::collections::BTreeMap<&str, &str> = std::collections::BTreeMap::new();
+        for (i, _) in key_body.match_indices("AppState::") {
+            let arm = &key_body[i + "AppState::".len()..];
+            let variant = &arm[..arm.find(" =>").expect("variant not followed by =>")];
+            let after = &arm[arm.find("=> \"").expect("arm has no string key") + 4..];
+            let key = &after[..after.find('"').expect("unterminated key literal")];
+            key_of.insert(variant, key);
+        }
+        // Vacuity guard: a rewrite that moves the arms out of the scanned window
+        // must fail loudly rather than compare against an empty map.
+        assert_eq!(
+            key_of.len(),
+            6,
+            "expected six AppState keys, parsed {key_of:?}"
+        );
+
+        // 2. The variants `AppState::is_reclaimable()` actually admits, mapped to
+        //    their wire keys.
+        let at = SPEC
+            .find("pub fn is_reclaimable(self) -> bool {")
+            .expect("AppState::is_reclaimable() not found");
+        let rest = &SPEC[at..];
+        let rec_body = &rest[..rest
+            .find("\n    }")
+            .expect("is_reclaimable() body not closed")];
+        let mut expected: Vec<&str> = rec_body
+            .match_indices("AppState::")
+            .map(|(i, _)| {
+                let arm = &rec_body[i + "AppState::".len()..];
+                let end = arm
+                    .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .unwrap_or(arm.len());
+                let variant = &arm[..end];
+                *key_of
+                    .get(variant)
+                    .unwrap_or_else(|| panic!("unknown AppState variant {variant}"))
+            })
+            .collect();
+        assert_eq!(
+            expected.len(),
+            2,
+            "expected two reclaimable tiers, parsed {expected:?}"
+        );
+        expected.sort_unstable();
+
+        let mut ours = RECLAIMABLE_STATES.to_vec();
+        ours.sort_unstable();
+        assert_eq!(
+            ours, expected,
+            "boost RECLAIMABLE_STATES must equal amos-applife's reclaimable tiers"
+        );
+    }
+
     #[test]
     fn a_plan_selects_cached_first_then_background() {
         let plan = reclaim_plan(&apps(&[

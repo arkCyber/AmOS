@@ -11,7 +11,7 @@
   import { defaultMediaStore } from "../lib/mediaStore";
   import { VMEMOS_KEY, buildWavBytes, normalizeVoiceMemos } from "../lib/voiceMemos";
   import { captureBlob, listCaptures } from "../lib/cameraCapture";
-  import { hasMediaBridge, mediaList, mediaLoad } from "../lib/media";
+  import { hasMediaBridge, mediaList, mediaLoad, mediaStreamUrl } from "../lib/media";
   import type { MediaItem, StandardDir } from "../lib/media";
   import {
     buildOrder,
@@ -21,6 +21,8 @@
     fmtSeconds,
     formatRate,
     indexOfTrackId,
+    isObjectUrl,
+    isStreamUrl,
     isTooLarge,
     mergeTracks,
     mimeForPlayable,
@@ -35,10 +37,12 @@
     trackFromMemo,
   } from "../lib/player";
   import type { PlayerTrack, RepeatMode } from "../lib/player";
+  import { REPEAT_LABEL_KEY } from "../lib/music";
   import { applyMediaSession, clearMediaSession, defaultMediaSession } from "../lib/mediaSession";
   import { assertHold, releaseHold, videoHoldActive } from "../lib/keepAwakeCore";
   import { loadPlayerPrefs, savePlayerPrefs, shouldSavePosition } from "../lib/playerPrefs";
   import { iconSvg } from "../lib/sysIcons";
+  import StoreErrorBar from "./StoreErrorBar.svelte";
   import { t } from "./locale.svelte";
 
   // Local collections that can hold playable media. `camera` is included so
@@ -53,6 +57,10 @@
   let loading = $state(false);
   let mediaErr = $state("");
   let scanErr = $state("");
+  // The session (track ∕ playhead ∕ volume ∕ mute ∕ repeat ∕ shuffle) is the user's own
+  // state and the lib promises it survives a remount, so a refused write must be said
+  // out loud — the controls would otherwise show a setting the next launch has lost.
+  let storeErr = $state("");
 
   let order = $state<number[]>([]);
   let pos = $state(0);
@@ -83,6 +91,8 @@
   // derived only propagates when the value actually changes (string `===`).
   const trackId = $derived(track?.id ?? null);
   const pct = $derived(pctProgress(posSec, durSec));
+  /** True while the active URL is a host-streamed one (see `isStreamUrl`). */
+  const streaming = $derived(isStreamUrl(url));
 
   const originKey = (o: string) => `player.origin.${o}`;
 
@@ -99,7 +109,17 @@
     try {
       const src = tr.source;
       if (src.kind === "file") {
-        if (isTooLarge(src.item.size_bytes)) return fail(t("player.tooLarge"));
+        // Above the in-memory ceiling the honest answer is **not** automatically a
+        // refusal any more: ask the host for a `Range`-capable stream URL and hand it to
+        // the element, so a 900 MB movie plays in bounded windows instead of not at all
+        // (docs/media-player.md §8). The host answers `null` when it will not serve the
+        // item (offline, or not in the authorized listing) — and *then* the refusal below
+        // is the truth, not a fallback we invented.
+        if (isTooLarge(src.item.size_bytes)) {
+          const streamUrl = await mediaStreamUrl(src.item);
+          if (streamUrl) return { url: streamUrl, error: "" };
+          return fail(t("player.tooLarge"));
+        }
         const bytes = await mediaLoad(src.item);
         if (!bytes) return fail(t("player.unavailable"));
         const buf = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
@@ -203,11 +223,21 @@
     ready = true;
   }
 
-  /** Persist the session; `force` bypasses the playhead throttle. */
+  /**
+   * Persist the session; `force` bypasses the playhead throttle.
+   *
+   * Every caller passes user-owned state (the discrete-prefs effect, the unmount save,
+   * the throttled playhead), so the store's verdict is read into `storeErr`: a refused
+   * write means the next launch will not find this session. One slot is correct here —
+   * all three callers funnel through this single function, so the latest verdict simply
+   * supersedes the previous one (there is no second writer to blank it). REQ-A1421.
+   */
   function persist(nowMs: number, force: boolean): void {
     if (!force && !shouldSavePosition(lastSaveAt, nowMs)) return;
     lastSaveAt = nowMs;
-    savePlayerPrefs({ trackId, positionSec: posSec, volume, muted, repeat, shuffle });
+    storeErr = savePlayerPrefs({ trackId, positionSec: posSec, volume, muted, repeat, shuffle })
+      ? ""
+      : t("common.storeWriteFailed");
   }
 
   // Restore the persisted session, then scan (resuming the last track).
@@ -263,7 +293,8 @@
     void (async () => {
       const r = await resolve(tr);
       if (cancelled) {
-        if (r.url) URL.revokeObjectURL(r.url);
+        // Only a URL *we* created is ours to release; a stream URL belongs to the host.
+        if (isObjectUrl(r.url)) URL.revokeObjectURL(r.url);
         return;
       }
       if (!r.url) {
@@ -277,7 +308,7 @@
     })();
     return () => {
       cancelled = true;
-      if (made) URL.revokeObjectURL(made);
+      if (isObjectUrl(made ?? "")) URL.revokeObjectURL(made as string);
     };
   });
 
@@ -480,6 +511,7 @@
   </div>
 {:else}
   <div class="flex h-full flex-col overflow-y-auto p-3">
+    <StoreErrorBar message={storeErr} />
     <div class="relative">
       {#if track.kind === "video"}
         <video
@@ -522,7 +554,12 @@
       <p class="truncate text-lg font-semibold">{track.title}</p>
       <p class="mt-0.5 text-xs text-neutral-500 dark:text-neutral-400">
         <span class="rounded-full bg-neutral-200/70 px-2 py-0.5 dark:bg-white/10">{track.kind === "video" ? t("player.video") : t("player.audio")}</span>
-        <span class="ml-1 rounded-full bg-accent/15 px-2 py-0.5 text-accent">{t(originKey(track.origin))}</span>
+        <span class="ml-1 rounded-full bg-accent/10 px-2 py-0.5 text-accent">{t(originKey(track.origin))}</span>
+        {#if streaming}
+          <!-- Honest label for what is actually happening: the bytes are NOT buffered;
+               the element reads bounded windows from the host. -->
+          <span class="ml-1 rounded-full bg-accent/10 px-2 py-0.5 text-accent">{t("player.streaming")}</span>
+        {/if}
         {#if track.subtitle}<span class="ml-1.5">{track.subtitle}</span>{/if}
       </p>
     </div>
@@ -585,12 +622,13 @@
       <button
         onclick={toggleShuffle}
         aria-label={t("player.shuffle")}
+        aria-pressed={shuffle}
         data-icon="shuffle"
         class={"grid h-11 w-11 place-items-center rounded-full transition active:scale-90 " + (shuffle ? "text-accent opacity-90" : "opacity-40")}
       >{@html iconSvg("shuffle", "h-5 w-5")}</button>
       <button
         onclick={cycleRepeat}
-        aria-label={t("player.repeat")}
+        aria-label={t(REPEAT_LABEL_KEY[repeat])}
         data-icon="repeat"
         class={"grid h-11 w-11 place-items-center rounded-full transition active:scale-90 " + (repeat === "off" ? "opacity-35" : repeat === "one" ? "text-accent opacity-90" : "opacity-80")}
       >{@html iconSvg("repeat", "h-5 w-5")}</button>
@@ -602,7 +640,7 @@
       >{@html iconSvg(muted ? "volumeX" : "volume", "h-5 w-5")}</button>
       <button
         onclick={cycleRate}
-        aria-label={t("player.rate")}
+        aria-label={t("player.rateValue", { rate: formatRate(rate) })}
         data-icon="rate"
         class="grid h-11 min-w-11 place-items-center rounded-full px-2 text-xs font-semibold opacity-80 transition active:scale-90"
       >{formatRate(rate)}</button>
@@ -630,7 +668,7 @@
             {#if tr.origin === "file" && isTooLarge(tr.sizeBytes)}
               <!-- Honest-boundary badge UP FRONT: a >MAX_PLAY_BYTES file is visibly
                    unplayable in the row, not only after clicking it. -->
-              <span class="shrink-0 rounded-full bg-danger/15 px-1.5 py-0.5 text-[10px] text-danger">{t("player.tooLargeShort")}</span>
+              <span class="shrink-0 rounded-full bg-danger/8 px-1.5 py-0.5 text-[10px] text-danger">{t("player.tooLargeShort")}</span>
             {/if}
             <span class="shrink-0 text-[10px] opacity-60">{t(originKey(tr.origin))}</span>
           </button>

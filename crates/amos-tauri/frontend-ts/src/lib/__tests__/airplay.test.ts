@@ -187,19 +187,18 @@ describe("AirPlay API - 参数类型", () => {
 });
 
 describe("AirPlay API - 桥接契约 (非 Tauri 环境)", () => {
-  test("isAirPlayAvailable 在非 Tauri 环境返回 false", async () => {
+  // REQ-A1336 / F-SH-602. `invoke` **从不 reject**：被拒 ∕ 无桥一律 resolve `null`。这些
+  // 包装器曾经把 `null` 折成 `false` / `[]` / `{kind:'failed', reason:'Not in Tauri
+  // environment'}` —— 前两个把「没问到」画成关于**平台**与**设备列表**的断言，第三个连
+  // **原因**都是合成的（宿主可能就在那里，只是拒绝了）。可被拒绝的读一律答 `null`。
+  test("isAirPlayAvailable 在非 Tauri 环境返回 null（不是 false）", async () => {
     const { isAirPlayAvailable } = await import("../airplay");
-    const result = await isAirPlayAvailable();
-    expect(typeof result).toBe("boolean");
-    // 在 Bun 环境中，backend.invoke 返回 null，所以应该是 false
-    expect(result).toBe(false);
+    await expect(isAirPlayAvailable()).resolves.toBeNull();
   });
 
-  test("getDevices 在非 Tauri 环境返回空数组", async () => {
+  test("getDevices 在非 Tauri 环境返回 null（不是空数组）", async () => {
     const { getDevices } = await import("../airplay");
-    const result = await getDevices();
-    expect(Array.isArray(result)).toBe(true);
-    expect(result).toHaveLength(0);
+    await expect(getDevices()).resolves.toBeNull();
   });
 
   test("getStatus 在非 Tauri 环境返回 null", async () => {
@@ -208,49 +207,34 @@ describe("AirPlay API - 桥接契约 (非 Tauri 环境)", () => {
     expect(result).toBeNull();
   });
 
-  test("discoverDevices 在非 Tauri 环境返回 failed 结果", async () => {
+  test("discoverDevices 在非 Tauri 环境返回 null（不合成 failed ∕ 原因）", async () => {
     const { discoverDevices } = await import("../airplay");
-    const result = await discoverDevices();
-    expect(result).toHaveProperty("kind");
-    expect(result.kind).toBe("failed");
-    if (result.kind === "failed") {
-      expect(result.reason).toBe("Not in Tauri environment");
-    }
+    await expect(discoverDevices()).resolves.toBeNull();
   });
 
-  test("connect 在非 Tauri 环境返回 failed 结果", async () => {
+  test("connect 在非 Tauri 环境返回 null", async () => {
     const { connect } = await import("../airplay");
-    const result = await connect("device-001");
-    expect(result).toHaveProperty("kind");
-    expect(result.kind).toBe("failed");
+    await expect(connect("device-001")).resolves.toBeNull();
   });
 
-  test("disconnect 在非 Tauri 环境返回 failed 结果", async () => {
+  test("disconnect 在非 Tauri 环境返回 null", async () => {
     const { disconnect } = await import("../airplay");
-    const result = await disconnect();
-    expect(result).toHaveProperty("kind");
-    expect(result.kind).toBe("failed");
+    await expect(disconnect()).resolves.toBeNull();
   });
 
-  test("startStream 在非 Tauri 环境返回 failed 结果", async () => {
+  test("startStream 在非 Tauri 环境返回 null", async () => {
     const { startStream } = await import("../airplay");
-    const result = await startStream("audio");
-    expect(result).toHaveProperty("kind");
-    expect(result.kind).toBe("failed");
+    await expect(startStream("audio")).resolves.toBeNull();
   });
 
-  test("stopStream 在非 Tauri 环境返回 failed 结果", async () => {
+  test("stopStream 在非 Tauri 环境返回 null", async () => {
     const { stopStream } = await import("../airplay");
-    const result = await stopStream();
-    expect(result).toHaveProperty("kind");
-    expect(result.kind).toBe("failed");
+    await expect(stopStream()).resolves.toBeNull();
   });
 
-  test("setVolume 在非 Tauri 环境返回 failed 结果", async () => {
+  test("setVolume 在非 Tauri 环境返回 null", async () => {
     const { setVolume } = await import("../airplay");
-    const result = await setVolume(0.5);
-    expect(result).toHaveProperty("kind");
-    expect(result.kind).toBe("failed");
+    await expect(setVolume(0.5)).resolves.toBeNull();
   });
 
   test("所有函数都不会抛出异常", async () => {
@@ -286,6 +270,57 @@ describe("AirPlay API - 桥接契约 (非 Tauri 环境)", () => {
     }
     
     expect(threw).toBe(false);
+  });
+});
+
+describe("AirPlay API - 有桥时的透传与拒绝 (REQ-A1336)", () => {
+  type Internals = { __TAURI_INTERNALS__?: unknown };
+  // The bridge lives on **`window`**, not on `globalThis` (`backend.ts`'s `bridge()` reads
+  // `(window as …).__TAURI_INTERNALS__`), so the fake has to be installed there.
+  const win = (globalThis as unknown as { window?: Internals });
+  win.window ??= {};
+
+  const install = (respond: (cmd: string) => unknown) => {
+    win.window!.__TAURI_INTERNALS__ = { invoke: async (cmd: string) => respond(cmd) };
+  };
+  const uninstall = () => {
+    delete win.window!.__TAURI_INTERNALS__;
+  };
+
+  test("宿主答了：应答原样落地（不折叠、不改造）", async () => {
+    const hostDevice: AirPlayDevice = {
+      id: "d1",
+      name: "TV",
+      kind: "tv",
+      supports_video: true,
+      supports_audio: true,
+      supports_mirroring: false,
+      signal_strength: 60,
+      connected: false,
+    };
+    install((cmd) => (cmd === "airplay_available" ? true : [hostDevice]));
+    const { isAirPlayAvailable, getDevices } = await import("../airplay");
+    await expect(isAirPlayAvailable()).resolves.toBe(true);
+    expect(await getDevices()).toEqual([hostDevice]);
+    uninstall();
+  });
+
+  test("桥在、宿主拒绝作答：与「没有桥」同值 —— 都是 null，都不是 false ∕ []", async () => {
+    install(() => {
+      throw new Error("host refused");
+    });
+    const { isAirPlayAvailable, getDevices, connect } = await import("../airplay");
+    await expect(isAirPlayAvailable()).resolves.toBeNull();
+    await expect(getDevices()).resolves.toBeNull();
+    await expect(connect("d1")).resolves.toBeNull();
+    uninstall();
+  });
+
+  test("宿主答了「不支持」：false 是**宿主的断言**，与 null 不是同一个值", async () => {
+    install(() => false);
+    const { isAirPlayAvailable } = await import("../airplay");
+    await expect(isAirPlayAvailable()).resolves.toBe(false);
+    uninstall();
   });
 });
 

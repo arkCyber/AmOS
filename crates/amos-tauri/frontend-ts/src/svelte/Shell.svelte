@@ -6,36 +6,51 @@
   // (Recents/Spotlight/NC) + hardware/edge policies. React-free import graph.
   import { onMount, onDestroy } from "svelte";
   import { propsChannel, disposePropsChannel } from "./propsBus";
-  import { svelteAppLoader } from "./appRegistry";
-  import { appTitleKey, isKnownApp } from "../lib/appMeta";
-  import { t } from "./locale.svelte";
+  import { appTitleKey } from "../lib/appMeta";
+  import { t, windowName } from "./locale.svelte";
   import type { HomeLayout } from "../lib/amosStore";
   import { moveBefore, addAppsToDock, readStoreValue, writeStoreValue } from "../lib/amosStore";
   import { amosWarn } from "../lib/debugLog";
   import { homeGrid, homeTile, deviceChrome, PHONE_GRID, type HomeGrid, type HomeTile } from "../lib/formLayout";
-  import { onLayoutChanged, wmLayoutSnapshot, wmOpen, wmSetShellTitle, type LayoutSnapshot, type FormFactor } from "../lib/wm";
+  import { onLayoutChanged, wmLayoutSnapshot, wmOpenReported, wmSetShellTitle, type LayoutSnapshot, type FormFactor } from "../lib/wm";
   import { windowOwnsShellNav } from "../lib/shellNav";
+  import { windowLabelFromHash } from "../lib/windowRoute";
   import { CONTACTS_KEY, seedContacts } from "../lib/contacts";
-  import { desktopFormActive, setFormFactor } from "../lib/desktopApps";
+  import { BRIGHTNESS_KEY, brightnessToAlpha, normalizeBrightness } from "../lib/brightness";
+  import { createStoreValue } from "./store";
+  import { desktopFormActive } from "../lib/formAuthority.svelte";
   import {
     applyLayout,
+    canSlideOver,
+    canSplit,
     enterEdit,
     enterLibrary,
+    enterSplit,
     exitEdit,
+    exitSplit,
     goHome,
     layout,
+    layoutRefused,
     lock,
     ncOpen,
     open,
+    openSlideOver,
     pulseId,
+    pulseSeq,
     recentsOpen,
+    reseatHomeLayout,
+    restoreSlideOver,
     setNc,
     setRecents,
     setSpot,
     setLayoutSnapshot,
+    restoreSplit,
     softLaunch,
     spotOpen,
     surface,
+    sysInkOpen,
+    closeSysInk,
+    openSysInk,
     unlock,
   } from "./shellState.svelte";
   import LockScreen from "./LockScreen.svelte";
@@ -45,8 +60,10 @@
   import { startAlarmWatcher } from "./osAlarmWatcher";
   import { startReminderWatcher } from "./osReminderWatcher";
   import { startPushWatcher } from "./osPushWatcher";
+  import { startOtaWatcher } from "./osOtaWatcher";
   import { startShortcutTriggers } from "./osShortcutTriggers";
   import { startCalendarWatcher } from "./osCalendarWatcher";
+  import { startFocusWatcher } from "./osFocusWatcher";
   import { startOsAutoOff } from "./osAutoOff";
   import { startOsTelephonyHold } from "./osTelephonyHold";
   import { startOsWakeHome } from "./osWakeHome";
@@ -58,17 +75,19 @@
   import { recordSpyHit, startTelemetrySpyWatcher } from "../lib/telemetrySpy";
   import {
     getStoreTiles,
-    isExtId,
     loadStoreTiles,
-    midOf,
     subscribeStoreTiles,
     tileById,
     type StoreTile,
   } from "../lib/storeApps";
   import HomeDock from "./HomeDock.svelte";
+  import StoreErrorBar from "./StoreErrorBar.svelte";
   import EditHome from "./EditHome.svelte";
   import AppLibrary from "./AppLibrary.svelte";
   import StatusBar from "./StatusBar.svelte";
+  import AppPane from "./AppPane.svelte";
+  import SplitSurface from "./SplitSurface.svelte";
+  import SlideOverSurface from "./SlideOverSurface.svelte";
   import Backdrop from "./Backdrop.svelte";
   import NotificationBanner from "./NotificationBanner.svelte";
   import IncomingCall from "./IncomingCall.svelte";
@@ -76,7 +95,9 @@
   import SpotlightPanel from "./SpotlightPanel.svelte";
   import NotificationCenter from "./NotificationCenter.svelte";
   import ClipboardAnnounce from "./ClipboardAnnounce.svelte";
+  import ShareSheet from "./ShareSheet.svelte";
   import ImeOverlay from "./ImeOverlay.svelte";
+  import DragGhost from "./DragGhost.svelte";
   // Keyboard admission for the touch shell (re-wired after the rollback that lost REQ-A335/336/338):
   // the *registry* is the one table that knows "which key opens which surface", `shellKeyIntent` is
   // the pure decision (its unit tests survived), and the panel is generated from the same table.
@@ -87,12 +108,16 @@
   // (and any future consumer — accessibility shortcut, etc.) cannot disagree.
   import { backActionAt, levelOf, pushDecision, rewindCount, type BackPosition, type BackSurface } from "../lib/backNav";
   import ShortcutHud from "./ShortcutHud.svelte";
-  import ExtAppHost from "./ExtAppHost.svelte";
+  import SystemInkLayer from "./SystemInkLayer.svelte";
 
   interface HomeProps {
     layout: HomeLayout;
     ext: StoreTile[];
     pulseId: string | null;
+    /** The soft launch's event counter (`shellState.pulseSeq`). `pulseId` is the value to
+     * highlight; this says a launch *happened*, which is what reveals a tile that lives
+     * on a page the grid is not currently showing. */
+    pulseSeq: number;
     /** Home-screen grid geometry for this device's **class** (see lib/formLayout).
      * The shell owns it because the shell is what reads the host's authority; the
      * grid is pushed down the same reactive channel as the layout, in place. */
@@ -100,6 +125,10 @@
     /** How big one tile is on this class (`lib/formLayout::homeTile`). Pushed with the
      * grid for the same reason: it is the host's class, not the component's guess. */
     tile: HomeTile;
+    /** The device class itself, for the class-aware Dock decisions the home screen
+     * makes on its own (`lib/formLayout::dockRecentSlots` — the iPad Dock's
+     * recently-used section). Pushed like `grid`/`tile`: the shell owns the host read. */
+    form: FormFactor;
   }
 
   // The host's layout authority (`form` + the **measured** screen). The shell reads
@@ -150,7 +179,7 @@
    * for every real launch and the desktop branch would never run.
    */
   function launchApp(id: string): void {
-    if (desktopFormActive()) void wmOpen(id);
+    if (desktopFormActive()) void wmOpenReported(id, "Shell");
     else open(id);
   }
 
@@ -162,7 +191,14 @@
   $effect(() => {
     if (!chrome.titleBar) return;
     const s = surface();
-    const asked = s.kind === "app" ? appTitle(s.id) : null;
+    // REQ-A478: the window names **itself**, and a window of an app is not just that app.
+    // Measured on this machine 2026-09-19: three `⌘N` Files windows came back from AX as
+    // `文件`, `文件`, `文件` — while each window's own titlebar drew `文件`, `文件 — 2`,
+    // `文件 — 3`. Two names for one window, on screen at the same time, is exactly the
+    // "名字只有一份" rule this effect exists to keep (and a screen reader read three
+    // identical window names). The label comes from the same fragment the surface did.
+    const label = windowLabelFromHash(typeof location === "undefined" ? null : location.hash);
+    const asked = s.kind === "app" ? (label ? windowName(label, null, ext).text : appTitle(s.id)) : null;
     void wmSetShellTitle(asked).then((applied) => {
       // The host bounds what it hands the OS (a third-party display name is truncated
       // with a visible `…`). Report a difference instead of hiding it — a title bar
@@ -180,7 +216,26 @@
   // empty, and an installed app never appears on the home screen / App Library.
   let ext = $state<StoreTile[]>(getStoreTiles());
   const refreshStoreTiles = () => {
-    void loadStoreTiles().then((tiles) => (ext = tiles));
+    void loadStoreTiles().then((tiles) => {
+      ext = tiles;
+      // The home layout was repaired at boot, before this load — while the tile
+      // cache was still cold, a store app the user had already placed on a page /
+      // the dock read as a ghost and was filtered out. Re-derive it now that the
+      // installed set is known (and, via the subscribe below, on every install /
+      // uninstall, so a removed app's placement is reconciled out too).
+      reseatHomeLayout();
+      // Same cold-cache half for the persisted **split** (a tablet's two-pane layout).
+      // `restoreSplit` at boot validated its panes before this load resolved, so a pane
+      // holding an installed store app read as a ghost and the whole split was dropped.
+      // Re-attempting here is a no-op once a split is on screen (the function's own
+      // `kind !== "home"` guard), so this cannot override a later user navigation.
+      restoreSplit();
+      // …and the same for the floating Slide Over panel, whose stored app is validated the
+      // same way (`restoreSlideOver` → `parseSlideOver`): a panel on an installed store app
+      // read as a ghost at boot and never came back. The no-op-once-shown guard is the
+      // function's own (`_slideOver !== null`).
+      restoreSlideOver();
+    });
   };
 
   // Feed the controlled screens from shellState whenever the visible surface is
@@ -191,8 +246,10 @@
         layout: layout(),
         ext,
         pulseId: pulseId(),
+        pulseSeq: pulseSeq(),
         grid: homeGridPlan,
         tile: homeTilePlan,
+        form: shellForm,
       });
     }
   });
@@ -208,14 +265,36 @@
       });
     }
   });
+  // 编辑主屏 draws the same tiles the home screen does, so it needs the same store-installed
+  // list: without `ext` a store app on the page has no chip to remove or reorder, and a hidden
+  // one has no way back (REQ-A1182). Fed exactly like `appLibrary` just above.
   $effect(() => {
     if (surface().kind === "edit") {
-      propsChannel<{ layout: HomeLayout }>("editHome").set({ layout: layout() });
+      propsChannel<{ layout: HomeLayout; ext: StoreTile[] }>("editHome").set({
+        layout: layout(),
+        ext,
+      });
     }
   });
 
   // ③c: feed overlay open flags from shellState (home & app surfaces).
-  $effect(() => propsChannel<{ open: boolean }>("recents").set({ open: shellRecents() }));
+  $effect(() =>
+    propsChannel<{
+      open: boolean;
+      pick: "split" | "slide" | null;
+      exclude: string | null;
+      ext: StoreTile[];
+    }>("recents").set({
+      open: shellRecents(),
+      pick: splitPicking ? "split" : slidePicking ? "slide" : null,
+      // A split pane may not repeat the primary app; a Slide Over panel may.
+      exclude: splitPicking && s.kind === "app" ? s.id : null,
+      // The picker offers installed store apps alongside the (built-in-only) recents —
+      // the shell already owns the tile list for the home screen, so the controlled
+      // overlay gets it the same way: pushed, not re-sourced.
+      ext,
+    }),
+  );
   $effect(() => propsChannel<{ open: boolean }>("spotlight").set({ open: shellSpot() }));
   $effect(() => propsChannel<{ open: boolean }>("nc").set({ open: shellNc() }));
 
@@ -238,10 +317,11 @@
         applyLayout(moveBefore(layout(), m.drag, m.over));
       } else if (e === "search") setSpot(true);
       else if (e === "library") enterLibrary();
+      else if (e === "edit") enterEdit();
     });
   });
   $effect(() => {
-    return propsChannel<{ layout: HomeLayout }>("editHome").on((e, d) => {
+    return propsChannel<{ layout: HomeLayout; ext: StoreTile[] }>("editHome").on((e, d) => {
       if (e === "change") applyLayout(d as HomeLayout);
       else if (e === "done") exitEdit();
     });
@@ -263,8 +343,15 @@
   // Overlay one-shot actions → shellState.
   $effect(() => {
     return propsChannel<{ open: boolean }>("recents").on((e, d) => {
-      if (e === "open" && typeof d === "string") open(d);
-      else if (e === "close") setRecents(false);
+      if (e === "open" && typeof d === "string") {
+        if (splitPicking) pickSecond(d);
+        else if (slidePicking) pickSlideOver(d);
+        else void open(d);
+      } else if (e === "close") {
+        setRecents(false);
+        splitPicking = false;
+        slidePicking = false;
+      }
     });
   });
   $effect(() => {
@@ -280,6 +367,10 @@
       else if (e === "recents") setRecents(true);
       else if (e === "edit") enterEdit();
       else if (e === "lock") lock();
+      // The system ink layer's door on touch (REQ-A1590): the Control Center is reachable from
+      // the top edge over *any* app, so this is what makes the stylus system-wide. `openSysInk`
+      // dismisses the sheet itself (`clearOverlays`), so the sheet needs no second "close" emit.
+      else if (e === "ink") openSysInk();
     });
   });
 
@@ -336,13 +427,21 @@
     // this is not a poll). A `null` answer (no bridge, or a failed command — recorded
     // in the diagnostics ledger by `lib/backend`) leaves the phone plan in place
     // rather than keeping a stale tablet reading (`WindowPage`'s honesty rule).
-    // The same snapshot also feeds `setFormFactor` so the app registry hides
-    // phone-only apps (e.g. `phone` dialer) on desktop — desktop has no SIM.
+    // `setLayoutSnapshot` also re-asserts the device class from the very snapshot
+    // it stores (see its doc), so the app registry hides phone-only apps
+    // (e.g. the `phone` dialer) on desktop — one writer, no second call to forget.
     void wmLayoutSnapshot().then((s) => {
       if (s) {
         layoutSnap = s;
-        setFormFactor(s.form);
         setLayoutSnapshot(s); // Initialize shellState with layout snapshot
+        // Bring back a split the last run was closed on, now that the measured
+        // screen (the `columns` gate) has actually answered. `restoreSplit` owns
+        // every refusal — no host at all (s is null) simply leaves the home surface.
+        restoreSplit();
+        // Same for the floating Slide Over panel. `restoreSlideOver` owns every
+        // refusal and always restores it *shown* (see its doc) — a restored panel the
+        // user could not see would look like a failed restore.
+        restoreSlideOver();
       }
     });
     // Desktop-shell capability switches (`AMOS_DESKTOP_SHORTCUTS` /
@@ -351,9 +450,15 @@
     // fetches them when it mounts (REQ-A287).
     void onLayoutChanged((s) => {
       layoutSnap = s;
-      setFormFactor(s.form);
       setLayoutSnapshot(s); // Update shellState on layout changes
     }).then((stop) => {
+      // REQ-A838: `null` = the `layout-changed` listen was refused, so no push will ever
+      // arrive and there is nothing to release. `stopLayoutWatch` keeps its no-op default —
+      // which is *correct* here, because a no-op is exactly what releasing nothing is. What
+      // must not happen is the shell reporting a live layout subscription; that answer is
+      // `bridgeDiag(LAYOUT_CHANGED_EVENT)`, and the push is an optimization — the snapshot
+      // above is already read once at mount.
+      if (stop === null) return;
       if (layoutDisposed) stop();
       else stopLayoutWatch = stop;
     });
@@ -377,9 +482,17 @@
       startAlarmWatcher(getActive),
       startReminderWatcher(getActive),
       startCalendarWatcher(getActive),
+      // Scheduled Do-Not-Disturb windows (REQ-A684): the shell is the host that
+      // owns the real DND bit, so it reconciles it — the decision is pure
+      // (`lib/focusSchedule`), and this only flips the one `amos.settings.dnd`.
+      startFocusWatcher(),
       // Remote push deliveries land in the same notification store the NC/banner
       // already render (the mapping is pure: `lib/pushNotifBridge`).
       startPushWatcher(),
+      // System-update check (REQ-A1457): the About page can check on demand, but a
+      // user who never opens it would never learn an update exists. This only
+      // *checks* — staging/flashing stays behind the page's explicit button.
+      startOtaWatcher(),
       // User automations (shortcut triggers): the Rust ledger owns *when* they fire
       // (so a time trigger survives "no window open"), this watcher owns the signals
       // the WebView can see (connectivity / battery / app-open) and runs the actions.
@@ -396,7 +509,14 @@
       // not at mount: the host's layout snapshot (which decides `shellForm`) arrives a beat
       // after this list is built, so a start-time decision would answer "phone" for every
       // window and the guard would be dead code on a real launch.
-      startOsAutoOff({ onSleep: () => navigateSelf(lock) }),
+      // `isLocked` is what keeps 「自动息屏」 working past its first fire: this watcher
+      // is started once here and the lock it triggers is a *surface* change inside
+      // this same component, so without it the loop stopped at the first sleep and
+      // the display never auto-off again for the rest of the launch (REQ-A1401).
+      startOsAutoOff({
+        onSleep: () => navigateSelf(lock),
+        isLocked: () => surface().kind === "lock",
+      }),
       startOsTelephonyHold(),
       startOsWakeHome({ onHome: () => navigateSelf(goHome) }),
       startOsHardwarePoll({
@@ -411,6 +531,11 @@
     ];
     refreshStoreTiles();
     void startLmkSurfaceWatcher().then((stop) => {
+      // REQ-A838: a refused `lmk-surface` listen means the container's kill/reclaim decisions
+      // will never reach us — the watcher is a pure event feed with no poll behind it, so the
+      // no-op default must stay and `bridgeDiag(LMK_SURFACE_EVENT)` is what says the shell is
+      // not watching rather than that the container is calm.
+      if (stop === null) return;
       if (lmkDisposed) stop();
       else stopLmkWatch = stop;
     });
@@ -418,6 +543,11 @@
     // from the daemon into a durable notification (the NC / banner render it).
     // Metadata-only by construction (see lib/telemetrySpy); no-op without Tauri.
     void startTelemetrySpyWatcher((hit) => recordSpyHit(hit, t)).then((stop) => {
+      // REQ-A838: this one is the sharpest of the three — it is an *audit* surface, and a
+      // refused listen leaves it reporting nothing at all while the shell keeps running. An
+      // empty egress audit and an audit that is not running are opposite claims;
+      // `bridgeDiag(SPY_HIT_EVENT)` is the only place that distinguishes them.
+      if (stop === null) return;
       if (spyDisposed) stop();
       else stopSpyWatch = stop;
     });
@@ -438,35 +568,69 @@
     for (const name of ["home", "editHome", "appLibrary", "lock", "recents", "spotlight", "nc"]) {
       disposePropsChannel(name);
     }
-    // Clear the form-factor signal so a torn-down shell can never leave a stale
-    // `desktop` answer in the app registry (which would hide phone-only apps on
-    // the next mount if the next shell booted on a phone/tablet).
-    setFormFactor(null);
+    // Clear the snapshot — and with it the form-factor signal — so a torn-down
+    // shell can never leave a stale `desktop` answer in the app registry (which
+    // would hide phone-only apps on the next mount if the next shell booted on a
+    // phone/tablet).
+    setLayoutSnapshot(null);
   });
 
   const s = $derived(surface());
 
-  // ③b: load + mount the active app screen by id (React-free registry).
-  let AppComp = $state<any>(null);
-  $effect(() => {
-    if (s.kind !== "app") {
-      AppComp = null;
-      return;
-    }
-    const load = svelteAppLoader(s.id);
-    if (!load) {
-      AppComp = null;
-      return;
-    }
-    let alive = true;
-    load().then((m) => {
-      if (alive) AppComp = m.default;
-    });
-    return () => {
-      alive = false;
-    };
-  });
+  // Split-screen entry (REQ-A512). The header's affordance only exists where two
+  // panes can actually fit (`canSplit()` = the host's measured `columns >= 2`), and
+  // the pick itself goes through `enterSplit`, whose **gate is the same one** — so
+  // the button's visibility and the transition's admission cannot disagree.
+  let splitPicking = $state(false);
+  const splitAvailable = $derived(canSplit() && shellForm !== "desktop");
 
+  function startSplitPick(): void {
+    splitPicking = true;
+    slidePicking = false;
+    setRecents(true);
+  }
+
+  // Slide Over entry (REQ-A675). Same gate shape as the split's: the affordance only
+  // exists where a panel can actually float (`canSlideOver()`), and the pick goes
+  // through `openSlideOver`, whose **gate is the same one** — so the button's
+  // visibility and the transition's admission cannot disagree.
+  let slidePicking = $state(false);
+  const slideOverAvailable = $derived(canSlideOver() && shellForm !== "desktop");
+
+  function startSlideOverPick(): void {
+    slidePicking = true;
+    splitPicking = false;
+    setRecents(true);
+  }
+
+  /** A pick from the sheet while in "choose a Slide Over app" mode. */
+  function pickSlideOver(id: string): void {
+    if (!openSlideOver(id)) {
+      // Reachable if the screen narrowed between the tap and the pick. Say so and
+      // stay put rather than open a panel the class cannot show.
+      amosWarn("shell", `slide over refused: the screen no longer fits a panel (${id})`);
+    }
+  }
+
+  /** A pick from the sheet while in "choose a second app" mode. */
+  function pickSecond(id: string): void {
+    const cur = s;
+    if (cur.kind !== "app") {
+      void open(id);
+      return;
+    }
+    if (id === cur.id) return; // the sheet already excludes it; belt and braces
+    if (!enterSplit(cur.id, id)) {
+      // Reachable if the screen narrowed between the tap and the pick. Say so and
+      // stay put rather than enter a split the class cannot show.
+      amosWarn("shell", `split refused: the screen no longer fits two panes (${cur.id})`);
+    }
+  }
+
+  // ③b: the app screen itself is mounted by `AppPane` (REQ-A512), which owns loading
+  // its screen by id. It used to live here as a single `AppComp` state, which is also
+  // why a split had nowhere to put its second app: one state can hold one screen.
+  //
   // ③c-ext (device-independent): the touch shell's **keyboard admission** (re-wired).
   //
   // Before this: one hard-coded "Escape closes the three overlays". It reached *less* than the
@@ -484,6 +648,22 @@
   const overlayTop = $derived(ncOpen() ? "nc" : recentsOpen() ? "recents" : spotOpen() ? "spot" : null);
   const overlayOpen = $derived(overlayTop !== null);
 
+  // G-β-1 · 屏幕降亮遮罩（仅**非桌面**形态）。桌面形态由 `DesktopShell` 画同一层
+  // （同一个 `amos.brightness` key、同一个 `brightnessToAlpha`），两条分支互斥，
+  // 所以永远不会叠成两层黑。手机 / 平板上整个设备 UI 就是这一个 WebView，遮罩覆盖
+  // 的就是整屏内容。z=[85] 高于控制中心 / 最近使用 / Spotlight（=40）与通知条（=70），
+  // **低于**来电全屏（=90）—— 压低亮度时来电界面仍清晰可辨。`pointer-events:none`
+  // 不抢事件；alpha=0 时不渲染。
+  const brightnessStore = createStoreValue<unknown>(BRIGHTNESS_KEY, {});
+  let brightnessPct = $state<number>(100);
+  $effect(() => {
+    const un = brightnessStore.subscribe((v) => {
+      brightnessPct = normalizeBrightness(v).pct;
+    });
+    return un;
+  });
+  const brightnessAlpha = $derived(brightnessToAlpha(brightnessPct));
+
   function closeTopOverlay() {
     if (overlayTop === "nc") setNc(false);
     else if (overlayTop === "recents") setRecents(false);
@@ -492,6 +672,18 @@
 
   $effect(() => {
     const onKey = (e: KeyboardEvent) => {
+      // The ink layer is modal (REQ-A1590): while it is up it owns the keyboard, and a dismiss
+      // lowers *it* — the surface underneath must not also navigate. It is deliberately not part
+      // of `overlayTop`/`backActionAt`: those model the shell's *navigation* position (which key
+      // opens which surface, how deep the history is), and a scratch drawing is neither.
+      if (sysInkOpen()) {
+        if (e.key === "Escape") {
+          e.preventDefault();
+          closeSysInk();
+        }
+        return;
+      }
+
       const intent = shellKeyIntent(e, SHELL_MODULES);
       if (intent.kind === "none") return;
 
@@ -513,6 +705,7 @@
       // agrees with the platform back gesture and any future consumer. The
       // pure decision tree:
       //   * overlay open   → close it
+      //   * split          → collapse to the primary app (REQ-A512)
       //   * app / library  → go home (deferred one tick so an inner consumer
       //                      — the library's search box — can claim the keystroke
       //                      via `preventDefault()` first)
@@ -523,6 +716,12 @@
       e.preventDefault();
       if (action === "close-overlay") {
         closeTopOverlay();
+        return;
+      }
+      if (action === "exit-split") {
+        // Back inside a split collapses it to the primary app (REQ-A512) — the same
+        // step the hardware back gesture takes, from the same decision.
+        exitSplit();
         return;
       }
       // action === "home"
@@ -579,6 +778,13 @@
   });
   /** Apply back presses until the shell is at the browser's depth (idempotent). */
   function reconcileBackTo(target: number): void {
+    // A platform back gesture with the ink layer up lowers the layer, not the surface underneath
+    // — the same rule the Escape branch follows. The ink layer is modal and is not a navigation
+    // level (`levelOf` does not count it), so this is where the gesture's meaning is intercepted.
+    if (sysInkOpen()) {
+      closeSysInk();
+      return;
+    }
     let guard = 0;
     while (levelOf(readBackPosition()) > target && guard++ < 8) {
       const here = readBackPosition();
@@ -588,6 +794,8 @@
         if (top.nc) setNc(false);
         else if (top.recents) setRecents(false);
         else setSpot(false);
+      } else if (action === "exit-split") {
+        exitSplit();
       } else if (action === "home") {
         goHome();
       } else break; // nothing left inside the shell — the platform may exit
@@ -692,10 +900,19 @@
            现在：`s.kind === "app"` ⇒ 这个窗口画它自己那个应用，其余（启动器 / 锁屏 /
            片段无法解析成 app 的窗口）仍是桌面壳。 -->
       {#if s.kind === "app"}
-        <DesktopAppWindow id={s.id} />
+        <DesktopAppWindow id={s.id} {ext} />
       {:else}
-        <DesktopShell />
+        <!-- REQ-A1179: the desktop chrome draws the *same* layout the touch home draws, so it
+             gets the same tile list the same way — pushed, from the one component that loads it. -->
+        <DesktopShell {ext} />
       {/if}
+
+      <!-- 系统级手写层（REQ-A1590；桌面挂载点补于 REQ-A1670）：桌面形态下也画。
+           控制中心（桌面浮层 `control-center-panel`，ControlCenter.svelte）的
+           「系统级手写」按钮调 `openSysInk()`，此前本分支没有挂载它 —— 于是那个按钮
+           在 PC 上**静默无效**（`_sysInkOpen` 被置真，屏幕上什么都不出现）。
+           每个桌面窗口是独立 WebView，所以它盖住的是唤起它的那个窗口（边界写在组件头）。 -->
+      <SystemInkLayer />
     {:else}
       {#if s.kind === "edit"}
         <EditHome />
@@ -710,71 +927,47 @@
           </div>
         </div>
       {:else if s.kind === "app"}
-        <div
-          class="flex h-full flex-col text-neutral-900 dark:text-neutral-100"
-          data-testid="app-surface"
-          inert={overlayOpen}
-        >
-          <StatusBar form={shellForm} />
-          <div class="flex items-center justify-between border-b border-neutral-200/70 bg-white/50 px-3 py-3 backdrop-blur-md dark:border-neutral-800 dark:bg-white/5">
-            <button
-              onclick={goHome}
-              aria-label={t("a11y.back")}
-              class="-ml-1 grid h-11 w-11 cursor-pointer place-items-center rounded-full text-accent text-[17px] font-semibold transition active:bg-black/5 dark:active:bg-white/10"
-            >‹</button>
-            <span class="flex-1 truncate text-center text-[17px] font-semibold tracking-tight">{appTitle(s.id)}</span>
-            <span class="w-10"></span>
-          </div>
-          <!-- The app host is the ScrollView: content-flow apps (Settings, Phone,
-               Photos, Clock…) grow past the viewport and scroll here. Without
-               overflow-y-auto they'd clip on device (content below unreachable). -->
-          <div class="min-h-0 flex-1 overflow-y-auto overscroll-contain">
-            {#key s.id}
-              {#if isExtId(s.id)}
-                <!-- A store-installed app has no local Svelte screen: it runs its
-                     own web-bundle at its own origin on the `amos-app://` protocol.
-                     The host resolves the entry URL from Rust (which also proves
-                     the app is installed and its entry is servable) and says why
-                     when it cannot. -->
-                <ExtAppHost mid={midOf(s.id)} name={appTitle(s.id)} />
-              {:else if AppComp}
-                <AppComp />
-              {:else}
-                <!-- An id with no mounted screen (a built-in whose loader is absent
-                     in this build, or an unknown id from a link/layout): never a
-                     blank frame. `isKnownApp` separates the two honestly. -->
-                <div
-                  data-testid="app-unavailable"
-                  class="flex h-full flex-col items-center justify-center gap-2 px-8 text-center"
+        <div class="h-full" inert={overlayOpen}>
+          <AppPane id={s.id} form={shellForm} onback={goHome}>
+            {#snippet trailing()}
+              <!-- Split entry (REQ-A512): only where two panes can actually fit — the
+                   host's *measured* `columns` (phone ⇒ 1 ⇒ no entry at all, so a phone
+                   never offers a control that could not work). -->
+              {#if splitAvailable}
+                <button
+                  onclick={startSplitPick}
+                  aria-label={t("a11y.splitEnter")}
+                  title={t("a11y.splitEnter")}
+                  data-testid="split-enter"
+                  class="grid h-11 w-11 cursor-pointer place-items-center rounded-full text-accent transition active:bg-black/5 dark:active:bg-white/10"
                 >
-                  <span class="text-3xl" aria-hidden="true">❓</span>
-                  <p class="text-sm font-semibold">{appTitle(s.id)}</p>
-                  <p class="text-xs opacity-60">
-                    {isKnownApp(s.id)
-                      ? t("app.screenMissing", { id: s.id })
-                      : t("app.unknown", { id: s.id })}
-                  </p>
-                </div>
+                  <span class="block h-6 w-6" aria-hidden="true">▥</span>
+                </button>
+              {:else}
+                <span class="w-10"></span>
               {/if}
-            {/key}
+              <!-- Slide Over entry (REQ-A675): a floating panel needs the same room a
+                   split does, so it shares the measured gate. -->
+              {#if slideOverAvailable}
+                <button
+                  onclick={startSlideOverPick}
+                  aria-label={t("a11y.slideOverEnter")}
+                  title={t("a11y.slideOverEnter")}
+                  data-testid="slide-over-enter"
+                  class="grid h-11 w-11 cursor-pointer place-items-center rounded-full text-accent transition active:bg-black/5 dark:active:bg-white/10"
+                >
+                  <span class="block h-6 w-6" aria-hidden="true">▤</span>
+                </button>
+              {/if}
+            {/snippet}
+          </AppPane>
+        </div>
+      {:else if s.kind === "split"}
+        <div class="flex h-full flex-col" inert={overlayOpen}>
+          <StatusBar form={shellForm} />
+          <div class="min-h-0 flex-1">
+            <SplitSurface form={shellForm} />
           </div>
-          <!-- Home affordance. On a **touch** class this is the iOS home-indicator bar
-               (its gesture bar). A macOS window has no such gesture → the bar is not
-               drawn there; the way back is the toolbar's back control above (plus Esc,
-               plus the hardware/NC surfaces) — see `lib/formLayout::deviceChrome`. -->
-          {#if chrome.homeIndicator}
-            <div class="flex justify-center pb-2 pt-1">
-              <button
-                aria-label={t("a11y.home")}
-                data-testid="home-indicator"
-                title={t("a11y.home")}
-                onclick={goHome}
-                class="grid w-40 cursor-pointer place-items-center py-2"
-              >
-                <span class="block h-1.5 w-16 rounded-full bg-neutral-800/80 ring-1 ring-white/10 dark:bg-neutral-200/90 dark:ring-black/10"></span>
-              </button>
-            </div>
-          {/if}
         </div>
       {:else}
         <!-- home surface -->
@@ -782,12 +975,21 @@
           <Backdrop />
           <div class="relative z-10 flex h-full flex-col">
             <StatusBar form={shellForm} />
+            <!-- The home grid is drawn from `_layout`; a refused layout write keeps that
+                 memory where it was, and this is the one line that says so. -->
+            {#if layoutRefused()}
+              <div class="px-4 pt-2"><StoreErrorBar message={t("common.storeWriteFailed")} /></div>
+            {/if}
             <div class="min-h-0 flex-1">
               <HomeDock />
             </div>
           </div>
         </div>
       {/if}
+
+      <!-- The floating Slide Over panel (REQ-A675): above the surface it overlays,
+           below the system sheets so Notification Center etc. still cover it. -->
+      <SlideOverSurface form={shellForm} />
 
       <!-- ③c: always-on chrome + overlays above home/app/edit -->
       <NotificationBanner />
@@ -796,10 +998,33 @@
       <SpotlightPanel />
       <NotificationCenter />
       <ClipboardAnnounce />
+      <!-- System share sheet (REQ-A703): renders nothing while closed. -->
+      <ShareSheet />
       <!-- Input method: the pinyin keyboard for whichever text field is focused. -->
       <ImeOverlay />
+      <!-- Cross-app drag & drop (REQ-A683): the chip that follows the pointer while
+           an item is dragged between panes. Renders nothing when no drag is live. -->
+      <DragGhost />
       {#if layoutSnap !== null}
         <ShortcutHud />
+      {/if}
+
+      <!-- 系统级手写层（REQ-A1590）：浮在整个 shell 之上、画在任意界面上。控制中心
+           两处都能唤起；桌面形态下它盖住的是**唤起它的那个窗口**（应用窗口是独立原生
+           窗口，WebView 里的浮层盖不到别的窗口 —— 边界写在组件头）。 -->
+      <SystemInkLayer />
+
+      <!-- G-β-1 · 屏幕降亮遮罩（仅非桌面形态；桌面形态由 DesktopShell 画同一层）。
+           slider 在控制中心（NotificationCenter），两边共用 lib/brightness.ts 的
+           `brightnessToAlpha`。pointer-events:none 不抢事件；alpha=0 时不渲染。 -->
+      {#if brightnessAlpha > 0}
+        <div
+          class="pointer-events-none absolute inset-0 z-[85] bg-black"
+          style="opacity: {brightnessAlpha}"
+          data-testid="brightness-overlay"
+          data-brightness-pct={brightnessPct}
+          aria-hidden="true"
+        ></div>
       {/if}
     {/if}
   {/if}

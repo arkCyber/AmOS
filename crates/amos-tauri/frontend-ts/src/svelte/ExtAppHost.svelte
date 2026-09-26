@@ -23,6 +23,12 @@
     fetchBundleEntry,
     type BundleHostFailure,
   } from "../lib/bundleHost";
+  import {
+    bundleFrameSeam,
+    installSandboxCapabilityHost,
+  } from "../lib/sandboxCapabilityHost";
+  import { daemonAuthorize } from "../lib/privacyBackend";
+  import { amosWarn } from "../lib/debugLog";
   import { t } from "./locale.svelte";
 
   // The store manifest id (NOT the `store:` tile id), and the app's display name
@@ -55,11 +61,38 @@
   // `bridged()`-derived copy of the same decision to disagree with it (that copy
   // was a constant, since `bridged()` is a plain function read).
   const failed = $derived(load.kind === "failed" ? load : null);
+
+  /**
+   * The **live** half of the capability seam (REQ-A721).
+   *
+   * `lib/sandboxBridge` decides *whether* a bundle's `capability.request` may be granted;
+   * until now **nothing called it**, so a frame was denied by absence rather than by
+   * policy (`unwired-allowlist.json` named this as the missing listener). Install it
+   * against *this* frame's `contentWindow` — the object the listener matches
+   * `event.source` against — while the frame is mounted, and tear it down with the
+   * component (the effect's return *is* the unsubscribe).
+   */
+  let frameEl: HTMLIFrameElement | null = $state(null);
+  $effect(() => {
+    if (load.kind !== "ready" || frameEl === null) return;
+    const frame = frameEl;
+    return installSandboxCapabilityHost(
+      // Read `contentWindow` lazily: the identity check compares it to `event.source`, so
+      // it must return the frame's *own* window object each time, never a copy.
+      bundleFrameSeam(() => frame.contentWindow, daemonAuthorize),
+      {
+        appId: mid,
+        onRefused: (reason, data) =>
+          amosWarn("bundle", `🛟 capability frame refused (${reason})`, data),
+      },
+    );
+  });
 </script>
 
 {#if load.kind === "ready"}
   <iframe
     data-testid="ext-app-frame"
+    bind:this={frameEl}
     title={name}
     src={load.url}
     sandbox={BUNDLE_FRAME_SANDBOX}

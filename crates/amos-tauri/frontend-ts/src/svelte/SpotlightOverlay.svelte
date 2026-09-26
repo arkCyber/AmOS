@@ -7,12 +7,15 @@
   // 数据：实时读 home layout 的 `page + dock`（去重）→ APP_META 元信息（icon + i18n 名称）。
   // 搜索：按名称 / id 子串匹配（大小写不敏感）。
   // 选中：Enter 打开 / 单击打开 → wm_open(id) → 关闭浮层。
-  import { onMount } from "svelte";
+  import { getContext, onMount } from "svelte";
   import { announceAppOpened } from "../lib/shortcuts";
-  import { APP_META, appIcon, appTitleKey } from "../lib/appMeta";
+  import { APP_META } from "../lib/appMeta";
+  import { iconForId, isDrawableApp, nameForId } from "../lib/appLookup";
+  import { getStoreTiles, type StoreTile } from "../lib/storeApps";
+  import { SHELL_CHROME_API, type ShellChromeApi } from "../lib/shellModule";
   import { LAYOUT_KEY, type HomeLayout, getLayout } from "../lib/amosStore";
   import { withoutPhone } from "../lib/phoneApps";
-  import { wmOpenWithDiag, wmOpen } from "../lib/wm";
+  import { wmOpenReported } from "../lib/wm";
   import { createStoreValue } from "./store";
   import { t } from "./locale.svelte";
   import { SPOTLIGHT_WIDTH, SPOTLIGHT_HEIGHT, SPOTLIGHT_INPUT_HEIGHT } from "../lib/desktopLayout";
@@ -20,6 +23,7 @@
   import { calcQuery } from "../lib/calculator";
   import { FILES_KEY, folderPath, normalizeFiles, searchFiles, type FEntry } from "../lib/files";
   import { buildSpotlightResults, type SpotlightRow } from "../lib/spotlightSearch";
+  import { nextListIndex } from "../lib/overviewKeys";
   import { revealFileAcrossWindows } from "./appLinks";
   import { clipboardWrite } from "../lib/clipboard";
 
@@ -27,6 +31,10 @@
   let { onclose }: { onclose?: () => void } = $props();
 
   let query = $state("");
+  // 已安装的商店应用：壳通过 `SHELL_CHROME_API.storeTiles` 推下来（getter ⇒ 保持活）；
+  // 单独渲染本组件时回退到模块缓存本身。
+  const api = getContext<ShellChromeApi | undefined>(SHELL_CHROME_API);
+  const ext = $derived<readonly StoreTile[]>(api?.storeTiles ?? getStoreTiles());
   let inputEl = $state<HTMLInputElement | null>(null);
 
   // ─── 真实应用列表（从 home layout + dock 合并去重）────────────────────────────────
@@ -44,7 +52,12 @@
     icon: string;
     name: string;
   }
-  // 全部可搜 app（用户的 home layout + 所有内置 app，去重；电话类 app 在桌面形态下不显示）
+  // 全部可搜 app（用户的 home layout + 所有内置 app + 已安装的商店应用，去重；电话类 app
+  // 在桌面形态下不显示）
+  //
+  // REQ-A1179：这里原先是 `if (!titleKey) continue; // 跳过未注册的 id（如 store tile 占位）`
+  // ——把商店瓷砖当成"占位"跳掉。可它是**已安装且可打开**的应用（同一个 `wm_open` 路径，
+  // 触屏侧的 App 资源库与桌面启动台都列它），于是桌面上按名字搜一个装好的应用搜不到。
   const allApps = $derived.by<AppEntry[]>(() => {
     const seen = new Set<string>();
     const result: AppEntry[] = [];
@@ -53,9 +66,15 @@
     for (const id of candidates) {
       if (seen.has(id)) continue;
       seen.add(id);
-      const titleKey = appTitleKey(id);
-      if (!titleKey) continue; // 跳过未注册的 id（如 store tile 占位）
-      result.push({ id, icon: appIcon(id), name: t(titleKey) });
+      if (!isDrawableApp(id, ext)) continue; // 既不是内置 app，也不是已安装的商店应用
+      result.push({ id, icon: iconForId(id, ext), name: nameForId(id, ext, t) });
+    }
+    // 装上但**还没被放到主屏**的商店应用同样可搜——macOS 的 Spotlight 找得到每一个已安装的
+    // 应用，桌面启动台也列它们（少这一条，用户装了应用却只能用启动台开）。
+    for (const tile of ext) {
+      if (seen.has(tile.id)) continue;
+      seen.add(tile.id);
+      result.push({ id: tile.id, icon: iconForId(tile.id, ext), name: nameForId(tile.id, ext, t) });
     }
     return result;
   });
@@ -97,6 +116,26 @@
   /** What the last activation did, when it needs saying (a copied calculation). */
   let notice = $state("");
 
+  /** How many quick actions the blank-query panel shows. */
+  const QUICK_ACTIONS = 5;
+
+  /**
+   * What the panel renders when there is no query — the shortcut list, which is a
+   * **selectable** list (it highlights `selected`), not decoration.
+   */
+  const quickApps = $derived(allApps.slice(0, QUICK_ACTIONS));
+
+  /**
+   * Which list the keyboard is driving. The panel shows one of two lists, and only one of
+   * them is ever on screen: the search rows when the query is non-empty, the quick actions
+   * when it is blank. Navigation used to bound and resolve against `results.rows` alone,
+   * which is **always empty** for a blank query (`buildSpotlightResults` returns no rows for
+   * `""`), so in the quick-action state ↑/↓ were dead and Enter did nothing — while the panel
+   * still drew a highlighted row, an affordance no key could act on.
+   */
+  const showingQuick = $derived(results.rows.length === 0 && query.trim() === "");
+  const navCount = $derived(showingQuick ? quickApps.length : results.rows.length);
+
   // 键盘：上下选择 + Enter 打开
   let selected = $state(0);
   // Reset the selection whenever the query changes. This is ONE effect reading
@@ -110,26 +149,14 @@
   async function openApp(id: string) {
     // REQ-A297 phase-2 §4: `invoke` swallows failures into `null` (REQ-A296).
     // The earlier try/catch was dead code. A silently-failed `wm_open` from
-    // Spotlight would feel like "Enter doesn't do anything" — log the null
-    // for ops but still close the panel (better than leaving the user with
-    // a dead modal over their desktop).
-    const r = await wmOpenWithDiag(id);
-    if (!r.ok) {
-      const diag = r.diag;
-      if (!diag.ok) {
-        // Only the `{ ok: false, kind: ... }` shape carries `kind` / `detail`
-        // — narrowed here so svelte-check sees the union.
-        const code =
-          diag.kind === "command-failed" &&
-          diag.detail &&
-          typeof diag.detail === "object"
-            ? (diag.detail as { code?: string }).code
-            : undefined;
-        // Soft log; the panel closes regardless. Keeps the failure visible
-        // in the diagnostic ledger without overwhelming the user.
-        console.warn(`[Spotlight] wm_open(${id}) refused`, code ?? diag.kind);
-      }
-    } else {
+    // Spotlight would feel like "Enter doesn't do anything" — say why, and
+    // still close the panel (better than a dead modal over the desktop).
+    //
+    // REQ-A1187: the report itself now comes from `wmOpenReported`, the shell's single
+    // owner for a refused `wm_open` — the `file` row below used to report its **store-write**
+    // refusal and then drop the door's verdict, so this panel had two `wm_open` rows with
+    // two different answers to the same failure.
+    if (await wmOpenReported(id, "Spotlight")) {
       // An app really opened → tell the automation runtime (`app` triggers).
       announceAppOpened(id);
     }
@@ -169,8 +196,19 @@
       // user asked for a window, and a window is what they can get.
       console.warn(`🛟 [Spotlight] could not queue the reveal for '${row.id}' (store refused)`);
     }
-    void wmOpen("files");
+    void wmOpenReported("files", "Spotlight");
     onclose?.();
+  }
+
+  /** Run whatever the highlighted row is — a search row, or a quick action. */
+  function runSelected(): void {
+    if (showingQuick) {
+      const app = quickApps[selected];
+      if (app) void openApp(app.id);
+      return;
+    }
+    const r = results.rows[selected];
+    if (r) activate(r);
   }
 
   function onKeyDown(e: KeyboardEvent) {
@@ -178,16 +216,18 @@
       onclose?.();
       return;
     }
-    if (e.key === "ArrowDown") {
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      // This overlay is modal, so it claims the arrows even when there is nowhere to go.
       e.preventDefault();
-      selected = Math.min(selected + 1, Math.max(0, results.rows.length - 1));
-    } else if (e.key === "ArrowUp") {
-      e.preventDefault();
-      selected = Math.max(selected - 1, 0);
+      // Where ↓/↑ go is **not** decided here: `lib/overviewKeys.nextListIndex` owns it, shared
+      // with the touch panel's Spotlight (`SpotlightPanel`), which draws the same list
+      // (REQ-A1040). Two copies of "clamp at the ends" is how the two Spotlights would start
+      // disagreeing about what ↓ does on the last row.
+      const next = nextListIndex(e.key, selected, navCount);
+      if (next !== null) selected = next;
     } else if (e.key === "Enter") {
       e.preventDefault();
-      const r = results.rows[selected];
-      if (r) activate(r);
+      runSelected();
     }
   }
 
@@ -299,7 +339,7 @@
         <p class="px-4 py-2 text-[11px] font-medium uppercase tracking-wider text-white/30">
           {t("desktop.quickActions")}
         </p>
-        {#each allApps.slice(0, 5) as app, i (app.id)}
+        {#each quickApps as app, i (app.id)}
           <button
             class="flex w-full items-center gap-3 rounded-lg px-4 py-2 text-left text-[14px] text-white/60 transition-colors {i === selected ? 'bg-blue-500/30' : 'hover:bg-white/10'}"
             onmouseenter={() => (selected = i)}

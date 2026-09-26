@@ -1,0 +1,5 @@
+{
+  "_why": "Fields of `DiagEntry` that are deliberately NOT rendered by the ledger's surface. Checked by scripts/diag-render-scan.mjs. Every entry must name a field that exists on the interface, a `kind` defined below, and a non-empty `reason` — an entry with no reason silences the check without saying why, which is the failure this gate exists to prevent.",
+  "kinds": [],
+  "fields": []
+}

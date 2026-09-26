@@ -16,9 +16,9 @@
 
 ## 剩余真实缺口（按可落地性排序）
 ### 可离线纯测/补测（下一优先）
-1. 各 App 的**过滤/选择语境一致性**抽查（仿相册翻页越界那类）——统一审计 `shown`/`list` 用法。
-2. 秒表**暂停态计圈/复位**边角（iOS 秒表允许运行中与暂停时计圈）——若有差异则修。
-3. 相机**双击缩放 与 点按锁定 手势互斥**精化（当前双击会同时触发对焦+缩放，属轻微 UX 瑕疵）。
+1. 各 App 的**过滤/选择语境一致性**抽查（仿相册翻页越界那类）——统一审计 `shown`/`list` 用法 → **✅ 已审（REQ-A617 / F-SH-095）**：全量 grep 各屏 `shown`/`filtered`/`results` 与 `.length` 的搭配后，**相册查看器**是唯一真错——计数器分母与幻灯片按钮的守卫读的是**未过滤**的 `list.length`，而查看器内容/翻页读的是**已过滤**的 `shown`，♥ 过滤下 1 张会显示 `1 / 40`、且幻灯片按钮恒现（`shown` 只有 1 张时 advance 恒为 null）。已统一为从 `shown` 取（`idx / total`、`total > 1`）。其余屏（Mail/Contacts/Notes/Store/Messages）经核**未发现**同类混用（Store 用 `results.length`、Mail 用 `shown.length`，均正确）。**遗留观察（未改，意图待定）**：`RemindersApp.svelte:412` 的 `{shown.length} / {pendingOf(reminders, sel.id).length}` 仅在 `!searching` 时渲染，此时 `shown === baseShown === pendingOf(...)` ⇒ 恒显示 `N / N`（冗余但非越界）；分母该取「列表总数」还是别的，属需你确认的意图问题，未擅自改。
+2. 秒表**暂停态计圈/复位**边角（iOS 秒表允许运行中与暂停时计圈）——~~若有差异则修~~ → **✅ 已修（REQ-A612 / F-SH-091）**：`ClockApp.svelte` 的「计次」按钮原为 `disabled={!sw.running}`（暂停即禁），现与「重置」同判据 `disabled={sw.elapsedMs === 0 && !sw.running}` —— 暂停（elapsed>0）仍可计次，仅完全归零的空闲态禁用；纯 `doLap`/`lapDeltas` 本就取自冻结的 `elapsedMs`，无需改动。
+3. 相机**双击缩放 与 点按锁定 手势互斥**精化（双击会同时触发对焦+缩放）——**✅ 已修（REQ-A615 / F-SH-094）**：原实现里双击的**第一次**点击仍会落下 AF 框（既有测试只断言「不锁定 AE/AF LOCKED」，从不检查框是否残留，缺陷在绿下存活）。现把「这一下是单击还是双击」抽成纯 `lib/camera.ts::classifyTap`（双击消费时间戳，第三下重新起算），并在识别为双击时 `undoDoubleTapFocus()` **撤销**第一次点击的 aim（含清空 `pointsOfInterest`）；单击仍即时对焦，双击只缩放、不留残留框。
 
 ### 需真机 / 系统能力（📱，进 device-bringup）
 - 相机：夜间、人像/景深、ProRAW、实况照片、原生光学镜头群、硬件对焦（`pointsOfInterest` 生效验证）。

@@ -58,7 +58,10 @@ cargo run -p amos-pdf-parser --example make_sample_pdf   # writes a small fixtur
 
 - **No OCR**: pages without a text layer are empty, and the extraction reports what it
   found rather than guessing.
-- **Encrypted/corrupt PDFs are refusals** (typed errors), never partial nonsense.
+- **Encrypted/corrupt PDFs are refusals** (typed errors), never partial nonsense: a
+  document that declares `/Encrypt` is refused with `PdfError::Encrypted`. This crate has
+  no password API, so even owner-password-only files (openable with an empty user
+  password) are refused rather than decoded.
 - **Layout is heuristic**: rows and tables come from geometry, and the design record lists
   the shapes that mislead it.
 - **Font decoding covers what the PDF declares** (`ToUnicode`/encoding); a font with neither

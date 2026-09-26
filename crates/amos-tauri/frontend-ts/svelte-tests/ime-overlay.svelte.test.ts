@@ -169,6 +169,27 @@ async function focusField(field: HTMLInputElement | HTMLTextAreaElement) {
 const sel = (host: { container: HTMLElement }, testid: string) =>
   host.container.querySelector(`[data-testid="${testid}"]`);
 
+/** Swap in a storage whose writes of `key` throw the way a full quota does; returns a restore. */
+function failWritesFor(key: string): () => void {
+  const real = window.localStorage;
+  const fake = {
+    get length() {
+      return real.length;
+    },
+    clear: () => real.clear(),
+    key: (i: number) => real.key(i),
+    getItem: (k: string) => real.getItem(k),
+    removeItem: (k: string) => real.removeItem(k),
+    setItem: (k: string, v: string) => {
+      if (k === key) throw new Error("QuotaExceededError");
+      real.setItem(k, v);
+    },
+  } as unknown as Storage;
+  Object.defineProperty(window, "localStorage", { value: fake, configurable: true, writable: true });
+  return () =>
+    Object.defineProperty(window, "localStorage", { value: real, configurable: true, writable: true });
+}
+
 describe("ImeOverlay.svelte — visibility", () => {
   test("a focused field on a fresh install offers the keyboard, it does not force it", async () => {
     const { host, field } = await harness(false);
@@ -189,6 +210,32 @@ describe("ImeOverlay.svelte — visibility", () => {
     expect(sel(host, "ime-keyboard")).toBeTruthy();
     expect(sel(host, "ime-show")).toBeNull();
     expect(window.localStorage.getItem(IME_ENABLED_KEY)).toBe("true");
+  });
+
+  test("a refused enable leaves the keyboard down, and says so (REQ-A1432)", async () => {
+    const { host, field } = await harness(false);
+    await focusField(field);
+    expect(sel(host, "ime-show")).toBeTruthy();
+
+    const restore = failWritesFor(IME_ENABLED_KEY);
+    try {
+      await fireEvent.click(sel(host, "ime-show")!);
+      await tick();
+      // 偏好没有落盘：键盘升起来就是替盘上那条「已开启」作证，而它并不存在。
+      expect(sel(host, "ime-keyboard")).toBeNull();
+      expect(sel(host, "ime-show")).toBeTruthy();
+      expect(window.localStorage.getItem(IME_ENABLED_KEY)).toBeNull();
+      expect(sel(host, "ime-store-error")?.textContent).toContain("未保存");
+    } finally {
+      restore();
+    }
+
+    // 存储回来可写：这一次真的落盘，键盘升起来，拒绝句消失。
+    await fireEvent.click(sel(host, "ime-show")!);
+    await tick();
+    expect(sel(host, "ime-keyboard")).toBeTruthy();
+    expect(window.localStorage.getItem(IME_ENABLED_KEY)).toBe("true");
+    expect(sel(host, "ime-store-error")).toBeNull();
   });
 
   test("with the IME on, focusing a field raises the dock", async () => {
@@ -342,29 +389,44 @@ describe("ImeOverlay.svelte — settings panel", () => {
 });
 
 describe("ImeOverlay.svelte — symbols, paging, refusals and the commit hint", () => {
-  test("the symbol page really types digits and punctuation in Chinese mode", async () => {
+  test("the Chinese symbol page types Chinese punctuation and keeps digits ASCII", async () => {
     const { host, field, keys } = await harness(true);
     await focusField(field);
 
+    await fireEvent.click(sel(host, "ime-symbols")!);
+    await fireEvent.click(sel(host, "ime-key-1")!);
+    await fireEvent.click(sel(host, "ime-key-。")!);
+    await fireEvent.click(sel(host, "ime-key-？")!);
+    await tick();
+
+    // ，。？！ in Chinese mode — a digit stays half-width (a phone number, not １２).
+    expect(field.value).toBe("1。？");
+    expect(keys).toEqual([]); // the engine only ever sees letters
+  });
+
+  test("the English page still types half-width ASCII punctuation", async () => {
+    const { host, field } = await harness(true);
+    await focusField(field);
+
+    await fireEvent.click(sel(host, "ime-mode")!); // zh → en
     await fireEvent.click(sel(host, "ime-symbols")!);
     await fireEvent.click(sel(host, "ime-key-1")!);
     await fireEvent.click(sel(host, "ime-key-.")!);
     await tick();
 
     expect(field.value).toBe("1.");
-    expect(keys).toEqual([]); // the engine only ever sees letters
   });
 
-  test("a symbol while composing commits the candidate first, then types the symbol", async () => {
+  test("a Chinese symbol while composing commits the candidate first, then types it", async () => {
     const { host, field } = await harness(true);
     await focusField(field);
 
     await fireEvent.click(sel(host, "ime-key-w")!);
     await fireEvent.click(sel(host, "ime-symbols")!);
-    await fireEvent.click(sel(host, "ime-key-.")!);
+    await fireEvent.click(sel(host, "ime-key-。")!);
     await tick();
 
-    expect(field.value).toBe("中国.");
+    expect(field.value).toBe("中国。");
     expect(sel(host, "ime-composition")).toBeNull(); // the code was consumed, not dropped
   });
 
@@ -609,7 +671,7 @@ describe("ImeOverlay.svelte — physical keys", () => {
     expect(f.commitIndex()).toBe(0);
   });
 
-  test("a physical punctuation key commits the code the user typed before it", async () => {
+  test("a physical punctuation key commits first and types the Chinese glyph", async () => {
     const f = await harness(true);
     await focusField(f.field);
     await fireEvent.click(sel(f.host, "ime-key-w")!);
@@ -618,10 +680,40 @@ describe("ImeOverlay.svelte — physical keys", () => {
     pressKey(f.field, ",");
     await tick();
     // A physical comma used to skip the engine entirely: it reached the field on
-    // its own, in front of the Chinese, while the pinyin code kept composing.
-    expect(f.field.value).toBe("中国,");
+    // its own, in front of the Chinese, while the pinyin code kept composing. It
+    // now commits the code first **and** reads as Chinese (，), not ASCII (,).
+    expect(f.field.value).toBe("中国，");
     expect(f.buffer()).toBe("");
     expect(f.commitIndex()).toBe(0);
+  });
+
+  test("a physical punctuation key with nothing composing is still the Chinese glyph", async () => {
+    const f = await harness(true);
+    await focusField(f.field);
+
+    pressKey(f.field, "?");
+    await tick();
+
+    expect(f.field.value).toBe("？");
+  });
+
+  test("a physical ASCII symbol with no Chinese twin is left to the field", async () => {
+    const f = await harness(true);
+    await focusField(f.field);
+
+    const seen = windowKeys();
+    try {
+      pressKey(f.field, "@");
+      await tick();
+    } finally {
+      seen.stop();
+    }
+
+    // `@` has no Chinese punctuation twin, so the IME neither consumes it nor
+    // rewrites it — the field (and the shell's shortcut bridge) keeps it, which is
+    // what keeps an email address typed in Chinese mode intact.
+    expect(f.field.value).toBe("");
+    expect(seen.keys).toEqual(["@"]);
   });
 
   test("a physical space is not swallowed when the code has no candidate", async () => {

@@ -85,7 +85,10 @@
 ### 2.2 代码文档
 
 ✅ **类型存根 (Type Stubs)**
-- `amos_link_py.pyi` - 完整的类型注解
+- `_native.pyi` - 完整的类型注解（PEP 561 为扩展模块 `amos_link._native` 解析的名字；
+  早先叫 `amos_link_py.pyi`，那个名字解析不到任何模块，也没有 `py.typed`，所以 IDE/类型检查
+  根本读不到它 —— 内容也早已漂移。REQ-A719 修好内容、改名并加 `py.typed`，且由
+  `scripts/py-stub-scan.mjs` 把它逐类逐成员绑到 `src/lib.rs` 的 pyo3 面）
 - IDE 自动完成支持
 - 类型检查支持
 
@@ -260,7 +263,8 @@ crates/amos-link-py/
 ├── python/
 │   └── amos_link/
 │       ├── __init__.py                 # Python 包入口
-│       └── amos_link_py.pyi            # 类型存根
+│       ├── py.typed                    # PEP 561 标记（REQ-A719）
+│       └── _native.pyi                 # 类型存根（REQ-A719 从 amos_link_py.pyi 改名）
 ├── examples/
 │   ├── simple_pubsub.py                # 基本发布/订阅示例
 │   ├── multi_topic.py                  # 多主题示例

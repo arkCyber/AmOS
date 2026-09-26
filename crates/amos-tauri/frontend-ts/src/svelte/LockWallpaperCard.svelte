@@ -3,13 +3,14 @@
   // ("锁屏背景" config in Settings). Choose a built-in wallpaper or add a custom
   // image (URL or ≤2.5MB upload); persisted as amos.settings.lockWallpaper for the
   // LockScreen backdrop.
-  import { readStoreValue, writeStoreValue } from "../lib/amosStore";
+  import { readStoreValue, writeStoreValueChecked } from "../lib/amosStore";
   import {
     WALLPAPER_FILES,
     WALLPAPER_PRESETS,
     isCustomWallpaper,
   } from "../lib/wallpaper";
   import { t } from "./locale.svelte";
+  import StoreErrorBar from "./StoreErrorBar.svelte";
 
   const GROUP =
     "overflow-hidden rounded-[11px] bg-white/70 ring-1 ring-black/5 dark:bg-white/[0.07] dark:ring-white/10";
@@ -36,36 +37,47 @@
   let active = $state<string | undefined>(initialActive);
   let url = $state(initialActive && isCustomWallpaper(initialActive) ? initialActive : "");
   let note = $state<string | null>(null);
+  let storeErr = $state("");
 
-  const writePref = (patch: Record<string, unknown>) => {
-    writeStoreValue("amos.settings", { ...readPrefs(), ...patch });
+  // 同 `WallpaperCard`（REQ-A1359 ∕ F-SH-623）：`writeStoreValue` 只返回 void，拒写与成功
+  // 在这张卡片看来字节相同。锁屏这张更重 —— 拒写的上传把 `active` 设成 data URL，于是
+  // **预览图**画了出来，而那串字节从未落盘，锁屏上永远不会出现它。
+  // 落盘成功才动 `active`：四条写入路径（预设 ∕ 自设 ∕ 清除 ∕ 上传）共用这一道门。
+  const commit = (patch: Record<string, unknown>, apply: () => void) => {
+    if (!writeStoreValueChecked("amos.settings", { ...readPrefs(), ...patch })) {
+      storeErr = t("common.storeWriteFailed");
+      return;
+    }
+    storeErr = "";
+    apply();
   };
+
   const previewSrc = $derived.by(() => {
     if (!active) return null;
     if (isCustomWallpaper(active)) return active;
     const f = WALLPAPER_FILES[active];
     return f ? `wallpapers/${f}` : null;
   });
-  const pick = (id: string) => {
-    writePref({ lockWallpaper: id });
-    active = id;
-    url = "";
-    note = null;
-  };
+  const pick = (id: string) =>
+    commit({ lockWallpaper: id }, () => {
+      active = id;
+      url = "";
+      note = null;
+    });
   const setCustom = () => {
     const v = url.trim();
-    if (v) {
-      writePref({ lockWallpaper: v });
-      active = v;
+    if (v)
+      commit({ lockWallpaper: v }, () => {
+        active = v;
+        note = null;
+      });
+  };
+  const clear = () =>
+    commit({ lockWallpaper: "" }, () => {
+      active = undefined;
+      url = "";
       note = null;
-    }
-  };
-  const clear = () => {
-    writePref({ lockWallpaper: "" });
-    active = undefined;
-    url = "";
-    note = null;
-  };
+    });
   const onFile = (e: Event) => {
     const input = e.target as HTMLInputElement;
     const f = input.files?.[0];
@@ -78,18 +90,19 @@
     const reader = new FileReader();
     reader.onload = () => {
       const data = typeof reader.result === "string" ? reader.result : "";
-      if (data) {
-        writePref({ lockWallpaper: data });
-        active = data;
-        url = "";
-        note = null;
-      }
+      if (data)
+        commit({ lockWallpaper: data }, () => {
+          active = data;
+          url = "";
+          note = null;
+        });
     };
     reader.readAsDataURL(f);
   };
 </script>
 
 <section class={"p-4 " + GROUP}>
+  <StoreErrorBar message={storeErr} />
   <div class="flex items-center justify-between">
     <h3 class="text-[15px] font-semibold text-neutral-800 dark:text-neutral-100">{t("wp.lockLabel")}</h3>
     {#if active}

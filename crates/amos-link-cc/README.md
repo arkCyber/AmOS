@@ -209,6 +209,8 @@ Entry points answer `0` on success, or a negative code (`-1` keyexpr, `-2` codec
 `-3` frame, `-4` unsupported, `-5` transport, `-6` closed, `-7` robot). The sentence that goes
 with it — and the "null pointer" explanation — lives in a **thread-local** buffer read with
 `amos_link_last_error()`; that pointer stays valid until the next `amos-link-cc` call on the
+same thread (the `strerror` contract), and `amos_link_error_clear()` empties it.
+
 ## Honest boundaries
 
 - **The crate is not new; its place in the build was.** It had been dropped from
@@ -224,8 +226,10 @@ with it — and the "null pointer" explanation — lives in a **thread-local** b
   thread-local.
 - **Not every entry point checks its inputs.** `amos_link_frame_decode_header` decodes
   immediately: a null `frame`, or a `frame_len` larger than the buffer, is the caller's bug
-  and will misbehave. The size a buffer must have is stated per function in `src/lib.rs`; the
-  generated header carries no such prose (cbindgen only emits declarations).
+  and will misbehave. The size a buffer must have is stated per function in `src/lib.rs`, and
+  — since REQ-A715 — the *checked-in* `amos_link.h` carries those `# Safety` contracts too
+  (cbindgen 0.29.4 emits the doc blocks; an earlier revision of this bullet claimed it "only
+  emits declarations", which that version does not).
 - **`amos_link_heartbeat_encode` has no capacity parameter** — the contract is "writable for
   `AMLK_MAX_FRAME_BYTES`", which is a much stronger requirement than the ~60-byte frame it
   actually writes. `amos_link_frame_encode` takes a capacity; this one arguably should too,
@@ -236,8 +240,12 @@ with it — and the "null pointer" explanation — lives in a **thread-local** b
   `make check` — they are compiled only when someone runs that Makefile with a C toolchain.
 - **No real-hardware or interop validation is recorded here.** The tests run in-process
   (node → publisher → subscriber roundtrip); nothing in this repository has driven this ABI
-  from a C program against a second machine, and `amos_link.h` is checked in rather than
-  regenerated in CI, so header/crate drift is only caught when someone runs cbindgen.
+  from a C program against a second machine. `amos_link.h` is still checked in rather than
+  regenerated in CI, so *content* drift is not impossible — but since REQ-A715 it is no longer
+  silent: `tests/header_binding.rs` reads both the header and `src/lib.rs` as text and fails if
+  the set of `amos_link_*` declarations drifts from the exported symbols, or if any function
+  carrying a `# Safety` contract on the Rust side (or any `unsafe extern "C" fn`) lacks that
+  contract above its declaration in the header.
 - The old README claimed "all FFI boundaries are validated for null pointers", ">95%
   coverage" and "no unwrap/panic in production code paths". The first two are not measured and
   were wrong; the third became true only with REQ-A388's panic gate. Its examples also
@@ -255,5 +263,3 @@ with it — and the "null pointer" explanation — lives in a **thread-local** b
 ## License
 
 MIT OR Apache-2.0 — see the root `LICENSE` files.
-
-same thread (the `strerror` contract), and `amos_link_error_clear()` empties it.

@@ -53,12 +53,28 @@ export function normalizeMagnifierSettings(raw: unknown): MagnifierSettings {
   };
 }
 
-/** Clamp to a sane tone factor: never fully black, never blown out. */
-export function clamp01(v: number): number {
-  return Math.min(1, Math.max(0.05, v));
-}
 export function clamp(v: number, lo: number, hi: number): number {
   return Math.min(hi, Math.max(lo, v));
+}
+
+/** Lowest tone factor — the lens never goes fully black (0% floors here, not to 0). */
+export const MIN_TONE_FACTOR = 0.05;
+/** Highest tone factor — the sliders' [MAX_TONE] (200%) means 2×, per the docs above. */
+export const MAX_TONE_FACTOR = MAX_TONE / 100;
+
+/**
+ * Convert a tone **percentage** — the sliders' own domain, `[MIN_TONE]..[MAX_TONE]`
+ * with `[DEFAULT_TONE]` (100) neutral — into the CSS `brightness()`/`contrast()`
+ * **factor** the filter wants: 100% → 1.0 (no change), 200% → 2.0, 0% → floored to
+ * [MIN_TONE_FACTOR] so the lens is never fully black.
+ *
+ * This is the *only* place the two domains meet. It exists because they drifted
+ * once: the component handed raw percentages to a factor-domain clamp, so every
+ * slider position from 1% to 200% produced the same `brightness(1) contrast(1)` and
+ * the sliders were inert (REQ-A729 / F-SH-187).
+ */
+export function toneFactor(percent: number): number {
+  return clamp(percent / 100, MIN_TONE_FACTOR, MAX_TONE_FACTOR);
 }
 
 /**
@@ -87,7 +103,13 @@ export function lensSourceRadius(zoom: number, lensRadius: number = LENS_R): num
   return Math.max(0.5, lensRadius / Math.max(1, zoom));
 }
 
-/** CSS filter string applying brightness/contrast tone factors to a canvas. */
+/**
+ * CSS filter string applying brightness/contrast to a canvas.
+ *
+ * Both arguments are the sliders' **percentages** (`[MIN_TONE]..[MAX_TONE]`, 100 =
+ * neutral) — the same values the component holds in `bright`/`contrast` and the same
+ * ones `normalizeMagnifierSettings` persists — so no caller has to remember to divide.
+ */
 export function toneFilter(brightness: number, contrast: number): string {
-  return `brightness(${clamp01(brightness)}) contrast(${clamp01(contrast)})`;
+  return `brightness(${toneFactor(brightness)}) contrast(${toneFactor(contrast)})`;
 }

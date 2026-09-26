@@ -26,8 +26,10 @@ use crate::error::{Error, Result};
 use crate::key::{Curve, IdentityKey};
 
 /// Recommended PBKDF2 iteration count for password-hash `derive_key`
-/// (OWASP guidance for PBKDF2-HMAC-SHA256). Callers may lower it in tests.
-pub const DEFAULT_PBKDF2_ROUNDS: u32 = 210_000;
+/// (OWASP guidance for PBKDF2-HMAC-SHA256, which is **600 000** — `210 000` is
+/// the SHA-512 figure). Callers may lower it in tests, but production at-rest
+/// sealing should use this default. (REQ-A561)
+pub const DEFAULT_PBKDF2_ROUNDS: u32 = 600_000;
 
 /// Byte prefix that heads every decrypted payload, identifying the at-rest
 /// wire format and its version. Bump `0x01` and update [`decrypt`]/[`Keystore`]
@@ -319,6 +321,14 @@ mod tests {
         let mut tampered = blob.clone();
         tampered[0] ^= 0x01;
         assert!(Keystore::from_sealed(b"right", &SALT, &NONCE, ROUNDS, &tampered).is_err());
+    }
+
+    #[test]
+    fn default_rounds_meet_owasp_pbkdf2_sha256_floor() {
+        // OWASP's PBKDF2-HMAC-SHA256 guidance is 600 000 iterations. The
+        // default must not silently regress below that (a prior defect shipped
+        // the SHA-512 figure, 210 000, under a SHA-256 doc).
+        const { assert!(DEFAULT_PBKDF2_ROUNDS >= 600_000) };
     }
 
     #[test]

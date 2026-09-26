@@ -214,11 +214,17 @@ impl PyLinkMetrics {
         self.inner.snapshot().dropped
     }
     
-    /// Get total errors
+    /// Get total errors: the frames this node failed to encode or decode (REQ-A608).
+    ///
+    /// The snapshot carries the two counters separately (`encode_errors` and
+    /// `decode_errors`); this is their sum, so the number Python sees is the same
+    /// truth the Rust `LinkMetrics` and the health report already report — never a
+    /// placeholder. A node that has hit no errors reads `0`, which is now a fact
+    /// about the counters rather than a constant.
     #[getter]
     fn errors(&self) -> u64 {
-        // MetricsSnapshot doesn't have errors field, return 0
-        0
+        let snap = self.inner.snapshot();
+        snap.decode_errors + snap.encode_errors
     }
     
     /// Get delivery ratio (0.0 to 1.0)
@@ -575,4 +581,34 @@ fn _native(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add("__doc__", "Python bindings for amos-link robot middleware")?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The `errors` getter must report what the node's counters hold, not a constant:
+    // a health check that reads `metrics.errors` has to see a real failure. This test
+    // fails against any implementation that returns a fixed `0` (it did before
+    // REQ-A608), which is exactly the "declared capability, no code path establishes
+    // it" defect it guards against.
+    #[test]
+    fn metric_errors_reports_the_snapshots_error_counters() {
+        let metrics = Arc::new(RustLinkMetrics::new());
+        let py = PyLinkMetrics {
+            inner: Arc::clone(&metrics),
+        };
+
+        assert_eq!(py.errors(), 0, "a node that has failed nothing reads zero");
+
+        metrics.record_decode_error();
+        metrics.record_encode_error();
+        metrics.record_encode_error();
+
+        assert_eq!(
+            py.errors(),
+            3,
+            "errors is decode_errors + encode_errors — a hardcoded 0 hides all three"
+        );
+    }
 }

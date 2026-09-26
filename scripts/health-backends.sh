@@ -13,5 +13,5 @@ cd "$ROOT"
 echo "== amos-ai status =="
 cargo run -q -p amos-ai --example status_once -- "$AI_SOCK" || { echo "FAIL: amos-ai not ready at $AI_SOCK" >&2; exit 1; }
 echo "== amos-translate status =="
-cargo run -q -p amos-translate --example status_once -- "$TR_SOCK" || { echo "FAIL: amos-translate not ready at $TR_SOCK" >&2; exit 1; }
+cargo run -q -p amos-translate --example translate_status_once -- "$TR_SOCK" || { echo "FAIL: amos-translate not ready at $TR_SOCK" >&2; exit 1; }
 echo "health OK"

@@ -128,6 +128,28 @@ pub(crate) fn now_rfc3339() -> String {
     )
 }
 
+/// Read the response's **status line** from `stream`.
+///
+/// One `read()` is not the status line: TCP hands the receiver whatever
+/// prefix has arrived, so a client that classifies its first read sees
+/// `"HTTP/1.1"` for a response that was in fact `200 OK` — and reports a
+/// delivery it took as `Failed` (which the dispatcher turns into an operator
+/// fallback for an alert that really landed). So read until the line ends
+/// (the first LF), the buffer is full, or the peer closes. `None` means the
+/// read failed outright, which stays `Failed` — the same as before.
+fn read_status_line(stream: &mut TcpStream) -> Option<String> {
+    let mut buf = [0u8; 256];
+    let mut filled = 0usize;
+    while filled < buf.len() && !buf[..filled].contains(&b'\n') {
+        match stream.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(_) => return None,
+        }
+    }
+    Some(String::from_utf8_lossy(&buf[..filled]).into_owned())
+}
+
 impl Channel for WebhookChannel {
     fn id(&self) -> ChannelId {
         self.id.clone()
@@ -181,12 +203,10 @@ impl Channel for WebhookChannel {
         if stream.write_all(&body).is_err() {
             return SendOutcome::Failed;
         }
-        let mut buf = [0u8; 256];
-        let n = match stream.read(&mut buf) {
-            Ok(n) => n,
-            Err(_) => return SendOutcome::Failed,
+        let response = match read_status_line(&mut stream) {
+            Some(r) => r,
+            None => return SendOutcome::Failed,
         };
-        let response = String::from_utf8_lossy(&buf[..n]);
         // HTTP status line: "HTTP/1.1 2xx …" ⇒ Sent; 4xx ⇒ Dropped; 5xx and
         // everything else ⇒ Failed.
         if response.starts_with("HTTP/1.1 2") || response.starts_with("HTTP/1.0 2") {

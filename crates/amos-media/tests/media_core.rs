@@ -39,6 +39,13 @@ fn all_collections_are_known_and_kinds_map_sensibly() {
     assert_eq!(StandardDir::Camera.default_kind(), MediaKind::Image);
     assert_eq!(StandardDir::Recordings.default_kind(), MediaKind::Audio);
     assert_eq!(StandardDir::Movies.default_kind(), MediaKind::Video);
+    // Every remaining variant too — `Music` was omitted here, which is exactly why
+    // it could sit as `File` (a paste of the `Root` arm) without anything going red.
+    assert_eq!(StandardDir::Music.default_kind(), MediaKind::Audio);
+    assert_eq!(StandardDir::Pictures.default_kind(), MediaKind::Image);
+    assert_eq!(StandardDir::Screenshots.default_kind(), MediaKind::Image);
+    assert_eq!(StandardDir::Download.default_kind(), MediaKind::File);
+    assert_eq!(StandardDir::Root.default_kind(), MediaKind::File);
 }
 
 #[test]

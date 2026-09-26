@@ -24,10 +24,24 @@
   import { modulesFor } from "../lib/shellModule";
   import { SHELL_MODULES } from "./shellModules";
   import { GLASS_TOPBAR_STYLE, GLASS_BORDER_SUBTLE } from "../lib/shellChrome";
+  import { installTopBarMenuAxis } from "../lib/menuKeys";
 
   /** Both slots, in registry order (`lib/shellModule.ts` sorts them). */
   const leftModules = modulesFor("topbar-left", SHELL_MODULES);
   const rightModules = modulesFor("topbar-right", SHELL_MODULES);
+
+  let leftSlotEl = $state<HTMLElement | null>(null);
+
+  // The bar's ←/→ axis belongs to the **bar**, not to one of its menus. The left group is one bar
+  // in macOS terms — 🍎 then File / Edit / View / Window / Help — but the two halves are separate
+  // registry widgets, so the axis used to live on the main menu's own `<nav>` and 🍎 fell outside
+  // it (← from File wrapped to Help instead of reaching 🍎). This is the one element that spans
+  // both, which makes it the only honest owner; `installTopBarMenuAxis` reads the triggers back
+  // out of it and no-ops while nothing is open, so installing once here is enough.
+  $effect(() => {
+    if (!leftSlotEl) return;
+    return installTopBarMenuAxis(leftSlotEl);
+  });
 </script>
 
 <!--
@@ -42,7 +56,7 @@
   style="{GLASS_TOPBAR_STYLE} {GLASS_BORDER_SUBTLE} border-bottom: 1px solid rgba(255,255,255,0.08);"
 >
   <!-- 左侧槽位：Apple 菜单 / 当前 app 名 / 主菜单（注册表里的三个挂件） -->
-  <div class="flex items-center gap-4" data-testid="topbar-left-slot">
+  <div class="flex items-center gap-4" data-testid="topbar-left-slot" bind:this={leftSlotEl}>
     {#each leftModules as mod (mod.id)}
       {@const Widget = mod.component}
       <Widget />

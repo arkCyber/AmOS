@@ -31,10 +31,16 @@ pub struct ExactAlarm {
     pub at_ms: u64,
 }
 
-/// A register of one-shot exact wall-clock alarms, ordered by fire time.
+/// A register of one-shot exact wall-clock alarms, keyed by id.
+///
+/// The map is ordered by [`JobId`], **not** by fire time — there is no
+/// time-ordered index. The fire-time ordering [`Self::due`] promises is produced
+/// by the explicit `sort()` in that method, not by the storage: the sort is
+/// load-bearing, and deleting it would silently hand fired alarms back in id
+/// order while the docs still claimed fire order. (REQ-A544.)
 #[derive(Clone, Debug, Default)]
 pub struct ExactAlarmClock {
-    /// `id -> at_ms`, kept also in a time-ordered index.
+    /// `id -> at_ms`. Id-keyed; this is the **only** index (see the type docs).
     alarms: BTreeMap<JobId, u64>,
 }
 
@@ -72,7 +78,9 @@ impl ExactAlarmClock {
 
     /// Fire every registered alarm whose time has arrived by `now_ms`. Each
     /// fires exactly once (removed on return). Results are ordered by fire time
-    /// (ties by id) so a caller can surface multiple alarms predictably.
+    /// (ties by id) so a caller can surface multiple alarms predictably — an
+    /// explicit `sort()` below provides that, since the map itself is id-ordered
+    /// (see the type docs). (REQ-A544.)
     pub fn due(&mut self, now_ms: u64) -> Vec<JobId> {
         // Collect (at_ms, id) for all due, sort by time then id, remove them.
         let mut due: Vec<(u64, JobId)> = self
@@ -90,6 +98,9 @@ impl ExactAlarmClock {
     }
 
     /// The earliest future instant (ms) to wake for, if any is scheduled.
+    ///
+    /// A linear scan over the id-keyed map — there is no time-ordered index to
+    /// consult (see the type docs), so this is O(n), not O(log n). (REQ-A544.)
     pub fn next_at(&self, now_ms: u64) -> Option<u64> {
         self.alarms
             .values()
@@ -128,6 +139,31 @@ mod tests {
         // Not re-fired on a later poll.
         assert_eq!(c.due(999), vec![JobId::new("late")]);
         assert!(c.is_empty());
+    }
+
+    /// The documented fire-time ordering is produced by `due`'s explicit
+    /// `sort()`, not by the storage (the map is id-ordered). The ids here are
+    /// chosen so id order and time order **disagree** (`z` fires before `a`) —
+    /// the only shape that can catch a missing sort, since `late`/`now`/`soon`
+    /// happen to sort both ways alike. (REQ-A544.)
+    #[test]
+    fn due_orders_by_fire_time_not_by_id() {
+        let mut c = ExactAlarmClock::new();
+        // id order: "a" < "m" < "z"; fire order: z(100), a(200), m(300).
+        c.register(JobId::new("m"), 300);
+        c.register(JobId::new("z"), 100);
+        c.register(JobId::new("a"), 200);
+        assert_eq!(
+            c.due(300),
+            vec![JobId::new("z"), JobId::new("a"), JobId::new("m")],
+            "fired alarms must be ordered by fire time, not by id"
+        );
+
+        // Equal fire times tie-break by id.
+        let mut t = ExactAlarmClock::new();
+        t.register(JobId::new("b"), 50);
+        t.register(JobId::new("a"), 50);
+        assert_eq!(t.due(50), vec![JobId::new("a"), JobId::new("b")]);
     }
 
     #[test]

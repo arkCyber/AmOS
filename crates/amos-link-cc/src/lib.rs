@@ -1318,6 +1318,13 @@ struct SimpleSubscriber {
     meta_rx: std::sync::mpsc::Receiver<(String, String, u64, Timestamp, u32)>,
     /// Set to `true` when the background task exits.
     closed: Arc<std::sync::atomic::AtomicBool>,
+    /// Frames the background reader accepted from the subscription (REQ-A609).
+    ///
+    /// Incremented by the reader thread the moment `recv()` yields a frame — the
+    /// subscriber "received" it whether or not the C caller has polled it yet.
+    received: Arc<std::sync::atomic::AtomicU64>,
+    /// Frames the background reader rejected as undecodable (REQ-A609).
+    decode_errors: Arc<std::sync::atomic::AtomicU64>,
     /// Handle to the background thread so we can join it on drop.
     #[allow(dead_code)]
     thread: std::thread::JoinHandle<()>,
@@ -1380,6 +1387,10 @@ pub unsafe extern "C" fn amos_link_subscriber_new(
                 let (meta_tx, meta_rx) = std::sync::mpsc::channel();
                 let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let closed_clone = closed.clone();
+                let received = Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let decode_errors = Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let received_reader = Arc::clone(&received);
+                let decode_errors_reader = Arc::clone(&decode_errors);
 
                 let thread = std::thread::spawn(move || {
                     let rt = match tokio::runtime::Builder::new_current_thread()
@@ -1402,6 +1413,8 @@ pub unsafe extern "C" fn amos_link_subscriber_new(
                             }
                             match subscription.recv().await {
                                 Ok(rx) => {
+                                    received_reader
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     let ts = rx.stamp;
                                     let meta = (
                                         rx.topic.to_string(),
@@ -1433,7 +1446,10 @@ pub unsafe extern "C" fn amos_link_subscriber_new(
                                     break;
                                 }
                                 Err(_) => {
-                                    // skip decode errors and continue
+                                    // A frame the link handed us that would not decode: count
+                                    // it and keep reading rather than tearing the subscriber down.
+                                    decode_errors_reader
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 }
                             }
                         }
@@ -1444,6 +1460,8 @@ pub unsafe extern "C" fn amos_link_subscriber_new(
                     payload_rx,
                     meta_rx,
                     closed,
+                    received,
+                    decode_errors,
                     thread,
                 });
                 Box::into_raw(ss) as *mut amos_link_subscriber
@@ -1629,6 +1647,16 @@ pub unsafe extern "C" fn amos_link_subscriber_recv(
     amos_link_poll::Ready
 }
 
+/// Fill `stats` with this subscriber's running counters (REQ-A609).
+///
+/// * `received` — frames the background reader accepted from the subscription;
+/// * `decode_errors` — frames it rejected as undecodable (it then keeps reading);
+/// * `dropped` — always `0`, because the reader→caller handoff is an unbounded channel
+///   and genuinely never discards a frame (see the body).
+///
+/// `received` counts what reached the subscriber, not what the C caller has polled:
+/// a frame sitting in the handoff channel is already received.
+///
 /// # Safety
 ///
 /// `sub` must be a live subscriber handle; `stats` must be a caller-owned, writable
@@ -1645,13 +1673,17 @@ pub unsafe extern "C" fn amos_link_subscriber_stats(
         return -2;
     }
     // SAFETY: `sub` passed the null checks above and is a live `Box<SimpleSubscriber>` handle.
-    let _s = unsafe { &*(sub as *const SimpleSubscriber) };
-    // Stats are maintained in the background thread; return zeros for now.
+    let s = unsafe { &*(sub as *const SimpleSubscriber) };
+    // The reader thread owns the counters (see `SimpleSubscriber`); report what it has
+    // actually seen. `dropped` is a genuine zero, not a placeholder: the reader→caller
+    // handoff is an **unbounded** std `mpsc` channel, so no frame is ever discarded —
+    // the only place a frame can be lost is upstream in the link's own QoS queue, which
+    // the node-level `amos_link_node_metrics` already reports as `dropped`.
     // SAFETY: `stats` was checked non-null above and is a caller-owned, writable `amos_link_sub_stats` (the header's contract for this parameter).
     unsafe {
-        (*stats).received = 0;
+        (*stats).received = s.received.load(std::sync::atomic::Ordering::Relaxed);
         (*stats).dropped = 0;
-        (*stats).decode_errors = 0;
+        (*stats).decode_errors = s.decode_errors.load(std::sync::atomic::Ordering::Relaxed);
     }
     0
 }

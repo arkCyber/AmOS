@@ -5,13 +5,12 @@
 
   import { onMount, onDestroy, tick } from "svelte";
   import { t, locale } from "./locale.svelte";
-  import { readStoreValue, writeStoreValue } from "../lib/amosStore";
+  import { readStoreValue, writeStoreValue, writeStoreValueChecked } from "../lib/amosStore";
   import {
     MEASURE_SETTINGS_KEY,
     MEASURE_HISTORY_KEY,
     normalizeMeasureSettings,
     normalizeMeasureHistory,
-    defaultMeasureSettings,
     createMeasurement,
     formatDistance,
     calibrateReference,
@@ -22,15 +21,46 @@
     type Measurement,
     type CalibrationResult,
   } from "../lib/measure";
+  import StoreErrorBar from "./StoreErrorBar.svelte";
 
   // Constants
   const MAX_HISTORY = 50;
   const MAX_VISIBLE_MEASUREMENTS = 10;
 
   // --- State ---
-  let settings = $state<MeasureSettings>(defaultMeasureSettings());
-  let history = $state<Measurement[]>([]);
-  
+  //
+  // Both are read from the store **synchronously, right here** — never from inside an
+  // `onMount` that sits behind an `await`. `onMount` is itself an effect, and the two persist
+  // effects below run in the *same* mount flush; a load that suspends first does not resume
+  // until the flush is over, so the persist effects write the **initial** values over the
+  // store before the load has read anything. That is what happened: `history` was seeded `[]`
+  // and filled in from `onMount(async …)`, so mounting the app wrote `[]` over the user's
+  // stored measurements and then read that `[]` straight back — every launch silently wiped
+  // the whole history. (The settings half was saved only by an accident of the same ordering:
+  // `readStoreValue` is synchronous, so the *first* read had already captured the real value
+  // before the clobber, and the effect wrote it back once `settings` was reassigned. Do not
+  // rely on that: on its own it still leaves a window where the store holds defaults.)
+  // REQ-A1407 / F-SH-665.
+  const initialSettings = normalizeMeasureSettings(
+    readStoreValue<unknown>(MEASURE_SETTINGS_KEY, undefined),
+  );
+  let settings = $state<MeasureSettings>(initialSettings);
+  const initialHistory = normalizeMeasureHistory(
+    readStoreValue<unknown>(MEASURE_HISTORY_KEY, undefined),
+  );
+  let history = $state<Measurement[]>(initialHistory);
+
+  // A rejected `amos.measure.history` write: the row list is **the user's content** — each row is
+  // created by a deliberate two-tap measurement and can be deleted one at a time from the history
+  // tab — so a refused write is exactly the case where the screen shows the new/deleted row and a
+  // reload shows it never happened. This is the last of the four keys `F-SH-253`'s boundary
+  // enumerated and dismissed as 「既定政策而非缺陷」 (`amos.weather.cities`, `amos.worldclock`,
+  // `amos.measure.history`, `amos.webman.history`); the other three have since each grown a verdict
+  // reader (REQ-A1416 ∕ REQ-A1410 ∕ REQ-A1357), so the reason is falsified by the tree — this key
+  // is the leftover. `amos.measure.settings` below stays `void` on purpose: it is a preference
+  // (`unit` / `showGuides` / the calibration constant), the allowlist's own `configuration` kind,
+  // and is a re-setup rather than lost content — the same line drawn for `amos.weather.city`.
+  let historyErr = $state("");
   // Camera state
   let videoEl = $state<HTMLVideoElement | null>(null);
   let stream: MediaStream | null = null;
@@ -55,18 +85,13 @@
   let containerWidth = $state(0);
   let containerHeight = $state(0);
 
-  // Load persisted settings and history
+  // The persisted settings/history are read at declaration (see `--- State ---` above): a read
+  // inside this callback lands *after* the mount flush, i.e. after the persist effects below
+  // have already written. Only the camera is started here.
   onMount(async () => {
-    try {
-      settings = normalizeMeasureSettings(await readStoreValue(MEASURE_SETTINGS_KEY, {}));
-      history = normalizeMeasureHistory(await readStoreValue(MEASURE_HISTORY_KEY, []));
-      
-      // Wait for DOM to be ready
-      await tick();
-      await startCamera();
-    } catch (err) {
-      console.error("初始化失败:", err);
-    }
+    // Wait for DOM to be ready
+    await tick();
+    await startCamera();
   });
 
   // Persist settings
@@ -74,9 +99,12 @@
     writeStoreValue(MEASURE_SETTINGS_KEY, settings);
   });
 
-  // Persist history
+  // Persist history, and read the verdict back (REQ-A1418 ∕ F-SH-676): a refused write leaves the
+  // history tab drawing a row that is not on disk, so the sentence must speak.
   $effect(() => {
-    writeStoreValue(MEASURE_HISTORY_KEY, history);
+    historyErr = writeStoreValueChecked(MEASURE_HISTORY_KEY, history)
+      ? ""
+      : t("common.storeWriteFailed");
   });
 
   async function startCamera() {
@@ -84,16 +112,15 @@
       stream = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: "environment", width: { ideal: 1920 }, height: { ideal: 1080 } },
       });
-      if (videoEl) {
-        videoEl.srcObject = stream;
-        cameraActive = true;
-        cameraError = "";
-      } else {
-        // If videoEl is not ready, release stream
-        stream.getTracks().forEach((track) => track.stop());
-        stream = null;
-        cameraError = "Video element not ready";
-      }
+      // `cameraActive` is what *renders* the `<video>` (both branches below are
+      // gated on it), so it must be set from the stream we just acquired — never
+      // from `videoEl`. Gating it on `videoEl` was a circle: the element that
+      // would bind `videoEl` only exists while `cameraActive` is true, so the
+      // element "not ready" branch was the only one that could ever run and the
+      // app was stuck on "Video element not ready" forever. The element binds
+      // after this flag flips; the effect below wires `srcObject` then.
+      cameraActive = true;
+      cameraError = "";
     } catch (err) {
       // Better error handling for different camera errors
       if (err instanceof DOMException) {
@@ -118,6 +145,23 @@
     }
     cameraActive = false;
   }
+
+  // Attach the acquired stream to whichever `<video>` is mounted. The element
+  // only binds once `cameraActive` flips (so `startCamera` cannot wire it
+  // synchronously), and each tab renders its *own* `<video>` — switching tabs
+  // rebinds `videoEl` to a fresh element with no `srcObject`, which would leave
+  // the calibrate tab showing a black feed. Re-attaching on every `videoEl`
+  // change covers both, the same idiom as CameraApp's stream effect.
+  $effect(() => {
+    const el = videoEl;
+    if (el && stream) {
+      try {
+        el.srcObject = stream;
+      } catch {
+        /* non-MediaStream runtimes */
+      }
+    }
+  });
 
   onDestroy(() => {
     stopCamera();
@@ -296,9 +340,14 @@
 </script>
 
 <div class="flex h-full flex-col bg-slate-900">
+  <div class="px-3 pt-2">
+    <StoreErrorBar message={historyErr} />
+  </div>
   <!-- Tab Bar -->
-  <div class="flex border-b border-slate-700 bg-slate-800">
+  <div class="flex border-b border-slate-700 bg-slate-800" role="tablist">
     <button
+      role="tab"
+      aria-selected={tab === "measure"}
       class="flex-1 px-4 py-3 text-sm font-medium transition-colors"
       class:bg-slate-700={tab === "measure"}
       class:text-sky-400={tab === "measure"}
@@ -308,6 +357,8 @@
       {t("measure.measure")}
     </button>
     <button
+      role="tab"
+      aria-selected={tab === "calibrate"}
       class="flex-1 px-4 py-3 text-sm font-medium transition-colors"
       class:bg-slate-700={tab === "calibrate"}
       class:text-sky-400={tab === "calibrate"}
@@ -317,6 +368,8 @@
       {t("measure.calibrate")}
     </button>
     <button
+      role="tab"
+      aria-selected={tab === "history"}
       class="flex-1 px-4 py-3 text-sm font-medium transition-colors"
       class:bg-slate-700={tab === "history"}
       class:text-sky-400={tab === "history"}

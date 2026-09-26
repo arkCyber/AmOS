@@ -46,7 +46,7 @@ describe("lib/customGroups - storage helpers", () => {
   test("removeCustomGroup deletes only the matching id (persisted)", () => {
     const { created } = addCustomGroup([], "A");
     const b = addCustomGroup([], "B");
-    const after = removeCustomGroup(b.groups, created.id);
+    const after = removeCustomGroup(b.groups, created.id).groups;
     expect(after.map((g) => g.name)).toEqual(["B"]);
     expect(getCustomGroups().map((g) => g.name)).toEqual(["B"]);
   });
@@ -54,19 +54,20 @@ describe("lib/customGroups - storage helpers", () => {
   test("renameCustomGroup updates the name and ignores empty input (persisted)", () => {
     const { created } = addCustomGroup([], "工具");
     const renamed = renameCustomGroup([created], created.id, "  工作  ");
-    expect(renamed[0].name).toBe("工作");
+    expect(renamed.groups[0].name).toBe("工作");
     expect(getCustomGroups()[0].name).toBe("工作");
-    // blank → unchanged (returns same list, nothing persisted)
+    // blank → unchanged (returns the same list, nothing attempted, nothing persisted)
     const same = renameCustomGroup([{ ...created, name: "工作" }], created.id, "   ");
-    expect(same[0].name).toBe("工作");
+    expect(same.groups[0].name).toBe("工作");
+    expect(same.ok).toBe(true);
   });
 
   test("setGroupIcon sets and clears the icon (persisted)", () => {
     const { created } = addCustomGroup([], "X");
-    const withIcon = setGroupIcon([created], created.id, "❤️");
+    const withIcon = setGroupIcon([created], created.id, "❤️").groups;
     expect(withIcon[0].icon).toBe("❤️");
     expect(getCustomGroups()[0].icon).toBe("❤️");
-    const cleared = setGroupIcon(withIcon, created.id, undefined);
+    const cleared = setGroupIcon(withIcon, created.id, undefined).groups;
     expect(cleared[0].icon).toBeUndefined();
     expect(getCustomGroups()[0].icon).toBeUndefined();
   });
@@ -251,6 +252,41 @@ describe("AppLibrary.svelte - custom group membership", () => {
     await tick();
 
     expect(getCustomGroups()[0].apps).toEqual(["phone"]);
+  });
+
+  test("成员 chip 的底色停在能过 AA 的档位（不是 /15）", async () => {
+    const { created } = addCustomGroup([], "工具");
+    setGroupApps([created], created.id, ["phone"]);
+    const { container } = await renderLibrary();
+    await tick();
+
+    const card = container.querySelector(
+      '[data-testid="app-library-custom-group"]',
+    ) as HTMLButtonElement | null;
+    await fireEvent.click(card!);
+    await tick();
+    const edit = container.querySelector(
+      '[data-testid="app-library-edit-members"]',
+    ) as HTMLButtonElement | null;
+    await fireEvent.click(edit!);
+    await tick();
+
+    const chipOf = (app: string): HTMLElement => {
+      const row = container.querySelector(
+        `button[aria-label="${zhLabel(app)}"]`,
+      ) as HTMLButtonElement | null;
+      expect(row, `${app} row`).toBeTruthy();
+      const chip = row!.querySelector("span.shrink-0.rounded-full") as HTMLElement | null;
+      expect(chip, `${app} chip`).toBeTruthy();
+      return chip!;
+    };
+    // 已是成员 → 移除 chip；不是成员 → 加入 chip。两者的文字色都压在各自的底色上：
+    // text-danger on bg-danger/15 = 4.10:1、text-accent on bg-accent/15 = 4.46:1，都在 AA 之下。
+    expect(chipOf("app.phone").className).toContain("bg-danger/8 text-danger");
+    expect(chipOf("app.clock").className).toContain("bg-accent/10 text-accent");
+    for (const app of ["app.phone", "app.clock"]) {
+      expect(chipOf(app).className).not.toMatch(/bg-(?:accent|danger)\/15/);
+    }
   });
 
   test("renaming a group updates its name and the card", async () => {
@@ -471,6 +507,150 @@ describe("AppLibrary.svelte - dedup names + custom icon", () => {
     await fireEvent.click(back as HTMLButtonElement);
     await tick();
     expect(container.textContent).toContain("❤️");
+  });
+});
+
+/**
+ * REQ-A1430: `lib/customGroups.ts::persist` signed `void` and every mutator
+ * (`addCustomGroup` ∕ `setGroupApps` ∕ `renameCustomGroup` ∕ `setGroupIcon` ∕
+ * `removeCustomGroup`) dropped the store's verdict. A custom group is *authored* by
+ * the user — its name, its emoji, its members and their order — and the only reader
+ * is `getCustomGroups()` at mount, so a refused write showed the folder on screen
+ * and lost it on the next launch, with nothing said.
+ */
+describe("AppLibrary.svelte - a refused custom-group write is reported", () => {
+  const REFUSED = zhLabel("common.storeWriteFailed");
+
+  /** Swap in a storage whose writes of `key` throw the way a full quota does. */
+  function failWritesFor(key: string): () => void {
+    const real = window.localStorage;
+    const fake = {
+      get length() {
+        return real.length;
+      },
+      clear: () => real.clear(),
+      key: (i: number) => real.key(i),
+      getItem: (k: string) => real.getItem(k),
+      removeItem: (k: string) => real.removeItem(k),
+      setItem: (k: string, v: string) => {
+        if (k === key) throw new Error("QuotaExceededError");
+        real.setItem(k, v);
+      },
+    } as unknown as Storage;
+    Object.defineProperty(window, "localStorage", { value: fake, configurable: true, writable: true });
+    return () =>
+      Object.defineProperty(window, "localStorage", { value: real, configurable: true, writable: true });
+  }
+
+  const seed = (name: string) => {
+    propsChannel<{ layout: { page: string[]; dock: string[]; hidden: string[] }; ext: [] }>(
+      "appLibrary",
+    ).set({ layout: { page: [], dock: [], hidden: [] }, ext: [] });
+    const { created } = addCustomGroup([], name);
+    return created;
+  };
+
+  const tidy = async () => {
+    await tick();
+    return render(AppLibrary).container;
+  };
+
+  test("creating a folder on a refused store says so and does not open the new (unpersisted) folder", async () => {
+    const restore = failWritesFor("amos.appLibrary.groups");
+    try {
+      const container = await tidy();
+      const newCard = container.querySelector(
+        '[data-testid="app-library-new-group"]',
+      ) as HTMLButtonElement;
+      expect(newCard).toBeTruthy();
+      await fireEvent.click(newCard);
+      await tick();
+      expect(getCustomGroups()).toEqual([]); // nothing landed
+      expect(container.textContent).toContain(REFUSED);
+      // The folder was NOT opened: opening it would show a folder the next launch loses.
+      expect(container.querySelector('[data-testid="app-library-rename-input"]')).toBeNull();
+      expect(container.querySelector('[data-testid="app-library-custom-group"]')).toBeNull();
+    } finally {
+      restore();
+    }
+  });
+
+  test("renaming on a refused store keeps the old name and says it did not land", async () => {
+    seed("工具"); // seeded BEFORE the refusal — the group already exists on disk
+    const restore = failWritesFor("amos.appLibrary.groups");
+    try {
+      const container = await tidy();
+      const card = container.querySelector(
+        '[data-testid="app-library-custom-group"]',
+      ) as HTMLButtonElement;
+      await fireEvent.click(card);
+      await tick();
+      await fireEvent.click(
+        container.querySelector('[data-testid="app-library-rename"]') as HTMLButtonElement,
+      );
+      await tick();
+      const input = container.querySelector(
+        '[data-testid="app-library-rename-input"]',
+      ) as HTMLInputElement;
+      await fireEvent.input(input, { target: { value: "工作" } });
+      await fireEvent.click(
+        container.querySelector('[data-testid="app-library-rename-save"]') as HTMLButtonElement,
+      );
+      await tick();
+      expect(container.textContent).toContain(REFUSED);
+      expect(getCustomGroups().map((g) => g.name)).toEqual(["工具"]);
+    } finally {
+      restore();
+    }
+  });
+
+  test("adding a member on a refused store keeps the membership and says it did not land", async () => {
+    seed("收藏");
+    const restore = failWritesFor("amos.appLibrary.groups");
+    try {
+      const container = await tidy();
+      await fireEvent.click(
+        container.querySelector('[data-testid="app-library-custom-group"]') as HTMLButtonElement,
+      );
+      await tick();
+      await fireEvent.click(
+        container.querySelector('[data-testid="app-library-edit-members"]') as HTMLButtonElement,
+      );
+      await tick();
+      // The picker rows carry `aria-pressed={memberSet.has(id)}`.
+      const picker = container.querySelector('[data-testid="app-library-custom-edit"]') as HTMLElement;
+      const firstRow = picker.querySelector("button[aria-pressed]") as HTMLButtonElement | null;
+      expect(firstRow).toBeTruthy();
+      await fireEvent.click(firstRow as HTMLButtonElement);
+      await tick();
+      expect(container.textContent).toContain(REFUSED);
+      expect(getCustomGroups()[0].apps).toEqual([]);
+    } finally {
+      restore();
+    }
+  });
+
+  test("a landed rename is silent (control)", async () => {
+    seed("工具");
+    const container = await tidy();
+    await fireEvent.click(
+      container.querySelector('[data-testid="app-library-custom-group"]') as HTMLButtonElement,
+    );
+    await tick();
+    await fireEvent.click(
+      container.querySelector('[data-testid="app-library-rename"]') as HTMLButtonElement,
+    );
+    await tick();
+    await fireEvent.input(
+      container.querySelector('[data-testid="app-library-rename-input"]') as HTMLInputElement,
+      { target: { value: "工作" } },
+    );
+    await fireEvent.click(
+      container.querySelector('[data-testid="app-library-rename-save"]') as HTMLButtonElement,
+    );
+    await tick();
+    expect(container.textContent).not.toContain(REFUSED);
+    expect(getCustomGroups().map((g) => g.name)).toEqual(["工作"]);
   });
 });
 

@@ -20,9 +20,10 @@
     WEATHER_CITIES,
   } from "../lib/weather";
   import type { TempUnit, WCity } from "../lib/weather";
-  import { readStoreValue, writeStoreValue } from "../lib/amosStore";
+  import { readStoreValue, writeStoreValue, writeStoreValueChecked } from "../lib/amosStore";
   import { iconSvg } from "../lib/sysIcons";
   import { locale, t } from "./locale.svelte";
+  import StoreErrorBar from "./StoreErrorBar.svelte";
 
   const CITIES_KEY = "amos.weather.cities";
   const CITY_KEY = "amos.weather.city";
@@ -38,17 +39,32 @@
   );
   let cities = $state<WCity[]>(initialCities);
 
+  // Validate the remembered selection against the **persisted** city list
+  // (`initialCities`), not against the default four — `normalizeWeatherCities(undefined)`
+  // reads nothing and answers with `defaultWeatherCities()`, so a selection of a
+  // user-added city (say Paris, the fifth) was judged "not in the list" and dropped;
+  // the write-back effects below then erased it from the store.
   const savedSel = readStoreValue<string>(CITY_KEY, "");
-  const initialSel = normalizeWeatherCities(undefined).some((c) => c.id === savedSel)
-    ? savedSel
-    : "";
+  const initialSel = initialCities.some((c) => c.id === savedSel) ? savedSel : "";
   let selId = $state<string>(initialSel);
   let unit = $state<TempUnit>("c");
   let edit = $state(false);
+  // A rejected `amos.weather.cities` write (full/unavailable storage): say so.
+  let citiesErr = $state("");
 
   // Persist whenever they change (mirrors the React useEffect writers).
+  //
+  // The city list is **content the user set** (added and removed by hand, and the chips redraw
+  // the moment they do), so its verdict is read — a refused write is exactly the case where the
+  // screen shows the new city and a reload shows it never happened. The world-clock list is the
+  // same fact and says so the same way (`ClockApp.svelte`, REQ-A1410). That round's sweep was
+  // file-local, so this sibling key (`amos.weather.cities`) — classified `configuration` in
+  // `scripts/store-allowlist.json` and absent from `lib/cloud.ts::SYNC_STORES`, so write-scan's
+  // `classify` returns `non-content` — kept the `void` write (REQ-A1416 ∕ F-SH-674). The
+  // remembered **selection** below is a preference, not content: a refused write there costs
+  // "which city you were looking at" and is not reported.
   $effect(() => {
-    writeStoreValue(CITIES_KEY, cities);
+    citiesErr = writeStoreValueChecked(CITIES_KEY, cities) ? "" : t("common.storeWriteFailed");
   });
   $effect(() => {
     writeStoreValue(CITY_KEY, selId);
@@ -82,6 +98,7 @@
 </script>
 
 <div class="p-4">
+  <StoreErrorBar message={citiesErr} />
   <div class="mb-2 flex flex-wrap items-center gap-1.5">
     {#each cities as c (c.id)}
       <button
@@ -99,8 +116,8 @@
       <button onclick={() => (edit = !edit)} class={smallBtn}>
         {edit ? t("common.done") : t("weather.edit")}
       </button>
-      <button onclick={() => (unit = "c")} class={chipCls(unit === "c")}>℃</button>
-      <button onclick={() => (unit = "f")} class={chipCls(unit === "f")}>℉</button>
+      <button onclick={() => (unit = "c")} aria-pressed={unit === "c"} class={chipCls(unit === "c")}>℃</button>
+      <button onclick={() => (unit = "f")} aria-pressed={unit === "f"} class={chipCls(unit === "f")}>℉</button>
     </div>
   </div>
 
@@ -109,7 +126,7 @@
       {#each cities as c (c.id)}
         <button
           onclick={() => removeAt(c.id)}
-          class="inline-flex items-center gap-1 rounded-full bg-neutral-200 px-2 py-0.5 text-xs text-danger dark:bg-neutral-700"
+          class="inline-flex items-center gap-1 rounded-full bg-danger/8 px-2 py-0.5 text-xs text-danger dark:bg-danger/20"
         >
           {t(`weather.city.${c.id}`)}<span data-icon="x" class="grid h-3 w-3 place-items-center">{@html iconSvg("x", "h-3 w-3")}</span>
         </button>

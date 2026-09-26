@@ -4,7 +4,11 @@
 //! to the real daemon over gRPC / Unix Domain Socket:
 //!
 //! * `feed_audio` streams mono PCM through the daemon's `StreamTranslate` audio
-//!   path (ASR → recognized text, surfaced as an [`AsrEvent::Final`]).
+//!   path (ASR → recognized text, surfaced as an [`AsrEvent::Final`]). The daemon
+//!   replies with text only, so the pipeline keeps its own **audio clock** (the
+//!   consumed sample count at 16 kHz) and stamps each final with the real
+//!   stream-relative `start`/`end` — the same meaning `amos-asr`'s local pipeline
+//!   gives them, so `amos_int::Segment.start`/`end` never disagree by provider.
 //! * `translate` calls the daemon's unary `Translate` RPC (honours source/target
 //!   languages, unlike the stream's text path which uses daemon defaults).
 //! * `synthesize` reports TTS as unsupported (the daemon has no TTS yet).
@@ -19,7 +23,9 @@ use amos_int::config::BothMode;
 use amos_int::error::{InterpretationError, Result};
 use amos_int::event::TtsRequest;
 use amos_int::language::Language;
-use amos_int::pipeline::{AsrEvent, Pipeline, PipelineInfo, SourceText, Translation, TtsAudio};
+use amos_int::pipeline::{
+    samples_to_duration, AsrEvent, Pipeline, PipelineInfo, SourceText, Translation, TtsAudio,
+};
 use amos_proto::translate::{
     translate_in, translator_client::TranslatorClient, TranslateIn, TranslateOut, TranslateRequest,
 };
@@ -55,6 +61,11 @@ pub struct GrpcPipeline {
     bidi: Arc<tokio::sync::Mutex<Option<Bidi>>>,
     /// Serializes send+read so responses correlate with requests by order.
     op: Arc<tokio::sync::Mutex<()>>,
+    /// The **audio clock**: stream-relative PCM consumed so far. The daemon's
+    /// `TranslateOut` carries only the recognized text (no timestamps), so this
+    /// is the one place that can say where in the stream a frame's final fell —
+    /// exactly as `amos-asr`'s `AsrPipeline` does for the local path.
+    fed: Arc<Mutex<Duration>>,
 }
 
 impl GrpcPipeline {
@@ -70,6 +81,7 @@ impl GrpcPipeline {
             channel: Arc::new(Mutex::new(None)),
             bidi: Arc::new(tokio::sync::Mutex::new(None)),
             op: Arc::new(tokio::sync::Mutex::new(())),
+            fed: Arc::new(Mutex::new(Duration::ZERO)),
         }
     }
 
@@ -99,6 +111,13 @@ impl GrpcPipeline {
         if let Ok(mut b) = self.bidi.try_lock() {
             *b = None;
         }
+    }
+
+    /// Read the audio clock's current position (stream-relative PCM consumed so
+    /// far). A plain `Duration` copy, deliberately **not** a held guard — so the
+    /// caller never holds a `std` lock across the awaits in `feed_audio`.
+    fn fed_so_far(&self) -> Duration {
+        *self.fed.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     /// Open the persistent `StreamTranslate` stream if not already open.
@@ -151,6 +170,12 @@ impl Pipeline for GrpcPipeline {
         if chunk.is_empty() {
             return Ok(Vec::new());
         }
+        // The audio-time window this frame covers: [start, end). `start` is where
+        // the stream stood before this frame; `end` is where it stands after. The
+        // clock only advances once the daemon has actually answered (below), so a
+        // failed send or read does not silently claim audio that never got through.
+        let start = self.fed_so_far();
+        let end = start + samples_to_duration(chunk.len());
         let pcm = pcm_to_i16le(chunk);
         let _op = self.op.lock().await;
         self.ensure_bidi().await?;
@@ -182,12 +207,19 @@ impl Pipeline for GrpcPipeline {
         };
 
         match msg {
-            Some(out) => Ok(vec![AsrEvent::Final {
-                text: out.segment,
-                lang: self.source_lang.clone(),
-                start: Duration::ZERO,
-                end: Duration::ZERO,
-            }]),
+            Some(out) => {
+                // The frame reached the daemon and came back: commit it to the clock
+                // and report the final with its real stream-relative bounds, so the
+                // downstream `amos_int::Segment.start`/`end` are the audio time a
+                // consumer can seek to — not a placeholder zero.
+                *self.fed.lock().unwrap_or_else(|p| p.into_inner()) = end;
+                Ok(vec![AsrEvent::Final {
+                    text: out.segment,
+                    lang: self.source_lang.clone(),
+                    start,
+                    end,
+                }])
+            }
             None => {
                 self.invalidate();
                 Err(InterpretationError::Pipeline(
@@ -279,5 +311,62 @@ mod tests {
         assert_eq!(out.provider, "amos-translate");
         assert!(!out.tts);
         assert!(!out.streaming_asr);
+    }
+
+    /// Spawn the real daemon (mock provider + mock ASR) on a private UDS and drive
+    /// `feed_audio` through it, asserting each `AsrEvent::Final` carries the frame's
+    /// **real** stream-relative window rather than `Duration::ZERO`. 160 samples at
+    /// 16 kHz is one 10 ms frame, so three frames tile `[0,10ms) [10,20ms) [20,30ms)`.
+    ///
+    /// REQ-A620 / F-TR-002: the daemon's `TranslateOut` carries only text, so the
+    /// clock lives in `GrpcPipeline::fed` and the shared `samples_to_duration` rule
+    /// (`amos_int`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn feed_audio_stamps_each_final_with_its_real_audio_time() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use amos_proto::translate::translator_server::TranslatorServer;
+        use tokio_stream::wrappers::UnixListenerStream;
+
+        let path: std::path::PathBuf =
+            std::env::temp_dir().join(format!("amos-grpc-clock-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let svc = crate::TranslatorService::new(
+            Arc::new(crate::provider::MockProvider::default()),
+            crate::TranslateConfig::default(),
+        )
+        .with_recognizer(Arc::new(crate::asr::MockRecognizer::default()));
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(TranslatorServer::new(svc))
+                .serve_with_incoming(UnixListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let pipe = GrpcPipeline::new(&path, "zh", "en");
+        let frame = vec![0.0f32; 160];
+        let mut bounds = Vec::new();
+        for _ in 0..3 {
+            for ev in pipe.feed_audio(&frame).await.unwrap() {
+                if let AsrEvent::Final { start, end, .. } = ev {
+                    bounds.push((start, end));
+                }
+            }
+        }
+        assert_eq!(
+            bounds,
+            vec![
+                (Duration::from_millis(0), Duration::from_millis(10)),
+                (Duration::from_millis(10), Duration::from_millis(20)),
+                (Duration::from_millis(20), Duration::from_millis(30)),
+            ],
+            "each final's window is the audio time of the frame that produced it"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }

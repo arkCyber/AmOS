@@ -10,10 +10,12 @@
  */
 
 import { describe, it, expect, beforeAll } from "vitest";
+import { fastestAsync, PERF_ATTEMPTS } from "../../__tests__/perfBudget";
 import {
   encryptMDMData,
   decryptMDMData,
   isCryptoAvailable,
+  isEncryptedEnvelope,
   getCryptoInfo,
 } from "../crypto/mdmCrypto";
 
@@ -229,9 +231,11 @@ describe("MDM 加密模块", () => {
         })),
       });
 
-      const start = performance.now();
-      await encryptMDMData(data);
-      const duration = performance.now() - start;
+      // REQ-A850 / F-DEV-106：原来是一次计时。同一份负载下的对照实测（12 组样本、预算
+      // 50ms）：单次计时 p50 36.04ms、最大 **201.49ms**，**4/12 组越过预算**；取 5 次
+      // 最小值 p50 20.53ms、最大 40.90ms，0/12 越过。红的含义是「刚才有人抢 CPU」，
+      // 不是「加密变慢了」。
+      const duration = await fastestAsync(PERF_ATTEMPTS, () => encryptMDMData(data));
 
       expect(duration).toBeLessThan(50);
     });
@@ -247,15 +251,35 @@ describe("MDM 加密模块", () => {
 
       const encrypted = await encryptMDMData(data);
 
-      const start = performance.now();
-      await decryptMDMData(encrypted);
-      const duration = performance.now() - start;
+      // 同族第二条，也是本轮**40 个自旋压满 18 核时整仓唯一变红的那一条**：实测
+      // 210.91ms（预算 50ms）—— 差值就是被抢占的时间，不是解密变慢了。判据换成取最小值。
+      const duration = await fastestAsync(PERF_ATTEMPTS, () => decryptMDMData(encrypted));
 
       expect(duration).toBeLessThan(50);
     });
   });
 
   describe("工具函数", () => {
+    it("isEncryptedEnvelope 只把真信封认成信封（明文配置、垃圾、未来版本都要分对）", async () => {
+      // 真信封（当前版本）。
+      const env = await encryptMDMData(JSON.stringify({ apiKey: "k" }));
+      expect(isEncryptedEnvelope(env)).toBe(true);
+
+      // 明文配置：有 version 但没有 ciphertext/iv，绝不能被当成信封（否则迁移路会被关掉）。
+      const plain = JSON.stringify({ enabled: true, version: "1.0.0", apiKey: "k" });
+      expect(isEncryptedEnvelope(plain)).toBe(false);
+
+      // 未来版本的信封仍是信封 —— 它必须落到硬失败路径，而不是被当明文吃掉。
+      const future = JSON.stringify({ version: 999, ciphertext: "AA", iv: "BB" });
+      expect(isEncryptedEnvelope(future)).toBe(true);
+
+      // 垃圾 / 非对象 / 数组 / 缺字段：都不是信封。
+      expect(isEncryptedEnvelope("not json")).toBe(false);
+      expect(isEncryptedEnvelope("null")).toBe(false);
+      expect(isEncryptedEnvelope("[]")).toBe(false);
+      expect(isEncryptedEnvelope(JSON.stringify({ version: 1, ciphertext: "x" }))).toBe(false);
+    });
+
     it("isCryptoAvailable 应该返回布尔值", () => {
       const available = isCryptoAvailable();
       expect(typeof available).toBe("boolean");

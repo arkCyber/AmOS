@@ -18,6 +18,9 @@ pub enum PdfError {
     Parse(String),
     /// An underlying parser (`lopdf`) error we bubble up verbatim.
     Lopdf(lopdf::Error),
+    /// The document is encrypted. This crate has no password API, so an encrypted
+    /// file is refused outright rather than decoded into partial nonsense.
+    Encrypted,
     /// The caller asked for something the file does not contain.
     NotFound(String),
 }
@@ -28,6 +31,11 @@ impl fmt::Display for PdfError {
             PdfError::Io(e) => write!(f, "cannot read PDF source: {e}"),
             PdfError::Parse(msg) => write!(f, "not a readable PDF: {msg}"),
             PdfError::Lopdf(e) => write!(f, "PDF structure error: {e}"),
+            PdfError::Encrypted => write!(
+                f,
+                "encrypted PDF: this crate has no password API and refuses encrypted \
+                 input rather than returning partial text"
+            ),
             PdfError::NotFound(msg) => write!(f, "{msg}"),
         }
     }

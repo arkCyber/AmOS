@@ -68,6 +68,7 @@ panic）：`crates/amos-wm/src/form.rs`。
 - `wm_split` 的 `axis` 新增 `auto`（空串同义）：由策略按屏幕宽高比选择，供会旋转 / 窗口可变的平板与桌面壳使用；其余取值仍逐一校验，未知值照旧拒绝。
 - `LayoutSnapshot` 携带 `form` / `columns` / `multi_window` / `free_resize` / `divider_gap`，前端**从宿主读能力**而不是靠 WebView 宽度猜；`lib/wm.ts` 的 `normalizeLayout` 把读不懂的载荷降级为最保守的 phone / 1 列——**能力绝不因畸形载荷而被"获得"**。
 - **线上契约（9 个键）由两个测试钉住**：`crates/amos-tauri/src/wm.rs` 的 `the_layout_snapshot_wire_shape_is_pinned`（快照 / `split` / `pane` 三层**精确键集** + 取值，含 `form` 走线上键、未测量时是占位屏）与 `frontend-ts/src/__tests__/wm.test.ts` 的镜像键集测试。为什么必须是测试：`lib/wm.ts` 经 `invoke(command, args)` 这个**变量命令名**的包装去调命令，`scripts/tauri-reply-scan.mjs` 按它的既定边界（只查静态可命名的 `invoke<T>("cmd")`）**看不见这一对**——不钉住的话，Rust 侧改个字段名只会在壳里读成 `undefined`，再由 `normalizeLayout` 静默降级为 phone 默认值（与 Round 47 的短信回收站缺陷同类）。
+- **`wm_windows` 的窗口列表形状此前"只声明、没钉住"（REQ-A704）**：`lib/wm.ts` 的 `WmWindowInfo` / `WmWindowsSnapshot` 自述为 Rust `amos-tauri::wm` 的 `WindowInfo` / `WmSnapshot` 的镜像，但 Rust 侧**没有任何** wire-shape 钉（对照上面 `LayoutSnapshot` 至少钉了 Rust 本地 `vec!`），`wm.test.ts` 的 `normalizeWindows` 用例又与一个 **TS 本地字面量**比较——改一侧字段名、只在那一侧的字面量里跟着改，两侧测试**全绿**，而 `windowOf` 读到 `undefined` 就逐字段退化（id `0`、按 label 猜 app、kind `"Unknown"`），Dock 的运行圆点与 AppExpose **悄悄**降级。`wm_windows` 同样经动态 `invoke(command, args)` 抵达、`tauri-reply-scan.mjs` 看不见，所以这里的绑定放在 `frontend-ts/src/__tests__/declaredMirrors.test.ts` 的描述块「wm.ts window-list wire shapes == the amos-tauri::wm serde structs」：读 `amos-tauri/src/wm.rs`，按声明序抽 `WindowInfo`（8 个）与 `WmSnapshot`（2 个）的 `pub` 字段名，与 `Object.keys(normalizeWindows(...))` **逐序**比较，并断言体**不**含 `rename`。未改运行时代码（两侧字段实测本就一致，无现存漂移）。
 - **第一个真正的消费者**：设置 →「窗口与形态」（`frontend-ts/src/svelte/settings/WindowPage.svelte`）读宿主当前值并随 `layout-changed` **实时**更新：设备形态 / 内容列数 / 多窗口 / 自由缩放 / 分栏间距 / 当前分屏（`describeSplit`）。诚实规则：**无宿主 ⇒ 全部显示「—」并在页面上说明原因**；宿主答 `null` ⇒ 回到「—」，**不保留陈旧读数**；页面不轮询、不猜。
 - **该页的状态判定是"订阅 + 有界重探 + 可见即重探"三条腿**：订阅负责即时（宿主只在真变化时发），重探（10 s、仅可见标签页）负责"**宿主消失**"——没有事件会为一个已经不存在的宿主而来，只看订阅就会把上一次读数永远留在屏上（REQ-A220 修的正是这个）；`visibilitychange` 负责"**回到页面**"——隐藏期间的重探被跳过，没有它用户回来会看到最多滞后 `PROBE_MS` 的读数（REQ-A221 补）。重探的 `null` 如实回到「—」，并把「**无桥**（浏览器预览）」与「**有桥但宿主不应答**」分开陈述（与权限面"读不到权威 vs 权威为空"同一区分）。
 - **布局桥的失败语义**：`lib/wm.ts` 的封装一律走 `lib/backend.ts` 的 `invoke`（单一真源）——**命令失败时 resolve 成 `null` 并记入诊断账本**，绝不 reject（一个 reject 就会在不写 `.catch` 的消费者里变成 unhandled rejection，且失败对 UI 不可见）。这条契约由 `src/__tests__/wm.test.ts` 的失败用例钉住。
@@ -76,7 +77,7 @@ panic）：`crates/amos-wm/src/form.rs`。
 - **读数→决策是一段纯函数（REQ-A223）**：宿主把生读数交给 `wm::shell_resize_reading(policy, 物理宽, 物理高, scale) -> Option<(Size /*was*/, Size /*now*/)>`，它做「物理 ⇒ 逻辑 ⇒ 问策略」这一段——REQ-A218 的 DPI 缺陷正是这段**组合**，而它此前内联在需要真 `AppHandle` 的 `fit_shell_window` 里、**无法单测**。它有两种**拒答**：坏尺寸（0×0 / NaN / 超大）在问策略**之前**就 `None`（绝不能长得像"默认值"而触发一次 resize），坏 scale（NaN / 0 / 负 / ∞）也 `None` 而不是按 1× 猜（`logical_size_of` 对**布局**路径仍按 1×，那是它自己的、被单测钉住的契约）。宿主侧 `scale_factor()` **读失败**时如实 `warn!` 并**不动作**（宁可不动，也不拿猜的因子去争一个 2× 用户自己选过的尺寸）。
 - **日志说的是"请求了什么"**：`fit_shell_window` 返回 `(was, now)`，boot 日志同时打新旧两边，并写明这是**请求**——`set_size` 是交给平台的一条指令，**权威尺寸**由随后的 `sync_window_layout` 实测给出（`set_size` 的落点本身需真桌面确认，见诚实边界）。
 - **分屏不再只是"看得见"（REQ-A224）**：设置 →「窗口与形态」在**宿主自报** `multi_window == true` 时渲染分屏控件——候选窗口（来自 `wm_split_candidates`，**不由页面编造**；不足两个时"进入分屏"按钮是 **inert** 的）、进入分屏（轴用 `auto`，交给宿主按真实屏幕宽高比选）、交换窗格、主窗格 ±5%、退出分屏。控件**不决定窗格怎么画**：宿主早已把窗格落到**真实 OS 窗口**（`apply_split_to_real`），控件只让用户能**提出请求**。诚实规则与页面读数一致——命令答 `null`（无宿主 / 宿主拒绝 / 失败）**绝不更新读数**（失败的动作不许看起来像成功），只多一行说明、明细在诊断账本；一次只跑一条命令且 `busy` 必被释放；**退出分屏后重读候选**（没有它"再次进入"会停在一份从未刷新的名单上）。点击前的闸门是**宿主自己的 `multi_window`**——手机类别答 `false`，页面就不提供这个请求（"先给你按、再被拒"是一种谎）。`scripts/unwired-scan.mjs` 的基线因此**缩减 5 条**（`wmSplit` / `wmSplitCandidates` / `wmSplitExit` / `wmSplitMove` / `wmSplitSwap` 从"已定义但未接"名单移除）；绝对百分比的 `wmSplitResize` 是同一操作的程序化形式、暂无界面采用，仍如实留在基线里。
-- 仍未做（诚实边界）：**壳内渲染两个窗格**。宿主今天的 `apply_split_to_real` 是把窗格落到**真实 OS 窗口**上的，而本文档把"多真实窗口 vs 壳内单窗口渲染"留成**未决的设计选择**——在壳里再画一遍会与宿主重复。同样地，`columns`（内容列数）当前只被如实**展示**，还没有内置 app 采纳它做双栏/主从布局。
+- **「多真实窗口 vs 壳内单窗口渲染」这个未决的设计选择已被作出，而触屏那条路只有一种可能（REQ-A512）**：Tauri v2 的移动端**只承载一个 WebView**，`wm_open` 在 Android/iOS 上**产不出第二个窗口**（`crates/amos-tauri/src/wm.rs` 的 `WebviewWindowBuilder` 路径与它遍布的 `#[cfg(desktop)]` 门）——于是触屏类别（phone/tablet）走**壳内双窗格**：`Shell.svelte` 的 `split` 表面渲染 `SplitSurface.svelte`，两块 `AppPane` 绝对定位在宿主给出的矩形上，中间的分隔条就是宿主在它们之间**留出的那个缝**。**几何绝不在 TypeScript 里写第二遍**：新增纯命令 `wm_pane_rects(axis, percent, width, height)`（不碰任何窗口，移动端可用、可无 `AppHandle` 单测）委托领域函数 `amos_wm::layout::split_panes`，用策略自己的 `divider_gap` / `min_pane`——**与桌面原生窗口分屏同一条规则**，壳只持有**意图**（哪两个 app、轴向、比例），所以"两套承载"不会各自漂移出一条几何。**门是实测 `columns >= 2`**（**不是** `multi_window`——后者是原生窗口语义，在移动端放开它会踩到窗口上限）：手机类别恒 `columns == 1` ⇒ `enterSplit` 返回 `false` 且**不改变表面**；窄平板窗口（<600 px，`columns_for` 的分档）同样拒绝。宿主答 `null`（无桥 / 拒绝 / 屏幕放不下两个最小窗格）时**保留上一组矩形并记诊断**，**不伪造**一个"能用的分屏"。**诚实边界**：①两套承载**只共用几何规则**，别无共享——设置页「窗口与形态」的原生分屏控件仍**仅桌面可用**（它按 `multi_window` 出闸）；②拖动分隔条按**每个 rAF 一次宿主往返**取新矩形（这正是"单一条几何规则"的代价），**真机延迟未实测**，若卡顿再谈节流；③~~分屏布局**不跨重启持久化**~~ → **已持久化（2026-09-20 补全）**：`lib/splitPersist.ts` 是纯解码层，`amos.split` 存**意图**（哪两个 app / 轴向 / 比例），`shellState.restoreSplit()` 在宿主报出实测屏幕后恢复**一次**——**诚实边界**是任一门窗 app 已不在装（或值被手改成不存在的 id）就**整体拒绝**、绝不半恢复，且 `desktop` 类别（其 app 是真 OS 窗口）与"表面已路由到别处"同样拒绝；写入落在**结算点**（进入 / 换窗格 / 退出即刻，拖拽比例按 250 ms 合并），不把一次拖拽变成每秒六十次 `store_set`；④`columns` 至此有了第一个**行为**消费者（此前只被「窗口与形态」页如实**展示**），且**已有内置 app 采纳**：设置页的 iPad 式主从侧栏由 `formLayout::masterDetail(form, columns, width)` 决定（2026-09-20 补全），所以 `columns` 现同时是分屏门与侧栏门的**同一个**信号。**新收尾（REQ-A700，2026-09-20）**：`clearSplitIntent()` 成为**每一处**永久离开分屏表面的唯一收尾——`goHome` / `lock` / `resetShellState` 此前都**不清** `amos.split`，于是用户按 Home / 锁屏 / 息屏丢掉的分屏会在下次启动被 `restoreSplit` **复活**；进入分屏的两扇活门（`enterSplit`、`open()` 的窗格重定向）此前也**不检查两窗格是否同一个 app**，会写下 `parseSplit` 会拒的 `primary === secondary`（下次启动被静默丢弃）——现由一条纯谓词 `isSplittablePair` 统一钉住。
 - **「窗口管理器 (调试)」卡片回来了（REQ-A225）**：`docs/multi-window.md` §4.2、`docs/gui-verify.md` A4、`docs/android-compat.md` W4 与 `docs/android-lmk-e2e.md` G1/G4 都要求用 `wm_windows` 的窗口列表做验收，但**没有任何 Svelte 界面读过 `wm_windows`**（只有 `lib/lmk.ts` 的内部对账用）——那几条人工验证在当前构建里**根本没法执行**（旧 React 宿主的卡片随宿主一起被删了，文档却还在指向它）。现在 设置 →「窗口与形态」页底部有这张卡片：按宿主自己的措辞逐条列出 `label [kind] state`，聚焦窗口标 `←聚焦`、**无 WebView 的容器合成表面**（`legacy:<window_id>`）标 `外部表面`；随 `layout-changed` 推送自动重读，并有「刷新」按钮；宿主未桥接 / 不应答 / 一个窗口都没有，三种情况各自如实陈述（**读失败时清空而不是保留上一份列表**——调试卡上显示一个已经不存在的窗口，比承认"不知道"更糟）。线格式的归一化收敛到 `lib/wm.ts` 的 `normalizeWindows`（无 `label` 的记录被**丢弃**，其余字段各自回落到最保守值），`lib/lmk.ts` 里那份重复的 `wmWindows` 封装与私有 `WmWindowInfo` 一并删除、改为复用同一份（单一真源）。
 - **候选窗格必须是本宿主能摆位的窗口（REQ-A226）**：`wm_split_candidates` 命令与 `LayoutSnapshot.candidates` 字段现在由**同一个** `pane_candidates` 生成，并**剔除外部容器合成表面**（`legacy:*`，Waydroid 合成、没有 `WebviewWindow`）——`apply_split_to_real` 本来就跳过它们（几何归容器所有），把它们当候选，只会让设置页给出一个**屏幕上不存在的分屏**（正是那个函数文档里警告的"模型说分了、屏幕没动"）。摆位被跳过也不再是静默的 `continue`：现在会 `warn!` 点名那个窗格。**模型层刻意仍接受任意两个窗口**（`enter_split` 不拒绝容器表面）：那是"描述它们该在哪"的意图层（该函数的注释写着"geometry is owned elsewhere / **comes later**"），更严格的拒绝需要给集成测试开一个**只有测试用**的公共注册缝——那本身就是本仓 `rust-unwired-scan` 要抓的缺陷类。所以本轮收敛为**更窄但正确**的规则：**offer 层面过滤 + 摆位失败如实上报**（见 `enter_split` 里的 NOTE）。**可逆性**：将来容器若愿意服从窗格矩形，去掉 `pane_candidates` 这一处过滤即可。界面侧：设置页检测到外部表面存在时，会在「可分屏窗口」下方说明它为何不在候选里，而调试卡仍如实列出它（不隐藏）。
 - **关窗必须留痕清零，且分屏不能比它的窗格活得久（REQ-A227）**：`wm_close`（LMK 拆除外部表面的路径：`lib/lmk.ts` → `wm_close` → `WmState::close`）此前只把窗口从 `amos-wm` 状态机里删掉，**却把 `label ⇄ id` 映射永久留着**——于是 `open_surface`（Android 启动 APK 的路径，`ai_bridge.rs`）在重开同一个 label 时短路进 `focus(已死 id)`，`WindowManager::focus` 对未知 id 返回空事件 ⇒ **重新启动该应用什么也没注册、也没有任何信号**（容器在跑、窗口管理器里没有它、调试卡也不显示）。现在 `close_core` 把该窗口从四张登记表（`by_label`/`labels`/`kinds`/`external`）**一起清掉**，因此"拆除 → 再次启动"会**真的重新注册**（新的 id、`Shown` + `Focused`，仍是 external System 表面）；同时**结束**引用它的分屏并把幸存窗格交回调用方（`close` 随即 `maximize` 它，与 `wm_split_exit` 同一恢复语义——否则幸存窗格会停在半屏、又没有任何分屏能解释它）。**刻意的不对称（`hide` 不结束分屏）**：隐藏是**可逆**的且窗口仍存在，`show` 之后窗格几何原样复原，所以模型继续描述这个排布是诚实的；只有"窗口已经不存在"才让分屏无法成立。
@@ -84,7 +85,7 @@ panic）：`crates/amos-wm/src/form.rs`。
 
 - **"请求"与"落没落"分开说（REQ-A230，实机驱动）**：`set_size` 是**异步**的请求，真机日志实测到"紧随其后的 `sync_window_layout` **读到的仍是旧尺寸**"（`columns=1`），约 50 ms 后才由 `Resized` 事件路径读出 `1024×720 / columns=3` —— 所以宿主的真实做法是：**把请求记下来**（`WmCore::shell_fit`），由**事件路径**（其读数是"已应用"的）交给纯函数 `shell_fit_outcome(requested, applied)` 判定，并**明确**报出结果：兑现 ⇒ `INFO the requested shell window size was applied width=… height=…`；**没兑现** ⇒ `WARN the OS applied a different shell window size than requested requested_… applied_…`。这条 warn 不是推测：在**本机笔记本屏**（逻辑 1728×1117）上强制平板类别（`AMOS_FORM_FACTOR=tablet`，策略给 900×1200 竖屏）实测被 OS 压到 **900×881**，宿主如实报出两个尺寸（而**同一次运行的数值会变**：另一次是 882 —— 所以宿主**不猜**边距、也不替屏幕"适配"）。**同轮更正**：REQ-A222/A223 曾写"`setup` 在屏幕实测之前调用它，**随后 `sync_window_layout` 读到的就是新尺寸**"——真机证明这句话是**错的**（异步落地），已在追溯矩阵该行就地标注更正；正确说法是"请求先记下，权威尺寸来自随后的事件实测"。
 - **PC 上"看得到窗口"本身是一条要修的链路（REQ-A232，实机驱动）**：`amos-wm` 断言"启动即 Launcher focused"，适配层文档也写着 `FocusChanged(Some(id)) → set_focus()`，但**启动路径从未把这件事告诉 OS** —— 于是从终端/脚本（后台进程）启动时，窗口**渲染正常却在别的 App 后面**，用户"看不到窗口内容"（本机实测：进程 `frontmost=false`，最前是编辑器）。补全：`WmState::focus_launcher()`（`show()` + `set_focus()`，**然后问平台** `is_focused()`——因为"调用返回 `Ok`"≠"用户看得见"；首版就踩了这个坑：日志写了"focused"而 `frontmost` 仍是 false）返回 `LauncherFocus{Focused|Refused|NoWindow}`；`setup` 里先按 macOS 请求 `ActivationPolicy::Regular`，再聚焦并**逐态如实上报**（`Refused` 会解释成因与出路）。**实测边界**：即便如此，**裸二进制**（`cargo build` 的产物、`make run-ui-release` 跑的那个）仍**不被 macOS 激活**——那需要一个 `.app` 包；`make app-open` 现在做这件事（`cargo tauri build --bundles app` + `open`，前置 dist 新鲜度门），**实测把窗口带到最前**（`frontmost=true`、窗口 1024×720、内容渲染 34 340 种颜色 vs 裸二进制时仅 3 078 种）。
-- **形态必须落到「内容」上，否则平板只是"更大的手机"（REQ-A234，用户诉求驱动）**：`LayoutPolicy` 决定的是**窗口**能做什么（`multi_window` / `free_resize` / `divider_gap` / `columns`），但"这个类别里**内容**怎么排"是另一件事，此前**无人处理**：`HomeDock.svelte` 把 `per = 12`（4 列 × 3 行）与 `grid-cols-4` 写死，于是 900×1200 的平板窗口里仍是手机密度（iPadOS 竖屏 **4×6=24**、横屏 **6×4=24**），而 `Shell.svelte` **从不读形态**——壳层里没有"我是平板"这个概念。补全落在 `frontend-ts/src/lib/formLayout.ts`（纯函数，仿本 crate 的纪律）：`homeGrid(form, width, height)` —— **phone/robot/desktop 与"未测量屏幕"一律保持 4×3（phon​e 字节级不变）**，平板按 iPadOS 密度，正方形按竖屏（与 `split_axis` 同规则），`0`/NaN/∞ 的未测量屏幕**降级为手机栅格**（镜像 `columns_for(0) == 1` 的"未测量 ⇒ 最保守"）；`pageCapacity(grid)` 是"每页几个"的唯一答案。宿主权威的流向不变量不变：**类别只来自宿主**——`Shell.svelte` 读 `wmLayoutSnapshot` 一次并跟随 `layout-changed` 推送，**绝不从 WebView 宽度猜类别**；通道载荷里没有 `grid` 时降级为手机栅格（能力不因缺失载荷而被"获得"）。渲染侧用**内联 `grid-template-columns`**（Tailwind 会 purge 动态类名），`data-cols`/`data-rows` 是它的可测证据。**诚实边界**：①`desktop` 当时**刻意排除**（它的窗口已是可自由缩放的 OS 窗口，REQ-A233 已与桌面对齐；改桌面启动器密度是另一件事，测试里明确钉住）—— 该决定已被用户诉求推翻，处置见下下一条 **REQ-A249**，那条"刻意排除"的测试也随之下沉为桌面自己的规则；②本轮**没有做** iPad 式**侧栏**：壳层没有 per-app 导航模型，编一个假目录比不做更糟；③这是**内容**几何，不是分屏——分屏入口仍不可达（见 §1.5 上文 `wm_open` 无消费者）。
+- **形态必须落到「内容」上，否则平板只是"更大的手机"（REQ-A234，用户诉求驱动）**：`LayoutPolicy` 决定的是**窗口**能做什么（`multi_window` / `free_resize` / `divider_gap` / `columns`），但"这个类别里**内容**怎么排"是另一件事，此前**无人处理**：`HomeDock.svelte` 把 `per = 12`（4 列 × 3 行）与 `grid-cols-4` 写死，于是 900×1200 的平板窗口里仍是手机密度（iPadOS 竖屏 **4×6=24**、横屏 **6×4=24**），而 `Shell.svelte` **从不读形态**——壳层里没有"我是平板"这个概念。补全落在 `frontend-ts/src/lib/formLayout.ts`（纯函数，仿本 crate 的纪律）：`homeGrid(form, width, height)` —— **phone/robot/desktop 与"未测量屏幕"一律保持 4×3（phon​e 字节级不变）**，平板按 iPadOS 密度，正方形按竖屏（与 `split_axis` 同规则），`0`/NaN/∞ 的未测量屏幕**降级为手机栅格**（镜像 `columns_for(0) == 1` 的"未测量 ⇒ 最保守"）；`pageCapacity(grid)` 是"每页几个"的唯一答案。宿主权威的流向不变量不变：**类别只来自宿主**——`Shell.svelte` 读 `wmLayoutSnapshot` 一次并跟随 `layout-changed` 推送，**绝不从 WebView 宽度猜类别**；通道载荷里没有 `grid` 时降级为手机栅格（能力不因缺失载荷而被"获得"）。渲染侧用**内联 `grid-template-columns`**（Tailwind 会 purge 动态类名），`data-cols`/`data-rows` 是它的可测证据。**诚实边界**：①`desktop` 当时**刻意排除**（它的窗口已是可自由缩放的 OS 窗口，REQ-A233 已与桌面对齐；改桌面启动器密度是另一件事，测试里明确钉住）—— 该决定已被用户诉求推翻，处置见下下一条 **REQ-A249**，那条"刻意排除"的测试也随之下沉为桌面自己的规则；②本轮**没有做** iPad 式**侧栏**：壳层没有 per-app 导航模型，编一个假目录比不做更糟——**该边界已由 2026-09-20 补全部分关闭**：先建**可复用的纯决策** `formLayout::masterDetail(form, columns, width)`（只描述"该不该有侧栏、多宽"，不含任何目录），再由**本身就有导航模型的**设置页采纳（`SettingsApp.svelte`，iPadOS 设置式 master-detail）；**其余 app 仍未采纳**，"壳层编一个假目录"依然是不做的决定——**该边界再由 2026-09-21 补全部分收窄（REQ-A739 / F-SH-196）**：**文件** app 是第二个采纳者（它有真导航模型 `folderTree(list)`），`FilesApp.svelte` 消费**同一个** `masterDetail`（不重写任何阈值／判据；`docs/FMEA.md` F-SH-196 记录了"每个 app 各写一遍够宽规则"这条被关上的漂移面），窄屏包裹层用 `display:contents` 保证 phone 路径**零回归**（不引入额外布局盒）；Notes 等仍**未**采纳，边界如实保持部分收窄；③这是**内容**几何，不是分屏——分屏入口**当时**仍不可达（见 §1.5 上文 `wm_open` 无消费者）；**该结论已由 REQ-A512 更正**（触屏走壳内双窗格，不再需要第二个原生窗口）。
 - **应用窗口必须以「自己的 app」开屏（REQ-A234）**：宿主创建每个应用窗口时用的是 `index.html#window=<label>`，注释写着 "so the boot script auto-navigates to that app's screen"（`crates/amos-tauri/src/wm.rs` 的 `WmEvent::Created` 分支），但**前端从未读过该 fragment**（`shell-entry.ts` 只认 `?surface=`）⇒ 每个应用窗口、以及**分屏的每个窗格**都显示**启动器**：`multi_window`（"两个 app 并排"是平板类别 `LayoutPolicy` 的全部意义）即便分屏成功，屏幕上也只是两份首页。补全：纯函数 `frontend-ts/src/lib/windowRoute.ts::appIdFromHash(hash)` —— 内置 app（`APP_META`）或 `store:<manifest.id>` 瓦片 ⇒ 该 id；**其余（含畸形 fragment、`legacy:*` 容器面、窗口 id、大小写不同）一律 `null`，绝不猜**（与 `FormFactor::parse` 的"unknown → None"同一条规则）；`shell-entry.ts` 在 `?surface=`（无头验收路径）之后调用它。**不复制** Rust 的 `LAUNCHER_LABEL`：启动器窗口本来就不带 fragment，且 `main` 不是任何 app id——多一份会漂移的常量换不到任何行为。
 - **PC 窗口与桌面对齐 = "最大化"，而不是猜一个尺寸（REQ-A233，用户诉求驱动）**：用户要求"PC 窗口的界面与苹果电脑的桌面对齐，100% 对齐"。实测现状：桌面（Finder `window of desktop`）**1496×967**，而壳窗口是**固定 1024×720 放在 (508,45)**——**右边缘 1532 越出桌面**、只覆盖约一半面积。根因落在**领域规则**上：`LayoutPolicy::initial_window` 是**类别事实**（"PC 的窗口默认多大"），它**根本不知道**屏幕/菜单栏/Dock 能给出多少"可用区"，于是宿主只能照抄一个数字。补全：把该决策从"给一个 `Size`"升级为 `ShellFit{Leave|Resize(Size)|Maximize}`——**phone/robot ⇒ Leave**（手机本就是默认、无 UI 类别不碰几何）、**tablet ⇒ Resize(900×1200)**（真平板就是这个形状）、**desktop ⇒ Maximize**（PC 的壳**属于**它运行的那块桌面：**可用区由平台决定**——菜单栏、Dock、刘海——所以这里必须是"最大化"，而不是本 crate 自己猜一个尺寸，猜尺寸正是壳曾是"越出桌面右边的板子"的原因）。宿主侧：`shell_resize_reading` → `shell_fit_reading`（返回 `(was, ShellFit)`），`fit_shell_window` 对 `Maximize` 走 `window_maximize`、对 `Resize` 走 `set_size`（**只有精确请求才登记 REQ-A230 的"兑现/未兑现"比对**；最大化没有精确尺寸可比，实测报告可用区，**不多说一句**）。**实机实测（同一台 Mac）**：请求日志 `requested a desktop-aligned (maximized) shell window … was_width=480 was_height=820` → 实测 **`width=1496 height=881 scale=2.0 columns=4`**；窗口矩形 **`(0,29,1496,882)`** vs 桌面 `(0,0,1496,967)` ⇒ **x 相同、宽度 100.0%、右边缘齐平、上边贴菜单栏、下边贴 Dock**；内容侧 **10 010 种颜色、四条边缘都不是单色**（没有 letterbox/留白）⇒ 内容**边到边填满**窗口。对照：改动前是 `(508,45,1024,720)`。**诚实边界**：①`Maximize` 用的是平台的"缩放/最大化"语义（macOS 的绿键行为），**不**保证覆盖菜单栏/Dock（那才叫 fullscreen，是另一种模式）；②`columns` 因此从 3 变成 **4**（桌面策略上限），这是"对齐"的正确后果，不是回归；③平板/手机/机器人路径未被本改动影响（各自 `Resize`/`Leave`，手机字节级不变）。
 
@@ -118,6 +119,10 @@ panic）：`crates/amos-wm/src/form.rs`。
 | 黄灯后 `AXMinimized=true`，而模型仍说 `Shown` | **不改模型**：模型如实描述"窗口存在且未被隐藏" ✓ |
 | 黄灯后按 ⌘N ⇒ `AXMinimized` **仍是 true**（`wm_open` 只发 focus 事件，`set_focus()`/`show()` 都不还原最小化窗口）⇒ AmOS 自己的 Dock 图标与 ⌘N 都失效 | 适配层新增 `WmState::reveal_window()`：先问 `is_minimized()`，是则 `unminimize()` 再 show/focus；接在 `WmEvent::Shown` 与 `WmEvent::FocusChanged` 两处（⌘N 走后者），并置于 REQ-A435 的"页面未加载不夺键"判定之前——**可见性与键盘焦点是两件事** |
 | `wm_windows` 不报告"被平台最小化" ⇒ Dock 右键菜单的 `隐藏/显示` 不区分（macOS 对最小化窗口显示"显示"） | **登记为边界**，不造状态：两行都可用（`显示` 会经上面那条路径还原 ✓），影响薄 |
+
+**壳自己的 ⌘M 也走这条路（REQ-A714，2026-09-20）**：`DesktopShell` 的 `menu.minimize` 从前调 `wm_hide`（`window.hide()`）——窗口**同时**离开屏幕与模型，于是 Dock 白点熄灭、Mission Control 除名，用户把在跑的应用读成已关（`docs/DESKTOP_GAP_ANALYSIS_2026_SEP20.md` §2 A1）。现在它调宿主的新命令 `wm_minimize`，由**平台**去 `window.minimize()`、模型一字不动，窗口于是落进 Dock；点 Dock 磁贴 / ⌘N 走的就是上表那条 `reveal_window()` 路径还原。**仍不造第三个状态**——上表三条处置原样成立。「显示桌面」热角与切 Space 的隐藏仍走 `wm_hide`（它们本就该隐藏），未动。
+
+**窗口列表从「拉」改成「推」（REQ-A717，2026-09-20）**：上面两张表都依赖「宿主说有哪些窗口」，而在这一轮之前，UI 唯一的途径是**轮询** `wm_windows`（`lib/wmWindowsPoll.ts` 的 5 秒 `setInterval`）——宿主在窗口列表变化时**从不主动说**。后果可见：⌘W 关掉一个窗口后，`Dock` 的「运行中」圆点最多再亮 5 秒才熄灭，用户盯着一个**已经不存在的窗口**；同一条陈旧标签正是 `wm.rs` 里 `wm_close`／`wm_zoom` 注释点名的 「a stale label from the 5 s `wm_windows` poll」。现在宿主在**模型变更的唯一咽喉** `WmState::apply` 末尾广播 `wm-changed`（带上权威 `WmSnapshot`，且只在事件批非空时发），前端 `lib/wm.ts::onWmChanged` 订阅它——与轮询共用**同一个** `normalizeWindows`，所以推送与轮询不会给出两种形状；**没有窗口列表**的帧被丢弃（否则空列表会被读成「所有应用都关了」而清空 Dock 圆点）。5 秒轮询**降级为 30 秒对账兜底**（`WM_WINDOWS_POLL_MS`），只兜「事件丢了／宿主还没发」。**如实边界**：推送只覆盖经 `apply` 的模型变更（`open`／`new_window`／`cycle_app`／`focus`／`hide`／`close`／`home`）——`open_surface`（外部容器面）与 `minimize`（本页上表：模型不改 `state`）不 `apply`，故不推送，这正是保留 30 秒对账的理由，而非疏漏。
 
 `amos-tauri` 接入示例（后续落地）：
 ```rust
@@ -376,6 +381,138 @@ Island、home indicator、手机密度的主屏），但**桌面形态本身**�
 另外：手机上的第二次 `wm_open` 现在会拿到具名拒绝（"form factor 'phone' does not allow
 multiple app windows …"），而手机自己的壳走的是单窗口 SPA 路由，不会走到那里。
 **仍未做**：真机观感复核（把桌面壳拉小、看窗口是否被拉回）——属设备/肉眼项。
+
+## 6.7 应用窗口的**身份**：一个应用可以有多扇窗（REQ-A473）
+
+上面 §6.4/§6.6 描述的一切都建立在一根字符串上：Tauri 的**窗口 label**。它同时扛着两件事 ——
+"哪扇平台窗口"与"哪个应用"。后果是结构性的，不是观感问题：`WmState::open()` 先查 `by_label`、
+查到就聚焦，所以第二次 `wm_open("files")` 只能把文件带前台；`app_window_title(label)` 按同一根
+字符串查表，任何不是裸 app id 的 label 掉进兜底 `"Amos"`；前端的 `#window=<label>` 路由把 label
+当 app id，实例窗口会渲染成"未知应用"。产品层也早记着这件事：File 菜单项只能叫 **"New Files
+Window"**（REQ-A434），因为"给当前应用再开一扇窗"缺少 label ⇄ app 之外的第二身份。
+
+**身份域**（`crates/amos-wm/src/identity.rs`，纯函数、无窗口、无 I/O）：
+
+| 概念 / 函数 | 规则 |
+|---|---|
+| `WindowIdentity { app, instance }` | 应用 id + **1 基**实例号 |
+| `label_for(app, n)` | 实例 1 = `<app>`；其余 = `<app>_<n>` |
+| `identity_of_label(label)` | 反解；**一个身份只有一种拼写**（`files_1` 被具名拒绝） |
+| `next_window_label(app, existing)` | **最小空闲序数**（关掉的 `_2` 被复用；同一棵树同一组名字）；上界 `MAX_WINDOWS_PER_APP = 16`，到顶是 `TooManyWindows` 具名拒绝 |
+| `cycle_target(current, peers, forward)` | 按序数排序 + 回绕；当前不在环内时取端 ⇒ **与调用方的 map 迭代顺序无关** |
+| `validate_app_id(app)` | 非空、无空白/控制字符、**不含分隔符**、≤ 64 **字符** |
+
+**分隔符是测出来的**：第一版用 `#`，Tauri 自己拒绝它 —— `Window labels must only include
+alphanumeric characters, -, /, : and _`（宿主测试建真窗口时暴露；这正是那些测试的价值）。
+三个候选逐一实测后取 `_`：`-` 在真实第三方 id 里太常见（`store:org.amos.demo-v2` 会被读成实例
+2 而不是被拒），`/` 带路径语义，`_` 与本仓既有惯例（`legacy:waydroid_0`）一致。
+
+**宿主侧的账本只有一个写入口**：`WmCore` 的 `labels` / `by_label` / `kinds` / `apps` 四张表由
+`bind` / `unbind` 两处维护，`close_core` 走 `unbind` ⇒ 身份记录**不可能**比窗口活得久（否则死窗口
+留在 ⌘` 环里，还会与复用中的 label 撞车）。命令面：
+
+| 命令 | 语义 |
+|---|---|
+| `wm_open(app_id)` | 打开/聚焦该应用的**第一扇**窗（幂等）；传实例 label 会**被拒**并指向 `wm_new_window` |
+| `wm_new_window(app_id)` | 再开一扇：宿主分配实例 label，调用方**只说应用**（UI 无法铸造任意平台 label） |
+| `wm_cycle_app(app_id, forward)` | 走该应用的环；**不足两扇窗时具名拒绝**（不是"成功但没动"） |
+
+`wm_windows` 的每条记录新增 `app` / `instance`：Dock 的运行中白点与顶栏的应用名都按 **app id**
+匹配 —— 按 label 匹配会让"多开一扇窗"反而把白点**熄灭**。前端 `lib/windowRoute.ts` 的
+`splitWindowLabel` 是唯一的本地解析器（启动路由必须在任何往返之前解析 label），它**先剥离有效后缀**
+（这是宿主的规则：app id 不含分隔符），因此非数字尾巴（`store:org.amos.some_app`）仍整体解析。
+
+**诚实边界**（与 §5 的其它条目同一纪律）：
+
+- **未做真机/GUI 复核**：⌘`/⌘N 在真窗口上的观感、实例窗口在 Dock/顶栏的呈现都还需要一次启动。
+- **实例号不跨启动稳定**：关闭后序数会被复用 —— 这是"不维护第二账本"的选择（与 `reclamp_windows`
+  读平台而不记账本是同一条推理）。
+- **App Exposé 已做**（REQ-A476）：`⌃↓` 铺开**焦点应用**的窗口 —— `svelte/AppExpose.svelte`（浮层注册表
+  `app-expose`，order 40），范围由 `lib/wm.ts` 的纯函数 `focusedAppOf` / `windowsOfApp`（按 **app id**
+  硬相等、排除 Hidden、`""` 不是通配符）决定，开关由 `desktopLayout.shouldShowAppExpose`（焦点应用的
+  窗口数 ≥ 2 —— 与 `shouldShowMissionControl` 的**总**窗口数是两个问题）。**不足两扇窗时什么都不开**
+  （macOS 同样）并把原因写进诊断账本（`desktopSystemKeys.appExposeRefusal`）。边界：**没有缩略图**
+  （瓷砖是应用图标 + 名字，与 Mission Control 的预览占位同一条）、**没有方向键网格导航**、顺序就是
+  宿主给的顺序。
+- **per-app 菜单模型**仍是 F-SH-001 那一族；**Dock 右键菜单**已有「新建窗口」（REQ-A474）。
+
+## 6.8 窗口**吸附** / 边缘平铺（REQ-A616）
+
+把窗口送到屏幕的**具名区域**（半屏 / 四分之一 / 整个工作区），而不是手拖。几何规则在
+`crates/amos-wm/src/snap.rs`（纯 `std`、无窗口、无 I/O），宿主命令是 `wm_snap(label, zone)`，前门是
+`DesktopShell` / `DesktopWindowKeys` 的 `⌃⌥` 弦族（表在 `frontend-ts/src/lib/snapZones.ts`）。
+
+**领域规则**（`SnapZone` × `snap_bounds(zone, work_area, min)`）：
+
+| 规则 | 内容 |
+|---|---|
+| 九区 | 四半屏（left/right/top/bottom）+ 四角 + `maximize`；`key()`/`parse()` 是线上一对，`ALL` 是唯一的表 |
+| 半数无缝 | 奇数边长按 `floor` + 余数拆（1497 → 748 + 749），**相加恒等于整体**，不留死列也不重叠 |
+| 最小优先 | 区域小于类别最小尺寸则先 `enforce_min` **长大**，再 `clamp_into(work_area)` **拉回**屏内 —— 与自由缩放路径同一组合 |
+| 原点被尊重 | `work_area` 是**可用**矩形（减去菜单栏 / Dock），带原点 ⇒ 副屏窗口吸附到**那块屏**上 |
+| 按名拒绝 | 前端不认识的 zone 由 `SnapZone::parse` 返回 `None`（**从不猜**），与 `FormFactor::parse` 同规 |
+
+**门控**：只有 **desktop** 类别的窗口允许自由窗口几何（`form.rs` 的 `free_resize`）。`main`（启动器）、
+活动分屏的窗格、外部表面由 `snap_plan` 的纯半**按名拒绝** —— 这些都是"宿主说不"，与"没有可吸附的聚焦
+窗口"是**两句不同的诊断**（`snapZones.ts::snapRefusal` 分开给出）。
+
+**判据排序（F-WM-027，本轮实测复现的缺陷）**：吸附弦是**壳自有**固定表，而系统 / Spaces / 浮层三域来自
+键盘设置。把固定表排在用户可配置判据**之前**，改键重叠时用户那行会被**静默吃掉**（REQ-A394 的形状）。
+因此吸附块置于 `onKeyDown` **最后**（Esc 之前）、`DesktopWindowKeys` 里置于系统循环**之后**；两族**默认值**
+本不相交（`⌃⌥` / `⌘…` / `⌃`+方向·数字 / `F3·F4·⌘Space·⌘Tab`），且 `shortcutMatches` 对修饰符**精确**比较，
+所以"默认不相交"是**可证的**而非约定。判据就地写明理由，以免下轮重构又把它提上去。
+
+**诚实边界**：
+
+- 吸附弦**未**进设置域的按键重绑（与 `SPACES_DEFAULTS` 同一条路：第四个配置域是独立改动）。
+- **未做真机截图验收**：证据是几何纯函数单测（半数无缝 / 最小尺寸优先 / 越界拉回）+ 组件级无头 DOM
+  用例（弦→`wm_snap` 的实参与宿主拒绝的上报）。
+- 回绝句是英文开发者诊断（与 `deadChordMessage` / `refusedChordMessage` 同一语域），**未**新增 i18n 键。
+
+## 6.9 多显示器（REQ-A690）
+
+吸附的几何规则（§6.8）从一开始就**带原点**：`work_area` 有非零原点时，窗口就吸附到**那块屏**上。缺的
+是**宿主侧**：直到本轮，布局模型只有**一个**矩形（启动器窗口 `inner_size()` 测得的那个），所以副屏上
+的窗口会被吸到主屏的一半——宿主根本没有「第二块屏」这个词。本轮把这个词补上。
+
+**领域**（`crates/amos-wm/src/display.rs`，纯 `std`，与 `layout.rs` / `snap.rs` 同规）：
+
+| 类型 / 方法 | 内容 |
+|---|---|
+| `Display` | `bounds`（整屏矩形，**全局**坐标，副屏可为负原点）、`work_area`（减去菜单栏 / Dock 的**可用**区；平台不报留白时等于 `bounds`，**从不**伪造内缩）、`scale`（只报不施）、`primary`、`name` |
+| `DisplaySet` | 平台顺序的**列表**，不是按 id 的表：平台的 id 跨热插拔不稳定，而本模块回答的每个问题（"在哪块屏"、"哪块是主屏"）都是**搜索**而非查表。**空集合法** = "平台什么都没说"，每个查询返回 `None`，宿主据此继续用测得的单一屏幕 |
+| `DisplaySet::containing(rect)` | `rect` 的**中心**落在哪块屏的 `bounds` 内；落在缝隙里返回 `None`（**从不猜邻居**） |
+| `DisplaySet::work_area_for(rect)` | 中心所在屏的可用区；中心不在任何屏上（如缩小后被甩到屏外）回退到**主屏**的可用区；空集才 `None` |
+| `DisplaySet::primary()` | 带 `primary` 标记的那块；平台没标则取**第一块**（未命名单显示器的诚实默认） |
+
+用**中心**而非左上角：一个窗口被拖到某屏右缘、一半在下一块屏上时，它**大部分**属于拥有其中心的那块屏，
+吸附就该铺在那块屏里。
+
+**宿主**（`crates/amos-tauri/src/wm.rs`）：`display_set(app)` 把 `available_monitors()` /
+`primary_monitor()` 的**物理**全局矩形按各屏 `scale_factor` 转成逻辑空间（与启动器窗口同一套
+`logical_rect`），**每次现读、从不缓存**——展示会热插拔，缓存副本正是本 crate 一直拒绝保存的「与平台
+不一致的账本」。读取入口是只读命令 `wm_displays`（返回 `DisplaySet`），**故意不做成 `LayoutSnapshot`
+的字段**：快照是布局**模型**的线上形状（两语言钉死），而显示器列表是**平台读数**，生命周期不同——要的人
+去问。
+
+**吸附如何选屏**（`snap_work_area`）：屏数 **< 2** 时返回 `core.screen`（测得的单一屏幕），**单屏行为与
+本轮之前逐字节相同**；≥ 2 时读目标窗口的**真实**外框（`outer_position` + `inner_size` + `scale_factor`，
+宿主不保存每窗几何账本，只能现读），取中心所在屏的可用区喂给 `snap_plan_in`。任何读取失败（列屏失败 /
+窗口测不到）**回退到 `core.screen`**——吸到"上次已知的屏"好过因为一次查询打嗝而**拒绝吸附**。
+
+**前门**：设置「窗口与形态」新增「显示器（调试）」卡（`WindowPage.svelte`），列出每块屏的名字 / 主屏标记 /
+矩形 / 可用区 / DPI，随同一 10s 探针刷新（热插拔不发 shell 事件，探针是唯一能察觉增删的路径）。诚实规则
+与窗口调试卡一致：宿主没答 ⇒ `null`（回到“—”，**不**保留上一份），**空集**照实显示"平台未报告任何显示器"，
+从不替它编一块。
+
+**诚实边界**：
+
+- **未做真机多屏截图验收**。证据是纯领域单测（中心归属 / 跨界 / 回退主屏 / 空集 / 可用区不超屏）+
+  宿主转换与选屏单测（负原点、2× 换算、显式可用区让副屏窗口留在副屏）+ 前端归一与镜像测试。
+- **混合 DPI 的相对摆放**只与调用方**每屏**的缩放同准：一个矩形无法同时表达两个缩放因子。宿主按各屏自身
+  `scale_factor` 换算**本屏**矩形，模块**从不猜**缩放；这条限制在此写明，不在代码里糊过去。
+- `wm_displays` 的**消费者只有设置卡**（一个只读、可断言的显示位），不驱动任何吸附决策——吸附只读**列屏 +
+  窗口外框**。
 
 ## 7. 相关文档
 

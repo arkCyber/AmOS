@@ -9,7 +9,7 @@
   },
   {
     "name": "wm_home",
-    "reason": "Multi-window host; the Svelte shell owns its own surface state (`shellState`), so nothing asks the WM to go home (docs/multi-window.md)."
+    "reason": "Multi-window host; `WindowManager::home()` works and is unit-tested (`amos-wm` `home_focuses_launcher`), but no frontend surface asks for it, because every \"go home\" the user can perform already has a live path: the touch shell's home pill / back / hardware key is `shellState.goHome()`; the desktop's Show Desktop drives `wm_windows`/`wm_hide`/`wm_focus` directly (REQ-A415); and the Launcher regains focus on its own through `promote_fallback_after` when the last app window closes or hides. Kept registered as a host capability without a consumer (docs/multi-window.md §1); REQ-A1133 audited it and found no defect to fix."
   },
   {
     "name": "clipboard_guest_status",
@@ -25,11 +25,7 @@
   },
   {
     "name": "media_read_range",
-    "reason": "Bounded-window read for large media (the streaming counterpart of `media_load`, docs/media-player.md). The player resolves tracks with `media_load` today; range reads are the custom-protocol/streaming path (device work)."
-  },
-  {
-    "name": "interpret_end_of_speech",
-    "reason": "Manual/VAD utterance boundary for the interpreter session. The screen drives start/audio/pause/resume/stop; a \"finish this sentence\" affordance does not exist yet."
+    "reason": "Bounded-window read for large media (the streaming counterpart of `media_load`, docs/media-player.md). **Corrected in REQ-A604**: the reason used to say 'the player resolves tracks with `media_load` today; range reads are the custom-protocol/streaming path (device work)' — both halves are now false. The player no longer resolves a whole item above `MAX_PLAY_BYTES`: it asks the host for an `amos-media://` URL (`media_stream_url`) and the registered protocol serves bounded `206` windows, so the streaming path a screen actually uses is the **protocol**, not this command. What stays true is that no JS caller wants windows directly: this is the JS-facing windowed read (a waveform/inspector, or a partial preview in Files), gated by the same read grant and the same error strings as `media_load`."
   },
   {
     "name": "interpret_restart",
@@ -60,6 +56,10 @@
     "reason": "Developer seam: feeds a synthetic camera frame into the in-process sensor host (host/dev + tests)."
   },
   {
+    "name": "sensor_host_record_vitals",
+    "reason": "Wellness producer seam (REQ-A1454): the step-counter / heart-rate samples are pushed by the on-device Kotlin glue (`SensorGlue.recordVitals`, the `(JFF)V` JNI upcall in android_glue.rs), exactly as `sensor_host_record_imu` is fed by the IMU half. The Health app *reads* the bus (`sensor_host_snapshot.vitals` + the `sensor-data` event), so there is no screen-side caller — the producer is the device, not the UI."
+  },
+  {
     "name": "sensor_host_acquire",
     "reason": "The in-process host's stream gate. Recorded in docs/unwired-exports-audit.md Round 10: exposing it would ask a *different* manager than the one producing the Settings card's stream."
   },
@@ -72,11 +72,7 @@
     "reason": "Per-app grant list from the daemon authority. The privacy dashboard reviews with `perm_grants_all` (one round-trip for every app) and gates with `perm_authorize`, so the per-app call has no consumer."
   },
   {
-    "name": "dock_badge_set",
-    "reason": "Registered host API with no consumer **yet**: `crates/amos-tauri/src/dock_badge.rs` applies the macOS Dock badge (`NSApplication.dockTile`) and requests attention, and both commands are wired into the invoke handler since REQ-A389. Nothing calls them: the Dock tile in this shell does not paint a badge, and there is no notification-to-badge bridge (the notification store has a `badge` field since REQ-A383, so the wiring is a small UI decision, not host work). Recorded here so the gate reads the truth — a ready API with no caller — instead of a missing call site."
-  },
-  {
-    "name": "dock_request_attention",
-    "reason": "Registered host API with no consumer **yet**: `crates/amos-tauri/src/dock_badge.rs` applies the macOS Dock badge (`NSApplication.dockTile`) and requests attention, and both commands are wired into the invoke handler since REQ-A389. Nothing calls them: the Dock tile in this shell does not paint a badge, and there is no notification-to-badge bridge (the notification store has a `badge` field since REQ-A383, so the wiring is a small UI decision, not host work). Recorded here so the gate reads the truth — a ready API with no caller — instead of a missing call site."
+    "name": "podcast_download_state",
+    "reason": "Single-episode download read. `PodcastsApp` gets every episode's `DownloadState` inside `podcast_feed`'s `EpisodeView.download`, and `doToggleDownload` re-reads that whole feed after a queue/forget, so no screen asks for one row on its own. Kept registered (the bridge method is unit-tested) as the seam a live per-row progress poll would use — the state is `Downloading { received, total }`, which only a poll can show advancing between feed snapshots."
   }
 ]

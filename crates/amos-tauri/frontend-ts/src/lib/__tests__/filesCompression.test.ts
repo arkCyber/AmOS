@@ -9,7 +9,8 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import { exportBundle, importBundle, BUNDLE_MAGIC } from "../filesCompression";
+import { readFileSync } from "node:fs";
+import { exportBundle, importBundle, BUNDLE_MAGIC, MAX_UNCOMPRESSED_BYTES } from "../filesCompression";
 import { normalizeFiles } from "../files";
 
 /** In Bun v1.2.x, the Web Streams gzip APIs are not available. The JS fallback
@@ -106,5 +107,32 @@ describe("filesCompression — fallback JS path", () => {
       expect(r.entries).toHaveLength(1);
       expect(r.entries[0]?.name).toBe("Good");
     }
+  });
+});
+
+describe("the JS fallback's bundle constants == the Rust authority", () => {
+  // REQ-A644: both constants are declared cross-language mirrors of `files.rs`.
+  // `filesCompression.ts` says the magic "Must match the Rust side" and the cap
+  // "(matches Rust)" — but nothing enforced it: this file's other cases use the
+  // LOCAL `BUNDLE_MAGIC` to check output, which is a value equal to itself, and
+  // the cap had no test at all. A drift on either side would silently make a
+  // bundle exported by one path un-importable by the other. These read
+  // `crates/amos-tauri/src/files.rs` and require equality in both directions.
+  const filesRs = readFileSync(new URL("../../../../../amos-tauri/src/files.rs", import.meta.url), "utf8");
+
+  it("the bundle magic equals the Rust `BUNDLE_MAGIC`", () => {
+    const m = /const BUNDLE_MAGIC:\s*&str\s*=\s*"([^"]+)"/.exec(filesRs);
+    expect(m).not.toBeNull();
+    expect(m?.[1]).toBe(BUNDLE_MAGIC);
+  });
+
+  it("the uncompressed cap equals the Rust `MAX_UNCOMPRESSED`", () => {
+    const m = /const MAX_UNCOMPRESSED:\s*usize\s*=\s*([0-9]+(?:\s*\*\s*[0-9]+)*)/.exec(filesRs);
+    expect(m).not.toBeNull();
+    // Evaluate the Rust arithmetic expression (`10 * 1024 * 1024`) rather than
+    // string-comparing it, so a cosmetic rewrite on either side is not a false red.
+    const rustCap = (m?.[1] ?? "").split("*").reduce((acc, n) => acc * Number(n.trim()), 1);
+    expect(rustCap).toBe(MAX_UNCOMPRESSED_BYTES);
+    expect(rustCap).toBe(10 * 1024 * 1024);
   });
 });

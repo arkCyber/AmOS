@@ -106,12 +106,19 @@ impl BatteryStatus {
     /// Fold a real [`amos_profiling::BatterySample`]: its `power_mw()` is `0.0`
     /// when the raw µA×mV pair is invalid, which we map back to `None` (honest
     /// "unavailable") rather than reporting a fabricated `0` W.
+    ///
+    /// A sample whose voltage is the **nominal fallback** is folded to `None` too: the
+    /// current is real but the power is an estimate over an assumed input, and
+    /// `live_power_mw` is drawn as a *reading*. `BatterySample::power_mw()` still answers for
+    /// that sample, so the estimate stays reachable — it is only this reading that refuses it
+    /// (REQ-A1449 / F-PWR-001, the same rule `amos_profiling::mean_power_mw` follows for the
+    /// averaged figure).
     pub fn from_sample(sample: &amos_profiling::BatterySample, level_pct: Option<f64>) -> Self {
         let mw = sample.power_mw();
         Self::new(
             level_pct,
             None,
-            if sample.is_valid() && mw > 0.0 {
+            if sample.is_valid() && sample.voltage_is_measured() && mw > 0.0 {
                 Some(mw)
             } else {
                 None

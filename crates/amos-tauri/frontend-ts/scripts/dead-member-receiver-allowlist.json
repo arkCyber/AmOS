@@ -1,0 +1,32 @@
+[
+  {
+    "path": "src/lib/enterprise/audit.ts",
+    "cls": "AuditLogger",
+    "name": "getConfig",
+    "reason": "**没有读它的界面，因为没有任何人可改的东西。** 审计配置（`AuditConfig`: minLevel / bufferSize / 保留条数 / 同步间隔）到今天没有一个用户面：`AuditLogViewer.svelte` 只读日志（`query` / `getStatistics` / `exportLogs`），`Settings` 里也没有审计页。它与下面那条 `updateConfig` 是**同一件事的两半** —— 一条读、一条写，两条都没有宿主。修法不是接其中一条，是造那个界面；在那之前把它列在这里，好让下一轮读到它时知道**缺的是界面**，而不是「读的人写漏了」。"
+  },
+  {
+    "path": "src/lib/enterprise/audit.ts",
+    "cls": "AuditLogger",
+    "name": "updateConfig",
+    "reason": "**`configChosen` 的唯一写者，而它零生产调用者 —— 于是一条登记过的判据在生产里不可达。** `loadConfig()` 的头一条判据是 `if (this.configChosen) return;`（「有人显式选过配置时，存储不能把它顶掉」，REQ-A897）；`configChosen` 只在 `updateConfig()` 里被置真，而本方法**只有测试在调**（`enterprise-audit.test.ts` 四处）。所以那条判据在生产里恒为假：**存储永远赢**。这不是 bug（没得选的时候本来就没有东西要保护），但它意味着 REQ-A897 的账本描述的是一个**还没有入口的**逃生口 —— 与 [[project_policy_predicate_no_production_caller]] 同一个形状。留在这里而不是删掉：一个真的设置页会需要它，删掉会把一条已经写对的保护一并删掉。"
+  },
+  {
+    "path": "src/lib/enterprise/api.ts",
+    "cls": "APIClient",
+    "name": "put",
+    "reason": "**动词糖没有消费者，因为「API 集成」这个面本身没人用。** `apiClient` 在生产里只被 `APISettings.svelte` 用到（`request` / `configure` / `getConfig`），而它发的是一个探活请求；企业侧的 POST 各自走自己的路（`webhooks.ts` / `mdm.ts` / `templates.ts` 都直接 `fetch`，不经过 `apiClient`）。`get`/`post`/`delete` 三条同族成员**不在**这一桶里，只是因为它们撞了内建集合方法名（见 `AMBIGUOUS_NAMES`）—— 也就是说它们的处境与 `put` 一样，只是本闸门看不见。修法与 `getConfig` 同：缺的是一个真的消费者，不是一个接线。"
+  },
+  {
+    "path": "src/lib/enterprise/api.ts",
+    "cls": "APIClient",
+    "name": "testConnection",
+    "reason": "**被面板自己的那一份取代，而且面板那份更强。** `APISettings.svelte::testConnection` 走 `apiClient.request({ method: \"GET\", path: \"/health\", skipRateLimit: true })` 并读 `result.statusCode`（非 2xx 是一个**回答**，`statusCode === 0` 才是「连不上」）—— 那正是 REQ-A819 的判词语义。类里这一份是自己 `fetch(this.config.baseUrl, { method: \"HEAD\" })` 的朴素版：它绕开了限流、重试与 `request()` 的错误折叠，产出的 `{success, message}` 也无法承载「HTTP 404」与「一个状态码都没收到」的区别。所以**不要**把面板改成调它（那是回退），要接就先把这一份改成同一条缝。同族第三个探活点是 `MDMPanel.svelte::testConnection`（探的是同一条路由）—— 三份合并是一次独立的重构，记在这里。"
+  },
+  {
+    "path": "src/lib/enterprise/mdm.ts",
+    "cls": "MDMManager",
+    "name": "shutdown",
+    "reason": "**测试里表达「重启」的那条缝，而且生产**不应该**调它。** 它做三件事：清 `executionCounts`、把 `this.config` 置 `null`、把引导备忘解回 `null`（`enterprise-mdm-boot.test.ts` 用它表达「重启后从存储重读」）。它**不在** `enterprise/index.ts::shutdownEnterprise()` 里是有意的：那里只调 `stopAutoSync()`，因为清掉配置会让门禁**失败方向朝开**（`isEnabled()` 恒假 ⇒ 三条判据全部放行）—— 一个已经装好的限制不该因为一次「关闭企业层」而失效，方向选的是 [[project_binding_direction_polarity]] 那条fail-strict。而清 `config` 的唯一正当场合就是「假装这正是重启」，那是测试的语义，不是生产的。"
+  }
+]

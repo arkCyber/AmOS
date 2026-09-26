@@ -8,7 +8,8 @@
   //
   // Honest states, never a blank frame (the rule `PwaHubApp` follows): "no bridge",
   // "Wine is not installed", "this host is not Linux" and "the host answered, and the
-  // list is empty" are **four different sentences**.
+  // list is empty" are four different sentences — and, since REQ-A836 / F-SH-266, so is
+  // "the host did not answer this enumeration", **per kind**.
   import {
     lastFailureReason,
     launchCommand,
@@ -17,14 +18,26 @@
     nativeLaunch,
     type NativeApp,
     type NativeAppKind,
+    type NativeAppsRead,
     type NativeAvailability,
   } from "../lib/nativeApps";
   import { t } from "./locale.svelte";
 
   type Load =
     | { kind: "loading" }
-    | { kind: "ok"; apps: NativeApp[]; availability: NativeAvailability }
-    | { kind: "offline" };
+    | { kind: "ok"; read: NativeAppsRead; availability: NativeAvailability }
+    | { kind: "offline" }
+    /**
+     * Neither enumeration answered (REQ-A836 / F-SH-266). It needs its own arm because
+     * folding it into an empty list reaches the per-section empty state, whose sentence
+     * is `native.empty.wine` — 《Wine 已安装，但它的前缀里没有可启动的 Windows 应用》—
+     * a positive claim about the host's filesystem made from a refused read.
+     * `native.offlineHint` right up the road forbids exactly that: 「既不显示应用，也不
+     * 假装成「本机没有应用」」. The honest sentence was already shipped; the fold put it
+     * out of reach. A **single** kind refusing keeps its own section honest instead —
+     * `read[kind] === null` → `native.appsUnconfirmed`, see `rowsOf` below.
+     */
+    | { kind: "unconfirmed" };
 
   type Launch =
     | { kind: "idle" }
@@ -43,16 +56,31 @@
       load = { kind: "offline" };
       return;
     }
-    const apps = await nativeApps();
-    load = { kind: "ok", apps: apps ?? [], availability };
+    const read = await nativeApps();
+    // Never a `?? []` on this read: `invoke` answers `null` for a refused command, so
+    // the fold turns "we could not enumerate" into "there is nothing to enumerate" and
+    // hands it to the empty-state wording (REQ-A836 / F-SH-266).
+    load = read === null ? { kind: "unconfirmed" } : { kind: "ok", read, availability };
   };
   $effect(() => {
     void run();
   });
 
-  const apps = $derived(load.kind === "ok" ? load.apps : []);
-  const wineApps = $derived(apps.filter((a) => a.kind === "wine"));
-  const linuxApps = $derived(apps.filter((a) => a.kind === "linux"));
+  /**
+   * One kind's rows, or `null` when the host did not answer that enumeration. The
+   * `null` must survive all the way to the wording — that is the whole point of the
+   * per-kind read.
+   */
+  const rowsOf = (kind: NativeAppKind): NativeApp[] | null =>
+    load.kind === "ok" ? load.read[kind] : null;
+  const wineApps = $derived(rowsOf("wine") ?? []);
+  const linuxApps = $derived(rowsOf("linux") ?? []);
+  /** The count is only a count when both enumerations answered (a lower bound is not one). */
+  const total = $derived(
+    load.kind === "ok" && load.read.wine !== null && load.read.linux !== null
+      ? load.read.wine.length + load.read.linux.length
+      : null,
+  );
 
   const start = async (app: NativeApp) => {
     launch = { kind: "busy", id: app.id };
@@ -65,14 +93,27 @@
         : { kind: "started", name };
   };
 
-  /** Is this surface even offered on this host? (Drives the empty-state wording.) */
-  const available = (kind: NativeAppKind): boolean => {
-    if (load.kind !== "ok") return false;
-    return kind === "wine" ? load.availability.wine : load.availability.linux;
+  /**
+   * Is this surface even offered on this host? (Drives the empty-state wording.)
+   * `null` is the third answer — the host did not reply to **that** probe — and it must
+   * not be folded into `false` here: the wording below turns `false` into a positive
+   * statement about the machine (REQ-A1363 / F-SH-627).
+   */
+  const available = (kind: NativeAppKind): boolean | null => {
+    if (load.kind !== "ok") return null;
+    return load.availability[kind];
   };
 
-  const emptyReasonKey = (kind: NativeAppKind): string =>
-    available(kind) ? `native.empty.${kind}` : `native.unavailable.${kind}`;
+  /**
+   * The sentence under an empty section. Three answers, three sentences: the host said
+   * yes (it can run these, and found none), said no (it cannot), or did not answer the
+   * probe at all — and only the first two license a claim about this machine.
+   */
+  const emptyReasonKey = (kind: NativeAppKind): string => {
+    const offered = available(kind);
+    if (offered === null) return "native.availabilityUnconfirmed";
+    return offered ? `native.empty.${kind}` : `native.unavailable.${kind}`;
+  };
 </script>
 
 <div
@@ -81,9 +122,9 @@
 >
   <header class="flex items-baseline justify-between gap-2">
     <h1 class="text-[17px] font-semibold tracking-tight">{t("app.nativeapps")}</h1>
-    {#if load.kind === "ok"}
+    {#if total !== null}
       <span class="text-xs opacity-60" data-testid="native-count"
-        >{t("native.count", { n: apps.length })}</span
+        >{t("native.count", { n: total })}</span
       >
     {/if}
   </header>
@@ -96,6 +137,13 @@
     <div class="rounded-2xl border border-amber-500/30 bg-amber-500/10 p-4" data-testid="native-offline">
       <p class="text-sm font-semibold">{t("native.offline")}</p>
       <p class="mt-1 text-xs opacity-70">{t("native.offlineHint")}</p>
+    </div>
+  {:else if load.kind === "unconfirmed"}
+    <div
+      class="rounded-2xl border border-amber-500/30 bg-amber-500/10 p-4"
+      data-testid="native-unconfirmed"
+    >
+      <p class="text-sm font-semibold">{t("native.appsUnconfirmed")}</p>
     </div>
   {:else}
     {#if launch.kind === "started"}
@@ -112,12 +160,19 @@
 
     <p class="text-[11px] opacity-60" data-testid="native-scope">{t("native.scope")}</p>
 
-    {#each [{ kind: "wine" as const, rows: wineApps }, { kind: "linux" as const, rows: linuxApps }] as section (section.kind)}
+    {#each [{ kind: "wine" as const, rows: wineApps, asked: rowsOf("wine") !== null }, { kind: "linux" as const, rows: linuxApps, asked: rowsOf("linux") !== null }] as section (section.kind)}
       <section data-testid={`native-section-${section.kind}`}>
         <h2 class="text-sm font-semibold">
-          {t(`native.section.${section.kind}`, { n: section.rows.length })}
+          <!-- A refused kind has no count, and `0` would be one (REQ-A836 / F-SH-266). -->
+          {t(`native.section.${section.kind}`, { n: section.asked ? section.rows.length : "—" })}
         </h2>
-        {#if section.rows.length === 0}
+        {#if !section.asked}
+          <!-- This kind's enumeration was refused: say that, and do not borrow a
+               sentence that makes a claim about the machine (REQ-A836 / F-SH-266). -->
+          <p class="mt-1 text-xs opacity-60" data-testid={`native-unasked-${section.kind}`}>
+            {t("native.appsUnconfirmed")}
+          </p>
+        {:else if section.rows.length === 0}
           <p class="mt-1 text-xs opacity-60" data-testid={`native-empty-${section.kind}`}>
             {t(emptyReasonKey(section.kind))}
           </p>

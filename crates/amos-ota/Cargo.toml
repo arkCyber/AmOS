@@ -1,0 +1,25 @@
+[package]
+name = "amos-ota"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Amos system-update (OTA) domain core: SemVer-correct version precedence, release channels + deterministic rollout cohorts, SHA-256 integrity + real Ed25519 (RFC 8032) signature verification, a battery/network gating decision, and a staged install state machine with an explicit rollback — pure std + sha2 + ed25519-dalek, no I/O, fully offline-testable. The fetch/deploy/reboot halves stay caller seams (UpdateProvider + the runtime)."
+
+[lib]
+name = "amos_ota"
+path = "src/lib.rs"
+
+[dependencies]
+serde.workspace = true
+sha2.workspace = true
+hex.workspace = true
+thiserror = "1"
+# The real authenticity verifier ([`verify::Ed25519Verifier`]). Same RFC 8032
+# scheme `amos-appstore` / `amos-identity` already use, so no new algorithm and
+# no new dependency edge in the lock file. The core is still I/O-free; this is
+# pure computation over bytes the caller supplies.
+ed25519-dalek = "2"
+
+[dev-dependencies]
+serde_json = "1"

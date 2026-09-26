@@ -68,8 +68,8 @@
 
 | 约束 | 实现 |
 |---|---|
-| **有界内存** | `MAX_PLAY_BYTES = 256 MiB`：`isTooLarge(size)` 命中即拒绝缓冲并渲染 `player.tooLarge`，**绝不**无界分配（Power-of-10 #3）。 |
-| **对象 URL 生命周期** | 每次切曲在 `$effect` 的清理里 `URL.revokeObjectURL`（含“解析期间又切歌”的竞态：已取消分支也会回收自己刚建的 URL）。 |
+| **有界内存** | `MAX_PLAY_BYTES = 256 MiB`：`isTooLarge(size)` 命中即**不整项缓冲** —— 先向宿主索取 `amos-media://` 流式 URL（`media_stream_url`），**宿主给不出**才渲染 `player.tooLarge`；任何一条路径都**绝不**无界分配（Power-of-10 #3）。 |
+| **对象 URL 生命周期** | 每次切曲在 `$effect` 的清理里 `URL.revokeObjectURL`（含“解析期间又切歌”的竞态：已取消分支也会回收自己刚建的 URL），且**只回收自己建的**：`isObjectUrl(u)` 是唯一判据 —— 协议 URL 属于宿主，播放器从不 `revoke` 它。 |
 | **失败可见** | 读字节/取 Blob 失败 → `player.unavailable`；媒体元素 `error` → `player.playbackError`；均**显式渲染**，不静默。 |
 | **拒绝不伪装** | 桥在授权拒绝时 `media_list` **reject**；屏幕记为 `denied`，此时**即使库为空也不回退到示例曲**，而是渲染“内容不可用”——沿用 `lib/media.ts` 的既有契约（绝不把拒绝塌缩成空歌单）。 |
 | **无挂起** | 扫描用 `Promise.allSettled`；单个集合失败不影响其余来源；媒体元素 `play()`/`pause()`/`requestFullscreen()` 全部 try/catch（无头 DOM 不炸渲染）。 |
@@ -214,13 +214,18 @@ bun run smoke:player   # 播放器：经 shell.html?surface=app&id=player 打开
 
 ## 8. 诚实边界（未做 / 需设备验收）
 
-- **流式传输尚未接线（前置内核已就绪）**：前端仍是“读全量字节 → Blob → object URL”，**大于
-  `MAX_PLAY_BYTES` 的视频会被诚实拒绝**而非流式播放。其**内核已落地并测试**：`amos-media::range`
-  （RFC 7233 单范围规划，18 例）+ `MediaProvider::read_range`（HostFs **真 seek**、Mock 切片、默认有界切片）
-  + 整项 `MAX_LOAD_BYTES` 上限 + 与 `load` **同读授权**的 `MediaManager::read_range` +
-  `media_read_range` 桥命令（见 `docs/media.md` §6）。仍**未做**的只剩 **Tauri 自定义协议注册**
-  （`register_asynchronous_uri_scheme_protocol`）与平台相关 URL 形式——那必须在真机上前后端一起验收，
-  因此**不在此环境伪造**；协议验证通过后，`MAX_PLAY_BYTES` 与 blob 兜底即可退役。
+- **流式传输已接线（四层都通了），真机验收仍未做**：播放器不再对大文件一律拒绝 —— 超过 `MAX_PLAY_BYTES` 的条目先向宿主索取
+  `amos-media://` URL（`media_stream_url`，**与 `media_load` 同一读授权**：不在授权列表里、或读授权被撤销 ⇒ `null`），
+  由 `register_asynchronous_uri_scheme_protocol` 注册的协议按 `Range:` 返还有界 `206` 窗口；**宿主给不出 URL 时**才回落到
+  原来的诚实拒绝（`player.tooLarge`），且此时屏幕上的徽标如实显示"流式播放（不整项缓冲）"。四层都在 host 上受测：
+  `amos-media::range`（RFC 7233 单范围 18 例 + **未知长度规划** 7 例：`plan_unknown`/`content_range_unknown`）、
+  `MediaProvider::read_range`（HostFs **真 seek**、Mock 切片、默认有界切片）、`MediaManager::read_range`（与 `load`
+  **同读授权**）、`amos-media::protocol`（`serve` = URL → 经 `list` 授权查表 → 规划窗口 → 字节 + 状态/`Content-Range`，含未报
+  尺寸条目的 `bytes a-b/*` 流式；22 例）、`amos-tauri::media`（`protocol_response` 的响应头 + `media_stream_url` 的三道门；
+  17 例）、前端（`mediaStreamUrl` 桥 + `isObjectUrl`/`isStreamUrl` 判据 + PlayerApp 的 DOM 用例）。仍**未做**的是
+  **真机验收**：真正的解码播放、wry 在 Windows/Android 对自定义 scheme 的重写形态、以及平台相关 URL 的实际可用性，
+  都只能在设备上前后端一起确认，因此**不在此环境伪造**。也正因为未验收，`MAX_PLAY_BYTES` 与 blob 兜底**仍然保留** ——
+  协议在某平台举手失败时，行为回落到今天这套，而不是让文件变成不可播。
 - **真机来源依赖既有设备后端**：`music` / `movies` / `camera` / `recordings` / `download` 的读取走
   `media_*` 桥；真机 Android MediaStore 后端（Kotlin `MediaStoreGlue` + `READ_MEDIA_*`）与
   `docs/android-storage-unify.md` 的设备验收项一致，未含在 host 测试矩阵内。

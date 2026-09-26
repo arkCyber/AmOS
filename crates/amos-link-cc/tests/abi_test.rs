@@ -859,28 +859,97 @@ fn node_topics_returns_zero_when_no_topics() {
     unsafe { ffi::amos_link_node_drop(node) };
 }
 
-// --- Subscriber stats (zeros) ---
+// --- Subscriber stats: real counters, not a constant (REQ-A609) --------------------------
+//
+// `amos_link_subscriber_stats` used to write `received = dropped = decode_errors = 0` with the
+// comment "Stats are maintained in the background thread; return zeros for now" — a premise that
+// was never true (nothing counted anything). The C header declares these as the subscriber's
+// running counters, so a caller reading an all-zero struct could not tell "no frame has arrived"
+// from "this function never counts". A fresh subscriber legitimately reads zero; a subscriber
+// that has had a frame delivered must read `received >= 1`, and that is exactly what a constant
+// cannot satisfy.
 #[test]
-fn subscriber_stats_returns_zeros() {
+fn subscriber_stats_count_delivered_frames() {
     let peer = std::ffi::CString::new("stats-sub").unwrap();
     let node =
         unsafe { ffi::amos_link_node_new(peer.as_ptr(), ffi::amos_link_node_kind::NodeRobot) };
     assert!(!node.is_null());
-    let pattern = std::ffi::CString::new("amos/stats-sub/*").unwrap();
+    let pattern = std::ffi::CString::new("amos/stats-sub/sensor/*").unwrap();
     let sub = unsafe {
-        ffi::amos_link_subscriber_new(node, pattern.as_ptr(), ffi::amos_link_qos_default())
+        ffi::amos_link_subscriber_new(node, pattern.as_ptr(), ffi::amos_link_qos_sensor())
     };
     assert!(!sub.is_null());
+
+    // A subscriber that has received nothing reads zero — now a fact about the counters.
     let mut s = ffi::amos_link_sub_stats {
         received: !0u64,
         dropped: !0u64,
         decode_errors: !0u64,
     };
-    let r = unsafe { ffi::amos_link_subscriber_stats(sub, &mut s) };
-    assert_eq!(r, 0);
-    assert_eq!(s.received, 0);
-    assert_eq!(s.dropped, 0);
+    assert_eq!(unsafe { ffi::amos_link_subscriber_stats(sub, &mut s) }, 0);
+    assert_eq!(s.received, 0, "nothing delivered yet");
     assert_eq!(s.decode_errors, 0);
+
+    // Publish one frame on the topic this subscriber watches and wait for it to arrive.
+    let topic = std::ffi::CString::new("amos/stats-sub/sensor/data").unwrap();
+    let pubr = unsafe { ffi::amos_link_publisher_new(node, topic.as_ptr()) };
+    assert!(!pubr.is_null());
+    let payload: &[u8] = &[0xAB, 0xCD];
+    assert_eq!(
+        unsafe { ffi::amos_link_publisher_publish(pubr, payload.as_ptr(), payload.len()) },
+        0
+    );
+
+    let mut received = ffi::amos_link_received {
+        topic: [0; 1024],
+        peer_id: [0; 64],
+        seq: 0,
+        stamp_secs: 0,
+        stamp_nanos: 0,
+        frame_len: 0,
+        payload_len: 0,
+    };
+    let mut payload_buf = [0u8; 64];
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut ready = false;
+    while std::time::Instant::now() < deadline {
+        let r = unsafe {
+            ffi::amos_link_subscriber_poll(
+                sub,
+                &mut received,
+                payload_buf.as_mut_ptr(),
+                payload_buf.len(),
+            )
+        };
+        if r == ffi::amos_link_poll::Ready {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        ready,
+        "the published frame must reach the subscriber's poll"
+    );
+
+    let mut s = ffi::amos_link_sub_stats {
+        received: 0,
+        dropped: 0,
+        decode_errors: 0,
+    };
+    assert_eq!(unsafe { ffi::amos_link_subscriber_stats(sub, &mut s) }, 0);
+    assert!(
+        s.received >= 1,
+        "a delivered frame must be counted, got {} — a hardcoded 0 hides it",
+        s.received
+    );
+    assert_eq!(
+        s.decode_errors, 0,
+        "a well-formed frame is not a decode error"
+    );
+    assert_eq!(s.dropped, 0, "the handoff channel never drops a frame");
+
+    unsafe { ffi::amos_link_publisher_drop(pubr) };
     unsafe { ffi::amos_link_subscriber_drop(sub) };
     unsafe { ffi::amos_link_node_drop(node) };
 }

@@ -51,6 +51,27 @@ const navigate = async (h: { container: HTMLElement }, label: string) => {
   await fireEvent.click(row as HTMLButtonElement);
 };
 
+/** Make every write of `key` fail (storage unavailable/full), as other suites do. */
+function failWritesFor(key: string): () => void {
+  const real = window.localStorage;
+  const fake = {
+    get length() {
+      return real.length;
+    },
+    clear: () => real.clear(),
+    key: (i: number) => real.key(i),
+    getItem: (k: string) => real.getItem(k),
+    removeItem: (k: string) => real.removeItem(k),
+    setItem: (k: string, v: string) => {
+      if (k === key) throw new Error("QuotaExceededError");
+      real.setItem(k, v);
+    },
+  } as unknown as Storage;
+  Object.defineProperty(window, "localStorage", { value: fake, configurable: true, writable: true });
+  return () =>
+    Object.defineProperty(window, "localStorage", { value: real, configurable: true, writable: true });
+}
+
 describe("SettingsApp.svelte (iOS-style grouped index)", () => {
   test("renders the account card + grouped rows", () => {
     const host = render(SettingsApp);
@@ -206,6 +227,161 @@ describe("SettingsApp.svelte (iOS-style grouped index)", () => {
     expect(txt(host)).not.toContain("已连接");
   });
 
+  test("the Wi-Fi password sheet's 连接 cannot be pressed with an empty field — and pressing it does not silently close (REQ-A1127)", async () => {
+    // A secure AP with no stored password opens the sheet. The 连接 button used to be
+    // live with an empty field: pressing it (or Enter) closed the sheet while
+    // `connectWithPassword` returned the config unchanged — a "success" that never
+    // happened, with no verdict anywhere. Now the empty field leaves the button
+    // disabled and the submit a no-op, so the sheet stays put.
+    writeStoreValue(SETTINGS_KEY, { wifi: true, airplane: false });
+    const host = render(SettingsApp);
+    await navigate(host, "无线局域网");
+    const flush = () => new Promise<void>((r) => setTimeout(r, 10));
+    await flush();
+    const secure = host.container.querySelector('button[aria-label="AmOS-5G"]') as HTMLButtonElement;
+    expect(secure).toBeTruthy();
+    await fireEvent.click(secure);
+    await flush();
+    const pw = host.container.querySelector('input[aria-label="Wi-Fi 密码"]') as HTMLInputElement | null;
+    expect(pw, "password sheet").toBeTruthy();
+    const connect = host.container.querySelector('button[aria-label="连接"]') as HTMLButtonElement | null;
+    expect(connect, "连接 button").toBeTruthy();
+    expect(connect?.disabled).toBe(true); // nothing typed → nothing to submit
+    // Whitespace is not a password either.
+    await fireEvent.input(pw as HTMLInputElement, { target: { value: "   " } });
+    await flush();
+    expect(connect?.disabled).toBe(true);
+    // Pressing the disabled control must not close the sheet pretending it joined.
+    await fireEvent.click(connect as HTMLButtonElement);
+    await flush();
+    expect(host.container.querySelector('input[aria-label="Wi-Fi 密码"]')).toBeTruthy();
+    // Enter is the second entry point to `submitPassword` and must honour the same gate.
+    await fireEvent.keyDown(pw as HTMLInputElement, { key: "Enter" });
+    await flush();
+    expect(host.container.querySelector('input[aria-label="Wi-Fi 密码"]')).toBeTruthy();
+    expect(readStoreValue<{ current?: string | null }>(WIFI_KEY, {}).current ?? null).toBeNull();
+    // A real password enables it, and submitting joins + remembers (positive control).
+    await fireEvent.input(pw as HTMLInputElement, { target: { value: "secret5g" } });
+    await flush();
+    expect(connect?.disabled).toBe(false);
+    await fireEvent.click(connect as HTMLButtonElement);
+    await flush();
+    expect(readStoreValue<{ current?: string | null }>(WIFI_KEY, {}).current).toBe("AmOS-5G");
+    expect(host.container.querySelector('input[aria-label="Wi-Fi 密码"]')).toBeNull(); // sheet closed
+  });
+
+  test("the password sheet belongs to the network it asks about — joining another one closes it (REQ-A1223)", async () => {
+    // A tap on a network is a new question, and the sheet answers exactly one: it opens
+    // for the *secure, password-less* AP you tapped. Joining a different network (here
+    // the open one) is that question being walked away from — but nothing cleared the
+    // sheet, so 「为「AmOS-5G」输入密码」 stayed on screen for a network the user had
+    // already left, with 连接 — the only control it still has enabled — one press from
+    // moving the connection silently back to it. The Bluetooth half of the same page
+    // states the rule for its own pending question (`btPairTarget = ""` at the top of
+    // `startBtScan`: "a new search is a new question"); the Wi-Fi half had no such reset.
+    writeStoreValue(SETTINGS_KEY, { wifi: true, airplane: false });
+    const host = render(SettingsApp);
+    await navigate(host, "无线局域网");
+    const flush = () => new Promise<void>((r) => setTimeout(r, 10));
+    await flush();
+    await fireEvent.click(host.container.querySelector('button[aria-label="AmOS-5G"]') as HTMLButtonElement);
+    await flush();
+    const pw = host.container.querySelector('input[aria-label="Wi-Fi 密码"]');
+    expect(pw, "password sheet for AmOS-5G").toBeTruthy();
+
+    // The user changes their mind and joins the open network instead.
+    await fireEvent.click(host.container.querySelector('button[aria-label="Cafe_Free"]') as HTMLButtonElement);
+    await flush();
+    expect(readStoreValue<{ current?: string | null }>(WIFI_KEY, {}).current).toBe("Cafe_Free");
+    // The abandoned network's sheet must be gone: the question on screen is the network
+    // the user just joined, not the one they walked away from.
+    expect(host.container.querySelector('input[aria-label="Wi-Fi 密码"]'), "stale sheet").toBeNull();
+  });
+
+  test("a refused password write does not close the sheet as if the join had happened (REQ-A1241)", async () => {
+    // `saveCfg` returns nothing, so its caller cannot tell "stored" from "refused" — and
+    // `submitPassword` cleared `pwFor` / `pwVal` either way. When the store refuses the
+    // write (unavailable/full) nothing was joined, so the sheet's disappearance is the
+    // app reporting a join that never happened — and the typed password is discarded with
+    // it. The rule is written three lines above, for the empty-field case (REQ-A1127:
+    // "closing the sheet here would read as 'the join happened' while nothing did"); the
+    // refused-write case is the same false verdict, so the sheet stays and the banner says why.
+    writeStoreValue(SETTINGS_KEY, { wifi: true, airplane: false });
+    const restore = failWritesFor(WIFI_KEY);
+    try {
+      const host = render(SettingsApp);
+      await navigate(host, "无线局域网");
+      const flush = () => new Promise<void>((r) => setTimeout(r, 10));
+      await flush();
+      await fireEvent.click(host.container.querySelector('button[aria-label="AmOS-5G"]') as HTMLButtonElement);
+      await flush();
+      const pw = host.container.querySelector('input[aria-label="Wi-Fi 密码"]') as HTMLInputElement;
+      expect(pw, "password sheet for AmOS-5G").toBeTruthy();
+      await fireEvent.input(pw, { target: { value: "secret5g" } });
+      await flush();
+      await fireEvent.click(host.container.querySelector('button[aria-label="连接"]') as HTMLButtonElement);
+      await flush();
+      // The store refused it, so nothing was joined…
+      expect(readStoreValue<{ current?: string | null }>(WIFI_KEY, {}).current ?? null).toBeNull();
+      // …and the write failure is reported rather than swallowed…
+      expect(txt(host)).toContain("保存失败");
+      // …so the sheet — the only place that join could have come from — must still be up.
+      expect(host.container.querySelector('input[aria-label="Wi-Fi 密码"]'), "sheet closed on a refused write").toBeTruthy();
+    } finally {
+      restore();
+    }
+  });
+
+  test("the Wi-Fi index row names the joined network, not 「未连接」 (REQ-A1123)", () => {
+    // The row used to answer a two-state question and never read `amos.wifi`, so it
+    // said 「未连接」 while the status bar and this very page named the joined network.
+    writeStoreValue(SETTINGS_KEY, { wifi: true, airplane: false });
+    writeStoreValue(WIFI_KEY, { current: "Cafe_Free", saved: ["Cafe_Free"], passwords: {} });
+    const host = render(SettingsApp);
+    const row = buttonContaining(host, "无线局域网");
+    expect(row?.textContent ?? "").toContain("Cafe_Free");
+    expect(row?.textContent ?? "").not.toContain("未连接");
+  });
+
+  test("the Wi-Fi index row still says 「未连接」 when the radio is on but nothing is joined (REQ-A1123)", () => {
+    writeStoreValue(SETTINGS_KEY, { wifi: true, airplane: false });
+    writeStoreValue(WIFI_KEY, { current: null, saved: [], passwords: {} });
+    const host = render(SettingsApp);
+    const row = buttonContaining(host, "无线局域网");
+    expect(row?.textContent ?? "").toContain("未连接");
+  });
+
+  test("the Wi-Fi index row shows 「关」 when the radio is off, even with a remembered SSID (REQ-A1123)", () => {
+    // The joined SSID outlives the radio; reading only `current` would name a network
+    // this device is not on.
+    writeStoreValue(SETTINGS_KEY, { wifi: false, airplane: false });
+    writeStoreValue(WIFI_KEY, { current: "Cafe_Free", saved: ["Cafe_Free"], passwords: {} });
+    const host = render(SettingsApp);
+    const row = buttonContaining(host, "无线局域网");
+    expect(row?.textContent ?? "").not.toContain("Cafe_Free");
+    expect(row?.textContent ?? "").toContain("关");
+  });
+
+  test("the Wi-Fi page's 「当前网络」 row answers with the link, not the radio (REQ-A1123)", async () => {
+    writeStoreValue(SETTINGS_KEY, { wifi: true, airplane: false });
+    writeStoreValue(WIFI_KEY, { current: "Cafe_Free", saved: ["Cafe_Free"], passwords: {} });
+    const host = render(SettingsApp);
+    await navigate(host, "无线局域网");
+    await new Promise<void>((r) => setTimeout(r, 10));
+    const cell = host.container.querySelector('[data-testid="wifi-current-network"]');
+    expect(cell?.textContent?.trim()).toBe("Cafe_Free");
+  });
+
+  test("the Wi-Fi page's 「当前网络」 row says 「未连接」 when on but not joined (REQ-A1123)", async () => {
+    writeStoreValue(SETTINGS_KEY, { wifi: true, airplane: false });
+    writeStoreValue(WIFI_KEY, { current: null, saved: [], passwords: {} });
+    const host = render(SettingsApp);
+    await navigate(host, "无线局域网");
+    await new Promise<void>((r) => setTimeout(r, 10));
+    const cell = host.container.querySelector('[data-testid="wifi-current-network"]');
+    expect(cell?.textContent?.trim()).toBe("未连接");
+  });
+
   test("now-real sub pages render their real controls", async () => {
     // notifications → real Do-Not-Disturb switch
     let host = render(SettingsApp);
@@ -338,5 +514,28 @@ describe("SettingsApp.svelte (iOS-style grouped index)", () => {
     settingsChannel().set({ query: "brightness", nonce: 8 });
     await Promise.resolve();
     expect(find()?.value).toBe("brightness");
+  });
+
+  test("a search link whose text begins with '#' is a search, not a page jump (REQ-A1092)", async () => {
+    const host = render(SettingsApp);
+    const find = () =>
+      [...host.container.querySelectorAll("input")].find(
+        (i) => i.getAttribute("aria-label") === "搜索设置",
+      ) as HTMLInputElement | undefined;
+
+    // The channel is fed by Spotlight's 「在设置中搜索」 action, which hands over the
+    // raw query — so "#…" is ordinary text a user can type. A page-name-shaped one
+    // must land in the box like any other term, not steer the screen.
+    settingsChannel().set({ query: "#dock", nonce: 21 });
+    await Promise.resolve();
+    expect(find(), "the index search field").toBeTruthy();
+    expect(find()?.value).toBe("#dock");
+
+    // …and a leading '#' that names no page must not be silently swallowed into an
+    // empty box either: the query the user asked for is what they must see.
+    await fireEvent.input(find() as HTMLInputElement, { target: { value: "" } });
+    settingsChannel().set({ query: "#1 号", nonce: 22 });
+    await Promise.resolve();
+    expect(find()?.value).toBe("#1 号");
   });
 });

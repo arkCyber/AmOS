@@ -94,6 +94,38 @@ impl Default for BackendStats {
     }
 }
 
+/// Typed failure modes for the native local backends added for the RK3588 /
+/// in-process-llama.cpp bring-up seams (`inference::rknn`,
+/// `inference::llama_cpp`).
+///
+/// These are **typed** so a caller (or an integration test) can distinguish "the
+/// SDK is not linked" from "the model file is missing" from "the binding is not
+/// written yet" without string-matching an `anyhow` chain. The
+/// [`InferenceBackend`] trait still returns `anyhow::Result` (its existing
+/// contract); these convert losslessly via the blanket
+/// `impl From<E: Error + Send + Sync + 'static> for anyhow::Error`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackendError {
+    /// The requested native provider/SDK is not linked into this build.
+    Provider(String),
+    /// The model file the operator named is missing, blank, or unusable.
+    ModelNotFound(String),
+    /// The seam exists but the binding has not been written yet.
+    NotImplemented(String),
+}
+
+impl std::fmt::Display for BackendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BackendError::Provider(m) => write!(f, "provider unavailable: {m}"),
+            BackendError::ModelNotFound(m) => write!(f, "model not found: {m}"),
+            BackendError::NotImplemented(m) => write!(f, "not implemented: {m}"),
+        }
+    }
+}
+
+impl std::error::Error for BackendError {}
+
 /// Local GPU/NPU backend using GGML (llama.cpp compatible).
 pub struct GgmlBackend {
     model_path: std::path::PathBuf,
@@ -1225,6 +1257,73 @@ impl InferenceBackend for MockBackend {
     }
 }
 
+/// The honest "no inference engine is configured" backend (Gap 4 / F-AI-016).
+///
+/// Built only when `build_backend_from_env` resolved *no* engine: `AMOS_BACKEND`
+/// unset/`auto`, no model on the resolution chain
+/// ([`crate::bundled_model::resolve_model_path`]), no cloud keys. It reports
+/// `metadata().name == "unconfigured"` (so `get_status.engine.kind` and the UI
+/// banner are truthful) and **every** generation attempt fails with a stated
+/// reason — it never serves the deterministic mock, so a user who pointed at a
+/// phone expecting real AI is never shown placeholder output dressed as a model.
+pub struct UnconfiguredBackend {
+    metadata: BackendMetadata,
+}
+
+impl Default for UnconfiguredBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl UnconfiguredBackend {
+    pub fn new() -> Self {
+        Self {
+            metadata: BackendMetadata {
+                name: "unconfigured".to_string(),
+                version: "0.0.0".to_string(),
+                model_name: "none".to_string(),
+                max_context_length: 0,
+                // Nothing can stream from an engine that does not exist.
+                supports_streaming: false,
+                supports_function_calling: false,
+                supports_images: false,
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl InferenceBackend for UnconfiguredBackend {
+    async fn infer(
+        &self,
+        _prompt: &str,
+        _context: &HashMap<String, String>,
+        _max_tokens: usize,
+    ) -> Result<Box<dyn TokenStream>> {
+        Err(anyhow!(
+            "no inference backend is configured: set AMOS_BACKEND (e.g. ggml/api/ollama) or \
+             stage a local model — see docs/ai-model-bundling.md. This daemon will not serve \
+             the deterministic mock as if it were a real model."
+        ))
+    }
+
+    fn metadata(&self) -> BackendMetadata {
+        self.metadata.clone()
+    }
+
+    async fn health_check(&self) -> Result<()> {
+        Err(anyhow!(
+            "unconfigured: this deployment has no inference backend (F-AI-016)"
+        ))
+    }
+
+    async fn get_stats(&self) -> BackendStats {
+        // Honest telemetry: no engine -> no metrics (never a fabricated 0).
+        BackendStats::default()
+    }
+}
+
 /// Backend factory that selects the appropriate implementation.
 pub enum BackendKind {
     /// Use local GGML (llama.cpp compatible) inference.
@@ -1256,8 +1355,25 @@ pub enum BackendKind {
         base: String,
         model: String,
     },
+    /// Rockchip RK3588 NPU via the RKNN runtime (`AMOS_BACKEND=rknn`). A
+    /// bring-up seam: build fails with a typed [`BackendError::Provider`] unless
+    /// the `rknn` feature is linked *and* the binding has been written — never a
+    /// fabricated success (see `inference::rknn`).
+    Rknn { model_path: String },
+    /// In-process llama.cpp (`AMOS_BACKEND=llama-cpp`). A bring-up seam: build
+    /// fails with a typed [`BackendError::Provider`] unless the
+    /// `llama-cpp-inproc` feature is linked *and* the binding has been written
+    /// (see `inference::llama_cpp`).
+    LlamaCppInProcess { model_path: String },
     /// Use mock backend (for testing).
     Mock,
+    /// **No backend is configured** — the deployment did not set `AMOS_BACKEND`
+    /// to a real engine, no model is bundled, and no env override names one.
+    /// Built explicitly so the daemon does **not** silently fall through to
+    /// `Mock` when a user pointed at a phone expecting real AI (F-AI-016).
+    /// Surfaces in `get_status.engine` as `"unconfigured"`, and the UI must
+    /// render the "no AI available" banner instead of pretending.
+    Unconfigured,
 }
 
 impl BackendKind {
@@ -1315,10 +1431,33 @@ impl BackendKind {
                 backend.health_check().await?;
                 Ok(Box::new(backend))
             }
+            BackendKind::Rknn { model_path } => {
+                // Typed refusal while the binding is a seam (F-NPU-001): the
+                // daemon must never claim NPU acceleration it does not have, and
+                // must never substitute the mock on an explicit `rknn` request.
+                let backend = crate::inference::rknn::Rk3588Backend::new(model_path.clone())?;
+                backend.health_check().await?;
+                Ok(Box::new(backend))
+            }
+            BackendKind::LlamaCppInProcess { model_path } => {
+                let backend =
+                    crate::inference::llama_cpp::LlamaCppInProcessBackend::new(model_path.clone())?;
+                backend.health_check().await?;
+                Ok(Box::new(backend))
+            }
             BackendKind::Mock => {
                 let backend = MockBackend::new();
                 backend.health_check().await?;
                 Ok(Box::new(backend))
+            }
+            BackendKind::Unconfigured => {
+                // Reach this branch only when `build_backend_from_env` explicitly
+                // decided the deployment is unconfigured (no env override, no
+                // bundled model, no operator-pinned one). It yields the honest
+                // `unconfigured` backend — never an implicit `Mock` fallback
+                // (F-AI-016). Its `infer`/`health_check` fail with a stated
+                // reason; only its metadata (name `"unconfigured"`) is useful.
+                Ok(Box::new(UnconfiguredBackend::new()))
             }
         }
     }

@@ -7,6 +7,8 @@
   // claims a running AP, never invents a client list, and refuses to switch on a
   // config that could not produce a working AP (blank name / too-short WPA key).
   import { readStoreValue, writeStoreValueChecked } from "../../lib/amosStore";
+  import { radioOpenSettings } from "../../lib/backend";
+  import { radioDisplayOn } from "../../lib/quickRadio";
   import {
     HOTSPOT_KEY,
     hotspotProblems,
@@ -31,16 +33,24 @@
   import ChoiceRow from "./ChoiceRow.svelte";
   import Field from "./Field.svelte";
   import ToggleRow from "./ToggleRow.svelte";
+  import StoreErrorBar from "../StoreErrorBar.svelte";
 
   let {
     qs,
     onToggle,
     refusal,
+    storeError = "",
   }: {
     qs: QuickSettings;
     onToggle: (k: RadioKey) => void;
     /** The last refused write (REQ-A203), or `null` when nothing was refused. */
     refusal?: RadioRefusalView | null;
+    /**
+     * The **store's** refusal for the AP switch, if any (REQ-A1381). `saveErr` is this
+     * page's own config write and `refusal` is the device's answer; the switch is the tap's
+     * success report, so the store's verdict is said in its own line.
+     */
+    storeError?: string;
   } = $props();
 
   let cfg = $state<HotspotCfg>(normalizeHotspot(readStoreValue<unknown>(HOTSPOT_KEY, undefined)));
@@ -55,7 +65,9 @@
     cfg = next;
   };
 
-  const on = $derived(!!qs.hotspot);
+  // "Is the AP on?" — the shared predicate, not the stored bit: airplane mode owns the
+  // other radios, so a gated hotspot reads off (the sentence below says the same).
+  const on = $derived(radioDisplayOn(qs, "hotspot"));
   const blocked = $derived(!!qs.airplane);
   const problems = $derived(hotspotProblems(cfg));
   const ready = $derived(hotspotReady(cfg));
@@ -70,10 +82,29 @@
 
   // Switching the AP on is refused while the config could not produce a working AP —
   // the switch must never claim a hotspot that cannot exist.
+  //
+  // The refusal is also *drawn*: a switch that looks live but silently returns is the
+  // shape this page exists to avoid, and it was the odd one out — airplane mode already
+  // disabled the same switch (with its sentence below). Both reasons a turn-on cannot
+  // happen now read the same way: the row is disabled and the line beneath it says which
+  // (the problem text when the config is the blocker, `settings.airplaneBlocks` when the
+  // gate is). Turning an already-on AP *off* stays possible regardless of the config, so
+  // the readiness half only applies while `on` is false — hence `ready` alone is not the
+  // predicate.
+  const canToggle = $derived(!blocked && (on || ready));
   const toggleHotspot = () => {
-    if (!on && !ready) return;
+    if (!canToggle) return;
     onToggle("hotspot");
   };
+  // The device refusing the AP is not a dead end: a normal install cannot hold
+  // `TETHER_PRIVILEGED`, so `TetheringGlue.setWifiTethering` can answer "no" and the
+  // system's tethering settings is where the user can still start it. The refusal carries
+  // that surface token; the open verdict is reported rather than swallowed (REQ-A1456).
+  let surfaceFailed = $state(false);
+  const openApSettings = async () => {
+    surfaceFailed = !(await radioOpenSettings("hotspot"));
+  };
+
   const pickBand = (v: string) => saveCfg(setBand(cfg, v as HotspotBand));
   const pickSecurity = (v: string) => saveCfg(setSecurity(cfg, v as HotspotSecurity));
 </script>
@@ -92,9 +123,13 @@
     <ToggleRow
       label={t("settings.hotspot")}
       on={on}
-      disabled={blocked}
+      disabled={!canToggle}
       ontoggle={toggleHotspot}
     />
+    {#if storeError}
+      <div class={SUB}></div>
+      <div class="px-4 pb-2"><StoreErrorBar message={storeError} /></div>
+    {/if}
     <div class="px-4 pb-3">
       <p class={HINT}>{t("settings.hotspotDesc")}</p>
     </div>
@@ -113,6 +148,21 @@
         <p role="status" data-testid="hotspot-refused" class={HINT}>
           {refusal.noteKey === "" ? t("radio.refused.unknown") : t(refusal.noteKey)}
         </p>
+        <!-- The way out the refusal carries (REQ-A1456): the device said no to *this*
+             attempt, and the system's own tethering settings is where the user can still
+             switch the AP on — offered instead of leaving the refusal a dead end. -->
+        {#if refusal.surface !== null}
+          <button
+            class="mt-1 text-[11px] font-semibold text-accent underline underline-offset-2"
+            data-testid="hotspot-refused-open-settings"
+            onclick={() => void openApSettings()}
+          >{t("radio.openSettings")}</button>
+        {/if}
+        {#if surfaceFailed}
+          <p role="status" data-testid="hotspot-surface-failed" class={HINT}>
+            {t("radio.openSettingsFailed")}
+          </p>
+        {/if}
       </div>
     {/if}
   </section>

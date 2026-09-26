@@ -2,8 +2,7 @@
 
 **版本**: 1.0  
 **日期**: 2026年9月17日  
-**状态**: 设计规格（待实现）
-
+**状态**: **部分实现（REQ-A584）**：MDM / 审计日志 / API 集成 三个标签已挂载（入口链完整，由 settingsReach.test.ts 与 settingsPageBodies.test.ts 核验）；第四块「企业模板」有意未挂载——其目录没有生产者，挂上去只会是永远空的屏幕（页面里用 settings.enterpriseTemplatesMissing 说明原因）。
 ---
 
 ## 📋 概述
@@ -772,5 +771,5 @@ let handleScrollThrottled = throttle(() => {
 ---
 
 **文档版本**: 1.0  
-**状态**: 设计规格（待实现）  
-**下一步**: 实施 UI 组件（Phase 4.5）
+**状态**: **部分实现（REQ-A584）**：MDM / 审计日志 / API 集成 三个标签已挂载（入口链完整，由 settingsReach.test.ts 与 settingsPageBodies.test.ts 核验）；第四块「企业模板」有意未挂载——其目录没有生产者，挂上去只会是永远空的屏幕（页面里用 settings.enterpriseTemplatesMissing 说明原因）。
+**下一步**: 实施 Phase 4.5 剩余项（模板目录的 MDM 同步生产者）

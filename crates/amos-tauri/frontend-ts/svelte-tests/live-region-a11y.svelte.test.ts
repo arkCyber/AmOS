@@ -16,6 +16,9 @@
  *     (WHAT + VALUE), not just "67%";
  *   • NotificationBanner wraps the toast in `role="alert"` so an arriving notification
  *     interrupts politely (assertive).
+ *
+ * REQ-A1028 adds a fifth surface: the 自动勿扰 editor's "which window is running now" line,
+ * which the 30 s tick changes on its own — `role="status"` (polite + atomic), never assertive.
  */
 import { afterEach, describe, expect, test } from "vitest";
 import { cleanup, render } from "@testing-library/svelte";
@@ -25,6 +28,7 @@ import LockScreen from "../src/svelte/LockScreen.svelte";
 import StatusBar from "../src/svelte/StatusBar.svelte";
 import NotificationBanner from "../src/svelte/NotificationBanner.svelte";
 import AboutPage from "../src/svelte/settings/AboutPage.svelte";
+import FocusSchedule from "../src/svelte/settings/FocusSchedule.svelte";
 import { t } from "../src/svelte/locale.svelte";
 
 afterEach(cleanup);
@@ -112,6 +116,23 @@ describe("live values: polite broadcast + atomic (REQ-A284)", () => {
       const srOnly = probe.querySelector(".sr-only")?.textContent?.trim() ?? "";
       expect(srOnly.startsWith(t("a11y.probeLabel"))).toBe(true);
     }
+  });
+
+  test("FocusSchedule — the running-window line is a polite status region (REQ-A1028)", () => {
+    // The 自动勿扰 editor's hint is the ONLY place the currently-running window is stated, and
+    // it changes on its own: a 30 s tick crosses a window boundary while the user is
+    // elsewhere on the page. Without a live region a screen reader user never learns the
+    // state changed — `scripts/a11y-scan.mjs` R5 flagged exactly this file, and it was the
+    // one live-region finding with no mitigation at all (the other three are the home tiles,
+    // whose reading is their accessible name per REQ-A1014 — see R5_ALLOW).
+    const host = render(FocusSchedule);
+    const hint = host.container.querySelector('[data-testid="focus-schedule-hint"]');
+    expect(hint).toBeTruthy();
+    expect(hint?.getAttribute("role")).toBe("status");
+    // Polite, never assertive: this is information, not an interruption. (`NotificationBanner`
+    // is the role=alert precedent — an arriving toast *is* an interruption.) Asserting the
+    // attribute is absent is what catches a regression to an explicit aria-live="assertive".
+    expect(hint?.getAttribute("aria-live")).toBeNull();
   });
 
   test("AboutPage — the live-status section has an accessible name", () => {

@@ -1,0 +1,5 @@
+{
+  "src/lib/formAuthority.svelte.ts": {
+    "reason": "Module-level `$state` rune (the whole point of the module: a `$derived` in a component must re-derive when the host pushes a new class, which a manual subscribe snapshot cannot do). `$state` is a Svelte compiler transform, so importing this file under plain `bun test` throws `$state is not a function` before any assertion runs — it is not unit-testable off the Svelte compiler the way `batterySources.svelte.ts` / `keyboardConfigHook.svelte.ts` are (those export pure adapters and keep $state out of module scope). Its behaviour is exercised through the components that read it."
+  }
+}

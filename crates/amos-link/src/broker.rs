@@ -156,7 +156,7 @@ impl RelayCounters {
 /// node-wide `metrics.dropped` count the same frames, so the two never disagree.
 ///
 /// **On both transports** (round 17): a networked subscription is fed by a forwarding task,
-/// not by the broker, so its counters are moved by [`RelayCounters`] — the same three
+/// not by the broker, so its counters are moved by `RelayCounters` — the same three
 /// outcomes the broker records in-process. Until then the relay updated only the node's set,
 /// so a remote subscriber reported `dropped: 0` for its whole life while its queue dropped
 /// (`docs/amos-link.md` §3.18).
@@ -281,10 +281,22 @@ impl LatestSlot {
 
     /// Best-effort store: overwrite whatever is pending (it is stale by definition).
     ///
-    /// `false` means "this frame reached nobody": the slot was already occupied by a newer
-    /// frame, or its lock is poisoned. Either way the caller counts a drop — a poisoned
-    /// slot must not be reported as a delivery (see [`LatestSlot::try_put`]).
+    /// `false` means "this frame reached nobody": the consumer is **gone**, the slot was
+    /// already occupied by a newer frame, or its lock is poisoned. Either way the caller
+    /// counts a drop — a poisoned slot must not be reported as a delivery (see
+    /// [`LatestSlot::try_put`]).
     pub(crate) fn offer(&self, ingress: Ingress) -> bool {
+        // A closed consumer can never take this frame, so storing it would *claim a delivery
+        // for a frame nobody reads*: `Drop for Subscription` closes the slot but the entry
+        // survives until the next publish's liveness sweep, so a frame routed in that window
+        // would otherwise be counted delivered here while the subscription reported
+        // `received: 0, dropped: 0`. This is the best-effort twin of the check
+        // `offer_blocking` makes for the reliable one — a closed slot refuses, and the loss
+        // is recorded on this subscription, not only in the broker's report.
+        if self.is_closed() {
+            self.counters.record_dropped();
+            return false;
+        }
         let replaced = match self.slot.lock() {
             Ok(mut g) => {
                 let replaced = g.is_some();
@@ -376,7 +388,11 @@ impl LatestSlot {
         self.taken.notify_waiters();
     }
 
-    fn is_closed(&self) -> bool {
+    /// True once this slot can never hand a frame over again.
+    ///
+    /// `pub(crate)` because the Zenoh relay's forwarding loops ask it too: they own their own
+    /// subscriber, so a consumer that has gone must end the task, not just fail one store.
+    pub(crate) fn is_closed(&self) -> bool {
         // A poisoned lock is a closed consumer: it can never hand a frame over again, so
         // both the publisher's wait (`offer_blocking`) and the consumer's loop (`recv`)
         // must end here instead of waiting for a notification nothing can send.
@@ -1267,6 +1283,33 @@ mod tests {
             .is_err());
         assert_eq!(counters.snapshot().dropped, 1);
         assert_eq!(counters.snapshot().received, 0);
+    }
+
+    #[tokio::test]
+    async fn a_closed_best_effort_slot_refuses_a_frame_instead_of_claiming_a_delivery() {
+        // The best-effort twin of the test above: `offer` and `offer_blocking` are the two
+        // ways a frame reaches a one-slot sink, and only the reliable one used to ask whether
+        // the consumer was still there. The race is the same one (`Drop for Subscription`
+        // closes the slot; the entry survives until the *next* publish's liveness sweep), so
+        // it is pinned here, on the slot, deterministically — not through `publish`.
+        let counters = Subscription::counters();
+        let slot = LatestSlot::new(Arc::clone(&counters));
+        slot.close();
+        let delivered = slot.offer(Ingress {
+            topic: topic("amos/dog1/sensor/imu"),
+            frame: frame(1),
+        });
+        // A frame stored into a slot whose consumer is gone reached nobody: reporting it as
+        // `true` makes `publish` count a delivery, the node-wide `metrics.delivered` agree,
+        // and the subscription claim `received: 0, dropped: 0` for a frame it never got.
+        assert!(!delivered, "a frame into a closed slot reached nobody");
+        assert!(!slot.has_pending(), "and it stored nothing");
+        assert_eq!(counters.snapshot().received, 0, "nothing was handed over");
+        assert_eq!(
+            counters.snapshot().dropped,
+            1,
+            "the loss is counted on this subscription, like the reliable path's"
+        );
     }
 
     #[tokio::test]

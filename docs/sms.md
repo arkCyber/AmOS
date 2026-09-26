@@ -24,12 +24,12 @@ amos-tauri sms bridge (Tauri command: sms_snapshot / sms_send)
   - `wire.rs`：纯 JSON 契约解析 `parse_snapshot` / `parse_messages`（缺字段/坏类型一律 `Invalid`，绝不伪造）。
   - 测试 **6 例** 全绿；`cargo fmt`/`clippy -D warnings` 干净。
 - workspace 注册该 crate。
-- **`amos-tauri` SMS 桥**（`src/sms.rs`）：`SmsBridge`（host= `MockSms::new()` 空收件箱·诚实；`with_provider` 供设备/测试）+ 命令 `sms_snapshot` / `sms_messages` / `sms_send`（`send` 成功返回 `"sent"` 以便区分成功/错误/离线）；序列化镜像 `SmsThreadOut` / `SmsMessageOut`。lib.rs 已 `manage` + 注册。测试 **3 例**（host 空 inbox / seeded 映射 / send 拒空）全绿；`clippy`/`fmt` 干净。
-- **前端桥函数**（`lib/backend.ts`）：`smsSnapshot()` / `smsMessages(threadId)` / `smsSend(address,text)`（离线返回 `null`/`false`，绝不伪造）。
+- **`amos-tauri` SMS 桥**（`src/sms.rs`）：`SmsBridge`（host= `MockSms::new()` 空收件箱·诚实；`with_provider` 供设备/测试）+ 命令 `sms_snapshot` / `sms_messages` / `sms_send`（`send` 回**平台自己的判决** `"sent"` ∕ `"unconfirmed"`，被拒为 `Err` —— 见 §2 的 `parse_send_reply`）；序列化镜像 `SmsThreadOut` / `SmsMessageOut`。lib.rs 已 `manage` + 注册。测试 **3 例**（host 空 inbox / seeded 映射 / send 拒空）全绿；`clippy`/`fmt` 干净。
+- **前端桥函数**（`lib/backend.ts`）：`smsSnapshot()` / `smsMessages(threadId)` / `smsSend(address,text)`（回 `"sent"` ∕ `"unconfirmed"` ∕ `"failed"` —— 三态，离线或拒答折成 `"failed"`，绝不伪造成功）。
 
 ## 已接入（设备侧，待真机验收）
-1. **`amos-sms` Android provider**：`src/android.rs::AndroidSmsProvider`（`feature android = ["dep:jni"]`，仅设备构建拉 jni）。持有 `JavaVM` + Kotlin `SmsGlue` 全局引用，经 JNI 调实例方法 `snapshot()` / `messages(threadId)` / `send(address,text)`，一律 String↔String JSON，再用 `wire.rs` 解析（send 回 `{"ok":true}` / `{"error":…}`）。门禁：`cargo check -p amos-sms --features android`。
-2. **Kotlin `SmsGlue.kt`**（`crates/amos-tauri/android-glue/com/amos/ai/glue/`）：`bind(context)` 存 `applicationContext` 并 `external fun attach(this)` 上升给 Rust；`snapshot()` 查 `content://sms` 按 `thread_id` 聚合（最新一条 + 未读计数，newest-first 单次扫描）、`messages(threadId)` 按 `date ASC`、`send()` 走 `SmsManager.sendTextMessage`（API31+ `getSystemService`，否则 `getDefault()`）。无权限/异常→诚实空结果或 `{"error":…}`，绝不伪造。
+1. **`amos-sms` Android provider**：`src/android.rs::AndroidSmsProvider`（`feature android = ["dep:jni"]`，仅设备构建拉 jni）。持有 `JavaVM` + Kotlin `SmsGlue` 全局引用，经 JNI 调实例方法 `snapshot()` / `messages(threadId)` / `send(address,text)`，一律 String↔String JSON，再用 `wire.rs` 解析（send 回 `{"state":"sent"}` ∕ `{"state":"unconfirmed","detail":…}` ∕ `{"error":…,"error_kind":…}`）。门禁：`cargo check -p amos-sms --features android`。
+2. **Kotlin `SmsGlue.kt`**（`crates/amos-tauri/android-glue/com/amos/ai/glue/`）：`bind(context)` 存 `applicationContext` 并 `external fun attach(this)` 上升给 Rust；`snapshot()` 查 `content://sms` 按 `thread_id` 聚合（最新一条 + 未读计数，newest-first 单次扫描）、`messages(threadId)` 按 `date ASC`、`send()` 走 `SmsManager.sendTextMessage`（API31+ `getSystemService`，否则 `getDefault()`）并**等电台的 `SMS_SENT` 回执**（见 §4 最后一条）。无权限/异常→诚实空结果或 `{"error":…}`，绝不伪造。
 3. **权限/组件**：`AndroidManifest.permissions.xml` 声明 `READ_SMS` / `SEND_SMS` / `RECEIVE_SMS`，`AndroidManifest.components.xml` 声明 `com.amos.ai.glue.SmsReceiver`（`SMS_RECEIVED` 广播、要求发送方持 `BROADCAST_SMS`）；`AmosGlue.onStart` 内 `startQuietly("sms") { SmsGlue.bind(...) }`（首个 bind 早于授权也没关系：glue 在调用时检查权限，授权后即生效，无需重绑）。两个片段都必须合并进生成清单 —— `scripts/android-glue-mirror.sh` 会校验（此前 receiver 注册只存在于 git-ignored 的生成文件里，见 REQ-A177）。
 4. **amos-tauri 设备装配**：`src/sms.rs` 的 `#[cfg(feature="android")] mod device` 提供 `DEVICE: OnceLock<Arc<dyn SmsProvider>>` 与 JNI upcall `Java_com_amos_ai_glue_SmsGlue_attach`（照 media/flashlight 的 exactly-once 安装）；命令经 `active(&state)` **设备优先**解析 provider，否则回退 host `MockSms`。`Cargo.toml` 的 `android` feature 已含 `amos-sms/android`。门禁：`cargo check -p amos-tauri --features android`。
 5. **MessagesApp 接真实线程**：`$effect` 探一次 `smsSnapshot()`；有真实线程则切换为真实收件箱（每个 thread → 会话，选中即 `smsMessages()` 载入），发送走 `smsSend(address,text)` 成功后重载线程，并在标题显示 `📡 真实短信` 标识、隐藏本地“新建/删除会话”入口；无真实 SMS（host/离线）完全退回原有本地会话，行为不变。
@@ -78,7 +78,7 @@ amos-tauri sms bridge (Tauri command: sms_snapshot / sms_send)
 - 取值范围：时间戳必须 ≥0（负值渲染成假日期）；`id`/`address` 不得为空。
 - `{"error":…,"error_kind":…}` → 类型化错误：`permission`→`PermissionDenied`、`unavailable`→`Unavailable`、`invalid`→`Invalid`，其余→`Failed`；**错误绝不等价于“空收件箱”**。
 - `parse_messages_for(payload, expected)`：回包线程 ID 必须等于请求 ID（否则会静默显示**别的会话**）。
-- `parse_send_reply`：只有 `{"ok":true}` 才算成功；`{}`/畸形回包 → `Invalid`，**永不假设已发送**。
+- `parse_send_reply`：只认回包的 `state` —— `{"state":"sent"}` → `Sent`；`{"state":"unconfirmed","detail":…}` → `Unconfirmed`（**第三种事实**：平台在窗口内没有给结果，既不是成功也不是失败）；未知 `state`、缺 `state`、以及修前那个 `{"ok":true}` 形状一律 → `Invalid`，**永不假设已发送**（REQ-A1620 / F-TEL-040）。
 
 ### 3. 桥层：不阻塞 UI、硬超时、审计（`crates/amos-tauri/src/sms.rs`）
 - 命令改为 `async`，provider 调用经 `tauri::async_runtime::spawn_blocking` 卸载到阻塞池，并套 `tokio::time::timeout`（**8s**）。理由：Tauri 的**同步**命令跑在主线程，而 ContentResolver/JNI 是阻塞调用——否则大收件箱查询会冻结整个 WebView。超时后调用方得到诚实错误（阻塞任务无法取消，但不再拖住 UI）。测试用 50ms 超时 + 500ms 阻塞闭包验证。
@@ -90,11 +90,13 @@ amos-tauri sms bridge (Tauri command: sms_snapshot / sms_send)
 - **有界查询**：`snapshot()` 单次 `date DESC LIMIT 4000` 窗口内推导“每线程最新一条 + 未读计数”（不再全表扫描）；输出受 `MAX_THREADS` 约束。文档明确：仅统计窗口内的未读（**有界并已声明**的取舍，而非静默）。
 - `messages()`：线程 ID 必须为 ≤20 位纯数字；`date DESC LIMIT 1000` 取最新后**反转为时间序**，并在回包中回显 `thread_id` 供 Rust 交叉校验。
 - `send()`：先查 `SEND_SMS` 权限；地址/正文按域规则复校；用 `SmsManager.divideMessage` **真分段**（>1 段走 `sendMultipartTextMessage`）；`SecurityException`→permission、`IllegalArgumentException`→invalid、其余→failed。
+- **判决来自电台的回执，而不是「它没抛异常」**（REQ-A1620 / F-TEL-040）：`SmsManager.sendTextMessage` 把消息排进队列就返回，关机 ∕ 无信号 ∕ 被拒都不抛，所以「没抛异常」在这一层根本不是判决。`send()` 为**每一分段**注册 `SMS_SENT` PendingIntent（包内私有 action `com.amos.ai.glue.SMS_SENT` + `setPackage(自己的包)` + `FLAG_MUTABLE`，配一个 `NOT_EXPORTED` 动态接收器 —— 广播以本应用身份发出，别的应用伪造不了），`SendProbe` 等**全部**分段（一段被拒即整条被拒，取最差的那个码），`SENT_WAIT_MS = 6000` **严格小于** Rust 的 `SMS_TIMEOUT = 8s`（慢电台落成 glue 自己的 `unconfirmed`，而不是调用方超时后丢掉原因）。每段 `RESULT_OK` 才 `{"state":"sent"}`；具名失败（`RADIO_OFF` ∕ `NO_SERVICE` ∕ `GENERIC_FAILURE` ∕ `NULL_PDU`）→ `{"error":…,"error_kind":"rejected"}`（是**错误**，屏幕绝不显示成功）；窗口内无结果 → `{"state":"unconfirmed","detail":…}`。**如实边界**：不宣称 `SMS_DELIVERED`（网络回执可能几分钟才到，超出同步调用的窗口 —— 报告不超出平台说过的话）；未做真机复核。
 - `SmsPermissions`（READ/SEND）与 `MediaPermissions` 同构；所有失败返回 `{"error":…,"error_kind":…}`，不再把异常吞成“空收件箱”。
 
 ### 5. 前端状态机（`backend.ts` + `MessagesApp.svelte`）
 - `smsStatus()` + `smsSnapshotResult()`：把「成功（可能为空）」「权限被拒」「其它失败」「未桥接」区分开。
 - UI 三态：`device=false`（宿主 mock）→ 保持本地会话；“真实收件箱为空”→ **本机暂无短信**（不显示本地演示会话）；读取失败 → 红字错误 + 授权提示 + 「重试」按钮（重试会重新探测后端状态）。读取期间按钮置灰（`smsBusy`）。
+- **发送结果三态**（REQ-A1620 / F-TEL-040）：只有 `sent` 才清空输入框并消费草稿；`failed` 保留文字并打红色 `role="alert"`；`unconfirmed`（平台在窗口内没给结果）**保留**输入框与草稿，用 `role="status"` 的琥珀色单独说「尚未收到发送结果：短信可能已发出，请勿重复发送。」（`newNote` ∕ `realNote`，随输入框里那条文字一起存在 —— 改字即自行收回，不需要第二处清空点）。
 
 ### 6. 收发能力补全（2026-09-10）
 - **推式接收（真正“收”）**：`SmsGlue` 双保险注册 `SMS_RECEIVED`：
@@ -204,6 +206,7 @@ Android 把所有短信放在一张表里，用 `type` 打标签；文件夹就�
 | 授予来电筛选角色后**横幅不更新**（仍显示「未获权限」） | `blocklist_request_role` 只负责**弹出**系统对话框；作答发生在**另一个 Activity**，耗时远晚于命令返回，`loadBlockStatus()` 早已读回旧值 | `PhoneApp` 在 `document.visibilitychange` / `window.focus`（回到前台）与**每次切到「拦截」标签**时重新探测 `blocklist_status`，横幅立即翻转；外部 `cmd role remove-role-holder` 撤销也会如实回到「需授权」。DOM 回归用例 +1 |
 | 「信息」页屏蔽成功文案**过度承诺**（未持角色也说来电会被拒接） | `message.blockSenderDone` 固定说「来电将被拒接」 | 改为「其短信不再显示；AmOS 持有「来电筛选」权限时来电将被拒接」（中英同步） |
 | 仅开启**「拦截未知号码」开关**时，徽标又比列表多 | `Blocklist::check` 把**无法解析的地址**（字母数字发送者 ID，如 `TM-ALIPAY`）判为 `Unknown` 而非「放行」→ 列表被 `filter_threads` 隐藏；但 `sms_counts` 的守卫只看 `has_sms_rules()`（此时一条规则都没有）→ 退回平台计数 | `BlocklistState::filters_sms()` =「有短信规则 **或** 未知开关开启」作为唯一守卫，`sms_counts` 改用它；`sms.rs` 测试 +1（字母数字发送者 ID 在开关开启时不计入、逐文件夹等于可见列表长度；关掉开关后平台计数重新生效）、`blocklist.rs` 测试 +1（守卫由规则或开关任一武装，仅来电规则不启用短信过滤） |
+| 仅开启**「拦截未知号码」开关**时，来电侧的角色横幅与角色申请不武装 | `Blocklist::check(addr, Channel::Call)` 对**无法解析/被隐藏**地址在开关开启时判 `Unknown`，`shouldBlockCall("")`（隐藏号码通路）折到 `blocks_call("")` ⇒ **开关开、零来电规则**时隐藏号码来电仍会被拒接；但 `BlocklistGlue.needsScreeningRole`（Kotlin）与 `PhoneApp.svelte` 的横幅闸都只看 `has_call_rules`（=`has_rules_for(Call)`），开关不算数 ⇒ 启动时不申请 `ROLE_CALL_SCREENING`、本屏也不亮横幅，用户以为未知来电已被拦截而实际没有 | `BlocklistState::filters_calls()` =「有来电规则 **或** 未知开关开启」作为唯一真相（与上一行的 `filters_sms()` 逐字同形），经 `BlocklistStatusOut.filters_calls` 暴露给 UI 与 Kotlin；JNI `hasCallRules` 改名 `filtersCalls`（名实相符），`has_call_rules` 保留为诚实事实、不再被消费。`blocklist.rs` 测试 +1（孪生用例）、`phone.svelte.test.ts` +1（开关单独武装横幅） |
 | **有来电规则但平台无法执法时，横幅完全不渲染** | `block-role-unavailable` 分支被 `needsCallRole` 打开，而 `needsCallRole` 要求 `role_supported` → 桌面端 / 无角色 Android 上「规则已记录但没人执行」看起来像「一切正常」（或什么都没发生） | 横幅改为三段式且**互斥穷尽**：`role_held` → 生效；`role_supported && role_requestable` → 需授权 + 前台授权按钮；**其余一律**渲染「不可用」说明（无授权按钮）。移除不可达的 `needsCallRole`，`phone.blockRoleUnsupported` 措辞覆盖三种成因（桌面端 / Android 10 以下 / 原生桥未就绪）。DOM 用例 +2（不可用态可见且无授权按钮；已持角色只显示生效） |
 | 被屏蔽后**打开中的线程仍被读取** | `refreshReal` 只判断「列表里还有没有别的线程」，活动线程消失且列表为空时仍按旧 id 调 `sms_messages`（真机上该读取会被 `sms_messages` 的屏蔽判定拒绝） | 改为在**新列表**里查找活动线程：消失则切到最新线程，或清空 `realActiveId`/`realMsgs`/`realErr`；屏蔽后不再读取不可见线程。`messages.svelte.test.ts` 增断言（屏蔽后 `sms_messages` 调用次数不增加） |
 
@@ -262,9 +265,83 @@ Android 把所有短信放在一张表里，用 `type` 打标签；文件夹就�
 
 **诚实边界**：这不是系统级删除——短信仍在平台短信库里（换一个短信应用仍可见）；彻底删除需将 AmOS 设为默认短信应用（平台限制，见下节）。回收站满 256 条时 FIFO 淘汰最旧条目，其含义是「自动恢复显示」，并在文档与测试中写明。
 
+### 14. 新建短信的发送失败在草稿文件夹里无处显示（REQ-A1069 / F-SH-384，2026-09-22）
+
+- **缺陷（实测）**：`sendNew`（设备态「新短信」撰写框的发送）在平台上拒绝发送时把 `realErr = t("message.sendFailed")`（「发送失败」）设上；但 `realErr` 只渲染在 `{#if folder === "draft"}` 这条链的**其它**分支里（`{:else if smsErr}` / `{:else if realThreads.length === 0}` / 最后的线程分支），**草稿分支自己一个字都不画**。撰写框（`{#if showNew}`）是这条链**上方**的兄弟节点，所以在草稿文件夹里新建并发送被拒时：撰写框原样留着、屏幕**没有任何一句话**说明发送失败——用户只能以为点没生效。
+- **为什么一件状态管两件事会漏**：`realErr` 同时被 `sendNew`（新短信撰写框）与 `sendReal`（线程内输入框）写。两个动作在两个不同的视图里，而渲染点只服务了后者；前者的失败于是成为「写得进、画不出」的值。这与 `FilesApp` 把一个读失败与一个写拒绝折进同一状态是同一形状（一个状态承载两件事，就会有一件被另一件遮住）。修法是**拆开**：新增 `newErr`，只由 `sendNew` 写、只在撰写框内渲染（`data-testid="new-sms-error"`），并随 `setFolder` / `startNew` / `cancelNew` / `editDraft` / 深链 `applyCompose` 一起清空；`realErr` 保留给线程内发送与加载失败。
+- **测试**：`svelte-tests/messages.svelte.test.ts` 新增两例——「收件箱里被拒的发送会说明」（钉住既有正确分支）与「草稿文件夹里被拒的发送也会说明（REQ-A1069）」。**先证后修**：未改前草稿例红（`expect(txt).toContain("发送失败")` 得空）、收件箱例绿。**负控**（`cp` 到 /tmp 后 `shasum -a 256` 逐字节还原，绝不用 `git checkout --`）：**NC-A** 拿掉撰写框里那段渲染 ⇒ **恰 2 红**（两例都靠它）；**NC-B** 把 `sendNew` 的 `newErr` 改回 `realErr`（还原状态拆分）⇒ **恰 1 红**（只有草稿例，收件箱例仍绿——证明该断言独立承重）。还原后 `MessagesApp.svelte` = `a16e90cf72dadf77bb41c01660d37a9e47201937e1cf8cb77efbcbd7fcaa1032`、`messages.svelte.test.ts` = `9e4427afe5564e4f4e973686061efbf438c0a207a6e57bd7938413467ac7e9b7`。
+- **诚实边界**：本轮只修「界面说不说」——**没有**改发送路径本身（`sms_send` 仍由平台裁决），也没有动线程内发送（`sendReal` 的 `realErr` 渲染点本就存在）。
+
+### 15. 草稿文件夹读失败被折进「暂无草稿」（REQ-A1070 / F-SH-385，2026-09-22）
+
+- **缺陷（实测）**：草稿箱是同一个 `{#if folder === "draft"} / {:else if smsErr} / …` 链的**第一支**，而 `smsErr`（读失败 / 无权限）的渲染点只在下游分支里。于是设备态下 `sms_snapshot(folder="draft")` 被拒（`SmsFolderSnapshotResult` 的 `ok:false`）时：`refreshReal` 确实设了 `smsErr`、也把 `realThreads` 清空，但草稿分支**一个字都不画**，屏幕上只有本机草稿列表与「暂无草稿」——**「读不到」被折成了「没有」**，正是 `SmsFolderSnapshotResult` 自己的文档说「会骗用户」的那种折叠。
+- **为什么本该拆开**：草稿夹有两处来源——AmOS 本地草稿（本机存储，永远读得到）与**系统草稿**（`realThreads`，读不到才是未知）。读失败只让**后者**未知，本地列表仍然为真、必须留在屏幕上；诚实的答复是「列表 + 一句读失败」。这同 `FilesApp` 保留仍然正确的列表、只对失败的读发话是一个形状（REQ-A1030）。
+- **修法**：在草稿分支里把系统草稿段改成 `{#if smsErr} … {:else if realThreads.length > 0} … {/if}`——读失败时画 `data-testid="sms-error"`（`role="alert"`）与（无权限时）`message.smsDeniedHint`，替代「系统草稿」区；本地草稿列表不动。页眉既有的「刷新」（`data-testid="refresh-sms"`）在草稿夹同样可达，因此不必另加重试入口。
+- **测试**：`svelte-tests/messages.svelte.test.ts` 新增一例「草稿文件夹读失败时如实说明、而不是读成空（REQ-A1070）」。**先证后修**：未改前红——屏幕文本为「…AmOS 草稿（写入系统草稿需将 AmOS 设为默认短信应用） 暂无草稿」，断言 `message.smsUnavailable`（「暂时无法读取短信」）得空。**负控**（`cp` 到 /tmp 后 `shasum -a 256` 逐字节还原，绝不用 `git checkout --`）：**NC-A** 把草稿分支的渲染守卫改回不画 `smsErr`（`{#if false}`）⇒ **恰 1 红**（只有本例，其余 43 例全绿）。还原后 `MessagesApp.svelte` = `4a8b2db2d6487a2fcfd0a59eed454e69a06f4fddcc704ea3a49867e25234bdc2`、`messages.svelte.test.ts` = `67d724523510d32231a217d5214a88d36ff9d6b7d81bd63dfa85ae47a3ac394d`。
+- **诚实边界**：本轮只修「读失败被说成空」——**没有**改 `sms_snapshot` 的读取路径，也没有把本地草稿与系统草稿的合并语义推宽；真实短信「已读」在 AmOS 侧没有后端命令（`sms.rs` 无 `sms_mark_read`）—— 那一半见 §16。
+
+### 16. 设备态的 ●N 徽标读过之后永不消失（REQ-A1075 / F-SH-390，2026-09-22）
+
+- **缺陷（实测）**：真机模式（`smsMode === "real"`）下，会话条上的 ●N 直接取自 `sms_snapshot` 的**设备**快照（`MessagesApp.svelte` 的 `{#if th.unread > 0}`）。而桥只注册了 `sms_status / sms_snapshot / sms_counts / sms_messages / sms_send / sms_trash_*`（`crates/amos-tauri/src/sms.rs`），`crates/amos-sms/src/provider.rs` 的 provider trait 也只有 `snapshot / messages / counts / send` —— **没有任何回写已读的能力**（平台规定只有默认短信 App 可以）。于是在这里点开一个会话、读完消息、返回列表，●N 原样还在；再读、再退，永远不变。
+- **为什么是缺陷**：这恰是同一文件**本机模型**早已修好的形状 —— 那个 `$effect` 调 `markAllRead`，注释写着 “Reading a thread marks its incoming messages read (iOS behaviour). Without this a conversation you are looking at keeps its ● badge … until you happen to send something”。可它的第一行是 `if (smsMode === "real") return;`：真机模式下屏幕上的恰恰是**另一个**模型，于是这条规则在唯一需要它的地方失效。徽标退化成噪声 —— 用户无从判断还有没有未读。
+- **修法与诚实边界**：AmOS 改不了设备，也**不能编造**一个清零的计数；能说的更窄 —— 「AmOS 已把该会话显示到 `<ts>`」。新增会期内的 `seenRealTs` 与 `markRealSeen` / `realUnread`；`loadReal` **读成功**后按「实际画出来的最新一条消息 `ts_ms`」标记（**读失败不标** —— 用户什么都没看到）；徽标条件改为 `th.unread > 0 && th.last_ts_ms > (seenRealTs[th.id] ?? 0)`，于是设备自己的 `last_ts_ms` 一前进（来了新消息），徽标就带着**设备**计数回来。**故意不做持久化**：该状态只对当前这次运行有意义（重启后重读设备才是事实），且把过期映射还原到另一台设备会藏掉真正未读的会话 —— 所以不进 store、无需 `store-allowlist.json` 条目。**未新增** `sms_mark_read` 命令：只有默认短信 App 能写设备已读，那是平台边界。
+- **测试**：`svelte-tests/messages.svelte.test.ts` 新增一例「读过的真实会话清掉 ● 徽标、来了新消息再出现（REQ-A1075）」：未读的「李四」显示 ●2 ⇒ 点开 ⇒ 徽标消失 ⇒ 切走不复活 ⇒ 设备 `last_ts_ms` 前进后再刷新 ⇒ 带设备计数 ●1 回来。**先证后修**：未改前红 —— 点开后 chip 文本仍为「李四●2」，断言 `not.toContain("●")` 收到 `"李四●2"`。**负控**（`cp` 到 /tmp 后 `shasum -a 256` 逐字节还原，绝不用 `git checkout --`）：**NC-A** 徽标条件改回 `{#if th.unread > 0}` ⇒ **恰 1 红**；**NC-B** 标记写入点改 `if (false) markRealSeen(…)` ⇒ **恰 1 红**（同一例），其余 44 例两处都全绿。还原后 `MessagesApp.svelte` = `ccdc77f6f60db31c7bb805900c6656a7b1a23291f4223688136cd33b96c0c728`、`messages.svelte.test.ts` = `79a078687fccf8a5c087c42d63c4f77b273a60576bce9ac8a139766163f00a0f`。
+
+### 17. 真机短信模式下通知效应替屏幕外的本机会话发言（REQ-A1098 / F-SH-412，2026-09-22）
+
+- **缺陷（实测）**：`MessagesApp.svelte` 顶部的注释早已声明规则 —— 「The real device store lives in its OWN state and never mixes with the local conversations / notification machinery（设备态有着自己的状态，绝不与本机会话 ∕ 通知机制混在一起）」。同一个文件里，**标为已读**的那个 `$effect` 第一行就是提前返回 `if (smsMode === "real") return; // the local model is not the visible one`；而**发布通知**的 `$effect` 把同一事实写成了一次**取值替换**：
+
+  ```js
+  const shownActive = smsMode === "real" ? "" : activeId;   // 真机模式下什么都不滤
+  const all = conversations.filter((c) => c.id !== shownActive).flatMap((c) => c.msgs);
+  ```
+
+  真机模式下本机 `conversations`（既**不在屏幕上**——真机模式渲染的是设备收件箱——也**不在手机上**）里有未读的每个会话，都会被发布成一条 `app:"信息"` 的通知。这不是「少了一道守卫」，而是守卫的写法**反过来放大了**它会替之发言的集合：那句 `""` 恰好在唯一需要过滤的模式下让 `filter` 恒真。
+- **为什么可达**：`lib/messages.ts::seedMessages` 的最新一条来信是 `read: false`，而唯一被标为已读的只有**当前打开**的那一个会话。本机只要有两个会话（打开的那个已读、另一个未读 —— `openReal` ∕ 真机模式的任何动作都不会去标它），真机模式下就会写出这条通知。实测探针：真机徽标（`data-testid="real-sms-badge"`）已亮、设备收件箱已显示「家人」的同时，`amos.notifications` 里躺着 `{app:"信息", title:"别人的未读"}`。
+- **为什么不能靠「挂载时模式还是 unknown」开脱**：`probeSms` 是最多 4 次尝试、每次间隔 1500ms 的异步探测，模式在挂载后一段时间内是 `"unknown"` —— 此时该效应**已经**按本机模型发布过通知；真机模式一旦确定，没有任何一条路径把那条通知收回。它会一直留着，指一条用户在屏幕上和手机里都找不到的消息。
+- **修法**：真机模式改成**提前返回**（与兄弟效应同形），并在该分支里**收回**本 App 自己的通知：
+
+  ```js
+  if (smsMode === "real") {
+    if (existing.some((n) => n.app === app)) {
+      writeStoreValue(NOTIF_KEY, removeAppNotifs(existing, app));
+    }
+    return;
+  }
+  ```
+
+  本机模式那一支的 `shownActive` 直接写 `activeId`（哨兵取值不再需要）。
+- **测试**：`svelte-tests/messages.svelte.test.ts` 新增两例 —— **a)** `in real device SMS mode an off-screen local thread raises no notification`（本机两会话、打开的那个已读，桥上报 `sms_status ⇒ device:true` 与一条设备线程 ⇒ 断言真机徽标已亮、`amos.notifications` 里**没有**「别人的未读」）；**b)** `in local mode that same off-screen thread still raises its notification`（同一夹具、无桥 ⇒ 断言该通知**仍在**）。b 是 a 的**边界孪生**：「收回」不得退化成「永不通知」。**先证后修**：两例对未改前的 `MessagesApp.svelte` 运行 ⇒ 恰 **1 红**（a 例；b 例绿 —— 它钉的是既有正确行为）。**负控**（`cp` 到 /tmp 后 `shasum -a 256` 逐字节还原，绝不用 `git checkout --`）：把效应还原成 HEAD 的取值替换形状（去掉真机分支）⇒ 恰 **1 红** ∕ 46 绿（b 例仍绿，按设计）。还原后 `MessagesApp.svelte` = `bbb0267d274b385f8e89926fc399474e1054df89c76d9f79a52803e7bb33dd5e`、`messages.svelte.test.ts` = `b3f80e7b0cb5ad5ef34ba065c9535e3e133ed3137d293baff74aacd7743e343b`。
+- **诚实边界**：本轮只改**前端一个效应**与两条 DOM 用例 —— **没有**动 `crates/amos-tauri/src/sms.rs` ∕ `crates/amos-sms/src/provider.rs`，也没有改通知存储格式或本机模式的发布行为；设备自身的未读仍由 ●N 徽标如实呈现（§16）。
+
+### 18. 真机会话撰写框没有在途守卫 —— 同一句话被发两次（REQ-A1152 / F-SH-457，2026-09-23）
+
+- **缺陷（实测，对照 HEAD 复核）**：`MessagesApp.svelte` 有两个发送动作，**只有一个是安全的**。`sendNew`（新短信撰写框）在调用前置 `smsBusy = true`、在回复里清掉，按钮也带 `disabled={smsBusy}`；而真机会话的 `sendReal` 三样都没有 —— 函数里不置标志，按钮（`data-icon="send"`）也没有 `disabled`。于是 `smsSend` 还在途中时，第二次输入（回车键的 `onkeydown` 处理**直接调 `sendReal`**，根本不经过按钮的 `disabled`）就会发出**第二条真实短信**。这不是「少了一道视觉灰化」：短信一旦交给平台的 `SmsManager` 就无法撤回。
+- **为什么全绿**：既有用例的假桥把 `sms_send` 立刻应答（`return "sent"`），在途窗口宽度为零 —— 「第一次还没回来时再按一次」这个用例从未被执行。
+- **修法**：守卫放进**函数本身**（`if (smsBusy) return;`），因为回车处理绕过按钮的 `disabled`；同时给 `sendReal` 的按钮补上 `disabled={smsBusy}` 与 `disabled:opacity-40`，与 `sendNew` 同形。**顺带**给 `sendNew` 补同一条函数内守卫 —— 它有同样的回车重复路径，只是此前只靠按钮的 `disabled` 挡住鼠标那一半。
+- **测试**：`svelte-tests/messages.svelte.test.ts` 新增一例 `a second Enter while a device send is in flight does not send twice`：假桥把 `sms_send` 挂在一个**未兑现的 Promise** 上，回车两次，断言 `sms_send` 只被调用 **1** 次。**先证后修**：未改前断言收到 `2`。**负控**（`cp` 到 /tmp 后 `shasum -a 256` 逐字节还原，绝不用 `git checkout --`）：删掉 `sendReal` 的函数内守卫 ⇒ 恰 **1 红 ∕ 47 绿**。还原后 `MessagesApp.svelte` = `40fc605290dbc4ade792017aba064e9d76097d46c3c91d8231e914a81d595f41`。
+- **诚实边界**：真机未复核（重复发送在设备上未再走一遍）；本轮**没有**把两个发送动作合并成一个共享入口，因为它们在两个视图里、错误串也各自独立（REQ-A1069）。
+
+### 19. 回收站的「恢复」与「清空」在主线程落盘（REQ-A1153 / F-TAU-023，2026-09-23）
+
+- **缺陷（实测，对照 HEAD 复核）**：`crates/amos-tauri/src/sms.rs` 的四个 `sms_trash_*` 命令里，`sms_trash_add` 走 `async` + `blocking(...)`，而 `sms_trash_restore` / `sms_trash_purge` 是**同步**命令 —— Tauri 的同步命令在**主线程**上执行。二者都调 `SmsTrashState::restore` / `purge`，而这两个方法末尾都调 `persist()`（`create_dir_all` + `std::fs::write` + `rename`）。同一份落盘在**兄弟命令**上被当成阻塞操作（`trash_add` 有 `SMS_TIMEOUT` 与阻塞池），在这两条上却直接压在 UI 线程上：慢盘 ∕ 满盘时整窗卡帧。
+- **修法**：两条命令改为 `async` + `blocking(...)`，与 `trash_add` 同形（`blocking` 已是本文件既有的「阻塞调用 + 硬超时」封装）；worker 失败按同族映射成 `AmosError::SmsProviderRejected`。**线形不变**：`Result` 的 `Ok` 分支仍是裸 `bool` ∕ `usize`（Tauri 只序列化 `Ok`），`sms_trash_list` 保持同步（纯内存读，无 I/O）。
+- **连带修法（新可达的失败路径**的诚实处理**）**：改成 `async` 之前，`sms_trash_restore` **不可能**返回 `Err`，于是前端 `smsTrashRestore` 把「宿主没应答」（`invoke` 包装器在拒绝时回 `null`）折成了 `false` —— 而 `false` 已被文档与测试钉为「回收站里没有这条」（§13）。这条新的失败路径若沿用旧折法，会把**宿主故障**说成「该短信已不在回收站里」，即一句关于回收站**内容**的、无法支撑的断言。故 `smsTrashRestore` 返回 `boolean | null`（`null` = 未被应答），`restoreOne` 新增 `ok === null` 分支用新键 `message.trashRestoreFailed`（「恢复显示失败，请重试」 ∕ `Could not restore — try again`）报出。`smsTrashPurge` 的 `typeof purged === "number"` 已经区分了这两者，无需改动。
+- **测试**：`svelte-tests/messages.svelte.test.ts` 新增一例 `a restore the bridge never answered says the restore failed, not that the row is stale`，用既有的 `throwFor` 假桥（真 reject）断言显示 `message.trashRestoreFailed` 且**不含** `message.trashNotInTrash`。**负控**：把 `ok === null` 折成 `ok === undefined` ⇒ 恰 **1 红 ∕ 48 绿**。Rust 侧既有 29 条 `sms::` 用例（`state.restore` ∕ `state.purge` 直接驱动，不经过命令签名）不受影响。
+- **诚实边界**：①真机未复核；②多个 `sms_trash_*` 命令现在**真正并发**（此前 `restore`/`purge` 与 `trash_add` 已可重叠），而 `persist()` 的临时文件名是固定的 `sms-trash.json.tmp` —— 两次并发落盘理论上可互相截断，落成后仍会被下次启动按「空」加载。这一条在本轮**未改**（属既有形状，且 UI 侧 `trashBusy` 把面板内的操作串行化了），登记为已知边界；③**没有**引入回收站的三态答复（那是 wire 变更，REQ-A291 已论证过不必要）。
+
 ### 已知边界 / 下一步
 - 系统短信库由默认短信应用拥有：AmOS 只能在**自己的视图与通知**层面屏蔽短信，无法删除系统行（除非 AmOS 成为默认短信应用）。§13 的回收站就是这条边界的视图层实现：隐藏/恢复/清空都不触碰系统库。
 - 来电拦截需用户授予系统「来电筛选」角色；未授权时仅记录规则、不拒接（UI 现在**明确显示**状态并提供前台授权按钮）。
 - 一键入口已做两处：**通话记录「最近」→「拦截」**（写入 `exact/both` 规则并切到拦截页）与**「信息」真机线程标题栏 →「屏蔽此号码」**（同一共享规则库；成功后该发件人被 `sms_snapshot` 过滤、线程消失，并以状态条说明原因）。
+
+### 运行期权限申请（REQ-A1577 ∕ F-TEL-037）
+
+`adb install -g` 只是**预授予**：普通安装不会授予，此前收件箱会永久报权限错、`SmsReceiver` 也收不到广播，而屏幕上唯一的话是「请在系统设置中…」——AmOS 里没有任何能触发的申请动作。现补上 JS 可等待的申请缝：
+
+- `SmsPermissionGlue.kt`（`REQ_SMS=9005`）经 `ActivityCompat.requestPermissions` 弹系统对话框，`MainActivity.onRequestPermissionsResult` → `PermissionWire.REQ_SMS` → `onSmsResult` 回填 Rust `sms_permission.rs` 的 oneshot（`GRANT_TIMEOUT=30s`）。
+- 三个权限作**一个集合**申请（部分授予折成 `denied`）；判定**回读平台**（`allGranted()`），不折 `grantResults` 的顺序。
+- 前端 `smsGrantRefusalKey` 把 granted ∕ denied ∕ timed-out ∕ unreadable ∕ host **五种回答分别说话**——只有 OS 自己的「否」才指向系统设置；`MessagesApp.svelte` 在读取被拒时给出可点的「授予短信权限」按钮。
+- **边界**：真机系统弹窗的端到端行为须设备时验收；本机（host 编译 + 源码钉 + 组件测试）只覆盖结构。
 
 

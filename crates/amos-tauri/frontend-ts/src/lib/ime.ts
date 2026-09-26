@@ -18,10 +18,12 @@
  *
  * Honest boundaries (see `docs/input-method.md`): the keyboard emits letters,
  * digits/punctuation and space — it is not a full symbol/emoji keyboard, and
- * `contenteditable` hosts (like the note preview) are not targeted yet.
+ * `contenteditable` hosts (like the note preview) are not targeted yet. In Chinese
+ * mode a punctuation key is the **Chinese** glyph (`，。？！`); the half-width forms
+ * live on the English page, and digits stay half-width in both modes.
  */
 import { invoke } from "./backend";
-import { readStoreValue, writeStoreValue } from "./amosStore";
+import { readStoreValue, writeStoreValueChecked } from "./amosStore";
 
 /** The nine fuzzy pairs, in display order (must match `amos_ime::FUZZY_PAIRS`). */
 export const IME_FUZZY_PAIRS = [
@@ -43,12 +45,64 @@ export const IME_LETTER_ROWS: readonly string[][] = [
   ["z", "x", "c", "v", "b", "n", "m"],
 ];
 
-/** Digits + common punctuation page (toggled by the `?123` key). */
+/** Digits + ASCII punctuation page (the `?123` key in **English** mode). */
 export const IME_SYMBOL_ROWS: readonly string[][] = [
   ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"],
   ["-", "/", ":", ";", "(", ")", "$", "&", "@", '"'],
   [".", ",", "?", "!", "'", "*", "#", "%", "+", "="],
 ];
+
+/**
+ * Digits + **Chinese** punctuation page — what the `?123` key shows in Chinese
+ * mode. Half-width ASCII punctuation belongs to the English page; in Chinese mode
+ * a punctuation key must read as Chinese (`，。？！`), the way every pinyin IME
+ * behaves. Digits stay half-width on purpose: `１２３` is never what a phone-number
+ * field wants.
+ *
+ * REQ-A759 (F-SH-216): the Chinese punctuation layer.
+ */
+export const IME_ZH_SYMBOL_ROWS: readonly string[][] = [
+  ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"],
+  ["，", "。", "？", "！", "、", "：", "；", "“", "”", "…"],
+  ["（", "）", "《", "》", "【", "】", "「", "」", "‘", "’"],
+];
+
+/**
+ * The ASCII→Chinese (full-width) punctuation a **physical** keyboard key becomes
+ * in Chinese mode. Only punctuation with an unambiguous Chinese form is mapped
+ * (a comma is always `，`); a straight quote has no single Chinese form — a
+ * Chinese quotation is a *pair* (`“…”` / `‘…’`) and both glyphs are keys on the
+ * Chinese symbol page — so `"`/`'` map to the **opening** glyph rather than
+ * guessing an open/close alternation from invisible state.
+ *
+ * Everything else (letters, digits, and ASCII symbols with no Chinese twin, like
+ * `@` or `#`) passes through unchanged — that is what keeps an email address or a
+ * phone number typed in Chinese mode readable.
+ */
+const ZH_PUNCTUATION: Readonly<Record<string, string>> = {
+  ",": "，",
+  ".": "。",
+  "?": "？",
+  "!": "！",
+  ":": "：",
+  ";": "；",
+  "(": "（",
+  ")": "）",
+  "<": "《",
+  ">": "》",
+  "[": "【",
+  "]": "】",
+  "{": "「",
+  "}": "」",
+  "\\": "、",
+  "'": "‘",
+  '"': "“",
+};
+
+/** The Chinese form of an ASCII punctuation key, or the key itself when it has none. */
+export function toChinesePunctuation(ch: string): string {
+  return ZH_PUNCTUATION[ch] ?? ch;
+}
 
 /** Candidates shown per page before the pager kicks in. */
 export const IME_CANDIDATE_PAGE_SIZE = 8;
@@ -228,9 +282,20 @@ export function readImeEnabled(): boolean {
   return readStoreValue<boolean>(IME_ENABLED_KEY, imeDefaultOn(coarse));
 }
 
-/** Persist the on/off preference (configuration — device-local by design). */
-export function writeImeEnabled(on: boolean): void {
-  writeStoreValue(IME_ENABLED_KEY, on);
+/**
+ * Persist the on/off preference (configuration — device-local by design).
+ *
+ * Returns the **store's** verdict (REQ-A1432), because this preference *is* the on-screen
+ * claim: the Settings switch and the keyboard's own ⌨ button each draw the value they just
+ * wrote, and it is the very key the *other* surface reads back. A refused `setItem`
+ * therefore cannot be reported as a saved preference — the switch would light (or the dock
+ * would rise) while `amos-ui.ime` still held the old value, and the listener each surface
+ * installs to stop the two from drifting (`STORE_CHANGED_EVENT`, dispatched only **after** a
+ * write lands) would never fire to correct it. `writeJson` refuses **per `setItem`**, so even
+ * a one-bit key is refused once the quota is gone.
+ */
+export function writeImeEnabled(on: boolean): boolean {
+  return writeStoreValueChecked(IME_ENABLED_KEY, on);
 }
 
 /** Number of candidate pages for `total` candidates (always at least 1). */

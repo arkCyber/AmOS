@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  AmOS System UI — Android instrumentation tests (device-side, run on a real device).
+
+  This is the **test** manifest (`androidTest/`), merged INTO the application's
+  manifest only when `:app:connectedArmDebugAndroidTest` is built. It declares
+  one instrumentation runner — `AndroidJUnitRunner` from AndroidX — which knows
+  how to instantiate `@RunWith(AndroidJUnit4::class)` classes and execute them
+  on the device.
+
+  Important — there is intentionally **no** `<application>` element here: the
+  manifest merger uses the main `<application>` and only the `<instrumentation>`
+  is added. Including a bare `<application>` overrides the main app's and
+  produces an APK with no `MainActivity`, and `:app:compileArmDebugKotlin`
+  cannot then run (the Activity that the Kotlin glue binds to is gone).
+
+  No permissions are declared here either: the runner inherits the *application*
+  manifest's permissions (RECORD_AUDIO etc.), which are what the
+  `@Before`-time `checkSelfPermission` call in each instrumentation test
+  verifies before touching `MediaRecorder`.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <uses-library android:name="android.test.runner" />
+    </application>
+
+    <instrumentation
+        android:name="androidx.test.runner.AndroidJUnitRunner"
+        android:targetPackage="com.amos.ai"
+        android:label="AmOS in-call recording instrumentation" />
+</manifest>

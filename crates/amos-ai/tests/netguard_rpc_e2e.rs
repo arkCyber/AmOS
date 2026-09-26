@@ -1,5 +1,5 @@
-//! Daemon e2e: the egress network-guard `Toggle` / `Status` / audit feed over a
-//! real UDS.
+//! Daemon e2e: the egress network-guard `Toggle` / `Status` / audit feed /
+//! app-egress declarations over a real UDS.
 //!
 //! Boots the real `amos_ai::server::serve()` (own test binary so its socket name
 //! can't race the other integration tests) with `AMOS_NETGUARD_ALLOW_INJECT=1`,
@@ -19,7 +19,10 @@
 //! asserts the state file is written through the real boot path.
 
 use amos_proto::amos_netguard::net_guard_service_client::NetGuardServiceClient;
-use amos_proto::amos_netguard::{NoteEgressRequest, StatusRequest, ToggleRequest};
+use amos_proto::amos_netguard::net_guard_service_server::NetGuardService;
+use amos_proto::amos_netguard::{
+    NoteEgressRequest, RevokeAppEgressRequest, SetAppEgressRequest, StatusRequest, ToggleRequest,
+};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::net::UnixStream;
@@ -149,6 +152,97 @@ async fn netguard_toggle_status_and_audit_feed_over_uds() {
     // Top domain is the higher-bytes destination.
     assert_eq!(after.top_egress[0].domain, "telemetry.vendor.example");
     assert_eq!(after.top_egress[0].bytes, 2500);
+
+    // App egress declarations over the real UDS: an app with its own uid
+    // contributes rules, a shared-uid bundle is recorded without one, and a
+    // revoke drops exactly that app. This is the path the PWA opener uses.
+    let declared = client
+        .set_app_egress(SetAppEgressRequest {
+            app_id: "org.amos.phone".into(),
+            uid: 10_123,
+            allow_domains: vec!["api.example.com".into(), "cdn.example.org".into()],
+        })
+        .await
+        .expect("SetAppEgress")
+        .into_inner();
+    assert_eq!(declared.policy_rules, 2);
+    assert_eq!(declared.declared_apps, 1);
+
+    let shared = client
+        .set_app_egress(SetAppEgressRequest {
+            app_id: "org.amos.pwa".into(),
+            uid: 0,
+            allow_domains: vec!["api.example.com".into()],
+        })
+        .await
+        .expect("SetAppEgress (shared uid)")
+        .into_inner();
+    assert_eq!(
+        shared.policy_rules, 2,
+        "a uid-0 bundle adds no rule (it cannot be isolated at the packet layer)"
+    );
+    assert_eq!(shared.declared_apps, 2, "but its declaration is recorded");
+
+    // A malformed host is refused at the seam, not stored.
+    let refused = client
+        .set_app_egress(SetAppEgressRequest {
+            app_id: "org.amos.bad".into(),
+            uid: 7,
+            allow_domains: vec!["*.example.com".into()],
+        })
+        .await
+        .expect_err("a wildcard host is not in the allow-list grammar");
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+
+    let revoked = client
+        .revoke_app_egress(RevokeAppEgressRequest {
+            app_id: "org.amos.phone".into(),
+        })
+        .await
+        .expect("RevokeAppEgress")
+        .into_inner();
+    assert_eq!(revoked.policy_rules, 0, "the phone app's rules are gone");
+    assert_eq!(
+        revoked.declared_apps, 1,
+        "the shared-uid declaration remains"
+    );
+
+    let final_status = client
+        .status(StatusRequest {})
+        .await
+        .expect("status")
+        .into_inner();
+    assert_eq!(final_status.policy_rules, 0);
+    assert_eq!(final_status.declared_apps, 1);
+    // Recording declarations never turns into an enforcement claim.
+    assert!(
+        !final_status.enforced,
+        "mock backend still does not enforce"
+    );
+
+    // A reboot: the daemon persisted intent *and* the declared registry to
+    // `AMOS_NETGUARD_STATE_PATH`. The same `bootstrap()` `serve()` uses restores
+    // both — the shared-uid declaration comes back (re-validated), still as a
+    // declaration and never a rule, and enforcement is still not fabricated.
+    let rebooted = amos_ai::netguard_service::bootstrap();
+    assert!(rebooted.enabled(), "armed intent survived the restart");
+    let restored = rebooted
+        .status(tonic::Request::new(StatusRequest {}))
+        .await
+        .expect("status")
+        .into_inner();
+    assert_eq!(
+        restored.declared_apps, 1,
+        "the shared-uid declaration was restored from disk"
+    );
+    assert_eq!(
+        restored.policy_rules, 0,
+        "uid-0 restores as a declaration, never a fabricated rule"
+    );
+    assert!(
+        !restored.enforced,
+        "a restart never fabricates enforcement from the file"
+    );
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(&state_path);

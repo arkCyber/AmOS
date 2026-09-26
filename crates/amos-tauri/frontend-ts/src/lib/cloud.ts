@@ -21,10 +21,11 @@ import { INTERP_LOG_KEY } from "./interp";
 // 这些 store 装的是**用户自己创建的内容**，此前不在备份集合里（store-scan 逐条
 // 点名）：用户的快捷指令与文件夹、浏览器的书签与下载列表、管理员/用户装的企业
 // 模板、审计记录。它们各自模块的键常量现在是导出的，这里直接引用，不重写字符串。
-import { SHORTCUTS_KEY, SHORTCUT_FOLDERS_KEY } from "./shortcuts";
+import { SHORTCUTS_KEY } from "./shortcuts";
 import { BOOKMARKS_KEY, DOWNLOADS_KEY } from "./webman";
 import { TEMPLATES_KEY } from "./enterprise/templates";
 import { AUDIT_LOGS_KEY } from "./enterprise/audit";
+import { HEALTH_HISTORY_KEY } from "./health";
 
 export const SETTINGS_KEY = "amos.settings";
 export const BACKUP_KEY = "amos.cloud.backup";
@@ -74,14 +75,16 @@ export const SYNC_STORES = [
   CALLLOG_KEY,
   INTERP_LOG_KEY,
   // 用户自己创建的内容（REQ-A384）：这些此前**不在**备份集合里，是 store-scan
-  // 逐条点名后才补上的 —— 快捷指令、它们所在的文件夹、浏览器书签与下载列表、
-  // 企业模板、审计记录。
+  // 逐条点名后才补上的 —— 快捷指令、浏览器书签与下载列表、企业模板、审计记录。
   SHORTCUTS_KEY,
-  SHORTCUT_FOLDERS_KEY,
   BOOKMARKS_KEY,
   DOWNLOADS_KEY,
   TEMPLATES_KEY,
   AUDIT_LOGS_KEY,
+  // 用户的每日步数/心率历史与训练记录（REQ-A1454）：用户自己积累的内容。原始累计
+  // 计数器（`amos.health.counter`）**不在**这里 —— 它是设备状态，跨设备恢复会让下一次
+  // 增量算错，因此登记为 store-allowlist 的 device-state。
+  HEALTH_HISTORY_KEY,
 ] as const;
 
 export interface CloudPrefs {

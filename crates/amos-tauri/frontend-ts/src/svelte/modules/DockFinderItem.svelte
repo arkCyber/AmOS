@@ -10,15 +10,22 @@
    * *running dot*, and the registry row supplies the window label for it
    * (`windowLabel: "files"`), not the widget id.
    */
-  import { wmOpen } from "../../lib/wm";
+  import { wmOpenReported } from "../../lib/wm";
   import { t } from "../locale.svelte";
   import DockTileButton from "./DockTileButton.svelte";
   import IconFinder from "../../assets/icons/IconFinder.svelte";
 
-  /** `wm_open` = create + focus; a failure is recorded in the diagnostics ledger by
-   * `lib/backend` and needs no handler here. */
+  /**
+   * `wm_open` = create + focus.
+   *
+   * A failure *is* recorded in the diagnostics ledger by `lib/backend` — but recorded is
+   * not read, and this comment used to stop at the first half, which is how the tile came
+   * to be the one entry point to this act that reported nothing (REQ-A1176). The host can
+   * refuse a perfectly valid click (a stale label, the class's `multi_window` cap), so the
+   * verdict goes through `wmOpenReported` like the Dock's other items.
+   */
   function openFinder() {
-    void wmOpen("files");
+    void wmOpenReported("files", "Dock");
   }
 </script>
 

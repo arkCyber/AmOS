@@ -98,6 +98,22 @@ describe("ImeKeyboard.svelte — keys", () => {
     expect(host.container.querySelector('[data-testid="ime-key-q"]')).toBeTruthy();
   });
 
+  test("the symbol page is Chinese in zh mode and ASCII in en mode", async () => {
+    // Chinese mode (the default): the page shows Chinese punctuation, no ASCII `.`
+    const zh = mount({ mode: "zh" });
+    await fireEvent.click(zh.container.querySelector('[data-testid="ime-symbols"]')!);
+    expect(zh.container.querySelector('[data-testid="ime-key-。"]')).toBeTruthy();
+    expect(zh.container.querySelector('[data-testid="ime-key-."]')).toBeNull();
+    expect(zh.container.querySelector('[data-testid="ime-key-1"]')).toBeTruthy(); // digits stay
+    zh.unmount();
+
+    // English mode: the same key shows the half-width ASCII page.
+    const en = mount({ mode: "en" });
+    await fireEvent.click(en.container.querySelector('[data-testid="ime-symbols"]')!);
+    expect(en.container.querySelector('[data-testid="ime-key-."]')).toBeTruthy();
+    expect(en.container.querySelector('[data-testid="ime-key-。"]')).toBeNull();
+  });
+
   test("space, backspace and enter report their intent", async () => {
     const onkey = vi.fn();
     const onbackspace = vi.fn();

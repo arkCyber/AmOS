@@ -9,6 +9,8 @@
  * - 错误恢复
  */
 import { describe, expect, test } from "vitest";
+import { fastest, PERF_ATTEMPTS } from "../../__tests__/perfBudget";
+import { readFileSync } from "node:fs";
 import { GlobalRegistrator } from "@happy-dom/global-registrator";
 import {
   isValidUrl,
@@ -19,13 +21,17 @@ import {
   generateId,
   createTab,
   closeTab,
-  formatTime,
+  timeLabel,
   formatFileSize,
   sanitizeUrl,
   validateTitle,
   applySafeSearch,
+  SAFE_SEARCH_UNMAPPED_HOSTS,
+  SEARCH_ENGINE_HOSTS,
+  safeSearchGapForEngine,
   addBookmark,
   removeBookmark,
+  bookmarkMatches,
   isBookmarked,
   loadBookmarks,
   addToHistory,
@@ -134,6 +140,23 @@ describe("书签数据模型", () => {
     expect(added).not.toBeNull();
     expect(loadBookmarks().map((b) => b.url)).toEqual(["https://example.com/bookmarked"]);
   });
+
+  test("「判在不在」与「找那一条」是同一个谓词（REQ-A1347 / FMEA F-SH-612）", () => {
+    // 星是实心还是空心由 `isBookmarked` 决定，它比的是 `sanitizeUrl` **规范化后**的 URL
+    // （`new URL(x).toString()`：主机名折小写、无路径的地址补上结尾 `/`）。而点下去之后
+    // 要删的那一条，原先是用**原始串**去 `find` 的 —— 同一个 URL 两种形态，于是两个判据
+    // 可以给出两个答案：★ 亮着、点下去找不到那一行、连一句提示都没有。
+    localStorage.removeItem("amos.webman.bookmarks");
+    const raw = "https://Example.COM"; // 页签里可能就是这个形态（大小写、无路径）
+    addBookmark(raw);
+    const stored = loadBookmarks()[0]!;
+    expect(stored.url, "存储里是规范化形态").not.toBe(raw);
+
+    expect(isBookmarked(raw), "「判在不在」认它").toBe(true);
+    expect(bookmarkMatches(stored, raw), "「找那一条」也必须认它").toBe(true);
+    // 旧写法（`b.url === url`）在这里是 false —— 这正是那个静默的空点，钉住它别再回来。
+    expect(stored.url === raw).toBe(false);
+  });
 });
 
 describe("历史记录数据模型", () => {
@@ -147,12 +170,13 @@ describe("历史记录数据模型", () => {
 });
 
 describe("标签页管理", () => {
-  test("createTab 创建标签", () => {
+  test("createTab 创建标签（空 URL ⇒ 空标题，文案交给 UI）", () => {
     const tab = createTab();
     expect(tab).toMatchObject({
       id: expect.any(String),
       url: "",
-      title: "新标签页",
+      // REQ-A405: 标题不由 lib 兜底 —— 空标题让 `tab.title || t("webman.newTab")` 生效。
+      title: "",
       loading: false,
       scrollY: 0,
       pinned: false,
@@ -162,7 +186,7 @@ describe("标签页管理", () => {
   test("createTab 带 URL 创建", () => {
     const tab = createTab("https://example.com");
     expect(tab.url).toBe("https://example.com/");
-    expect(tab.title).not.toBe("新标签页");
+    expect(tab.title).not.toBe("");
   });
 
   test("closeTab 关闭标签", () => {
@@ -203,16 +227,16 @@ describe("设置", () => {
 });
 
 describe("工具函数", () => {
-  test("formatTime 格式化时间", () => {
+  test("timeLabel 给出语言无关的时间描述符", () => {
     const now = Date.now();
-    
-    // 今天的时间显示时间
-    const todayStr = formatTime(now);
-    expect(todayStr).toMatch(/\d{2}:\d{2}/);
-    
-    // 昨天显示"昨天"
-    const oneDayAgo = now - 86400000;
-    expect(formatTime(oneDayAgo)).toBe("昨天");
+
+    // 今天只给钟点，文案由 UI 层按 locale 渲染
+    const today = timeLabel(now);
+    expect(today.kind).toBe("clock");
+    if (today.kind === "clock") expect(today.text).toMatch(/\d{2}:\d{2}/);
+
+    // 昨天是**词**，不由 lib 决定语言
+    expect(timeLabel(now - 86400000).kind).toBe("yesterday");
   });
 
   test("formatFileSize 格式化文件大小", () => {
@@ -409,6 +433,53 @@ describe("安全测试 - 安全搜索过滤", () => {
     const result = applySafeSearch("not-a-url", true);
     expect(result).toBe("not-a-url");
   });
+
+  // ── REQ-A1314：覆盖范围必须**可读**，缺口必须**被记录** ────────────────────────
+
+  test("表里没有的引擎宿主（百度）原样返回 —— 这是一个**被记录的缺口**，不是静默的 bug", () => {
+    const url = "https://www.baidu.com/s?wd=test";
+    expect(applySafeSearch(url, true)).toBe(url);
+  });
+
+  test("缺口清单与安全搜索表**一起**回答「谁能开安全搜索」（少改一处 ⇒ 这条红）", () => {
+    // 这条断言的用意：任何人往 `SAFE_SEARCH_PARAMS` 里补上百度那一行，就必须同时把
+    // `SAFE_SEARCH_UNMAPPED_HOSTS` 去掉百度 —— 否则下方 `以 unmapped 身份仍不生效` 会红。
+    expect([...SAFE_SEARCH_UNMAPPED_HOSTS]).toEqual(["baidu.com"]);
+    for (const host of SAFE_SEARCH_UNMAPPED_HOSTS) {
+      const url = `https://www.${host}/s?wd=test`;
+      expect(applySafeSearch(url, true), `${host} 被声明为未覆盖，却加上了参数`).toBe(url);
+    }
+  });
+
+  test("两个 host 后缀匹配走点分边界（`evil-google.com` 不该被当成 google.com）", () => {
+    const url = "https://evil-google.com/search?q=test";
+    expect(applySafeSearch(url, true)).toBe(url);
+    // 子域名才算
+    expect(applySafeSearch("https://images.google.com/search?q=t", true)).toContain("safe=active");
+  });
+
+  // ── REQ-A1333：缺口必须对**用户**说出来，不只是写在注释里 ─────────────────────
+
+  test("safeSearchGapForEngine：选中的引擎有没有安全搜索，逐个回答", () => {
+    expect(safeSearchGapForEngine("google")).toBeNull();
+    expect(safeSearchGapForEngine("bing")).toBeNull();
+    expect(safeSearchGapForEngine("duckduckgo")).toBeNull();
+    // 百度那一行不在表里 ⇒ 返回它的宿主，界面据此把缺口画出来（此前用户一个字都看不到）。
+    expect(safeSearchGapForEngine("baidu")).toBe("baidu.com");
+  });
+
+  test("每个可选引擎的宿主**恰好**被两张表之一认领（加一个引擎就必须归类，少改一处 ⇒ 这条红）", () => {
+    for (const [engine, host] of Object.entries(SEARCH_ENGINE_HOSTS)) {
+      const inParams = applySafeSearch(`https://www.${host}/s?wd=t`, true) !== `https://www.${host}/s?wd=t`;
+      const inGap = (SAFE_SEARCH_UNMAPPED_HOSTS as readonly string[]).includes(host);
+      expect(
+        inParams !== inGap,
+        `${engine} → ${host} 必须恰好属于「有参数」或「缺口」之一（表里都没有 ⇒ 界面会谎称它有效）`,
+      ).toBe(true);
+      // 判据与 `safeSearchGapForEngine` 的答案一致：缺口清单就是它的唯一来源。
+      expect(safeSearchGapForEngine(engine as keyof typeof SEARCH_ENGINE_HOSTS)).toBe(inGap ? host : null);
+    }
+  });
 });
 
 describe("并发安全测试 - 书签管理", () => {
@@ -474,8 +545,9 @@ describe("并发安全测试 - 历史记录管理", () => {
     expect(() => addToHistory("https://private.example/", "Private", true)).not.toThrow();
   });
 
-  test("searchHistory 空查询返回最近记录、null 返回空、正常查询有结果", () => {
-    expect(searchHistory("")).toEqual(loadHistory().slice(0, 20));
+  test("searchHistory 空查询返回整段历史、null 返回空、正常查询有结果", () => {
+    // 不再截到 20 条（REQ-A1292）：列表长度由数据源自己决定。
+    expect(searchHistory("")).toEqual(loadHistory());
     expect(searchHistory(null as any)).toEqual([]);
     expect(Array.isArray(searchHistory("test"))).toBe(true);
   });
@@ -570,6 +642,39 @@ describe("边界测试 - 数量限制", () => {
     expect(LIMITS.HISTORY_MAX_COUNT).toBe(500);
     expect(LIMITS.TAB_MAX_COUNT).toBe(50);
     expect(LIMITS.DOWNLOAD_MAX_COUNT).toBe(100);
+  });
+
+  /**
+   * 上面那条用例把 `LIMITS` 钉在**自身字面量**上（`toBe(2048)` / `toBe(255)`），那对本文件
+   * 是自洽的，却对**跨语言契约**零保护：Rust 下载管线在 `webman_download.rs` 里把两个常量
+   * **声明**为镜像本模块 —— `MAX_FILENAME_BYTES` 文档「(`LIMITS.FILENAME_MAX_LENGTH` in the
+   * UI)」、`MAX_URL_BYTES` 文档「mirroring the UI's `LIMITS.URL_MAX_LENGTH`」。任一侧改一个
+   * 数字，UI 与宿主就按**两个不同的上限**判定同一次下载：UI 放行的 3000 字符 URL 被宿主
+   * 具名拒绝（用户点了下载却没有反应），或 UI 截到 255 的文件名被宿主截到另一个长度（存储行
+   * 与磁盘文件名对不上）。本用例 `readFileSync` 读权威，令这一漂移变成一条红测试（REQ-A662）。
+   */
+  describe("LIMITS 的两个下载上限 == Rust webman_download.rs 的权威常量（REQ-A662）", () => {
+    function rustConst(name: string): number {
+      const src = readFileSync(
+        new URL("../../../../src/webman_download.rs", import.meta.url),
+        "utf8",
+      );
+      const m = new RegExp(`pub const ${name}: usize = (\\d+);`).exec(src);
+      expect(m, `${name} not found in amos-tauri/src/webman_download.rs`).not.toBeNull();
+      return Number(m?.[1]);
+    }
+
+    test("URL_MAX_LENGTH 等于 Rust MAX_URL_BYTES", () => {
+      const cap = rustConst("MAX_URL_BYTES");
+      expect(cap).toBeGreaterThan(0); // 漏读守卫：正则失配时不是默默比 0
+      expect(LIMITS.URL_MAX_LENGTH).toBe(cap);
+    });
+
+    test("FILENAME_MAX_LENGTH 等于 Rust MAX_FILENAME_BYTES", () => {
+      const cap = rustConst("MAX_FILENAME_BYTES");
+      expect(cap).toBeGreaterThan(0);
+      expect(LIMITS.FILENAME_MAX_LENGTH).toBe(cap);
+    });
   });
 
   test("标签页数量限制", () => {
@@ -677,9 +782,9 @@ describe("可靠性测试 - 错误处理", () => {
     expect(favicon).toBe("");
   });
 
-  test("formatTime 处理无效时间戳", () => {
-    expect(formatTime(-1)).toBe("未知时间");
-    expect(formatTime(NaN)).toBe("未知时间");
+  test("timeLabel 处理无效时间戳", () => {
+    expect(timeLabel(-1).kind).toBe("unknown");
+    expect(timeLabel(NaN).kind).toBe("unknown");
   });
 
   test("formatFileSize 处理无效大小", () => {
@@ -698,11 +803,12 @@ describe("性能测试 - ID 生成", () => {
   });
 
   test("generateId 性能基准", () => {
-    const start = Date.now();
-    for (let i = 0; i < 10000; i++) {
-      generateId();
-    }
-    const elapsed = Date.now() - start;
+    // REQ-A850 / F-DEV-106：`Date.now()` 的差值 = 干活 + 被抢占的时间；取 K 次最小值。
+    const elapsed = fastest(PERF_ATTEMPTS, () => {
+      for (let i = 0; i < 10000; i++) {
+        generateId();
+      }
+    });
     expect(elapsed).toBeLessThan(1000); // 10000 次应该在 1 秒内完成
   });
 });

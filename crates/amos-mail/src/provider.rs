@@ -56,6 +56,9 @@ pub trait MailProvider: Send + Sync {
     /// Star / unstar a message.
     async fn set_flagged(&self, mailbox: &str, id: &str, flagged: bool) -> Result<()>;
 
+    /// Mark a message replied / un-replied.
+    async fn set_answered(&self, mailbox: &str, id: &str, answered: bool) -> Result<()>;
+
     /// Remove a message from `mailbox`.
     async fn delete(&self, mailbox: &str, id: &str) -> Result<()>;
 
@@ -248,6 +251,38 @@ impl MockMailProvider {
         Ok(())
     }
 
+    /// Serialize the current store so a failed [`save_file`](Self::save_file) can be
+    /// undone with [`restore`](Self::restore).
+    ///
+    /// This is the undo half of an all-or-nothing write. A caller that mutates the store
+    /// and then cannot persist it must be able to put memory back, so the running state
+    /// matches the refusal it reports rather than quietly diverging from the disk
+    /// (audit PH-P2-02).
+    pub fn snapshot(&self) -> Result<Vec<u8>> {
+        let store = self
+            .store
+            .lock()
+            .map_err(|_| MailError::Provider("mock store poisoned".into()))?;
+        serde_json::to_vec(&*store).map_err(|e| MailError::Provider(format!("serialize: {e}")))
+    }
+
+    /// Replace the store with a [`snapshot`](Self::snapshot)'s bytes.
+    ///
+    /// The well-known mailboxes are re-ensured exactly as [`open_file`](Self::open_file)
+    /// does, so a restore can never leave the store without `INBOX`/`Sent`.
+    pub fn restore(&self, bytes: &[u8]) -> Result<()> {
+        let mut store: Store = serde_json::from_slice(bytes)
+            .map_err(|e| MailError::Provider(format!("parse snapshot: {e}")))?;
+        store.ensure(INBOX);
+        store.ensure(SENT);
+        let mut guard = self
+            .store
+            .lock()
+            .map_err(|_| MailError::Provider("mock store poisoned".into()))?;
+        *guard = store;
+        Ok(())
+    }
+
     /// Append an *incoming* message to `INBOX` (used by tests / seeding). The
     /// message id is minted automatically and drives ordering by date/sequence.
     pub fn deliver(
@@ -258,7 +293,8 @@ impl MockMailProvider {
         body: impl Into<String>,
         date: i64,
     ) -> Result<String> {
-        self.insert(INBOX, from, to, subject, body, date, vec![])
+        // `deliver` seeds *incoming* mail, which this mock has no HTML form for.
+        self.insert(INBOX, from, to, subject, body, None, date, vec![])
     }
 
     /// Internal insert used by both `deliver` and `send`; returns the new id.
@@ -272,6 +308,7 @@ impl MockMailProvider {
         to: Vec<Address>,
         subject: impl Into<String>,
         body: impl Into<String>,
+        body_html: Option<String>,
         date: i64,
         attachments: Vec<StoredAttachment>,
     ) -> Result<String> {
@@ -304,7 +341,7 @@ impl MockMailProvider {
             flagged: false,
             answered: false,
             body_plain: body.into(),
-            body_html: None,
+            body_html,
             attachments,
         });
         Ok(id)
@@ -457,10 +494,18 @@ impl MailProvider for MockMailProvider {
             draft.to.clone(),
             draft.subject.clone(),
             draft.body_plain.clone(),
+            draft.body_html.clone(),
             date,
             attachments,
         )?;
-        Ok(SendReceipt { id, date })
+        // The mock has no wire: the message is filed in `Sent` and delivered
+        // nowhere, so the receipt says so rather than letting a caller print
+        // 「已发送」(F-SH-824).
+        Ok(SendReceipt {
+            id,
+            date,
+            delivered: false,
+        })
     }
 
     async fn set_seen(&self, mailbox: &str, id: &str, seen: bool) -> Result<()> {
@@ -504,6 +549,28 @@ impl MailProvider for MockMailProvider {
                 id: id.to_string(),
             })?;
         msg.flagged = flagged;
+        Ok(())
+    }
+
+    async fn set_answered(&self, mailbox: &str, id: &str, answered: bool) -> Result<()> {
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| MailError::Provider("mock store poisoned".into()))?;
+        let msgs = store
+            .mailboxes
+            .get_mut(mailbox)
+            .ok_or_else(|| MailError::UnknownMailbox {
+                mailbox: mailbox.to_string(),
+            })?;
+        let msg = msgs
+            .iter_mut()
+            .find(|m| m.id == id)
+            .ok_or_else(|| MailError::NotFound {
+                mailbox: mailbox.to_string(),
+                id: id.to_string(),
+            })?;
+        msg.answered = answered;
         Ok(())
     }
 
@@ -569,7 +636,7 @@ impl MailProvider for MockMailProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Attachment, INBOX};
+    use crate::model::{Attachment, INBOX, SENT};
 
     fn addr(email: &str) -> Address {
         Address::bare(email).unwrap()
@@ -661,6 +728,12 @@ mod tests {
         let receipt = p.send(draft.clone()).await.unwrap();
         assert_eq!(receipt.id, "m1");
         assert!(receipt.date > 0);
+        assert!(
+            !receipt.delivered,
+            "the mock has no wire — its receipt must not claim the message was \
+             delivered, or the UI prints 「已发送」 for a message that never left \
+             the device (F-SH-824)"
+        );
 
         let sent = p.list(SENT, None).await.unwrap();
         assert_eq!(sent.len(), 1);
@@ -698,6 +771,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sent_html_body_lands_in_the_sent_copy() {
+        // `SendDraft::html(..)` — the declared "HTML body alongside the plain
+        // text" — must survive into the stored copy. Before this fix it was
+        // dropped here and `Email.body_html` was `None` from every provider, so
+        // the capability was declared but established by no code path.
+        let p = MockMailProvider::new();
+        let draft = SendDraft::new(vec![addr("them@x.io")], "rich", "plain text")
+            .unwrap()
+            .from(addr("me@x.io"))
+            .html("<p>rich <b>text</b></p>");
+        let receipt = p.send(draft).await.unwrap();
+
+        let full = p.fetch(SENT, &receipt.id).await.unwrap();
+        assert_eq!(full.body_plain, "plain text");
+        assert_eq!(full.body_html.as_deref(), Some("<p>rich <b>text</b></p>"));
+    }
+
+    #[tokio::test]
+    async fn plain_draft_has_no_html_body() {
+        // The control: a draft that never called `.html(..)` stays `None`, so the
+        // test above measures the HTML path and not a default.
+        let p = MockMailProvider::new();
+        let draft = SendDraft::new(vec![addr("them@x.io")], "plain", "just text")
+            .unwrap()
+            .from(addr("me@x.io"));
+        let receipt = p.send(draft).await.unwrap();
+        assert_eq!(p.fetch(SENT, &receipt.id).await.unwrap().body_html, None);
+    }
+
+    #[tokio::test]
     async fn seen_and_flagged_toggle_and_persist() {
         let p = seeded();
         let id = p.list(INBOX, None).await.unwrap()[0].id.clone();
@@ -708,6 +811,17 @@ mod tests {
         assert!(f.seen && f.flagged);
         p.set_seen(INBOX, &id, false).await.unwrap();
         assert!(!p.fetch(INBOX, &id).await.unwrap().summary.flags.seen);
+    }
+
+    #[tokio::test]
+    async fn answered_flag_toggles_and_persists() {
+        let p = seeded();
+        let id = p.list(INBOX, None).await.unwrap()[0].id.clone();
+        assert!(!p.fetch(INBOX, &id).await.unwrap().summary.flags.answered);
+        p.set_answered(INBOX, &id, true).await.unwrap();
+        assert!(p.list(INBOX, None).await.unwrap()[0].flags.answered);
+        p.set_answered(INBOX, &id, false).await.unwrap();
+        assert!(!p.fetch(INBOX, &id).await.unwrap().summary.flags.answered);
     }
 
     #[tokio::test]
@@ -889,5 +1003,43 @@ mod tests {
         let id = p.list(INBOX, None).await.unwrap()[0].id.clone();
         p.move_to(INBOX, &id, "INBOX").await.unwrap();
         assert_eq!(p.list(INBOX, None).await.unwrap().len(), 3);
+    }
+
+    /// `snapshot`/`restore` is the undo half of an all-or-nothing write: a caller that
+    /// mutates and then cannot persist can put memory back (audit PH-P2-02). Pinned here
+    /// so the pair is exercised without a bridge.
+    #[tokio::test]
+    async fn snapshot_restore_round_trips_a_mutation() {
+        let p = seeded();
+        let before = p.snapshot().unwrap();
+        let id = p.list(INBOX, None).await.unwrap()[0].id.clone();
+        p.set_flagged(INBOX, &id, true).await.unwrap();
+        p.delete(INBOX, &id).await.unwrap();
+        assert_eq!(p.list(INBOX, None).await.unwrap().len(), 2);
+
+        p.restore(&before).unwrap();
+        let restored = p.list(INBOX, None).await.unwrap();
+        assert_eq!(
+            restored.len(),
+            3,
+            "the restore puts back the deleted message"
+        );
+        assert!(
+            restored.iter().all(|m| !m.flags.flagged),
+            "and the flag it was snapshotted with"
+        );
+    }
+
+    /// The restore re-ensures the well-known mailboxes, exactly as `open_file` does, so a
+    /// snapshot taken before a mailbox existed cannot leave the store without `INBOX`/`Sent`.
+    #[tokio::test]
+    async fn restore_re_ensures_the_well_known_mailboxes() {
+        let p = MockMailProvider::new();
+        // A store missing `Sent` — what a hand-edited or truncated snapshot could carry.
+        p.restore(br#"{"mailboxes":{"Archive":[]},"next_seq":7}"#)
+            .unwrap();
+        let boxes = p.list_mailboxes().await.unwrap();
+        assert!(boxes.iter().any(|b| b == INBOX), "{boxes:?}");
+        assert!(boxes.iter().any(|b| b == SENT), "{boxes:?}");
     }
 }

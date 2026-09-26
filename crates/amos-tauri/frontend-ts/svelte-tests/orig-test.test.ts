@@ -1,5 +1,15 @@
 /**
- * desktop-shell.svelte.test.ts — the macOS-form shell topology (PC desktop).
+ * orig-test.test.ts — the *wider* macOS-form shell suite (PC desktop).
+ *
+ * This file and `desktop-shell.svelte.test.ts` share a header, a boot-fact helper
+ * (`./shellHostBootFacts`) and ~41 byte-identical cases — they diverged from one original
+ * and were kept in parallel, so **the pair must not be treated as an accidental copy**:
+ * this file also carries the cases that exist nowhere else (the Dock's box per edge +
+ * context menus + `+N` overflow, the hot-corner behaviours including Show Desktop, the
+ * stage's multi-select open, and the `wallpaperFallbackColor` bootstrap). Deleting it
+ * drops that coverage. A maintainer should either fold those cases into
+ * `desktop-shell.svelte.test.ts` or give this file a name that says what it tests —
+ * not delete it. Until then the header at least names *itself*, not its sibling.
  *
  * Why these cases exist (each one is a defect this file was written against, not a
  * spare assertion):
@@ -32,6 +42,7 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { cleanup, fireEvent, render } from "@testing-library/svelte";
 import { tick } from "svelte";
+import { isBootFact } from "./shellHostBootFacts";
 import DesktopShell from "../src/svelte/DesktopShell.svelte";
 import Dock from "../src/svelte/Dock.svelte";
 import { LAYOUT_KEY, readStoreValue, writeStoreValue } from "../src/lib/amosStore";
@@ -76,9 +87,13 @@ const DESKTOP_SNAPSHOT = {
  * non-poll invocation. `wm_windows` is polled (Dock running dots + shell's focused
  * window reader), so it would always be the last call; `lastCall` skips it so
  * "what did the user's keypress do" is answerable from the test. */
+
 /** Installs a fake host. `desktopFeatures` is what the host answers for
  *  `desktop_features_disabled` (REQ-A287) — the *production* path for the two shell
- *  capability switches, as opposed to the `window.__amosDisabledFeatures` test hook. */
+ *  capability switches, as opposed to the `window.__amosDisabledFeatures` test hook.
+ *
+ *  The boot-fact list itself lives in `./shellHostBootFacts` (REQ-A487): it used to be copied
+ *  into this file and its sibling, and the two copies drifted. */
 function installHost({
   windows = [] as unknown[],
   commands = [] as string[],
@@ -90,10 +105,10 @@ function installHost({
       // Boot facts (polled/asked once at mount) are not "a command the shell sent in
       // response to something": the cases that assert `__lastCall === undefined` mean
       // "this gesture reached no host command", so the boot reads must stay out of the
-      // probe (REQ-A287 added `desktop_features_disabled`).
-      const isBootFact =
-        cmd === "wm_windows" || cmd === "wm_layout_snapshot" || cmd === "desktop_features_disabled";
-      if (!isBootFact) {
+      // probe (REQ-A287 added `desktop_features_disabled`). The list itself lives in
+      // `svelte-tests/shellHostBootFacts.ts` (REQ-A487): it was copied per file, and
+      // REQ-A485's boot-time push reached only one copy.
+      if (!isBootFact(cmd)) {
         (window as unknown as Record<string, unknown>).__lastCall = { cmd, args };
       }
       if (cmd === "wm_layout_snapshot") return DESKTOP_SNAPSHOT;
@@ -158,12 +173,23 @@ function failWritesFor(key: string): () => void {
  * with `label: 'files'`" without parsing `__lastCall` (which is also written). */
 function installHostWithRecorder() {
   (window as unknown as Record<string, unknown>).__wmOpens = [] as string[];
+  (window as unknown as Record<string, unknown>).__wmNewWindows = [] as string[];
   (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
     invoke: async (cmd: string, args?: unknown) => {
       if (cmd === "wm_open") {
         const label = (args as { label?: string } | undefined)?.label;
         if (typeof label === "string") {
           ((window as unknown as { __wmOpens: string[] }).__wmOpens).push(label);
+        }
+        (window as unknown as Record<string, unknown>).__lastCall = { cmd, args };
+      }
+      // REQ-A473: File ▸ New Window is per-app now (`wm_new_window` with the **app id**),
+      // so this recorder has to see that command too — the `wm_open` labels above are no
+      // longer what that row sends.
+      if (cmd === "wm_new_window") {
+        const appId = (args as { appId?: string } | undefined)?.appId;
+        if (typeof appId === "string") {
+          ((window as unknown as { __wmNewWindows: string[] }).__wmNewWindows).push(appId);
         }
         (window as unknown as Record<string, unknown>).__lastCall = { cmd, args };
       }
@@ -197,6 +223,7 @@ afterEach(() => {
   delete (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
   delete (window as unknown as { __lastCall?: unknown }).__lastCall;
   delete (window as unknown as { __wmOpens?: unknown }).__wmOpens;
+  delete (window as unknown as { __wmNewWindows?: unknown }).__wmNewWindows;
   // The capability switches are module state in `lib/desktopFeatures` (one boot answer
   // per page load), so a case that answers "disabled" must not leak into the next one.
   resetDesktopFeaturesForTest();
@@ -1100,11 +1127,18 @@ describe("DesktopShell.svelte — the macOS chrome", () => {
     expect(container.querySelector('[data-testid="desktop-selection-count"]')).toBeNull();
   });
 
-  test("system shortcuts route through the focused window to wm_close / wm_hide", async () => {
-    // ⌘W / ⌘M / ⌘H must (a) reach the host as `wm_close` / `wm_hide`, and (b) carry the
+  test("system shortcuts route through the focused window to wm_close / wm_minimize", async () => {
+    // ⌘W / ⌘M must (a) reach the host as `wm_close` / `wm_minimize`, and (b) carry the
     // **focused** window label (not the Dock layout or a hard-coded string). They do not
     // fire when the focused window is the launcher (`main` — closing the launcher would
     // leave the desktop without a home surface).
+    //
+    // REQ-A724 (mirrored from `desktop-shell.svelte.test.ts`, its byte-identical sibling):
+    // ⌘M **minimizes**, it does not hide (⌘H is the hide chord). This file kept the old
+    // `wm_hide` expectation while the sibling was updated with the behaviour change, so
+    // `bun run test:svelte` was red on exactly this line — the drift the header above
+    // warns these two parallel copies are prone to. The assertion now pins the same
+    // property the sibling does.
     installHost({
       windows: [
         { label: "files", kind: "App", state: "Focused", focused: true },
@@ -1134,7 +1168,7 @@ describe("DesktopShell.svelte — the macOS chrome", () => {
     await settle();
     const last2 = (window as unknown as Record<string, { cmd: string; args: unknown }>)
       .__lastCall;
-    expect(last2.cmd).toBe("wm_hide");
+    expect(last2.cmd).toBe("wm_minimize");
     expect(last2.args).toEqual({ label: "files" });
   });
 
@@ -1302,7 +1336,7 @@ describe("DesktopShell.svelte — the macOS chrome", () => {
     expect(v.showIcons).toBe(false);
   });
 
-  test("topbar File → New Window fires wm_open('files') (REQ-A275)", async () => {
+  test("topbar File → New Window asks the host for a window of an app (REQ-A473)", async () => {
     installHostWithRecorder();
     const { container } = render(DesktopShell);
     await tick();
@@ -1318,8 +1352,12 @@ describe("DesktopShell.svelte — the macOS chrome", () => {
     await fireEvent.click(row);
     await tick();
     await settle();
-    const opens = (window as unknown as { __wmOpens: string[] }).__wmOpens;
-    expect(opens).toContain("files");
+    // REQ-A473: the row asks for **one more window of an app** (`wm_new_window`) instead of
+    // opening the Files window by name — with only the launcher focused the app is the
+    // shell's own file manager (`newWindowTarget`, one rule for the row, ⌘N and the native
+    // menu item).
+    const requested = (window as unknown as { __wmNewWindows: string[] }).__wmNewWindows;
+    expect(requested).toEqual(["files"]);
   });
 });
 
@@ -1348,7 +1386,7 @@ describe("Dock.svelte — names, grouping and capacity", () => {
 
     expect(byAria(container, zh["desktop.launchpad"])).toBeTruthy();
     expect(byAria(container, zh["desktop.finder"])).toBeTruthy();
-    expect(byAria(container, zh["desktop.trashInFiles"])).toBeTruthy();
+    expect(byAria(container, zh["desktop.trash"])).toBeTruthy();
     // The old code put `appTitleKey(id)` (e.g. `app.clock.title`) straight into
     // aria-label: a screen reader read the key out loud.
     const labels = [...container.querySelectorAll("button[aria-label]")].map((b) =>
@@ -1370,10 +1408,11 @@ describe("Dock.svelte — names, grouping and capacity", () => {
     );
     expect(ids).toEqual(["notes", "dock-launchpad", "dock-finder", "dock-trash"]);
     // Its handler used to be `if (id === "trash") return;` — pressable, announced as
-    // pressable, and doing nothing (FMEA F-SH-001).
+    // pressable, and doing nothing (FMEA F-SH-001). REQ-A783 made it live: it opens Files on
+    // the trash pane, so what this *container* test pins is that the tile is in the dock and
+    // pressable; where it goes is pinned by the tile's own test in `dock-widgets.svelte.test.ts`.
     const trash = container.querySelector<HTMLButtonElement>('[data-testid="dock-trash"]')!;
-    expect(trash.disabled).toBe(true);
-    expect(trash.getAttribute("aria-disabled")).toBe("true");
+    expect(trash.disabled).toBe(false);
   });
 
   test("the separator is drawn BEFORE the trash (that is the one grouping the Dock has)", async () => {
@@ -1383,7 +1422,7 @@ describe("Dock.svelte — names, grouping and capacity", () => {
     await tick();
     await settle();
     const sep = container.querySelector('[data-testid="dock-separator"]') as Element;
-    const trash = byAria(container, zh["desktop.trashInFiles"]) as Element;
+    const trash = byAria(container, zh["desktop.trash"]) as Element;
     expect(sep && trash).toBeTruthy();
     const rel = sep.compareDocumentPosition(trash);
     expect(Boolean(rel & Node.DOCUMENT_POSITION_FOLLOWING)).toBe(true);
@@ -1486,7 +1525,7 @@ describe("Dock.svelte — names, grouping and capacity", () => {
     expect(chip).toBeTruthy();
     expect(byAria(narrow.container, zh["desktop.dockOverflow"].replace("{n}", "5"))).toBeTruthy();
     // …and the system items survive the squeeze (macOS never drops the trash).
-    expect(byAria(narrow.container, zh["desktop.trashInFiles"])).toBeTruthy();
+    expect(byAria(narrow.container, zh["desktop.trash"])).toBeTruthy();
     expect(byAria(narrow.container, zh["desktop.finder"])).toBeTruthy();
   });
 
@@ -1500,7 +1539,7 @@ describe("Dock.svelte — names, grouping and capacity", () => {
         // The Dock reads `wm_windows` for its running-dot poll AND `wm_close` for the
         // Quit menu action. Filter the poll so the assertion reads the user-action
         // call, not the most recent ambient tick.
-        if (cmd !== "wm_windows" && cmd !== "wm_layout_snapshot") {
+        if (!isBootFact(cmd)) {
           (window as unknown as Record<string, unknown>).__lastCall = { cmd, args };
         }
         if (cmd === "wm_windows") {
@@ -1731,6 +1770,68 @@ describe("Dock.svelte — names, grouping and capacity", () => {
     expect(chip.getAttribute("aria-expanded")).toBe("false");
   });
 
+  test("right-clicking the +N chip shows the SAME full list — not the Dock's preferences menu", async () => {
+    // F-SH-346 / REQ-A1029: the chip listened for `onclick` only, so its right-click bubbled
+    // up to the Dock container's `oncontextmenu` and answered with 「Dock 偏好设置」 — a menu
+    // about icon size and magnification — to a user who asked "which apps did not fit?".
+    // On a Mac the chip's right-click is the same full list as its left-click.
+    setWindowWidth(400); // dockCapacity(400) = 6; minus the 3 system items leaves 3 slots
+    seedDock(MANY_APPS); // 8 apps ⇒ the last five are the hidden ones
+    installHost({ windows: [] });
+    const { container } = render(Dock);
+    await tick();
+    await settle();
+
+    const chip = container.querySelector<HTMLButtonElement>(
+      '[data-testid="dock-overflow"] button',
+    )!;
+    await fireEvent.contextMenu(chip, { clientX: 12, clientY: 34 });
+    await tick();
+
+    // The chip's own list, with exactly the apps that did not fit …
+    const menu = container.querySelector('[data-testid="dock-overflow-menu"]')!;
+    expect(menu).toBeTruthy();
+    const listed = [...menu.querySelectorAll("[data-testid^='dock-overflow-item-']")].map((b) =>
+      b.getAttribute("data-testid")!.replace("dock-overflow-item-", ""),
+    );
+    expect(listed).toEqual(MANY_APPS.slice(3));
+    expect(chip.getAttribute("aria-expanded")).toBe("true");
+    // … and NOT the global Dock menu (the answer to a question nobody asked).
+    expect(container.querySelector('[data-testid="dock-global-context-menu"]')).toBeNull();
+  });
+
+  test("with the context-menu feature off, the +N chip's right-click is not intercepted either", async () => {
+    // The chip's right-click obeys the same switch as the Dock's other right-click menus
+    // (`AMOS_DOCK_CONTEXT_MENU=disabled`): nothing is consumed, so the browser's own menu
+    // appears. A chip that kept intercepting while the tiles around it did not would be a
+    // second, quieter way to lie about what the gesture does.
+    (window as { __amosDisabledFeatures?: string[] }).__amosDisabledFeatures = [
+      "dock-context-menu",
+    ];
+    try {
+      setWindowWidth(400);
+      seedDock(MANY_APPS);
+      installHost({ windows: [] });
+      const { container } = render(Dock);
+      await tick();
+      await settle();
+
+      const chip = container.querySelector<HTMLButtonElement>(
+        '[data-testid="dock-overflow"] button',
+      )!;
+      // `dispatchEvent` answers `false` once `preventDefault` has been called, so this is
+      // the "nothing was consumed" half: with the feature off the gesture must fall through
+      // to the browser's own menu, not be silently swallowed by a chip that kept listening.
+      const notCancelled = await fireEvent.contextMenu(chip, { clientX: 12, clientY: 34 });
+      await tick();
+      expect(notCancelled).toBe(true);
+      expect(container.querySelector('[data-testid="dock-overflow-menu"]')).toBeNull();
+      expect(container.querySelector('[data-testid="dock-global-context-menu"]')).toBeNull();
+    } finally {
+      delete (window as { __amosDisabledFeatures?: string[] }).__amosDisabledFeatures;
+    }
+  });
+
   test("picking from the overflow list opens that app through wm_open", async () => {
     setWindowWidth(400);
     seedDock(MANY_APPS);
@@ -1916,6 +2017,32 @@ describe("HotCornersListener — a hot corner opens the overlay the registry dec
     await fireEvent.keyDown(window, { key: "Escape" });
     await tick();
     expect(container.querySelector('[data-testid="overlay-layer"]')).toBeNull();
+  });
+
+  test("a 'Notification Center' corner opens the notifications overlay, NOT Control Center", async () => {
+    // Same wrong-id shape the `mission-control` case above was fixed for: this branch used
+    // to toggle `control-center-panel`, so a corner the Settings dropdown labels
+    // "Notification Center" (and that the bar's clock toggles, via `ClockWidget`) opened the
+    // Control Center instead — an overlay nobody asked for, and the notification panel never.
+    setWindowWidth(2000);
+    writeStoreValue(HOT_CORNER_KEY, [
+      { corner: "top-right", action: "notification-center", delay: 0 },
+    ]);
+    installHost();
+    const { container } = render(DesktopShell);
+    await tick();
+    await settle();
+
+    await placeCursor(2000, 0); // the top-right zone
+    await tick();
+    await settle();
+    await settle();
+
+    const layer = container.querySelector('[data-testid="overlay-layer"]');
+    expect(layer?.getAttribute("data-overlay")).toBe("notifications");
+    expect(container.querySelector('[data-testid="desktop-notification-center"]')).toBeTruthy();
+    // The bug's signature: the *other* panel must not be what opened.
+    expect(container.querySelector('[data-testid="control-center-panel"]')).toBeNull();
   });
 
   test("the Show Desktop hot corner really hides the visible app windows, and the same corner brings them back", async () => {

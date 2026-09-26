@@ -631,6 +631,7 @@ pub unsafe extern "system" fn Java_com_amos_ai_glue_DevCareGlue_attach(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use amos_devocare::{MAX_JUNK_ITEMS, MAX_SCAN_DEPTH};
 
     #[test]
     fn a_scan_reply_maps_rows_and_counts_unknown_kinds_as_partial() {
@@ -757,5 +758,142 @@ mod tests {
             BatteryReading::unknown()
         );
         assert_eq!(parse_battery_reply("{not json"), BatteryReading::unknown());
+    }
+
+    /// A lowercase `snake_case` token (a candidate `kind` wire tag).
+    fn is_snake_tag(t: &str) -> bool {
+        !t.is_empty() && t.chars().all(|c| c.is_ascii_lowercase() || c == '_')
+    }
+
+    /// The tag list the glue's **header** declares: the `// a | b | c` run right
+    /// after the "…wire tags exactly" line (stops at the first non-`//` line).
+    fn declared_kind_tags(src: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut started = false;
+        for line in src.lines() {
+            let t = line.trim_start();
+            if !started {
+                started = t.contains("wire tags exactly");
+                continue;
+            }
+            if !t.starts_with("//") {
+                break;
+            }
+            let before = out.len();
+            for tok in t.trim_start_matches("//").split('|') {
+                let tok = tok.trim();
+                if is_snake_tag(tok) {
+                    out.push(tok.to_string());
+                }
+            }
+            if out.len() == before {
+                break; // an empty comment line ends the list
+            }
+        }
+        out
+    }
+
+    /// Every lowercase `snake_case` literal the glue can hand back as a `kind`:
+    /// `-> "…"` arms and direct `itemJson(…, "…", …)` arguments. Both live on a
+    /// single source line; comment lines are skipped so the header's `-> {"error":…}`
+    /// API sketch is not mistaken for an emit site.
+    fn emitted_kind_tags(src: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for line in src.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") || trimmed.starts_with('*') || trimmed.starts_with("/*") {
+                continue;
+            }
+            for needle in ["-> ", "itemJson("] {
+                if let Some(i) = line.find(needle) {
+                    let after = &line[i + needle.len()..];
+                    if let Some(open) = after.find('"') {
+                        let rest = &after[open + 1..];
+                        if let Some(close) = rest.find('"') {
+                            let tok = &rest[..close];
+                            if is_snake_tag(tok) {
+                                out.push(tok.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The integer the glue spells after `NAME = ` (Kotlin's `10_000` underscores
+    /// are stripped before parsing).
+    fn kt_usize(src: &str, name: &str) -> usize {
+        let needle = format!("{name} = ");
+        let i = src
+            .find(&needle)
+            .unwrap_or_else(|| panic!("DevCareGlue.kt no longer declares `{name}`"));
+        let digits: String = src[i + needle.len()..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '_')
+            .collect();
+        digits
+            .replace('_', "")
+            .parse()
+            .unwrap_or_else(|_| panic!("DevCareGlue.kt `{name}` is not a number: {digits:?}"))
+    }
+
+    /// The glue's device-care contract is **declared** in prose — "`kind` tags must
+    /// match amos-devocare's `JunkKind` wire tags exactly" and "mirrors hostfs
+    /// MAX_SCAN_DEPTH / MAX_JUNK_ITEMS" — but nothing checked it: the glue is Kotlin
+    /// (only compiled on the heavy Android/JDK path) and `jni-contract-scan` binds
+    /// JNI *member names*, not these literals. A one-sided change is quiet on both
+    /// sides: rename a Kotlin tag and Rust's `parse_item` counts those rows as
+    /// *unknown* (the scan silently reports fewer items as `partial`); change
+    /// `MAX_ITEMS` and Rust either trips `TooManyItems` or accepts a list it should
+    /// have refused. So pin both sides by reading the Kotlin source — the same way
+    /// `rotation.rs` / `alarm_sched.rs` pin their glue's status words (REQ-A724 /
+    /// F-SH-182).
+    #[test]
+    fn the_glue_kind_tags_and_caps_are_pinned_to_the_kotlin_source() {
+        const KOTLIN: &str = include_str!("../android-glue/com/amos/ai/glue/DevCareGlue.kt");
+
+        // 1. The tag list the glue *declares* must equal `JunkKind`'s wire tags,
+        //    in both directions (a Rust rename or a header edit each go red).
+        let mut declared = declared_kind_tags(KOTLIN);
+        let mut rust_tags: Vec<String> =
+            JunkKind::ALL.iter().map(|k| k.key().to_string()).collect();
+        assert!(
+            declared.len() >= 8 && rust_tags.len() >= 8,
+            "the tag census shrank: {declared:?} vs {rust_tags:?}"
+        );
+        declared.sort();
+        rust_tags.sort();
+        assert_eq!(
+            declared, rust_tags,
+            "the glue's declared JunkKind tags have drifted"
+        );
+
+        // 2. Every `kind` the glue can actually *emit* must be a wire tag — this
+        //    catches a code literal drifting from the header, not just the header.
+        let emitted = emitted_kind_tags(KOTLIN);
+        assert!(
+            emitted.len() >= 7,
+            "the emit-site scan found too few sites: {emitted:?}"
+        );
+        for tag in &emitted {
+            assert!(
+                JunkKind::from_key(tag).is_some(),
+                "DevCareGlue.kt emits {tag:?}, which is not a JunkKind wire tag"
+            );
+        }
+
+        // 3. The two caps the glue enforces must equal the ones Rust enforces.
+        assert_eq!(
+            kt_usize(KOTLIN, "MAX_DEPTH"),
+            MAX_SCAN_DEPTH,
+            "DevCareGlue.kt MAX_DEPTH drifted from hostfs MAX_SCAN_DEPTH"
+        );
+        assert_eq!(
+            kt_usize(KOTLIN, "MAX_ITEMS"),
+            MAX_JUNK_ITEMS,
+            "DevCareGlue.kt MAX_ITEMS drifted from MAX_JUNK_ITEMS"
+        );
     }
 }

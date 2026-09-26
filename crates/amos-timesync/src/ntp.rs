@@ -21,11 +21,20 @@ use crate::time_source::TimeSource;
 const DEFAULT_NTP_PORT: u16 = 123;
 /// Socket read timeout for a single NTP exchange.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
-/// Reject any reply outside a plausible epoch window (years 2000–2100) right at
-/// the network source — before `SyncedClock` runs its own check — so a caller
-/// using `NtpTimeSource` directly never gets an absurd `SystemTime`.
-const MIN_ACCEPTED_EPOCH_SECS: u64 = 946_684_800; // 2000-01-01T00:00:00Z
-const MAX_ACCEPTED_EPOCH_SECS: u64 = 4_102_444_800; // 2100-01-01T00:00:00Z
+
+/// Whether an epoch-second value lies inside the accepted plausible window — the
+/// *same* window [`SyncedClock`](crate::SyncedClock) enforces (years 2000–2100).
+///
+/// This guard runs at the network source, before the clock's own check, so a
+/// caller using `NtpTimeSource` directly never sees an absurd `SystemTime`. It
+/// deliberately takes its bounds from the clock's single authority
+/// (`Plausibility::default()`) rather than re-declaring them: a copy would let a
+/// widened clock window and this early guard silently disagree about which remote
+/// times are plausible. (REQ-A664 / F-SH-129.)
+fn within_window(secs: u64) -> bool {
+    let window = crate::clock::Plausibility::default();
+    (window.min_epoch_secs..window.max_epoch_secs).contains(&secs)
+}
 
 /// An SNTP time source that queries a configured set of NTP servers.
 ///
@@ -116,7 +125,7 @@ fn query_one(addr: SocketAddr, timeout: Duration) -> Result<SystemTime> {
         .map_err(|e| Error::Source(format!("snmp query {addr}: {e:?}")))?;
 
     let secs = reply.sec();
-    if !(MIN_ACCEPTED_EPOCH_SECS..MAX_ACCEPTED_EPOCH_SECS).contains(&secs) {
+    if !within_window(secs) {
         return Err(Error::Implausible(secs));
     }
     // The NTP second fraction is a fixed-point value in units of 2^-32 s.
@@ -149,6 +158,19 @@ mod tests {
             host_port.iter().all(|a| a.port() == 1123),
             "custom port must be honoured"
         );
+    }
+
+    #[test]
+    fn accepted_window_is_the_clock_window_and_is_half_open() {
+        let w = crate::clock::Plausibility::default();
+        // Inside the window (2023) passes; a garbage far-past reply is refused.
+        assert!(within_window(1_700_000_000), "2023 is inside the window");
+        assert!(!within_window(315_532_800), "1980 is below the floor");
+        assert!(!within_window(0), "epoch 0 is below the floor");
+        // The window is half-open `[min, max)`: the floor is admitted, the ceiling
+        // is not — matching `Plausibility`'s own `>= min && < max` contract.
+        assert!(within_window(w.min_epoch_secs));
+        assert!(!within_window(w.max_epoch_secs));
     }
 
     #[test]

@@ -29,6 +29,7 @@
   } from "../../lib/shellChrome";
   import { t } from "../locale.svelte";
   import { installMenuKeyboard } from "../../lib/menuKeys";
+  import { placeMenuAt } from "../../lib/menuPlacement";
 
   let {
     items,
@@ -51,6 +52,14 @@
     return installMenuKeyboard(menuEl, { onClose: () => onclose?.() });
   });
 
+  /**
+   * The placement rule (REQ-A481): the overflow chip lives in the Dock, so its menu is anchored a
+   * few dozen points above the window's bottom edge — drawn straight down it was clipped by the
+   * window before this. This panel is also height-capped (`max-height: 320px`), so the measured
+   * height is the *real* height the rule must use.
+   */
+  let placed = $derived.by(() => (menuEl ? placeMenuAt(menuEl, x, y) : { left: x, top: y, flipped: false }));
+
   /** Open `id` and close — capturing both callbacks *before* the unmount. */
   function pick(id: string): void {
     const open = onpick;
@@ -64,8 +73,8 @@
   bind:this={menuEl}
   class="fixed z-[200] {CHROME_MENU_PANEL}"
   style="
-    left:{x}px;
-    top:{y}px;
+    left:{placed.left}px;
+    top:{placed.top}px;
     {CHROME_MENU_PANEL_STYLE}
     max-height: 320px;
     overflow-y: auto;

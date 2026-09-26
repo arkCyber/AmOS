@@ -29,7 +29,8 @@
 //! > strategy knob** and `AMOS_ACCELERATION` is not honoured anywhere (it remains
 //! > only in the historical CODE_COMPLETION_SUMMARY.md table).
 
-/// Env var naming the accelerator strategy: `auto|cpu|vulkan|metal|nnapi|qnn|neuropilot|off`.
+/// Env var naming the accelerator strategy:
+/// `auto|cpu|vulkan|metal|nnapi|qnn|neuropilot|rknn|off`.
 pub const AMOS_ACCEL_ENV: &str = "AMOS_ACCEL";
 /// Env override naming the silicon vendor when auto-detection can't run
 /// (e.g. cross-compiling or a bring-up harness): `qualcomm|mediatek|generic`.
@@ -104,6 +105,10 @@ pub enum Accel {
     Qnn,
     /// MediaTek NeuroPilot NPU SDK (vendor-specific; requires `neuropilot` SDK).
     NeuroPilot,
+    /// Rockchip RK3588 NPU via the RKNN runtime (`librknnrt.so`). Vendor-specific;
+    /// requires the `rknn` feature (i.e. the daemon was cross-compiled against the
+    /// RK3588 SDK). See `docs/rk3588-bringup.md` — the binding is a *seam* today.
+    Rk3588Npu,
     /// Acceleration explicitly disabled (same effect as [`Accel::Cpu`], but the
     /// operator asked for it rather than it being chosen).
     Off,
@@ -120,6 +125,7 @@ impl Accel {
             "nnapi" => Some(Accel::Nnapi),
             "qnn" | "snpe" => Some(Accel::Qnn),
             "neuropilot" | "mtk" => Some(Accel::NeuroPilot),
+            "rknn" | "rk3588" | "rk3588npu" => Some(Accel::Rk3588Npu),
             "off" | "none" | "disabled" => Some(Accel::Off),
             _ => None,
         }
@@ -127,9 +133,10 @@ impl Accel {
 
     /// Is the SDK/native backend needed by this accelerator compiled in?
     ///
-    /// `qnn`/`neuropilot` require their vendor SDKs (see
-    /// `docs/qcom-mtk-bringup.md`); until the daemon is built against them they
-    /// are honestly unavailable and `effective()` will refuse to pick them.
+    /// `qnn`/`neuropilot`/`rknn` require their vendor SDKs (see
+    /// `docs/qcom-mtk-bringup.md` / `docs/rk3588-bringup.md`); until the daemon
+    /// is built against them they are honestly unavailable and `effective()`
+    /// will refuse to pick them.
     pub fn compiled_in(self) -> bool {
         match self {
             // CPU/Vulkan/Metal/NNAPI are runtime backends (llama.cpp features),
@@ -137,6 +144,9 @@ impl Accel {
             Accel::Auto | Accel::Cpu | Accel::Vulkan | Accel::Metal | Accel::Nnapi => true,
             Accel::Qnn => cfg!(feature = "qnn"),
             Accel::NeuroPilot => cfg!(feature = "neuropilot"),
+            // RK3588's RKNN runtime: only "compiled in" when the daemon was built
+            // with the `rknn` feature (cross-compiled against librknnrt.so).
+            Accel::Rk3588Npu => cfg!(feature = "rknn"),
             Accel::Off => true,
         }
     }
@@ -150,6 +160,7 @@ impl Accel {
             Accel::Nnapi => "nnapi",
             Accel::Qnn => "qnn",
             Accel::NeuroPilot => "neuropilot",
+            Accel::Rk3588Npu => "rknn",
             Accel::Off => "off",
         }
     }
@@ -160,7 +171,10 @@ impl Accel {
         if self.compiled_in() {
             None
         } else {
-            Some("SDK not linked (see docs/qcom-mtk-bringup.md)")
+            match self {
+                Accel::Rk3588Npu => Some("RKNN SDK not linked (see docs/rk3588-bringup.md)"),
+                _ => Some("SDK not linked (see docs/qcom-mtk-bringup.md)"),
+            }
         }
     }
 }
@@ -359,6 +373,43 @@ mod tests {
         }
     }
 
+    /// Gap 7 test 7.3-1: `AMOS_ACCEL=rknn` (case-insensitively) parses to the
+    /// RK3588 NPU strategy rather than being silently ignored.
+    #[test]
+    #[serial_test::serial(accel_env_lock)]
+    fn rknn_env_value_parses_to_rk3588_npu_accel() {
+        for value in ["rknn", "RKNN", "Rk3588", "rk3588npu", "  rknn  "] {
+            std::env::set_var(AMOS_ACCEL_ENV, value);
+            assert_eq!(
+                AccelProfile::from_env().accel,
+                Accel::Rk3588Npu,
+                "AMOS_ACCEL={value:?} must select the RK3588 NPU"
+            );
+        }
+        std::env::remove_var(AMOS_ACCEL_ENV);
+        assert_eq!(Accel::Rk3588Npu.label(), "rknn");
+    }
+
+    /// Gap 7 test 7.3-2 (mirrors the QNN honesty test): an RKNN request on a
+    /// build without the `rknn` feature resolves to CPU **with a reason**, so the
+    /// daemon never claims an NPU it was not linked against (F-NPU-001).
+    #[test]
+    fn rknn_without_feature_resolves_to_cpu_with_reason() {
+        let p = profile(Accel::Rk3588Npu, SoCVendor::GenericAndroid);
+        let (eff, reason) = p.resolve();
+        if cfg!(feature = "rknn") {
+            assert_eq!(eff, Accel::Rk3588Npu);
+            assert!(reason.is_none());
+        } else {
+            assert_eq!(eff, Accel::Cpu, "uncompiled RKNN must not be claimed");
+            let reason = reason.expect("must explain the downgrade honestly");
+            assert!(
+                reason.contains("RKNN"),
+                "the reason must name the missing SDK: {reason}"
+            );
+        }
+    }
+
     #[test]
     fn gpu_accel_produces_offload_args() {
         // Only this test touches AMOS_GPU_LAYERS_ENV, so the read is deterministic.
@@ -375,6 +426,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(accel_env_lock)]
     fn unknown_accel_env_value_is_ignored_not_guessed() {
         // from_env_value is private; exercise it through the public from_env().
         // Only this test writes AMOS_ACCEL_ENV, so no cross-test race.

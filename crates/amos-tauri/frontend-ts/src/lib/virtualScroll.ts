@@ -69,13 +69,18 @@ export function calculateVirtualRange(
   const clampedOverscan = Math.max(0, Math.floor(overscan));
   const count = Math.floor(itemCount);
 
-  const startIndex = Math.max(
-    0,
-    Math.floor(clampedScroll / itemHeight) - clampedOverscan
-  );
   const endIndex = Math.min(
     count - 1,
     Math.ceil((clampedScroll + clampedHeight) / itemHeight) + clampedOverscan
+  );
+  // `startIndex` is clamped to `endIndex`, not just to `0`. The scroll offset outlives
+  // the list: when rows are filtered or deleted under a large `scrollTop`, the naive
+  // start (`floor(scroll/itemHeight) - overscan`) lands *past* the new last index, the
+  // `for` loop runs zero times, and the list draws nothing — a blank screen for a
+  // non-empty list. A window of at least the last row is the honest floor.
+  const startIndex = Math.min(
+    endIndex,
+    Math.max(0, Math.floor(clampedScroll / itemHeight) - clampedOverscan)
   );
 
   const items: VirtualItem[] = [];

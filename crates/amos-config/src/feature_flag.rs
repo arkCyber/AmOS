@@ -21,6 +21,17 @@
 //! whose unknown keys evaluate to `false` (fail-closed). A typo in the caller
 //! can never grant access by accident.
 //!
+//! The same rule now covers the *operator's* side of a `version_min` rule: a
+//! version string the evaluator cannot parse is not compared at all, so it
+//! cannot open the gate (see [`version_gte`]). A rollout minimum must be plain
+//! `MAJOR.MINOR.PATCH`. (REQ-A541.)
+//!
+//! It covers the *caller's* side of a `percent` rule too: a context with no
+//! `install_id` cannot be placed on the ring, so a percentage rollout is
+//! withheld rather than hashed from the empty string — which is a constant
+//! bucket, not a roll. [`FlagContext::for_this_process`] supplies the
+//! documented `AMOS_INSTALL_ID` → `AMOS_SOCKET` → pid chain. (REQ-A1751.)
+//!
 //! **Compatibility shim**: [`FeatureFlagSet::from_resolver`] keeps the old
 //! signature so existing callers do not break. It still returns the empty
 //! default; the **file-based** loading has moved to
@@ -52,13 +63,54 @@ pub enum FlagValue {
 
 #[derive(Debug, Clone, Default)]
 pub struct FlagContext {
-    /// Stable per-install id (a hash of `AMOS_INSTALL_ID`, falls back to
-    /// `AMOS_SOCKET` or the process pid).
+    /// Stable per-install id used to place this install on a percentage
+    /// rollout ring. [`FlagContext::for_this_process`] fills it from
+    /// `AMOS_INSTALL_ID` (trimmed, non-empty), else `AMOS_SOCKET` (trimmed,
+    /// non-empty), else `pid-<process id>`. A rule with `"percent": N` **does
+    /// not open for an empty id** — see [`FeatureFlagSet::is_enabled`].
     pub install_id: String,
     /// User-supplied id (e.g. SSO subject).
     pub user_id: Option<String>,
     /// App version, for staged rollouts.
     pub version: Option<String>,
+}
+
+impl FlagContext {
+    /// Build a context identified by *this* process.
+    ///
+    /// The `install_id` follows the chain documented on the field:
+    /// `AMOS_INSTALL_ID` → `AMOS_SOCKET` → `pid-<pid>`. Each candidate is
+    /// trimmed and a blank one is skipped — a variable set to `""` names no
+    /// install, and admitting it would put every such device on the same
+    /// bucket, which is the failure this entry point exists to avoid.
+    ///
+    /// **Honest boundary**: only `install_id` is filled. `user_id` and
+    /// `version` stay `None` because neither is derivable from the process
+    /// environment — a `users` or `version_min` rule therefore still withholds
+    /// for a context built here. A caller that knows the user or app version
+    /// should set those fields itself. (REQ-A1751.)
+    pub fn for_this_process() -> Self {
+        Self {
+            install_id: default_install_id(),
+            user_id: None,
+            version: None,
+        }
+    }
+}
+
+/// The documented per-install id chain: `AMOS_INSTALL_ID` → `AMOS_SOCKET` →
+/// `pid-<process id>`. Always returns a non-empty string, so a percentage
+/// rollout always has a bucket to place the caller on.
+fn default_install_id() -> String {
+    for var in ["AMOS_INSTALL_ID", "AMOS_SOCKET"] {
+        if let Ok(v) = std::env::var(var) {
+            let v = v.trim();
+            if !v.is_empty() {
+                return v.to_string();
+            }
+        }
+    }
+    format!("pid-{}", std::process::id())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -308,12 +360,22 @@ impl FeatureFlagSet {
                     return false;
                 }
                 if let Some(pct) = percent {
-                    if let Some(ctx) = ctx {
-                        // Stable per-install bucket: `fnv1a(install_id) % 100`.
-                        let bucket = fnv1a_u32(ctx.install_id.as_bytes()) % 100;
-                        return bucket < u32::from(*pct);
+                    // Stable per-install bucket: `fnv1a(install_id) % 100`.
+                    //
+                    // An id we do not have cannot be *placed* on the ring: the
+                    // hash of the empty string is a constant bucket (61), so
+                    // folding it in would make `percent: 50` open for every
+                    // device and `percent: 70` open for none — a rollout that
+                    // silently does not roll. Withhold, exactly as the `users`
+                    // and `version_min` arms do when their deciding field is
+                    // missing (and as `version_gte` refuses a version it cannot
+                    // place, REQ-A541). (REQ-A1751.)
+                    let install = ctx.map(|c| c.install_id.trim()).unwrap_or("");
+                    if install.is_empty() {
+                        return false;
                     }
-                    return false;
+                    let bucket = fnv1a_u32(install.as_bytes()) % 100;
+                    return bucket < u32::from(*pct);
                 }
                 false
             }
@@ -330,17 +392,33 @@ fn fnv1a_u32(bytes: &[u8]) -> u32 {
     h
 }
 
-/// Tiny semver `>=` for `MAJOR.MINOR.PATCH` strings. Non-semver strings fall
-/// back to lexicographic compare — explicit so a typo never silently passes.
+/// Whether version `a` is at or above the minimum `b`, for plain
+/// `MAJOR.MINOR.PATCH` strings.
+///
+/// A version we cannot parse — a missing field (`"10"`, `"10.0"`), a `v`
+/// prefix, a pre-release (`"1.0.0-rc1"`), `"latest"`, an empty string — is
+/// **not compared at all**: the gate does not open. Such a string cannot be
+/// *placed* relative to the minimum, and the obvious way to guess (string
+/// ordering) is not the version order. It reads `"9.0.0" >= "10"` and
+/// `"1.0.0-rc1" >= "1.0.0"` as true, so a `version_min` typo would be admitted
+/// by any version whose first digit happens to sort higher, and a pre-release
+/// build would outrank its own release. Admitting a version we cannot place is
+/// the same failure as answering `true` for an unknown flag key (see the module
+/// docs), refused the same way. The cost is named rather than hidden: a
+/// `version_min` written as anything but `MAJOR.MINOR.PATCH` never opens its
+/// gate — write the release, not its `-rc`. (REQ-A541.)
 fn version_gte(a: &str, b: &str) -> bool {
-    let pa = parse_semver(a);
-    let pb = parse_semver(b);
-    match (pa, pb) {
+    match (parse_semver(a), parse_semver(b)) {
         (Some(x), Some(y)) => x >= y,
-        _ => a >= b,
+        _ => false,
     }
 }
 
+/// Parse `MAJOR.MINOR.PATCH` (exactly three numeric fields, nothing else).
+///
+/// Strict on purpose: a pre-release or build suffix (`1.0.0-rc1`, `1.0.0+3`)
+/// is **not** accepted here, so it returns `None` and such a version can never
+/// satisfy a `version_min` gate (see [`version_gte`]). (REQ-A541.)
 fn parse_semver(s: &str) -> Option<(u32, u32, u32)> {
     let mut parts = s.split('.');
     let major = parts.next()?.parse().ok()?;
@@ -428,6 +506,57 @@ mod tests {
             version: Some("0.9.0".into()),
         };
         assert!(!s.is_enabled("x", Some(&older)));
+    }
+
+    /// A `version_min` (or an app version) the evaluator cannot parse cannot be
+    /// *placed* against the other side, so the gate stays shut. It used to be
+    /// decided by string ordering instead, which is not the version order:
+    /// `"9.0.0" >= "10"` and `"1.0.0-rc1" >= "1.0.0"` are both true
+    /// lexicographically, so a minimum missing its patch field was opened by any
+    /// version starting with a higher digit, and a pre-release build outranked
+    /// its own release. (REQ-A541.)
+    #[test]
+    fn a_version_we_cannot_place_never_opens_the_gate() {
+        // A typo'd / unparsable `version_min`: the operator's side.
+        for min in ["10", "10.0", "v10", "latest", "1.0.0-rc1", ""] {
+            let s = FeatureFlagSet::from_json(&json!({"x": {"version_min": min}})).unwrap();
+            for app in ["9.0.0", "11.0.0", "nightly"] {
+                assert!(
+                    !s.is_enabled("x", Some(&version_ctx("i", app))),
+                    "version_min={min:?} must not open the gate for app={app:?}"
+                );
+            }
+        }
+        // A well-formed minimum, but a version we cannot parse on the app side.
+        let s = FeatureFlagSet::from_json(&json!({"x": {"version_min": "1.0.0"}})).unwrap();
+        for app in ["nightly", "1.0.0-rc1", "1.0.0+build7", ""] {
+            assert!(
+                !s.is_enabled("x", Some(&version_ctx("i", app))),
+                "app={app:?} cannot be placed against 1.0.0, so the gate stays shut"
+            );
+        }
+        // The control: a plain `MAJOR.MINOR.PATCH` above the minimum still opens.
+        assert!(s.is_enabled("x", Some(&version_ctx("i", "1.0.1"))));
+    }
+
+    /// Version ordering is numeric, never string ordering: `10.0.0` is above
+    /// `9.0.0`, although `"10.0.0" < "9.0.0"` as strings. (REQ-A541.)
+    #[test]
+    fn version_ordering_is_numeric_not_lexicographic() {
+        let above = FeatureFlagSet::from_json(&json!({"x": {"version_min": "9.0.0"}})).unwrap();
+        assert!(above.is_enabled("x", Some(&version_ctx("i", "10.0.0"))));
+        let below = FeatureFlagSet::from_json(&json!({"x": {"version_min": "10.0.0"}})).unwrap();
+        assert!(!below.is_enabled("x", Some(&version_ctx("i", "9.0.0"))));
+    }
+
+    /// A context with an explicit app version (the `ctx` helper above pins
+    /// `"1.2.3"`, which is the wrong shape for a version-gate test).
+    fn version_ctx(install: &str, version: &str) -> FlagContext {
+        FlagContext {
+            install_id: install.into(),
+            user_id: None,
+            version: Some(version.into()),
+        }
     }
 
     /// Test-scoped unique-dir helper. Suffix is nanoseconds-since-epoch +
@@ -594,5 +723,96 @@ mod tests {
 
         std::env::remove_var("AMOS_FEATURE_FLAGS_FILE");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The `percent` arm must not fold an **absent** install id into a
+    /// measured bucket. Its two sibling arms — `users` and `version_min` —
+    /// both *withhold* when the field that decides them is missing from the
+    /// context, but `percent` hashed the empty string, and
+    /// `fnv1a_u32(b"") % 100 == 61`, so `{"percent": 50}` read **on for every
+    /// device** and `{"percent": 70}` read **off for every device**. The
+    /// rollout silently did not roll and nothing said so.
+    ///
+    /// An unidentifiable install is not "install #61": it cannot be *placed*
+    /// on the ring, so it must not be admitted — the same discipline as
+    /// [`version_gte`] refusing a version it cannot place (REQ-A541).
+    #[test]
+    fn a_percent_roll_without_an_install_id_never_opens_the_gate() {
+        for pct in [1u8, 50, 70, 100] {
+            let s = FeatureFlagSet::from_json(&json!({"x": {"percent": pct}})).unwrap();
+            assert!(
+                !s.is_enabled("x", None),
+                "percent={pct} with no context at all must not open the gate"
+            );
+            let blank = FlagContext::default(); // install_id: ""
+            assert!(
+                !s.is_enabled("x", Some(&blank)),
+                "percent={pct} with an empty install_id must not open the gate"
+            );
+            let spaces = FlagContext {
+                install_id: "   ".into(),
+                ..FlagContext::default()
+            };
+            assert!(
+                !s.is_enabled("x", Some(&spaces)),
+                "percent={pct} with a whitespace-only install_id must not open the gate"
+            );
+        }
+
+        // The siblings already withhold without the field that decides them
+        // (`user_id`, `version`) — the comparison that makes `percent`'s fold a
+        // divergence rather than a house style.
+        let users = FeatureFlagSet::from_json(&json!({"x": {"users": ["alice"]}})).unwrap();
+        assert!(!users.is_enabled("x", Some(&FlagContext::default())));
+        let version = FeatureFlagSet::from_json(&json!({"x": {"version_min": "1.0.0"}})).unwrap();
+        assert!(!version.is_enabled("x", Some(&FlagContext::default())));
+
+        // Positive control: an identifiable install still rolls, and both
+        // corners behave (`0` never, `100` always).
+        let all = FeatureFlagSet::from_json(&json!({"x": {"percent": 100}})).unwrap();
+        assert!(all.is_enabled("x", Some(&ctx("install-42", None))));
+        let none = FeatureFlagSet::from_json(&json!({"x": {"percent": 0}})).unwrap();
+        assert!(!none.is_enabled("x", Some(&ctx("install-42", None))));
+    }
+
+    /// `FlagContext::for_this_process()` implements the fallback chain the
+    /// `install_id` field documents (`AMOS_INSTALL_ID` → `AMOS_SOCKET` →
+    /// process pid), so a caller with no per-install id of its own can still
+    /// get a **non-empty, stable** bucket input. Before it existed the
+    /// documented chain named behaviour no code performed (F-DEV-046 family),
+    /// and the obvious caller — `FlagContext::default()` — hung every device
+    /// on bucket 61.
+    #[test]
+    fn for_this_process_yields_a_non_empty_stable_install_id() {
+        // The chain reads process-global env; the lock keeps it from racing
+        // the sibling test that sets `AMOS_FEATURE_FLAGS_FILE`.
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // A configured id is used verbatim, trimmed; stability within one
+        // process is what makes the bucket stable across evaluations.
+        std::env::set_var("AMOS_INSTALL_ID", "  install-from-env  ");
+        std::env::remove_var("AMOS_SOCKET");
+        let a = FlagContext::for_this_process();
+        assert_eq!(a.install_id, "install-from-env");
+        assert_eq!(a.install_id, FlagContext::for_this_process().install_id);
+
+        // A blank `AMOS_INSTALL_ID` is not an id — fall through to the socket.
+        std::env::set_var("AMOS_INSTALL_ID", "   ");
+        std::env::set_var("AMOS_SOCKET", "/tmp/amos.sock");
+        assert_eq!(FlagContext::for_this_process().install_id, "/tmp/amos.sock");
+
+        // Both absent → a per-process id, still non-empty, and it opens a
+        // 100% roll (the end-to-end point of the guard above).
+        std::env::remove_var("AMOS_INSTALL_ID");
+        std::env::remove_var("AMOS_SOCKET");
+        let c = FlagContext::for_this_process();
+        assert!(
+            !c.install_id.is_empty(),
+            "the pid fallback must not be empty"
+        );
+        assert!(c.install_id.contains(&std::process::id().to_string()));
+        let all = FeatureFlagSet::from_json(&json!({"x": {"percent": 100}})).unwrap();
+        assert!(all.is_enabled("x", Some(&c)));
     }
 }

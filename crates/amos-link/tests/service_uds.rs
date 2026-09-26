@@ -490,3 +490,124 @@ async fn the_control_plane_folds_in_a_robots_actuation_reports() {
     server.abort();
     let _ = std::fs::remove_file(&path);
 }
+
+/// A plan mounted through `service::server(node)` — the shape the crate recommends to a
+/// deployment that brings its own transport or clock — must fold in the return path too.
+///
+/// **REQ-A890 / F-LK-031**: `server(node)` was `LinkService::new(node)`, which wired neither
+/// the heartbeat **nor** the actuation watcher, while its own doc (and `docs/amos-link.md` §5)
+/// said only *liveness* was left to the caller. So the deployment the doc names — Zenoh
+/// transport, calibrated clock — got a `ListActuations` that answered 「没有机器人上报过」
+/// for as long as it ran, which is exactly the conflation the return path exists to forbid
+/// (空 ≠ 全员空闲), and it had no way to fix it: the watcher and its table are private, and
+/// `with_heartbeat` was the only constructor that started them.
+///
+/// The caller-owns-liveness half of that doc is still true and is *why* `server` is not
+/// `with_heartbeat`: this node does not beat unless the caller spawns its heartbeat. The
+/// return path is not a liveness question — it is the whole content of an RPC — so every
+/// constructor starts it.
+#[tokio::test]
+async fn a_caller_owned_node_still_folds_in_the_return_path() {
+    let path: PathBuf = std::env::temp_dir().join(format!(
+        "amos-link-server-return-{}-{}.sock",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let _ = std::fs::remove_file(&path);
+
+    // One link (broker), two nodes: the daemon that mounts the plane, and the robot whose
+    // bridge reports. Same topology as the `with_heartbeat` test above — only the mount
+    // call differs, which is the point.
+    let metrics = Arc::new(LinkMetrics::new());
+    let clock = Arc::new(Clock::host());
+    let transport = Broker::with_metrics(Arc::clone(&metrics)).shared();
+    let daemon = LinkNode::with_parts(
+        PeerId::new("amos-daemon").expect("peer"),
+        NodeKind::Tool,
+        Arc::clone(&transport),
+        Arc::clone(&clock),
+        Arc::clone(&metrics),
+    );
+    let robot = LinkNode::with_parts(
+        PeerId::new("dog1").expect("peer"),
+        NodeKind::Robot,
+        Arc::clone(&transport),
+        Arc::clone(&clock),
+        Arc::clone(&metrics),
+    );
+
+    let dog1 = PeerId::new("dog1").expect("peer");
+    let control = robot
+        .subscriber::<AgentAction>(
+            Topic::pattern("amos/dog1/control/*").expect("pattern"),
+            amos_link::qos::Qos::control(),
+        )
+        .await
+        .expect("subscribe control");
+    let mut bridge = RobotBridge::new(control, MockRobotHal::new())
+        .reporting(robot.publisher::<ActuationState>(actuation_topic(&dog1).expect("topic")))
+        .with_report_refresh(std::time::Duration::from_millis(20));
+    let commander = robot.publisher::<AgentAction>(
+        Topic::channel_topic("dog1", Channel::Control, "action").expect("topic"),
+    );
+
+    // The mount under test: the caller-owned-node constructor, not `with_heartbeat`.
+    let socket = path.clone();
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(service::server(Arc::new(daemon)))
+            .serve_with_incoming(tokio_stream::wrappers::UnixListenerStream::new(
+                tokio::net::UnixListener::bind(socket).expect("bind uds"),
+            ))
+            .await
+    });
+    wait_for_socket(&path).await;
+
+    let owned = path.clone();
+    let channel = Endpoint::try_from("http://[::1]:50051")
+        .expect("endpoint")
+        .connect_with_connector(service_fn(move |_: Uri| {
+            let path = owned.clone();
+            async move {
+                let stream = UnixStream::connect(path).await?;
+                Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
+            }
+        }))
+        .await
+        .expect("connect the channel");
+    let mut client = RobotLinkClient::new(channel);
+
+    // Drive the robot until its report shows up in the folded table. If the watcher is not
+    // running this loop never converges — the table stays empty and the assertion below names
+    // the empty answer as the failure.
+    let mut trotting = None;
+    for _ in 0..60 {
+        commander
+            .publish(&AgentAction::new(r#"{"action":"trot","speed":0.5}"#))
+            .await
+            .expect("publish trot");
+        bridge.step().await.expect("step");
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        let list = client
+            .list_actuations(Empty {})
+            .await
+            .expect("list_actuations")
+            .into_inner();
+        if let Some(found) = list.robots.into_iter().find(|r| r.robot == "dog1") {
+            trotting = Some(found);
+            break;
+        }
+    }
+    let trotting = trotting.expect(
+        "a plane mounted with `service::server(node)` folds the return path in; an empty \
+         list here is the 「没有机器人上报过」 answer this test exists to forbid",
+    );
+    assert_eq!(trotting.gait, "trot");
+    assert!(trotting.armed, "the drivers are energized");
+
+    server.abort();
+    let _ = std::fs::remove_file(&path);
+}

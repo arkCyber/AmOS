@@ -186,6 +186,13 @@ async fn full_device_lifecycle_enroll_sync_lock_ack() {
     assert!(sync["config"].is_object());
     assert_eq!(sync["config"]["deviceStatus"], "active");
     assert_eq!(sync["config"]["deviceId"], "dev-e2e-1");
+    // The enroller is the fact stored at enroll (`org.admin_email`), not the
+    // literal `"admin"`. The client merges this config over its own state, so a
+    // constant here would overwrite the real enroller it captured at enroll.
+    assert_eq!(
+        sync["config"]["enrolledBy"], "admin@amos.local",
+        "sync must return the stored enroller, not a hardcoded literal: {sync}"
+    );
     // `serverTime` must be present and numeric.
     assert!(
         sync["serverTime"].is_number(),
@@ -704,5 +711,503 @@ async fn oversize_enroll_is_refused_with_413() {
         resp.status(),
         StatusCode::PAYLOAD_TOO_LARGE,
         "oversized enroll must be 413"
+    );
+}
+
+// ========================================================================
+// A device that reports FAILURE is recorded as failed, not acknowledged (REQ-A410)
+// ========================================================================
+
+/// The ack contract had no way to say "I could not do it": a device that answered
+/// `{"result": "lock refused: …"}` was recorded as **acknowledged**, so the operator's console
+/// showed a completed lock while the device was still unlocked. `ok: false` fixes that — and it
+/// has to be **additive**, because the device agents live outside this repository.
+#[tokio::test]
+async fn a_device_that_reports_failure_is_not_recorded_as_acknowledged() {
+    let admin = "test-admin-token";
+    let app = fresh_router(admin).await;
+
+    // Enroll one device.
+    let (_, enroll) = body_json(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/mdm/enroll")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "enrollmentToken": "AMOS-ENROLL-TOKEN-TEST",
+                            "deviceId": "dev-fail",
+                            "deviceName": "Failer",
+                            "platform": "android",
+                            "userAgent": "ua"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    let key = enroll["data"]["apiKey"].as_str().unwrap().to_string();
+
+    // Helper: the admin locks the device, then the device polls its own commands and answers the
+    // single pending one. `lock` cancels nothing here because each round is acked before the next.
+    let issue_lock = || async {
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/admin/devices/dev-fail/lock")
+                    .header("authorization", format!("Bearer {admin}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&json!({})).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (_, cmds) = body_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/mdm/commands?device_id=dev-fail")
+                        .header("authorization", format!("Bearer {key}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        let pending = cmds["commands"].as_array().expect("commands array");
+        assert_eq!(pending.len(), 1, "one pending command: {cmds}");
+        pending[0]["id"].as_str().expect("cmd id").to_string()
+    };
+
+    // (1) The device reports **failure**. The server must record `failed`; before this field the
+    //     only outcome the protocol could express was "acknowledged".
+    let refused_cmd = issue_lock().await;
+    let (status, failed) = body_json(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/mdm/commands/{refused_cmd}/ack"))
+                    .header("authorization", format!("Bearer {key}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "deviceId": "dev-fail",
+                            "ok": false,
+                            "result": "lock refused: device policy forbids it"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "failed ack refused: {failed}");
+    assert_eq!(
+        failed["status"], "failed",
+        "a reported failure must not be recorded as an acknowledgement: {failed}"
+    );
+
+    // (2) The legacy ack — **no `ok` field at all** — keeps its old meaning, because the device
+    //     agents are not in this repository and must not break on the new field.
+    let done_cmd = issue_lock().await;
+    let (status, acked) = body_json(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/mdm/commands/{done_cmd}/ack"))
+                    .header("authorization", format!("Bearer {key}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "deviceId": "dev-fail",
+                            "result": "locked-screen-shown"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "legacy ack refused: {acked}");
+    assert_eq!(
+        acked["status"], "acknowledged",
+        "the legacy ack must keep its meaning: {acked}"
+    );
+
+    // Both outcomes are terminal: the device is not asked to run either command again.
+    let (_, after) = body_json(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/mdm/commands?device_id=dev-fail")
+                    .header("authorization", format!("Bearer {key}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        after["commands"].as_array().expect("commands array").len(),
+        0,
+        "nothing may stay pending after either outcome: {after}"
+    );
+}
+
+// ========================================================================
+// REQ-A1809 — the documented raw `<prefix><token>` auth form must authenticate
+// ========================================================================
+
+/// `state::extract_api_key`'s own doc (and `admin_auth.rs`) lists **two**
+/// accepted device header forms: `Authorization: Bearer <key>` and the raw
+/// `Authorization: <prefix><key>`. `enroll_device` stores the SHA-256 of the
+/// **prefixed** key (`hash_key(prefix + token)`) and `validate_api_key` hashes
+/// whatever string it is handed — so the raw branch must hand over the full
+/// `<prefix><key>`, not the prefix-stripped remainder. Otherwise the documented
+/// form can never authenticate. This walks the real router end-to-end.
+#[tokio::test]
+async fn the_documented_raw_prefix_header_form_authenticates() {
+    let admin = "test-admin-token";
+    let app = fresh_router(admin).await;
+
+    // Enroll a device; the returned key is the full `<prefix><token>`.
+    let (status, enroll) = body_json(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/mdm/enroll")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "enrollmentToken": "AMOS-ENROLL-TOKEN-TEST",
+                            "deviceId": "dev-raw-1",
+                            "deviceName": "Raw Header Device",
+                            "platform": "android",
+                            "userAgent": "amos-e2e/1.0"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "enroll failed: {enroll}");
+    let api_key = enroll["data"]["apiKey"]
+        .as_str()
+        .expect("apiKey present")
+        .to_string();
+    assert!(
+        api_key.starts_with("amos_"),
+        "the enrolled key carries the configured prefix, got {api_key:?}"
+    );
+
+    let sync_body = |app: axum::Router, auth: String| {
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/mdm/sync")
+                .header("authorization", auth)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({ "deviceId": "dev-raw-1", "lastSyncAt": 0 }))
+                        .unwrap(),
+                ))
+                .unwrap(),
+        )
+    };
+
+    // The documented raw form: the header IS the full `<prefix><token>`.
+    let (status, sync) = body_json(sync_body(app.clone(), api_key.clone()).await.unwrap()).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the documented raw <prefix><token> header must authenticate, got {status}: {sync}"
+    );
+
+    // Positive control: the `Bearer` form keeps working on the same device (so a
+    // fix that broke `Bearer`, or one that merely accepted everything, is caught).
+    let (status, sync) = body_json(
+        sync_body(app.clone(), format!("Bearer {api_key}"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the Bearer form must keep working: {sync}"
+    );
+
+    // Negative control: a raw header with a wrong token must still 401 — the raw
+    // branch checks the prefix, it does not blanket-accept any header.
+    let (status, _) = body_json(sync_body(app, "amos_deadbeef".to_string()).await.unwrap()).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a raw header with a bad token must still be refused"
+    );
+}
+
+// ========================================================================
+// A `forced_shortcuts` policy is actually delivered to the device (REQ-A1808)
+// ========================================================================
+
+/// Enroll `device_id` and return its API key. Shared by the policy tests below.
+async fn enroll(app: &axum::Router, device_id: &str) -> String {
+    let (_, enroll) = body_json(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/mdm/enroll")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "enrollmentToken": "AMOS-ENROLL-TOKEN-TEST",
+                            "deviceId": device_id,
+                            "deviceName": device_id,
+                            "platform": "android",
+                            "userAgent": "ua"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    enroll["data"]["apiKey"]
+        .as_str()
+        .expect("apiKey present")
+        .to_string()
+}
+
+/// The admin creates one policy and returns the raw response.
+async fn create_policy(app: &axum::Router, admin: &str, body: Value) -> (StatusCode, Value) {
+    body_json(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/admin/policies")
+                    .header("authorization", format!("Bearer {admin}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await
+}
+
+/// POST a sync for `device_id` with `api_key` and return its `config` object.
+async fn sync_for(app: &axum::Router, device_id: &str, api_key: &str) -> Value {
+    let (status, sync) = body_json(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/mdm/sync")
+                    .header("authorization", format!("Bearer {api_key}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "deviceId": device_id,
+                            "lastSyncAt": 0
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "sync failed: {sync}");
+    sync["config"].clone()
+}
+
+/// The operator pins two shortcuts with a `forced_shortcuts` policy; the device must
+/// **receive** them. `create_policy` accepts and stores the policy type, and the client
+/// gates its edit/delete affordances on `config.enforcedShortcuts.includes(id)` — but the
+/// sync response hardcoded `enforcedShortcuts: []`, so that list was structurally empty
+/// and every enforced shortcut stayed editable on the device.
+#[tokio::test]
+async fn a_forced_shortcuts_policy_reaches_the_device() {
+    let admin = "test-admin-token";
+    let app = fresh_router(admin).await;
+    let key = enroll(&app, "dev-mdm-policy").await;
+
+    let (status, created) = create_policy(
+        &app,
+        admin,
+        json!({
+            "type": "forced_shortcuts",
+            "name": "Pin the payment shortcuts",
+            "config": { "shortcuts": ["sc-pin-pay", "sc-pin-lock"] },
+            "priority": 10
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "policy create failed: {created}");
+
+    let config = sync_for(&app, "dev-mdm-policy", &key).await;
+    assert_eq!(
+        config["enforcedShortcuts"],
+        json!(["sc-pin-pay", "sc-pin-lock"]),
+        "the device must be told which shortcuts its organization pinned: {config}"
+    );
+    // The policy itself still rides along whole, so the device has the name/priority too.
+    // (The default org seeds two unrelated policies, so filter rather than index.)
+    let policies = config["policies"].as_array().expect("policies array");
+    let pinned_policy = policies
+        .iter()
+        .find(|p| p["type"] == "forced_shortcuts")
+        .expect("the pinned policy must still be delivered whole");
+    assert_eq!(pinned_policy["name"], "Pin the payment shortcuts");
+    assert_eq!(pinned_policy["priority"], 10);
+}
+
+/// Negative controls for the same derivation: only an **enabled** `forced_shortcuts`
+/// policy contributes, and a policy of any other type contributes nothing. A union that
+/// refused to distinguish these would pass the positive test above while enforcing
+/// policies the organization turned off.
+#[tokio::test]
+async fn only_enabled_forced_shortcut_policies_are_enforced() {
+    let admin = "test-admin-token";
+    let app = fresh_router(admin).await;
+    let key = enroll(&app, "dev-mdm-policy-nc").await;
+
+    // (1) A *disabled* forced_shortcuts policy: created enabled, then switched off.
+    let (_, pinned) = create_policy(
+        &app,
+        admin,
+        json!({
+            "type": "forced_shortcuts",
+            "name": "off again",
+            "config": { "shortcuts": ["sc-nope"] }
+        }),
+    )
+    .await;
+    let pinned_id = pinned["data"]["id"]
+        .as_str()
+        .expect("policy id")
+        .to_string();
+    assert_eq!(
+        sync_for(&app, "dev-mdm-policy-nc", &key).await["enforcedShortcuts"],
+        json!(["sc-nope"]),
+        "an enabled policy must be enforced before we switch it off"
+    );
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/api/admin/policies/{pinned_id}"))
+                .header("authorization", format!("Bearer {admin}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({ "enabled": false })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "disable failed");
+
+    // (2) A policy of a *different* type, whose config happens to carry a `shortcuts` key.
+    let (status, other) = create_policy(
+        &app,
+        admin,
+        json!({
+            "type": "data_retention",
+            "name": "not a pin policy",
+            "config": { "shortcuts": ["sc-impostor"] }
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "other policy create failed: {other}"
+    );
+
+    assert_eq!(
+        sync_for(&app, "dev-mdm-policy-nc", &key).await["enforcedShortcuts"],
+        json!([]),
+        "a disabled policy and an unrelated policy type must both contribute nothing"
+    );
+}
+
+/// A `forced_shortcuts` policy whose config cannot be read as a shortcut list is
+/// **refused at creation** — never stored and then silently dropped from the sync,
+/// which is the failure the device cannot distinguish from "nothing is pinned".
+#[tokio::test]
+async fn an_unusable_forced_shortcuts_config_is_refused_at_creation() {
+    let admin = "test-admin-token";
+    let app = fresh_router(admin).await;
+
+    for bad in [
+        json!({}),
+        json!({ "shortcuts": "sc-pin-pay" }),
+        json!({ "shortcuts": [1, 2] }),
+        json!({ "shortcuts": ["  "] }),
+    ] {
+        let (status, resp) = create_policy(
+            &app,
+            admin,
+            json!({ "type": "forced_shortcuts", "name": "broken", "config": bad }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "an unusable forced_shortcuts config must be refused, got {resp} for {bad}"
+        );
+        assert_eq!(resp["success"], false);
+    }
+
+    // Nothing was stored: the org has the two policies it was seeded with and no
+    // `forced_shortcuts` policy among them.
+    let (_, list) = body_json(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/admin/policies")
+                    .header("authorization", format!("Bearer {admin}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        !list["data"]
+            .as_array()
+            .expect("data array")
+            .iter()
+            .any(|p| p["type"] == "forced_shortcuts"),
+        "a refused policy must not be persisted: {list}"
     );
 }

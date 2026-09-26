@@ -69,10 +69,11 @@ impl FlatIndex {
         self.rows.iter().any(|r| r.id == id)
     }
 
-    /// Append a vector. Errors on dimension mismatch / a duplicate id (use
-    /// [`upsert`](Self::upsert) to replace) — nothing is partially inserted.
+    /// Append a vector. Errors on a dimension mismatch, a blank id, a
+    /// non-finite component, or a duplicate id (use [`upsert`](Self::upsert) to
+    /// replace) — nothing is partially inserted. (REQ-A583)
     pub fn add(&mut self, vector: Vector) -> Result<()> {
-        self.validate_dim(vector.data.len())?;
+        self.validate_vector(&vector)?;
         if self.contains(&vector.id) {
             return Err(VectorDbError::Invalid(format!(
                 "id already indexed: {} (use upsert to replace)",
@@ -87,9 +88,11 @@ impl FlatIndex {
     }
 
     /// Insert, or replace any existing row with the same id. Idempotent and
-    /// order-stable: re-indexing an edited note overwrites its old vector.
+    /// order-stable: re-indexing an edited note overwrites its old vector. The
+    /// same full contract as [`add`](Self::add) is enforced, so a bad vector
+    /// can never replace a good one. (REQ-A583)
     pub fn upsert(&mut self, vector: Vector) -> Result<()> {
-        self.validate_dim(vector.data.len())?;
+        self.validate_vector(&vector)?;
         if let Some(row) = self.rows.iter_mut().find(|r| r.id == vector.id) {
             row.data = vector.data;
         } else {
@@ -221,6 +224,28 @@ impl FlatIndex {
     pub fn load_from(path: impl AsRef<Path>) -> Result<Self> {
         let bytes = std::fs::read(path)?;
         Self::load_bytes(&bytes)
+    }
+
+    /// Shared insert guard used by add / upsert: the *full* documented vector
+    /// contract — a non-empty id, every component finite, and a length equal to
+    /// the index dimension. [`Vector::new`] establishes this, but the struct's
+    /// fields are public and it derives `Deserialize`, so a caller can build a
+    /// `Vector` that bypassed `new`; the index re-checks rather than trusting
+    /// the caller. A stored `NaN` would score `NaN`, which `total_cmp` sorts to
+    /// rank 0 (it places positive `NaN` above `+inf`) — the exact silent
+    /// corruption this crate claims to prevent. Empty data needs no separate
+    /// branch: `dim >= 1` always, so the dimension guard below refuses it.
+    /// (REQ-A583)
+    fn validate_vector(&self, vector: &Vector) -> Result<()> {
+        if vector.id.trim().is_empty() {
+            return Err(VectorDbError::Invalid("vector id must be non-empty".into()));
+        }
+        if let Some(&v) = vector.data.iter().find(|v| !v.is_finite()) {
+            return Err(VectorDbError::Invalid(format!(
+                "vector data contains a non-finite value: {v}"
+            )));
+        }
+        self.validate_dim(vector.data.len())
     }
 
     /// Shared dimension guard used by add / upsert / search.
@@ -444,5 +469,50 @@ mod tests {
         idx.remove("a");
         idx.add(v("a", vec![0.0, 1.0])).expect("ok");
         assert_eq!(idx.len(), 1);
+    }
+
+    // A `Vector` can be built without going through `Vector::new` — its fields
+    // are public and it derives `Deserialize`. The index must therefore refuse
+    // a bad vector on its own; otherwise a stored `NaN` scores `NaN` and
+    // `total_cmp` sorts it to rank 0 (the documented failure).
+    #[test]
+    fn insert_refuses_a_vector_that_bypassed_validation() {
+        let mut idx = FlatIndex::new(2).expect("ok");
+        let hand_built = Vector {
+            id: "poison".into(),
+            data: vec![f32::NAN, 1.0],
+        };
+        assert!(idx.add(hand_built.clone()).is_err());
+        assert!(idx.upsert(hand_built).is_err());
+        assert!(idx.is_empty(), "a refused vector must not be stored");
+    }
+
+    #[test]
+    fn insert_refuses_a_blank_id_like_load_does() {
+        let mut idx = FlatIndex::new(2).expect("ok");
+        let blank = Vector {
+            id: "   ".into(),
+            data: vec![1.0, 0.0],
+        };
+        assert!(idx.add(blank.clone()).is_err());
+        assert!(idx.upsert(blank).is_err());
+        assert!(idx.is_empty());
+    }
+
+    #[test]
+    fn a_poisoned_row_can_never_rank_top() {
+        // Defence in depth: a non-finite row is refused at insert, so the top
+        // hit is always a real (finite-scoring) vector.
+        let mut idx = FlatIndex::new(2).expect("ok");
+        idx.add(v("good", vec![1.0, 0.0])).expect("ok");
+        let poison = Vector {
+            id: "poison".into(),
+            data: vec![f32::NAN, 1.0],
+        };
+        assert!(idx.upsert(poison).is_err());
+        let hits = idx.search(&[1.0, 0.0], Metric::Cosine, 5).expect("ok");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "good");
+        assert!(hits[0].score.is_finite());
     }
 }

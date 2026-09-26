@@ -84,7 +84,13 @@ message ImuReply {
   uint64 timestamp_ms = 1;
   Vec3 accel_m_s2 = 2;
   Vec3 gyro_rad_s = 3;
+  // Die temperature in °C. No field presence (proto3 scalar without `optional`),
+  // so `0` is this message's "not reported" sentinel — a device with no
+  // die-temperature source has no value to send. Consumers must read `0` as
+  // unknown, never as a measured 0 °C; see `amos-sensor`'s `ImuSample.temperature_c`
+  // (an `Option`) and the same discipline on `GnssReply.accuracy_m` / `sats_in_view`.
   float temperature_c = 4;
+  // Negotiated report rate in Hz; `0` = not negotiated yet (same sentinel rule).
   uint32 rate_hz = 5;
 }
 

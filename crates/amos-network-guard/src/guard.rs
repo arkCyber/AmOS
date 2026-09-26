@@ -21,6 +21,16 @@ pub trait NetworkGuard: Send + Sync {
     fn apply(&self, policies: &[Policy]) -> Result<()>;
     /// Clear all rules installed by this guard.
     fn flush(&self) -> Result<()>;
+    /// Whether this backend actually **drops traffic** for the rules it is given.
+    ///
+    /// The honest default is `false`: a backend that merely records or defers must
+    /// say so, so a status surface can never read "enforced" off a guard that is
+    /// not enforcing. A real `VpnService` / nftables path overrides this to `true`
+    /// **only once it truly drops traffic** — overriding it early would put the
+    /// lie back that `enforced` exists to prevent. (REQ-A580)
+    fn enforces(&self) -> bool {
+        false
+    }
 }
 
 /// Deterministic test/demo backend: records what was applied and always succeeds.
@@ -95,5 +105,13 @@ mod tests {
         assert_eq!(guard.applied_count(), 1);
         guard.flush().unwrap();
         assert!(guard.applied().is_empty());
+    }
+
+    #[test]
+    fn recording_backends_do_not_claim_to_enforce_by_default() {
+        // The trait's default must stay `false`: a recording/deferred backend that
+        // reported `true` would let a status surface claim a firewall that does not
+        // exist. A real backend opts in by overriding `enforces()`.
+        assert!(!MockNetworkGuard::new().enforces());
     }
 }

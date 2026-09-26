@@ -21,10 +21,35 @@ import { invoke, subscribe } from "./backend";
 
 /** Whether NFC hardware is present on this device. */
 export type NfcAvailableResult = {
+  /** Whether the platform reports an adapter at all. **Derived** from `state` by the
+   *  Rust side (`NfcStatusResult::from_state`), never set independently — and `false`
+   *  for `unavailable` too, which is why **no caller may read it as "no hardware"**.
+   *  That sentence belongs to `state === "no-hardware"` alone. */
   available: boolean;
-  /** The platform-reported NFC state ("enabled" | "disabled" | "no_hardware"). */
-  state: string;
+  /** The adapter state — see `NfcStateWire`. */
+  state: NfcStateWire;
+  /** Why this side could not read the adapter, when the answer is `unavailable`.
+   *  Absent whenever the platform answered for itself. */
+  detail?: string;
 };
+
+/**
+ * The wire spelling of the Rust `NfcState` enum (`#[serde(rename_all = "kebab-case")]`
+ * in `amos-tauri/src/ble.rs`). Bound to its Rust source by
+ * `__tests__/declaredMirrors.test.ts`, so a renamed variant fails the build rather
+ * than silently falling through to the unknown-state wording.
+ *
+ * `"unavailable"` is **not** a fourth adapter state: the platform knows three
+ * (`enabled` / `disabled` / `no-hardware`), and `unavailable` is the host's own
+ * "we could not ask" — an undeclared `android.permission.NFC` arrives here as a
+ * `SecurityException`, so reading it as `no-hardware` is how the app came to tell
+ * users their phone had no NFC radio (REQ-A775 / F-AND-007).
+ */
+export type NfcStateWire =
+  | "enabled"
+  | "disabled"
+  | "no-hardware"
+  | "unavailable";
 
 /** One record inside an NDEF message. */
 export interface NdefRecord {
@@ -59,7 +84,7 @@ export type NfcWriteResult =
 export const NFC_TAG_EVENT = "nfc-tag-discovered";
 
 /** Whether the platform has NFC hardware and whether it is currently enabled.
- *  `state: "no_hardware"` = no NFC at all; `state: "disabled"` = hardware present
+ *  `state: "no-hardware"` = no NFC at all; `state: "disabled"` = hardware present
  *  but user turned it off; `state: "enabled"` = ready to use. */
 export async function nfcStatus(): Promise<NfcAvailableResult | null> {
   return invoke<NfcAvailableResult>("nfc_status");
@@ -71,40 +96,146 @@ export async function isNfcReady(): Promise<boolean> {
   return s?.state === "enabled";
 }
 
-/** Start NFC foreground dispatch (so the System UI receives tag events).
+/**
+ * Start NFC foreground dispatch (so the System UI receives tag events).
  *  The WebView subscribes to `NFC_TAG_EVENT` to get tag reads.
- *  Call once when the NFC screen mounts; stop when it unmounts via `nfcStopDispatch`. */
-export async function nfcStartDispatch(): Promise<boolean> {
-  return (await invoke<boolean>("nfc_start_dispatch")) ?? false;
+ *  Call once when the NFC screen mounts; stop when it unmounts via `nfcStopDispatch`.
+ *
+ * `null` = the host did not answer (no bridge, or the command was refused). It is its own fact
+ * and must not be folded into `false`: `false` is the platform's own refusal — something the
+ * device decided — while a command the host never carried out decided nothing (REQ-A1337). */
+export async function nfcStartDispatch(): Promise<boolean | null> {
+  return await invoke<boolean>("nfc_start_dispatch");
 }
 
-/** Stop NFC foreground dispatch (releases the NFC adapter). */
-export async function nfcStopDispatch(): Promise<boolean> {
-  return (await invoke<boolean>("nfc_stop_dispatch")) ?? false;
+/** Stop NFC foreground dispatch (releases the NFC adapter).
+ *
+ * `null` = the host did not answer (REQ-A1337). A stop that was never carried out leaves the
+ * adapter exactly as it was, so the caller must not read `null` as "now stopped". */
+export async function nfcStopDispatch(): Promise<boolean | null> {
+  return await invoke<boolean>("nfc_stop_dispatch");
 }
 
 /** Format a raw NFC tag into an NDEF-formatted tag.
- *  Returns `true` on success. After formatting, use `nfcWriteMessage` to write content. */
-export async function nfcFormatTag(): Promise<boolean> {
-  return (await invoke<boolean>("nfc_format_tag")) ?? false;
+ *  Returns `true` on success. After formatting, use `nfcWriteMessage` to write content.
+ *
+ * `null` = the host did not answer (REQ-A1337): `false` is the platform reporting that the
+ * format was attempted and refused, which is a fact about the tag; a command that never ran
+ * establishes nothing about the tag. */
+export async function nfcFormatTag(): Promise<boolean | null> {
+  return await invoke<boolean>("nfc_format_tag");
 }
 
 /** Write an NDEF message to the currently held tag.
  *  `records` are serialised as hex strings by the bridge.
- *  Returns the number of bytes written, or an error. */
+ *  Returns the number of bytes written, or an error.
+ *
+ * `null` = the host did not answer (REQ-A1337). The old `?? { ok: false, error: "not bridged" }`
+ * invented a **cause** — an English string this module made up — and `nfc.writeFailed` renders
+ * `error` verbatim, so a Chinese screen answered 「写入失败：not bridged」 about a write nobody
+ * ever attempted. */
 export async function nfcWriteMessage(
   records: NdefRecord[],
-): Promise<NfcWriteResult> {
-  const r = await invoke<NfcWriteResult>("nfc_write_message", {
-    records,
-  });
-  return r ?? { ok: false, error: "not bridged" };
+): Promise<NfcWriteResult | null> {
+  return await invoke<NfcWriteResult>("nfc_write_message", { records });
 }
 
-/** Read the raw bytes from a specific NFC tag id.
- *  Returns the tag content as hex string pairs, or null when unreadable. */
-export async function nfcReadBytes(tagId: string): Promise<string | null> {
-  return invoke<string | null>("nfc_read_bytes", { tagId });
+/**
+ * What reading a tag came back as — the wire spelling of the Rust `NfcReadState` enum
+ * (`#[serde(rename_all = "kebab-case")]` in `amos-tauri/src/ble.rs`), bound to its Rust and
+ * Kotlin sources by `__tests__/declaredMirrors.test.ts` and by
+ * `scripts/nfc-read-glue-const-scan.mjs`.
+ *
+ * This union exists because the reply used to be `string | null`, and that one `null` was the
+ * answer to four different questions: no tag was in the field, the tag was read fine and holds
+ * no NDEF payload, the read threw, and — the host's own — *we never got to ask*. The screen had
+ * a single branch for it, so all four printed **"读取失败：系统没有返回卡片字节"**, a sentence
+ * about the tag. The tag that was read perfectly well and simply has nothing on it was reported
+ * as a failed read (REQ-A781 / F-AND-009).
+ *
+ * `unavailable` is the fourth state and it is not a tag fact: it is an answer the **host** gave,
+ * in its own words (`detail`), saying the read could not be attempted — no glue bound, a JNI
+ * error, or a host build. Never word it as something the tag did.
+ *
+ * And it is not the same as the wrapper answering `null` (REQ-A1337): `unavailable` is a host
+ * that spoke, `null` is a host that said nothing. The old `?? { state: "unavailable", detail:
+ * "not bridged" }` merged the two and had to invent the `detail` to fill the slot — an English
+ * string, which `nfc.readUnavailable` renders verbatim onto a Chinese screen.
+ */
+export type NfcReadStateWire =
+  | "bytes"
+  | "empty"
+  | "no-tag"
+  | "failed"
+  | "unavailable";
+
+/** What `nfc_read_bytes` answers. */
+export interface NfcReadOutcome {
+  /** What happened. Derive everything else from this. */
+  state: NfcReadStateWire;
+  /** The hex id of the tag the glue **actually read**. `undefined` when nothing was read.
+   *
+   *  The glue can only ever act on the last tag it saw, while this screen addresses a tag the
+   *  user picked out of a list — so this field is the only thing that can stop one tag's bytes
+   *  from being shown under another tag's name. Compare it with {@link nfcReadBelongsTo}. */
+  tag_id?: string;
+  /** The bytes as lowercase hex. Present exactly for `state === "bytes"`, and `""` is a real
+   *  answer (a zero-length payload) — which is what makes `nfc.readEmpty` reachable. */
+  hex?: string;
+  /** Why, when there is a why: the glue's own words for `failed`, the host's own for
+   *  `unavailable`. Absent when the tag answered for itself. */
+  detail?: string;
+}
+
+/**
+ * Read the bytes the glue is holding, for the tag the user selected.
+ *
+ * `tagId` cannot select *what* is read — the Kotlin glue reads `lastTag` and takes no argument —
+ * so the answer carries the id it really read and the caller must compare them.
+ */
+export async function nfcReadBytes(tagId: string): Promise<NfcReadOutcome | null> {
+  return await invoke<NfcReadOutcome>("nfc_read_bytes", { tagId });
+}
+
+/**
+ * Whether the bytes in `out` are the bytes of the tag the caller asked about.
+ *
+ * The one place this comparison lives, so a test can pin it and the screen cannot forget it:
+ * the glue reads whatever tag it last saw, so a read that reports a *different* id is the hex of
+ * another tag, and rendering it inside the selected tag's card would attribute it to the wrong
+ * one. `failed`/`no-tag`/`unavailable` are not "for" any tag — nothing was read.
+ */
+export function nfcReadBelongsTo(out: NfcReadOutcome | null, tagId: string): boolean {
+  return (out?.state === "bytes" || out?.state === "empty") && out.tag_id === tagId;
+}
+
+/**
+ * The sentence the screen shows for a read.
+ *
+ * Every state gets its own wording, and the wording is about the right subject: `empty` says the
+ * tag carries nothing (a *successful* read), `no-tag` says nothing is in the field, `failed`
+ * carries the glue's own error, `unavailable` says this app could not ask, and only
+ * `unavailable` may be worded as our own limitation rather than the tag's answer.
+ *
+ * `nfc.readOtherTag` is the fifth outcome and it is not a state: the read succeeded, but on a
+ * different tag than the caller asked about — so the bytes are shown, labelled as that tag's.
+ */
+export function nfcReadNoticeKey(out: NfcReadOutcome, requestedTagId: string): string {
+  if (!nfcReadBelongsTo(out, requestedTagId) && (out.state === "bytes" || out.state === "empty")) {
+    return "nfc.readOtherTag";
+  }
+  switch (out.state) {
+    case "bytes":
+      return "nfc.readOk";
+    case "empty":
+      return "nfc.readNoPayload";
+    case "no-tag":
+      return "nfc.readNoTag";
+    case "failed":
+      return "nfc.readFailed";
+    default:
+      return "nfc.readUnavailable";
+  }
 }
 
 /* ---- NDEF helpers (pure, testable) ---- */
@@ -232,10 +363,12 @@ export function decodeUriRecord(record: NdefRecord): string | null {
 }
 
 /** Subscribe to NFC tag discovery events.
- *  Each event payload is `NfcTag`. Returns an unsubscribe function. */
+ *  Each event payload is `NfcTag`. Returns an unsubscribe, or `null` when the subscription
+ *  was not established (REQ-A838): a tag reader that is not listening and one that is
+ *  listening in an empty room both produce no tags, and only the `null` tells them apart. */
 export async function subscribeNfcTag(
   onTag: (tag: NfcTag) => void,
-): Promise<() => void> {
+): Promise<(() => void) | null> {
   // `bridged()` is a boolean, so the old `b.listen(...)` threw and the `try/catch` swallowed
   // it: tag events were never delivered at all (REQ-A412). `subscribe()` is the bridge helper
   // that performs the event-plugin handshake (and is a no-op outside Tauri).

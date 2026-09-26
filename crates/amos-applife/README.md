@@ -17,10 +17,12 @@ Part of **[Amos](../../README.md)**. Design record: [`docs/app-lifecycle.md`](..
 - `AppLifecycle` folds transitions into records (`ProcessRecord`) and keeps the **LRU
   order** the reclaim path needs, so "evict the least recently used cached app" is a
   lookup, not a guess.
-- Memory-pressure reclaim ranks candidates by state (`reclaim_rank`) and returns a plan —
-  the caller decides whether to execute it, which keeps the decision testable offline.
-- The crate is **pure**: no clocks, no syscalls, no files. `now` is passed in (the caller
-  owns time), so every rule is reproducible in a unit test.
+- Memory-pressure reclaim ranks candidates by state (`AppState::rank`, most-reclaimable
+  first) and returns a plan — the caller decides whether to execute it, which keeps the
+  decision testable offline.
+- The crate is **pure**: no clocks, no syscalls, no files. Recency is a monotonic counter
+  bumped on every transition (there is no `now` parameter), so every rule is reproducible
+  in a unit test.
 
 It is **not** a supervisor: it never kills a process itself. `crates/amos-supervisor` owns
 process control, and the daemon's LMK path applies what this crate decides.
@@ -44,13 +46,13 @@ cargo fmt -p amos-applife -- --check
 ## Examples
 
 ```bash
-# Walk one app through the real states and reclaim it under memory pressure.
+# Walk one app through the real states and reclaim it under a bounded budget.
 cargo run -p amos-applife --example lifecycle_walk
 ```
 
 | example | shows |
 |---|---|
-| `lifecycle_walk` | launch → visible → background → cached, the LRU order each step produces, and the ranked reclaim plan under `Critical` pressure |
+| `lifecycle_walk` | launch → foreground → background → cached, the LRU order each step produces, and the ranked reclaim plan under a bounded `budget` |
 
 ## Honest boundaries
 
@@ -63,8 +65,8 @@ cargo run -p amos-applife --example lifecycle_walk
 
 ## Related
 
-- [`docs/app-lifecycle.md`](../../docs/app-lifecycle.md) — the state table, thresholds and
-  the LMK-proxy contract.
+- [`docs/app-lifecycle.md`](../../docs/app-lifecycle.md) — the state table, the reclaim
+  order and the LMK-proxy contract.
 - [`crates/amos-android`](../amos-android/README.md) — the container side (`lmk.rs`,
   `activity_observer.rs`) that feeds activity state in.
 - [`crates/amos-monitor`](../amos-monitor/README.md) — folds these process counts into one

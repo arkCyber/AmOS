@@ -25,6 +25,22 @@ async fn connect(
     Ok(AiAgentClient::new(channel))
 }
 
+/// Pin the deterministic mock engine for the whole test binary.
+///
+/// These tests exercise the RPC surface, not a model. With no GGUF staged the
+/// daemon's unset default is now an honest `unconfigured` engine (Gap 4) that
+/// streams nothing, so the mock must be requested **explicitly** (the daemon's own
+/// `AMOS_BACKEND=mock` dev path). `Once` makes the process-global env write
+/// race-free: every caller blocks until the first one has set it.
+fn use_mock_backend() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        std::env::set_var("AMOS_BACKEND", "mock");
+        std::env::set_var("AMOS_ASR_BACKEND", "mock");
+    });
+}
+
 async fn wait_for_socket(path: &std::path::Path) {
     for _ in 0..50 {
         if path.exists() {
@@ -40,6 +56,7 @@ async fn stream_chat_delivers_tokens_then_done() {
     let _ = std::fs::remove_file(&path);
 
     // Spawn the server on a background task.
+    use_mock_backend();
     let server_path = path.clone();
     let server = tokio::spawn(async move {
         amos_ai::server::serve(server_path).await.unwrap();
@@ -94,6 +111,7 @@ async fn stream_chat_semantic_intent_returns_ui_card() {
     let path: PathBuf = std::env::temp_dir().join(format!("amos-card-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&path);
 
+    use_mock_backend();
     let server_path = path.clone();
     let server = tokio::spawn(async move {
         amos_ai::server::serve(server_path).await.unwrap();
@@ -145,6 +163,7 @@ async fn get_status_exposes_live_monitoring_metrics() {
         std::env::temp_dir().join(format!("amos-test-{}-metrics.sock", std::process::id()));
     let _ = std::fs::remove_file(&path);
 
+    use_mock_backend();
     let server_path = path.clone();
     let server = tokio::spawn(async move {
         amos_ai::server::serve(server_path).await.unwrap();
@@ -218,6 +237,7 @@ async fn sensor_service_mounted_and_profile_exposed() {
         std::env::temp_dir().join(format!("amos-profile-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&path);
 
+    use_mock_backend();
     let server_path = path.clone();
     let server = tokio::spawn(async move {
         amos_ai::server::serve(server_path).await.unwrap();
@@ -319,6 +339,7 @@ async fn get_status_reports_a_live_log_sink_over_uds() {
     let path: PathBuf =
         std::env::temp_dir().join(format!("amos-logsink-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&path);
+    use_mock_backend();
     let server_path = path.clone();
     let server = tokio::spawn(async move {
         let _ = amos_ai::server::serve_with_log_sink(server_path, Some(handle)).await;

@@ -59,9 +59,39 @@ message EndRequest {
   CallIdMsg call = 1;
 }
 
+// Set the call's mute flag. `muted` is the desired state, not a toggle, so a
+// retried or deduplicated request can never flip a call the user did not touch.
+message MuteRequest {
+  CallIdMsg call = 1;
+  bool muted = 2;
+}
+
 message StatusRequest {}
 
 message WatchRequest {}
+
+// Which provider actually backs the daemon's telephony service.
+//
+// The UI asks this so it never draws a *simulated* call as a real one. The
+// load-bearing case is MOCK: `Dial` then does NOT reach the platform telephony
+// stack, so a caller that needs a real call (above all an emergency number) must
+// take a path that can actually place one instead of accepting the mock's
+// fabricated success.
+enum BackendKind {
+  BACKEND_UNSPECIFIED = 0;
+  // In-process simulation: no SIM, no Telecom, no network. Dev/demo only.
+  BACKEND_MOCK = 1;
+  // Real platform telephony over the Android stack.
+  BACKEND_ANDROID = 2;
+  // No provider wired: `Dial` is refused honestly rather than simulated.
+  BACKEND_UNCONFIGURED = 3;
+}
+
+message BackendStatus {
+  BackendKind kind = 1;
+  // The backend's own words: why it is a mock, or why nothing is wired.
+  string detail = 2;
+}
 
 message CallSnapshot {
   CallIdMsg call = 1;
@@ -71,6 +101,9 @@ message CallSnapshot {
   EndReason end_reason = 5;
   bool emergency = 6;
   RecordingState recording = 7;
+  // Whether this call's outbound audio is muted. Always false once the call has
+  // ENDED (mute cannot outlive the call it applies to, like `recording`).
+  bool muted = 8;
 }
 
 message CallList {
@@ -87,14 +120,20 @@ message CallStateEvent {
 // signalling events the UI (and AI assistant) need to react to (incoming call,
 // connected, remote hangup). StartRecording/StopRecording toggle call recording
 // (only legal while a call is ACTIVE + non-emergency) and return the authoritative
-// snapshot so the UI can reflect the recording state without a round-trip.
+// snapshot so the UI can reflect the recording state without a round-trip. SetMuted
+// carries the call's mute flag the same way (legal on any live call, emergency
+// included — muting your own mic on a 110 call is the caller's decision, unlike
+// recording it, which is a hard legal rule).
 service Telephony {
   rpc Dial(DialRequest) returns (CallIdMsg);
   rpc Answer(AnswerRequest) returns (CallIdMsg);
   rpc End(EndRequest) returns (CallIdMsg);
   rpc StartRecording(CallIdMsg) returns (CallSnapshot);
   rpc StopRecording(CallIdMsg) returns (CallSnapshot);
+  rpc SetMuted(MuteRequest) returns (CallSnapshot);
   rpc SimulateIncoming(SimulateIncomingRequest) returns (CallIdMsg);
   rpc Status(StatusRequest) returns (CallList);
+  // Honest backend identity: whether `Dial` reaches the platform or simulates it.
+  rpc GetBackend(StatusRequest) returns (BackendStatus);
   rpc Watch(WatchRequest) returns (stream CallStateEvent);
 }

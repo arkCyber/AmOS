@@ -269,6 +269,38 @@ export function isCryptoAvailable(): boolean {
 }
 
 /**
+ * 这段存储字节**是不是一个加密信封**（而不是旧版本的明文配置）。
+ *
+ * 为什么这个判断本身是承重的：`MDMManager.loadConfig()` 在解密失败时要决定"回退到
+ * 明文解析"还是"硬失败"。一个信封（`{version, ciphertext, iv, timestamp}`）**本身就是
+ * 合法 JSON** —— 所以 `JSON.parse(raw)` 一定成功，回退会收下一份全是 `ciphertext`/`iv`
+ * 的垃圾配置（没有 `enabled` ⇒ `isEnabled()` 恒假 ⇒ MDM 静默停用），而紧随其后的
+ * "自动迁移"还会把它**加密覆盖回原密文**，把 apiKey / 组织 / 策略永久抹掉。能区分
+ * 这两种字节，才谈得上"解密失败时保留原密文"。
+ *
+ * 判据只看**信封的三个必需字段的形状**（不校验值）：`version` 是有限数字、`ciphertext`
+ * 与 `iv` 是字符串。刻意不要求 `version === ENCRYPTION_VERSION` —— 一个**未来版本**的
+ * 信封同样不能被当成明文吃掉，它必须落到同一条硬失败路径上，而不是被静默降级。
+ * `MDMConfig` 自身没有 `ciphertext`/`iv` 字段，所以明文配置不会误判成信封。
+ */
+export function isEncryptedEnvelope(raw: string): boolean {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return false;
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+  const o = parsed as Record<string, unknown>;
+  return (
+    typeof o["version"] === "number" &&
+    Number.isFinite(o["version"]) &&
+    typeof o["ciphertext"] === "string" &&
+    typeof o["iv"] === "string"
+  );
+}
+
+/**
  * 获取加密模块信息（用于调试和审计）
  */
 export function getCryptoInfo() {

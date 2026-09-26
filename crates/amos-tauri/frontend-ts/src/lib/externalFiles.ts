@@ -99,9 +99,26 @@ export function filterExternalByName(files: ExternalFile[], query: string): Exte
   return files.filter((f) => f.name.toLowerCase().includes(q));
 }
 
-/** Total bytes of the visible files (0 when all sizes are unknown). */
-export function totalExternalBytes(files: ExternalFile[]): number {
-  return files.reduce((sum, f) => sum + (f.sizeBytes ?? 0), 0);
+/**
+ * Total bytes of the visible files, or `null` when it cannot be measured.
+ *
+ * `sizeBytes` is `number | null` at the wire (`MediaItem.size_bytes`): `null` means
+ * the platform did not report that file's size. Summing the known ones and calling
+ * the result "the total" states a byte count the code never measured — and the
+ * Files screen prints 「—」 for that same file, one row below the header that would
+ * carry the fabricated number. So one unmeasured size withholds the total; `0` is
+ * returned only when every file really reads 0 (or the list is empty).
+ */
+export function totalExternalBytes(files: ExternalFile[]): number | null {
+  let sum = 0;
+  for (const f of files) {
+    // A negative size is not a measurement either — no screen may total it.
+    if (typeof f.sizeBytes !== "number" || !Number.isFinite(f.sizeBytes) || f.sizeBytes < 0) {
+      return null;
+    }
+    sum += f.sizeBytes;
+  }
+  return sum;
 }
 
 /** A group of external files under one standard collection. */
@@ -158,7 +175,8 @@ export function recentExternalFiles(files: ExternalFile[], max: number): Externa
 export interface ExternalFileGroupView {
   groups: ExternalCollection[];
   fileCount: number;
-  totalBytes: number;
+  /** `null` when any visible file's size was not reported — see [`totalExternalBytes`]. */
+  totalBytes: number | null;
 }
 
 /**

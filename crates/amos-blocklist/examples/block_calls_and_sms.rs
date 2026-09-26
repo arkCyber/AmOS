@@ -80,7 +80,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // The list is data: whatever the UI writes is what Android's filter reads.
     let json = list.to_json();
-    let reloaded = Blocklist::from_json(&json, amos_blocklist::DEFAULT_CAP)?;
+    let reloaded = Blocklist::from_json(&json, amos_blocklist::DEFAULT_CAP)?.list;
     println!(
         "JSON round trip: {} rule(s) before, {} after (identical={})",
         list.len(),

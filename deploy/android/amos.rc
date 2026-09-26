@@ -36,6 +36,10 @@ on property:sys.boot_completed=1
 #     `asr-sherpa` feature and the sherpa model files present under
 #     AMOS_SHERPA_MODEL_DIR (push them with scripts/build-android.sh). If either
 #     is missing the daemon reports the honest "voice not configured" state.
+#   * AMOS_NETGUARD_STATE_PATH → the egress network-guard's durable state (armed
+#     intent + every app's declared egress), under the same /data/amos this rc
+#     creates for "socket + any shared state". Without it the guard is pure
+#     in-memory, so a reboot silently forgets what each app declared. (REQ-A744)
 service amos-ai /system/bin/amos-ai --socket /data/amos/ai.sock
     class main
     user root
@@ -46,6 +50,7 @@ service amos-ai /system/bin/amos-ai --socket /data/amos/ai.sock
     setenv AMOS_OLLAMA_HOST http://localhost:11434
     setenv AMOS_ASR_BACKEND sherpa
     setenv AMOS_SHERPA_MODEL_DIR /data/amos/sherpa
+    setenv AMOS_NETGUARD_STATE_PATH /data/amos/netguard.json
     oom_score_adj -1000
 
 # Optional: restart policy — init restarts crashed services automatically for

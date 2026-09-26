@@ -6,7 +6,9 @@
  */
 
 import { describe, test as it, expect, beforeEach, afterEach } from "bun:test";
-import { auditLogger } from "../enterprise/audit";
+import { auditLogger, AuditLogger, type AuditLog } from "../enterprise/audit";
+import { UNATTRIBUTED_USER_ID, UNATTRIBUTED_USER_NAME } from "../buildIdentity";
+import { AMOS_UI_VERSION } from "../version";
 
 // Note: No mocking needed - audit logger works with real storage in test environment
 
@@ -94,10 +96,28 @@ describe("企业审计日志系统", () => {
 
       expect(log.metadata).toBeDefined();
       expect(log.metadata.platform).toBeTruthy();
-      expect(log.metadata.appVersion).toBeTruthy();
+      // 版本是**真实构建常量**（REQ-A695），不是 `audit.ts` 里那份会腐烂的第二份 `"0.1.0"`。
+      expect(log.metadata.appVersion).toBe(AMOS_UI_VERSION);
       expect(log.metadata.tags).toBeDefined();
       expect(log.metadata.tags).toEqual(expect.arrayContaining(["update", "management"]));
       expect(log.metadata.custom).toEqual({ version: "2.0" });
+    });
+
+    it("条目上的操作主体在缺席时如实标记 unattributed（不冒充真人，REQ-A695）", async () => {
+      await auditLogger.log({
+        eventType: "setting_change",
+        eventCategory: "system",
+        eventDescription: "切换一个设置",
+        result: "success",
+      });
+      await auditLogger.flushBuffer();
+
+      const log = auditLogger.query({}).find((l) => l.eventDescription === "切换一个设置")!;
+      expect(log.userId).toBe(UNATTRIBUTED_USER_ID);
+      expect(log.userName).toBe(UNATTRIBUTED_USER_NAME);
+      expect(log.userEmail).toBeUndefined();
+      // 旧实现会把这里写成会被读成真实账号的 "user-default" / "Default User"。
+      expect(log.userName).not.toBe("Default User");
     });
   });
 
@@ -468,24 +488,53 @@ describe("企业审计日志系统", () => {
       expect(logs.length).toBeGreaterThanOrEqual(3);
     });
 
-    it("应该支持手动刷新缓冲区", async () => {
+    /**
+     * REQ-A897。这条是**唯一**能钉住本轮缺陷的断言：写一条日志，然后**不刷新**就查。
+     *
+     * 从前这条会失败（`query()` 只读 `this.logs`，而刚写的行在 `buffer` 里），而
+     * 生产里把行搬过去的只有「缓冲满 1000 条」和「`initialize()` 起的刷新定时器」
+     * 两条路 —— 后者从没启动过（`initializeEnterprise()` 零调用者），所以挂载着的
+     * 审计查看器在设备上一行都看不到。旧测试写的是「刷新前 count、刷新后
+     * count 变大」，也就是**它自己补上了生产从不做的那一步**，所以一直是绿的。
+     */
+    it("写下来的一条日志，不刷新也能被读到", async () => {
       await auditLogger.log({
         eventType: "shortcut_create",
         eventCategory: "management",
-        eventDescription: "测试日志",
+        eventDescription: "不刷新就该看得见",
         result: "success",
       });
 
-      // 刷新前日志数
-      let logs = auditLogger.query({});
-      const countBefore = logs.length;
+      const logs = auditLogger.query({});
+      expect(logs.map((l) => l.eventDescription)).toContain("不刷新就该看得见");
+      // 统计读的是同一份并集，否则列表和数字会互相打架。
+      expect(auditLogger.getStatistics().totalLogs).toBe(logs.length);
+    });
 
-      // 手动刷新
+    /**
+     * 上面那条的对照：`flushBuffer()` 仍然要把行从缓冲**移动**进主数组（落盘 + 进同步
+     * 队列），并且**不重复计数** —— 少了这一条，「并集」写成「复制」也能通过上面那条。
+     */
+    it("刷新把行搬进主数组，且不重复计数", async () => {
+      await auditLogger.log({
+        eventType: "shortcut_create",
+        eventCategory: "management",
+        eventDescription: "搬一次",
+        result: "success",
+      });
+      const before = auditLogger.query({});
+
+      // 缓冲区是私有字段：这里要看的是**移动**（而不是拷贝），所以直接读它 ——
+      // 公开面只能看到「并集里还是那一条」，两种实现都会通过。
+      const priv = auditLogger as unknown as { buffer: AuditLog[] };
+      expect(priv.buffer).toHaveLength(1);
+
       await auditLogger.flushBuffer();
 
-      // 刷新后日志数应增加
-      logs = auditLogger.query({});
-      expect(logs.length).toBeGreaterThan(countBefore);
+      expect(priv.buffer).toHaveLength(0);
+      const after = auditLogger.query({});
+      expect(after).toHaveLength(before.length);
+      expect(new Set(after.map((l) => l.id)).size).toBe(after.length);
     });
   });
 
@@ -570,5 +619,84 @@ describe("企业审计日志系统", () => {
       const uniqueIds = new Set(logIds);
       expect(uniqueIds.size).toBe(10);
     });
+  });
+});
+
+/**
+ * REQ-A897 —— 流水线**自己站起来**，因为它唯一的启动器在生产里没人调。
+ *
+ * 这一组用的是**全新实例**（不走共享 `beforeEach` 的 `initialize()`），因为要问的
+ * 正是「没有任何人调 `initialize()` 时会怎样」。观测点是 `globalThis.setInterval`：
+ * 它同时是「起没起来」和「起了一次还是两次」的判据 —— 从前重复 `initialize()` 会把
+ * 旧句柄覆盖掉，那只定时器再也没人能停（REQ-A385 的形状）。
+ */
+describe("审计流水线的自启动（REQ-A897）", () => {
+  const withIntervalSpy = async (body: () => Promise<void>) => {
+    const real = globalThis.setInterval;
+    const started: number[] = [];
+    globalThis.setInterval = ((fn: TimerHandler, ms?: number) => {
+      started.push(ms ?? 0);
+      return real(fn as never, ms as never);
+    }) as unknown as typeof globalThis.setInterval;
+    try {
+      await body();
+      return started;
+    } finally {
+      globalThis.setInterval = real;
+    }
+  };
+
+  /**
+   * 只数**刷新**那一只（`DEFAULT_CONFIG.flushInterval` = 30s）。
+   *
+   * `setInterval` 在一个观察窗口里被叫两次是**有正当理由的**：`config.syncEnabled` 且
+   * `mdmManager.isEnabled()` 时还会起一只同步定时器（`syncInterval` = 300s），而
+   * `mdmManager` 是**模块级单例** —— 在一个进程里跑整个纯批次时，别的测试文件把它 enable
+   * 过，于是这条测试的窗口里就多出一只不属于本文件的定时器。实测（`bun run test` 的纯批次里
+   * 收到 2 只；确定性复现：`bun test --preload <打开 MDM 的脚本> <本文件>` ⇒ `Received
+   * length: 2`，筛掉之后 1），不筛就断言「恰好一只」，读的其实是**别人的全局状态**，
+   * 这正是本仓库那类「单跑绿、批次红」的假断言。筛掉延时不是 30_000 的调用之后，断言的
+   * 才是本文件自己的性质：刷新定时器恰好一只、且不被叠起来。
+   */
+  const FLUSH_MS = 30_000; // DEFAULT_CONFIG.flushInterval(30s) * 1000
+  const flushTimers = (ms: number[]) => ms.filter((m) => m === FLUSH_MS);
+
+  it("没被 initialize 过的实例，第一条 log() 就把刷新定时器起起来（且只有一只）", async () => {
+    const fresh = new AuditLogger();
+    // 观察窗口里**只有** `log()` 这一句：`shutdown()` 自己也会写一条
+    // `system_stop` → `log()` → 自启动，把它圈进来就会让这条断言失去意义
+    // （实测：把 `log()` 里的 `ensureInitialized()` 删掉，它照样绿）。
+    const started = flushTimers(
+      await withIntervalSpy(async () => {
+        await fresh.log({
+          eventType: "shortcut_create",
+          eventCategory: "management",
+          eventDescription: "自启动",
+          result: "success",
+        });
+      }),
+    );
+    // 0 = 从没起来（本轮修的就是这个）；2 = 叠了两只；1 = 恰好一只。
+    expect(started).toHaveLength(1);
+    await fresh.shutdown();
+  });
+
+  it("只读的一条路也会把它起起来 —— 查看器先于任何 log() 打开时同样看得见", async () => {
+    const fresh = new AuditLogger();
+    // 同上：窗口里只有 `query()`（`getStatistics()` 走的是同一条路，一并断言）。
+    const afterQuery = flushTimers(
+      await withIntervalSpy(async () => {
+        fresh.query({});
+      }),
+    ).length;
+    const started2 = flushTimers(
+      await withIntervalSpy(async () => {
+        fresh.getStatistics();
+      }),
+    );
+    expect(afterQuery).toBe(1);
+    // 幂等：已经在跑就不再起第二只。
+    expect(started2).toHaveLength(0);
+    await fresh.shutdown();
   });
 });

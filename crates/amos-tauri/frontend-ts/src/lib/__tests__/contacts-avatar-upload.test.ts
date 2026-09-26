@@ -12,8 +12,10 @@
  * Unit tests here focus on data structure and contact list manipulation.
  */
 
-import { describe, it, expect } from "bun:test";
+import { describe, it, expect, test } from "bun:test";
 import {
+  compressImage,
+  processAvatarUpload,
   setContactAvatar,
   getContactAvatarSrc,
   hasCustomAvatar,
@@ -58,9 +60,192 @@ describe("CustomAvatar data structure", () => {
   });
 });
 
-// Note: compressImage and processAvatarUpload tests are skipped in unit tests
-// because they require Canvas API which is not available in Node.js test environment.
-// These functions are tested through integration tests in a browser environment.
+// The old note here said the image pipeline "require[s] Canvas API which is not
+// available in Node.js test environment" and left it to a browser integration pass
+// that never existed (audit PH-P2-13). The functions reach for exactly four globals
+// — `Image`, `document.createElement("canvas")`, a 2D context, and `FileReader` —
+// so a recording fake covers the geometry headlessly. What this still cannot prove
+// is that a browser rasterises the result; what it *can* prove is the size contract.
+
+interface DrawCall {
+  sx: number;
+  sy: number;
+  sw: number;
+  sh: number;
+  dx: number;
+  dy: number;
+  dw: number;
+  dh: number;
+}
+
+interface CanvasEnv {
+  draws: DrawCall[];
+  restore: () => void;
+}
+
+/** Install fake `Image`/`document`/`FileReader` globals; call `restore()` when done. */
+function installCanvasEnv(sourceW: number, sourceH: number, ctxAvailable = true): CanvasEnv {
+  const draws: DrawCall[] = [];
+  const g = globalThis as unknown as Record<string, unknown>;
+  const saved = { Image: g.Image, document: g.document, FileReader: g.FileReader };
+
+  class FakeImage {
+    width = sourceW;
+    height = sourceH;
+    onload: (() => void) | null = null;
+    onerror: (() => void) | null = null;
+    set src(_v: string) {
+      queueMicrotask(() => this.onload?.());
+    }
+  }
+
+  const documentStub = {
+    createElement(_tag: string) {
+      const canvas: {
+        width: number;
+        height: number;
+        getContext: (_id: string) => unknown;
+        toDataURL: () => string;
+      } = {
+        width: 0,
+        height: 0,
+        getContext: (_id: string) =>
+          ctxAvailable
+            ? {
+                drawImage: (
+                  _img: unknown,
+                  sx: number,
+                  sy: number,
+                  sw: number,
+                  sh: number,
+                  dx: number,
+                  dy: number,
+                  dw: number,
+                  dh: number,
+                ) => {
+                  draws.push({ sx, sy, sw, sh, dx, dy, dw, dh });
+                },
+              }
+            : null,
+        // Encode the canvas size so a test can read back what was emitted.
+        toDataURL: () => `data:image/jpeg;base64,W${canvas.width}H${canvas.height}`,
+      };
+      return canvas;
+    },
+  };
+
+  class FakeFileReader {
+    onload: ((e: { target: { result: string } }) => void) | null = null;
+    onerror: (() => void) | null = null;
+    result: string | null = null;
+    readAsDataURL(_blob: unknown) {
+      queueMicrotask(() => this.onload?.({ target: { result: "data:image/png;base64,SRC" } }));
+    }
+  }
+
+  g.Image = FakeImage;
+  g.document = documentStub;
+  g.FileReader = FakeFileReader;
+
+  return {
+    draws,
+    restore: () => {
+      g.Image = saved.Image;
+      g.document = saved.document;
+      g.FileReader = saved.FileReader;
+    },
+  };
+}
+
+describe("compressImage geometry", () => {
+  test("never upscales a source smaller than maxWidth", async () => {
+    const env = installCanvasEnv(64, 64);
+    try {
+      const out = await compressImage("data:image/png;base64,SRC", 512, 0.9);
+      // A 64px source must stay 64px: `maxWidth` is an upper bound, not a target size.
+      expect(env.draws[0]!.dw).toBeLessThanOrEqual(64);
+      expect(env.draws[0]!.dh).toBeLessThanOrEqual(64);
+      expect(out).toContain("W64H64");
+    } finally {
+      env.restore();
+    }
+  });
+
+  test("downscales a large source to exactly maxWidth (positive control)", async () => {
+    const env = installCanvasEnv(1024, 768);
+    try {
+      const out = await compressImage("data:image/png;base64,SRC", 512, 0.9);
+      expect(env.draws[0]!.dw).toBe(512);
+      expect(env.draws[0]!.dh).toBe(512);
+      expect(out).toContain("W512H512");
+    } finally {
+      env.restore();
+    }
+  });
+
+  test("center-crops the shorter edge, never stretching", async () => {
+    const env = installCanvasEnv(400, 300);
+    try {
+      await compressImage("data:image/png;base64,SRC", 128, 0.8);
+      const d = env.draws[0]!;
+      expect([d.sw, d.sh]).toEqual([300, 300]);
+      expect([d.sx, d.sy]).toEqual([50, 0]);
+      expect([d.dw, d.dh]).toEqual([128, 128]);
+    } finally {
+      env.restore();
+    }
+  });
+
+  test("rejects when no 2D context is available", async () => {
+    const env = installCanvasEnv(100, 100, false);
+    try {
+      await expect(compressImage("data:image/png;base64,SRC", 128, 0.8)).rejects.toThrow(
+        "Canvas context not available",
+      );
+    } finally {
+      env.restore();
+    }
+  });
+});
+
+describe("processAvatarUpload", () => {
+  test("refuses a non-image file", async () => {
+    await expect(
+      processAvatarUpload(new File(["x"], "a.txt", { type: "text/plain" })),
+    ).rejects.toThrow("File must be an image");
+  });
+
+  test("refuses a file over 10MB", async () => {
+    const big = { type: "image/png", size: 11 * 1024 * 1024 } as unknown as File;
+    await expect(processAvatarUpload(big)).rejects.toThrow("Image too large (max 10MB)");
+  });
+
+  test("keeps a small source small in both sizes", async () => {
+    const env = installCanvasEnv(96, 96);
+    try {
+      const avatar = await processAvatarUpload(new File(["x"], "a.png", { type: "image/png" }));
+      expect(avatar.type).toBe("base64");
+      // Neither the 128px thumbnail nor the 512px full size may grow a 96px source.
+      expect(env.draws.map((d) => d.dw)).toEqual([96, 96]);
+      expect(avatar.thumbnail).toContain("W96H96");
+      expect(avatar.data).toContain("W96H96");
+    } finally {
+      env.restore();
+    }
+  });
+
+  test("produces the two documented sizes for a large source", async () => {
+    const env = installCanvasEnv(1024, 1024);
+    try {
+      const avatar = await processAvatarUpload(new File(["x"], "a.png", { type: "image/png" }));
+      expect(env.draws.map((d) => d.dw)).toEqual([128, 512]);
+      expect(avatar.thumbnail).toContain("W128H128");
+      expect(avatar.data).toContain("W512H512");
+    } finally {
+      env.restore();
+    }
+  });
+});
 
 describe("setContactAvatar", () => {
   const makeContact = (id: string, name: string): Contact => ({

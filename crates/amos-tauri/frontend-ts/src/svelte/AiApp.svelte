@@ -6,6 +6,7 @@
   // localized banner; live chat/voice need a real amos-ai daemon + mic.
   import {
     bridged,
+    bridgeDiag,
     subscribe,
     getAiStatus,
     sendChat,
@@ -23,14 +24,17 @@
     type HistoryTurn,
   } from "../lib/backend";
   import { tokenOf, cardOf, sessionMetaOf, type AiCard } from "../lib/stream";
+  import { callActionDetailText } from "../lib/phone";
   import { AI_TARGET_WINDOW } from "./appLinks";
   import { capTail } from "../lib/bounded";
+  import { copyTextToClipboard } from "../lib/clipboard";
   import { parseVoiceEvent } from "../lib/voice";
   import { readStoreValue, writeStoreValue } from "../lib/amosStore";
   import { localId } from "../lib/localId";
   import { NOTES_KEY, normalizeNotes } from "../lib/notes";
   import { buildCitedSnippet, buildRagPrompt, NOTES_RAG_INDEXED_KEY } from "../lib/notesRag";
   import { askNotes, liveRagClient, syncNotesIndex } from "../lib/notesRagRun";
+  import { ragQueryRefusedForForeground } from "../lib/rag";
   import VoiceMicButton from "./VoiceMicButton.svelte";
   import StreamVoiceButton from "./StreamVoiceButton.svelte";
   import DeviceMicButton from "./DeviceMicButton.svelte";
@@ -59,9 +63,20 @@
   let copiedReply = $state(false);
   let confirmClear = $state(false);
   let sessions = $state<AiSessionInfo[] | null>(null);
+  // The session list read was refused, so `sessions`'s `null` is 「我没问到」 and not a verdict
+  // (REQ-A1536 / F-SH-778). A separate flag because `null` is also the value before the first read
+  // lands — that is 「还没问」, and the lazy load re-reads on the next open, so the sentence must
+  // not appear for it. Same shape as the sibling write-refusal slot `sessErr` below.
+  let sessionsUnanswered = $state(false);
+  // A refused/unanswered session delete gets its own slot, next to the list it is about — not
+  // `meta`, which carries the send/stop refusals and would let one gesture blank the other's
+  // reading (the two-slot rule the same screen already applies to its copy errors).
+  let sessErr = $state("");
   let sessOpen = $state(false);
   let showHist = $state<string | null>(null);
-  let histories = $state<Record<string, HistoryTurn[] | "loading">>({});
+  // `"unanswered"` is a third state next to the turns list: the history read was refused, so
+  // drawing an empty list would be a claim the RPC never established (REQ-A1536 / F-SH-778).
+  let histories = $state<Record<string, HistoryTurn[] | "loading" | "unanswered">>({});
   let busy = $state(false);
   let msgs = $state<AiMsg[]>([]);
 
@@ -87,8 +102,24 @@
     const e = await systemPeekContext(AI_TARGET_WINDOW);
     ctxEntry = e ?? null;
   };
+  // A refused detach must not read as done. `system_clear_context` fails on the host
+  // (`wm.rs`: a bad target label) and `invoke` folds that into `null` — the same value
+  // its `void` success has — so `ctxEntry = null` on a refusal hid the hint while the
+  // host still held the context and `chat_agent` merged it into the next request: the
+  // user removed a context that the AI kept receiving. The verdict comes from the
+  // diagnosis slot (REQ-A296), never from the return value.
+  let ctxError = $state<string | null>(null);
   const dropContext = async () => {
+    ctxError = null;
     await systemClearContext(AI_TARGET_WINDOW);
+    const diag = bridgeDiag("system_clear_context");
+    if (!diag.ok) {
+      const words = diag.kind === "not-bridged" ? "" : callActionDetailText(diag.detail);
+      ctxError = t("ai.contextClearFailed", {
+        detail: words === "" ? t("ai.contextNoReason") : words,
+      });
+      return; // the entry is still attached — keep it on screen and keep it detachable
+    }
     ctxEntry = null;
   };
   $effect(() => {
@@ -121,13 +152,45 @@
       CHAT_MSG_CAP,
     );
   };
+  /**
+   * Why the bridge refused a command, in one word: the typed `code` off a
+   * `command-failed` entry, else the entry's own `kind`. `""` when the ledger's last
+   * word on the command is "fine" — the same read `DesktopShell.windowMenuAction`
+   * makes (REQ-A297), so we never invent a reason we did not observe.
+   *
+   * The AI commands that need this (`chat_agent`, `cancel_ai_session`) are both
+   * `Result<(), AmosError>`: the host's `Ok(())` reaches the bridge as the very same
+   * `null` a refusal does, so their payload cannot separate the two and only the
+   * ledger can.
+   */
+  const refusalDetail = (command: string): string => {
+    const d = bridgeDiag(command);
+    if (d.ok) return "";
+    return d.kind === "command-failed" && d.detail && typeof d.detail === "object"
+      ? ((d.detail as { code?: string }).code ?? d.kind)
+      : d.kind;
+  };
+
   // Session panel open/close + lazy load.
   const toggleSessions = async () => {
     const open = !sessOpen;
     sessOpen = open;
     if (open && sessions === null) {
-      const res = await listSessions();
-      if (Array.isArray(res)) sessions = res;
+      // No host at all is not a refusal: the screen already names the cause
+      // (`backend.inBrowser`), so the browser shell keeps its plain empty state. Only a host
+      // that *was asked* and did not answer is 「我没问到」(REQ-A1536 / F-SH-778).
+      if (!bridged()) return;
+      const answer = await listSessions();
+      if (Array.isArray(answer)) {
+        sessions = answer;
+        sessionsUnanswered = false;
+      } else {
+        // `listSessions` answers `null` for "no bridge" and for an RPC that never reached the
+        // daemon, so nothing about the session list was established — say so rather than drawing
+        // 「暂无 daemon 会话」, a claim about the daemon only a *landed* read can make
+        // (REQ-A1536 / F-SH-778).
+        sessionsUnanswered = true;
+      }
     }
   };
   const toggleHist = async (id: string) => {
@@ -138,9 +201,17 @@
     showHist = id;
     if (histories[id] === undefined) {
       histories = { ...histories, [id]: "loading" as const };
-      const res = await getSessionHistory(id);
-      const turns = res && Array.isArray(res.turns) ? res.turns : [];
-      histories = { ...histories, [id]: turns };
+      if (!bridged()) {
+        histories = { ...histories, [id]: [] };
+        return;
+      }
+      const answer = await getSessionHistory(id);
+      // A refused read (or an answer with no turn list) is not an empty history — the same
+      // 「我没问到」 vs 「答了：空的」 distinction as the list above (REQ-A1536 / F-SH-778).
+      histories = {
+        ...histories,
+        [id]: answer && Array.isArray(answer.turns) ? answer.turns : "unanswered",
+      };
     }
   };
 
@@ -151,7 +222,12 @@
     subscribed = true;
     if (!online) return;
     let alive = true;
-    const unsubs: (() => void)[] = [];
+    // REQ-A838: `subscribe` answers `null` when the listen was refused, and the teardown below
+    // must tolerate that — it is the same "nothing to release" case, not an error. Keeping the
+    // `null`s in the list (rather than filtering them out) means the teardown stays a faithful
+    // one-line release of whatever was acquired. Which of the five channels actually opened is
+    // the ledger's answer (`bridgeDiag("ai-token-received")` etc.), not this array's length.
+    const unsubs: ((() => void) | null)[] = [];
     void getAiStatus().then((s) => {
       if (!alive) return;
       if (s?.model) {
@@ -207,7 +283,7 @@
     })();
     return () => {
       alive = false;
-      unsubs.forEach((f) => f());
+      unsubs.forEach((f) => f?.());
     };
   });
 
@@ -252,7 +328,10 @@
         writeStoreValue(NOTES_RAG_INDEXED_KEY, res.indexed);
         const qr = await askNotes(liveRagClient, v);
         if (qr === null) {
-          citeMsg = t("ai.citeOffline");
+          // Two different `null`s: the index refused *this window* (F-AI-019) versus the index
+          // being unreachable. The refusal is a fact about focus, so the honest sentence names
+          // focus — and the turn still goes out, just without note context.
+          citeMsg = ragQueryRefusedForForeground() ? t("ai.citeRefused") : t("ai.citeOffline");
         } else if (qr.hits.length > 0) {
           prompt = buildRagPrompt(v, buildCitedSnippet(qr.hits));
           citeMsg = t("ai.citeUsed", { n: String(qr.hits.length) });
@@ -265,27 +344,34 @@
     }
     // A stop during retrieval cancels the turn before it reaches the daemon.
     if (aborted) return;
-    const r = await sendChat(prompt, conversationId());
+    await sendChat(prompt, conversationId());
     // The daemon consumed the attached system context while merging it into this
     // request, so re-peek and stop claiming it is still attached.
     void refreshContext();
-    // If the command failed to reach the daemon (r == null) no `ai-chat-complete`
-    // event will ever fire — clear busy so the UI never sticks on "⏹ 停止".
-    if (r == null && !aborted) {
+    // A send the daemon never received emits no `ai-chat-complete`, so the turn must
+    // be ended here or the UI sticks on "⏹ 停止". The payload cannot say whether it
+    // was received (`chat_agent` returns `Result<(), AmosError>`, so `Ok(())` and a
+    // refusal are both `null`), so ask the ledger (REQ-A297) instead.
+    if (!bridgeDiag("chat_agent").ok && !aborted) {
       curId = null;
       busy = false;
-      meta = t("backend.offline");
+      meta = t("ai.sendRefused", { code: refusalDetail("chat_agent") });
     }
   }
 
   const stop = () => {
     if (!busy) return;
     aborted = true;
-    void cancelAiSession().then((res) => {
-      if (res == null) {
-        curId = null;
-        busy = false;
-        meta = t("backend.offline");
+    void cancelAiSession().then(() => {
+      // The turn ends here either way: the user asked to stop, and a stop taken while
+      // the turn is still fetching note context has no open stream to cancel — no
+      // `ai-chat-complete` is coming, so waiting for the event would strand the UI on
+      // "⏹ 停止". Only the ledger may speak about the host, and `cancel_ai_session`
+      // (also `Result<(), AmosError>`) reports the same `null` whether it landed or not.
+      curId = null;
+      busy = false;
+      if (!bridgeDiag("cancel_ai_session").ok) {
+        meta = t("ai.stopRefused", { code: refusalDetail("cancel_ai_session") });
       }
     });
   };
@@ -312,27 +398,64 @@
     };
   });
 
+  // The session list is a **mirror** of the daemon's ledger, so it may only move when the
+  // daemon *answered*. `invoke` folds every failure — not bridged, or an RPC that never reached a
+  // daemon — into `null`, and `null` establishes nothing: the pre-fix bodies awaited
+  // `clearSessions()` / `removeSession()` and moved the mirror regardless, so a delete the host
+  // never carried out still vanished its row, and a 清空 blanked a list the daemon still held.
+  // The row leaving the screen *is* this surface's success report, so the lie had nowhere else to
+  // show (REQ-A1453 / F-SH-704). `false` / `0` are the daemon's own answers — "it did not exist"
+  // (`RemoveSessionReply.removed`, `proto/ai_agent.proto:364`) and "nothing was cleared"
+  // (`ClearSessionsReply.removed`, `:356`) — and following the daemon's answer is correct there.
+  //
+  // The open history panel is part of the same gesture: `showHist` names a row, so a session that
+  // left the list must not keep a history drawn under it (the viewer-copy-outlives-the-write
+  // family) — and its cached turns go with it, or a re-listed id would draw the old ones.
+  const forgetHistory = (id: string) => {
+    if (showHist === id) showHist = null;
+    histories = Object.fromEntries(Object.entries(histories).filter(([k]) => k !== id));
+  };
   const clearSess = async () => {
-    await clearSessions();
+    sessErr = "";
+    const removed = await clearSessions();
+    if (removed === null) {
+      sessErr = t("ai.sessionsClearUnanswered");
+      return;
+    }
     sessions = [];
+    showHist = null;
+    histories = {};
   };
   const delSess = async (id: string) => {
-    await removeSession(id);
+    sessErr = "";
+    const removed = await removeSession(id);
+    if (removed === null) {
+      sessErr = t("ai.sessionRemoveUnanswered");
+      return;
+    }
     sessions = (sessions ?? []).filter((s) => s.session_id !== id);
+    forgetHistory(id);
   };
 
   const lastAgent = $derived([...msgs].reverse().find((m) => m.role === "agent" && m.text));
+  // REQ-A1271 — the claim follows the effect. The pre-fix body was
+  // `try { await navigator.clipboard?.writeText(lastAgent.text); copiedReply = true; } catch {}`;
+  // when the API is absent (the case `PhotosApp::copyText` names as the normal one in a WebView
+  // without a secure context) the optional call short-circuits to `undefined` — no throw, so the
+  // `catch` never fired and 「✓」 was set over an empty clipboard. The shared helper asks the
+  // API's presence first and answers `false`; a refused copy says so instead.
+  let copyErr = $state("");
   const copyReply = async () => {
     if (!lastAgent?.text) return;
-    try {
-      await navigator.clipboard?.writeText(lastAgent.text);
-      copiedReply = true;
-      window.setTimeout(() => {
-        copiedReply = false;
-      }, 1500);
-    } catch {
-      /* clipboard unavailable: no-op */
+    if (!(await copyTextToClipboard(lastAgent.text))) {
+      copyErr = t("common.copyFailed");
+      return;
     }
+    copyErr = "";
+    copiedReply = true;
+    window.setTimeout(() => {
+      copiedReply = false;
+    }, 1500);
   };
 
   // Last user question — the target of "↺ resend".
@@ -392,8 +515,22 @@
     </div>
   </div>
   {#if meta}<p class="mt-0.5 text-[11px] opacity-60">{meta}</p>{/if}
+  {#if copyErr}
+    <p
+      role="status"
+      data-testid="ai-copy-error"
+      class="mt-0.5 rounded-md bg-black/5 px-2 py-1 text-[11px] text-danger dark:bg-white/10"
+    >{copyErr}</p>
+  {/if}
   {#if sessOpen}
     <div class="mt-1 space-y-1 rounded-xl bg-neutral-200/50 p-2 text-[11px] dark:bg-neutral-800/50">
+      {#if sessErr}
+        <p
+          role="status"
+          data-testid="ai-session-error"
+          class="rounded-md bg-danger/10 px-2 py-1 text-danger dark:bg-danger/20"
+        >{sessErr}</p>
+      {/if}
       {#if sessions && sessions.length > 0}
         <button onclick={() => void clearSess()} class="block w-full text-right text-accent hover:underline">{t("ai.clearSessions")}</button>
       {/if}
@@ -416,6 +553,15 @@
             >{@html iconSvg("x", "h-3 w-3")}</button>
           </div>
         {/each}
+      {:else if sessionsUnanswered}
+        <!-- The read was refused: `sessions` is `null`, which is 「我没问到」. The `{:else}` used
+             to draw this as 「暂无 daemon 会话」 — an assertion about the daemon that a refused RPC
+             cannot support (REQ-A1536 / F-SH-778). -->
+        <p
+          role="status"
+          data-testid="ai-sessions-unanswered"
+          class="opacity-60"
+        >{t("ai.sessionsUnanswered")}</p>
       {:else}
         <p class="opacity-60">{t("ai.sessionEmpty")}</p>
       {/if}
@@ -423,6 +569,12 @@
         <div class="max-h-32 space-y-1 overflow-auto border-t pt-1">
           {#if histories[showHist] === "loading"}
             <p class="opacity-50">{t("ai.historyLoading")}</p>
+          {:else if histories[showHist] === "unanswered"}
+            <p
+              role="status"
+              data-testid="ai-history-unanswered"
+              class="opacity-60"
+            >{t("ai.historyUnanswered")}</p>
           {:else if (histories[showHist] as HistoryTurn[]).length === 0}
             <p class="opacity-60">{t("ai.historyEmpty")}</p>
           {:else}
@@ -456,6 +608,13 @@
         class="shrink-0 opacity-70 hover:opacity-100"
       >✕</button>
     </div>
+    {#if ctxError}
+      <p
+        role="alert"
+        data-testid="ai-context-error"
+        class="mt-1 rounded-md bg-red-500/15 px-2 py-1 text-[11px] font-medium text-red-700 dark:text-red-300"
+      >{ctxError}</p>
+    {/if}
   {/if}
 
   <div
@@ -511,6 +670,13 @@
       disabled={busy}
       session={() => conversationId()}
       onStart={() => pushMsg("user", t("ai.voicePrompt"))}
+      onError={(cmd) => {
+        // The push-to-talk mic's start/end are `Result<(), _>`: a host that never opened the
+        // listener (or never finalized the utterance) answers the same `null` as success, so the
+        // refusal is read off the ledger (REQ-A297) and said here — the screen that owns the
+        // status line. Without it the user held the mic, spoke, and got silence.
+        meta = t("ai.voiceRefused", { code: refusalDetail(cmd) });
+      }}
     />
     <DeviceMicButton
       online={online}

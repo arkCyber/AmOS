@@ -310,11 +310,56 @@ mod tests {
         assert!(!disabled_for(DesktopFeature::Shortcuts, Some(&over)));
     }
 
+    /// The host returns the disabled capabilities as **wire-key strings**, and the UI keeps an
+    /// answer only if it already knows the key (`lib/desktopFeatures.ts` filters the host's reply
+    /// through its own `DESKTOP_FEATURES`). So the two lists are one contract with no compiler:
+    /// rename a key on either side and the operator's `AMOS_DESKTOP_SHORTCUTS=disabled` silently
+    /// stops matching — the host reports `["kbd"]`, the UI drops the key it does not know, and the
+    /// capability the user switched off stays on.
+    ///
+    /// This used to be pinned by **re-typing** the UI's strings here, a value equal to itself that
+    /// the test's own name called "the strings the UI uses". It now *reads* the UI source (like
+    /// `incall.rs`'s Kotlin pin), so a rename on either side fails here.
     #[test]
     fn the_wire_keys_are_the_strings_the_ui_uses() {
-        // Pinned because the UI matches these exact strings (`lib/desktopFeatures.ts`).
-        assert_eq!(DesktopFeature::Shortcuts.key(), "shortcuts");
-        assert_eq!(DesktopFeature::DockContextMenu.key(), "dock-context-menu");
+        const UI: &str = include_str!("../frontend-ts/src/lib/desktopFeatures.ts");
+        // The array literal is the UI's one declaration of these keys.
+        let start = UI
+            .find("export const DESKTOP_FEATURES")
+            .expect("lib/desktopFeatures.ts declares DESKTOP_FEATURES");
+        let tail = &UI[start..];
+        let open = tail.find('[').expect("DESKTOP_FEATURES is an array");
+        let close = tail[open..]
+            .find(']')
+            .expect("DESKTOP_FEATURES array is closed");
+        let ui_keys: Vec<&str> = tail[open + 1..open + close]
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.trim_matches(|c| c == '"' || c == '\''))
+            .collect();
+
+        let host_keys: Vec<&str> = DesktopFeature::ALL.iter().map(|f| f.key()).collect();
+        // A rewrite that moved the array out of the window must fail loudly, not compare empty sets.
+        assert_eq!(
+            ui_keys.len(),
+            host_keys.len(),
+            "the UI lists {ui_keys:?}, the host knows {host_keys:?} — the lists must be the same set"
+        );
+        for key in &host_keys {
+            assert!(
+                ui_keys.contains(key),
+                "lib/desktopFeatures.ts no longer spells {key:?} — the host's wire key has drifted"
+            );
+        }
+        for key in &ui_keys {
+            assert!(
+                host_keys.contains(key),
+                "lib/desktopFeatures.ts lists {key:?}, which the host does not know — the UI drops it silently"
+            );
+        }
+
+        // The env vars are the other half of the same documented contract (`docs/ENV_VARIABLES.md`).
         assert_eq!(
             DesktopFeature::Shortcuts.env_var(),
             "AMOS_DESKTOP_SHORTCUTS"

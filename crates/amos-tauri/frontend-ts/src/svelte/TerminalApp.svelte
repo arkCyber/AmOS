@@ -15,10 +15,13 @@
     pushHistory,
     capLines,
     PROMPT,
+    termRefused,
+    termRefusalReason,
     type TermLine,
   } from "../lib/terminal";
   import { parseAnsi, decodeOutput } from "../lib/ansi";
   import { termSpawn, termWrite, termRead, termKill, termResize } from "../lib/backend";
+  import { amosWarn } from "../lib/debugLog";
   import { t } from "./locale.svelte";
   import { onDestroy } from "svelte";
   import { ptySizeFor } from "../lib/terminal";
@@ -87,12 +90,20 @@
       charH: cell.h,
     });
     if (!size || (size.cols === lastSize.cols && size.rows === lastSize.rows)) return;
-    lastSize = size;
-    try {
-      await termResize(sess, size.cols, size.rows);
-    } catch {
-      /* offline / feature off — the session keeps its default grid */
-    }
+    // `lastSize` is the dedup key above, so it must record the size the **session
+    // actually took**, not the one we asked for: assigning it first meant a refused
+    // resize was remembered as applied, and the session stayed on its old grid while the
+    // box drew a new one. The observer only calls back on a real layout change, so this
+    // is the next keyboard/rotation/app-switch — narrow, but it is the retry the session
+    // has.
+    //
+    // A refusal is **not** `null`: `term_resize` answers `TermOut` (not `Result`), so the
+    // reason arrives in the reply with `id: 0` and `running: false` — `invoke` reports the
+    // call as ok. `if (reply)` therefore tested a value that is an object on every path
+    // and could never be false; `termRefused` is the predicate that reads the channel the
+    // host actually uses.
+    const reply = await termResize(sess, size.cols, size.rows);
+    if (!termRefused(reply)) lastSize = size;
   }
 
   // Live (real-PTY) session state.
@@ -131,7 +142,20 @@
     ro?.disconnect();
     ro = null;
     if (live && sess > 0) {
-      void termKill(sess).catch(() => {});
+      // "No orphan" is a claim the reply has to confirm: `term_kill` answers `TermOut`,
+      // so a kill the host refused still looks like a successful call (see `termRefused`),
+      // and the `catch` that used to sit here could never run at all. There is no window
+      // left to draw in, so the ledger gets the breadcrumb — the child outliving the app
+      // is exactly the kind of thing only a log can tell you about.
+      void termKill(sess).then((r) => {
+        if (termRefused(r) || (r !== null && r.running)) {
+          amosWarn("terminal", "term_kill did not confirm the session ended", {
+            session: sess,
+            reason: termRefusalReason(r),
+            running: r === null ? null : r.running,
+          });
+        }
+      });
     }
   });
 
@@ -163,14 +187,37 @@
   const submit = () => {
     if (live) {
       const trimmed = draft.trim();
-      if (trimmed !== "") {
-        void termWrite(sess, `${trimmed}\n`).catch(() => {});
-        appendLines([{ text: `${PROMPT} ${draft}`, kind: "cmd" as const }]);
-      } else {
-        appendLines([{ text: PROMPT, kind: "cmd" as const }]);
-      }
+      const shown = draft;
       pushDraftHistoryOnly();
       draft = "";
+      if (trimmed === "") {
+        appendLines([{ text: PROMPT, kind: "cmd" as const }]);
+        return;
+      }
+      // The reply is the **only** verdict this call has: `term_write` answers `TermOut`, so
+      // a refusal is a perfectly successful bridge call whose `error` carries the reason and
+      // whose `id` is 0 (`invoke` never folds that to `null`, REQ-A296). The `.catch()` that
+      // guarded this line could therefore never run — the command cannot throw — and the
+      // reply was discarded along with it, so the screen drew `$ mycommand` as an **entered**
+      // command for a write the session never took, and the user waited for output that could
+      // not come. An ENDED pty is the ordinary way in: the poller stops polling when the shell
+      // exits but leaves `live` true, so the prompt keeps accepting lines. Draw the command
+      // line only once the shell has actually taken it, and say the reason when it has not.
+      void termWrite(sess, `${trimmed}\n`).then((r) => {
+        if (termRefused(r)) {
+          const reason = termRefusalReason(r);
+          appendLines([
+            {
+              text: t("terminal.writeFailed", {
+                detail: reason === "" ? t("terminal.writeNoReason") : reason,
+              }),
+              kind: "err" as const,
+            },
+          ]);
+          return;
+        }
+        appendLines([{ text: `${PROMPT} ${shown}`, kind: "cmd" as const }]);
+      });
       return;
     }
     // offline demo path

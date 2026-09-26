@@ -13,9 +13,14 @@
     type TaskApp,
     type TaskSnapshot,
   } from "../lib/taskmgr";
+  import { bridgeDiag } from "../lib/backend";
+  import { callActionDetailText } from "../lib/phone";
   import { t } from "./locale.svelte";
 
   const REFRESH_MS = 3000;
+  // The cadence while the panel has nothing to draw — same rule as `SystemPanel.svelte`
+  // (REQ-A1356) and `MonitorApp.svelte`, whose comments call each poll a reconnect probe.
+  const RECONNECT_MS = 5000;
   const GROUP =
     "overflow-hidden rounded-[11px] bg-white/70 ring-1 ring-black/5 dark:bg-white/[0.07] dark:ring-white/10";
   const ROW = "flex items-center justify-between gap-3 px-4 py-3";
@@ -36,6 +41,24 @@
   let snap = $state<TaskSnapshot>(normalizeTaskSnapshot(null));
   let busy = $state(false);
   let inflight = false;
+  /** A refusal the daemon actually sent (see `reportRefusal`), or null. */
+  let refused = $state<string | null>(null);
+
+  /**
+   * A lifecycle action that resolved `null` was **either** "no daemon" **or** "the daemon
+   * answered and refused" — the two used to be the same silent nothing (the `.catch`
+   * commented "daemon offline" was unreachable, because `lib/taskmgr.ts` folded the
+   * rejection to `null` before it ever surfaced). The ledger now records the reason, so
+   * this reads it back: a real refusal is *said*, a missing daemon stays quiet.
+   */
+  const reportRefusal = (command: string) => {
+    const diag = bridgeDiag(command);
+    // `not-bridged` / no record: the panel is already hiding itself offline, so there is
+    // nothing to claim. Only a command the daemon *ran and failed* has words to show —
+    // through the shared normalizer, so a machine token never reaches the sentence.
+    if (diag.ok || diag.kind !== "command-failed") return;
+    refused = callActionDetailText(diag.detail) || t("settings.taskRefusedNoReason");
+  };
 
   const refresh = () => {
     if (inflight) return;
@@ -44,9 +67,6 @@
     taskmgrSnapshot()
       .then((s) => {
         if (s) snap = normalizeTaskSnapshot(s);
-      })
-      .catch(() => {
-        /* daemon offline → keep previous / nothing */
       })
       .finally(() => {
         inflight = false;
@@ -58,12 +78,14 @@
     if (inflight) return;
     inflight = true;
     busy = true;
+    // A new action supersedes the previous action's verdict: without this the
+    // refusal outlives what it describes, so a later action that *succeeded*
+    // still sits beside a sentence saying the earlier one failed.
+    refused = null;
     taskmgrAppAction(id, action)
       .then((s) => {
         if (s) snap = normalizeTaskSnapshot(s);
-      })
-      .catch(() => {
-        /* daemon offline */
+        else reportRefusal("taskmgr_app_action");
       })
       .finally(() => {
         inflight = false;
@@ -74,12 +96,12 @@
     if (inflight) return;
     inflight = true;
     busy = true;
+    // Same rule as `act`: a new action supersedes the previous verdict.
+    refused = null;
     taskmgrJobAction(id, action)
       .then((s) => {
         if (s) snap = normalizeTaskSnapshot(s);
-      })
-      .catch(() => {
-        /* daemon offline */
+        else reportRefusal("taskmgr_job_action");
       })
       .finally(() => {
         inflight = false;
@@ -101,8 +123,15 @@
     refresh();
   });
   $effect(() => {
-    if (!hasAny) return;
-    const id = window.setInterval(refresh, REFRESH_MS);
+    // Kept armed in **both** states, only the period changes (REQ-A1364 / F-SH-628). The
+    // pre-fix `if (!hasAny) return;` made the very state that hides the panel switch off
+    // the only thing that could ever un-hide it: `{#if hasAny}` below has no `else`, the
+    // 刷新 button lives *inside* that branch, and nothing else on these screens re-reads
+    // `taskmgr_snapshot` — so a daemon absent at mount left the whole section missing for
+    // the session. The sibling `SystemPanel.svelte` (REQ-A1356) already states the rule;
+    // this is the same panel, on the same screen, one line down.
+    const ms = hasAny ? REFRESH_MS : RECONNECT_MS;
+    const id = window.setInterval(refresh, ms);
     return () => window.clearInterval(id);
   });
 </script>
@@ -123,6 +152,15 @@
     {#if snap.decision}
       <p class="px-4 py-1 text-xs opacity-70">
         {t("settings.taskDecision", { mode: modeLabel(snap.decision.mode), reason: snap.decision.reason })}
+      </p>
+    {/if}
+
+    {#if refused}
+      <!-- A refused action is a verdict, not an absence: the daemon ran the command and
+           said no (a dead app, an unknown action). Without this the button did nothing,
+           silently, and the app the user meant to stop kept running. -->
+      <p role="alert" data-testid="task-refused" class="px-4 py-1 text-xs text-danger">
+        {t("settings.taskRefused", { detail: refused })}
       </p>
     {/if}
 

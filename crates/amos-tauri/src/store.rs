@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Runtime, State};
 
 /// Payload broadcast on every mutation.
 #[derive(Clone, Serialize)]
@@ -41,6 +41,16 @@ pub const STORE_UPDATED_EVENT: &str = "store-updated";
 /// (REQ-A254) — `scripts/tauri-event-scan.mjs` flagged it as "emitted by the host
 /// but no screen subscribes to it", which is exactly what it was.
 pub const APP_FOCUSED_KEY: &str = "amos.app_focused";
+
+/// The store key for the shell's UI language, stored **raw** (`"zh"` / `"en"`).
+///
+/// Two Rust readers sit on this key and neither can see the other: the native menu bar
+/// (`menu::stored_locale`, REQ-A437) and the system tray (`tray::stored_locale`, REQ-A864).
+/// They were written as two literals with a comment promising they matched, which is a
+/// promise only a reader can keep; the key is a value here so the compiler keeps it. The
+/// frontend writes it through the same string (`locale.svelte.ts`) — that half is checked
+/// by `i18n-scan`, which is why the key is *not* duplicated in the locales.
+pub const LOCALE_KEY: &str = "amos-ui.locale";
 
 /// File used when `AMOS_STATE_FILE` is unset: `~/.amos/state.json`.
 const DEFAULT_RELATIVE: &str = ".amos/state.json";
@@ -163,24 +173,38 @@ impl SharedStore {
 
     /// Mutate + persist without broadcasting (Rust services can use this even
     /// without an `AppHandle`).
+    ///
+    /// The guard is taken the same way [`Self::get`] takes it: a *poisoned* lock is not a
+    /// refusal to write. The map is still there, and dropping the mutation here would make
+    /// the durable mirror silently disagree with what the writer thinks it stored (the
+    /// frontend broadcasts the new value to every window and keeps it in `localStorage`,
+    /// while the next boot's hydration copies the *stale* snapshot back over it).
+    /// REQ-A1474.
     pub fn insert(&self, key: &str, value: String) {
-        if let Ok(mut g) = self.inner.lock() {
-            g.insert(key.to_string(), value);
-        }
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(key.to_string(), value);
         self.persist();
     }
 
     /// Mutate + persist without broadcasting (Rust services can use this even
-    /// without an `AppHandle`).
+    /// without an `AppHandle`). Same poisoned-lock rule as [`Self::insert`].
     pub fn remove_key(&self, key: &str) {
-        if let Ok(mut g) = self.inner.lock() {
-            g.remove(key);
-        }
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(key);
         self.persist();
     }
 
     /// Write a value, persist, and broadcast the change to every window.
-    pub fn set(&self, app: &AppHandle, key: &str, value: String) {
+    ///
+    /// Generic over the runtime for the same reason `close_target` in `wm.rs` is: the
+    /// window-manager paths that write this key are generic (REQ-A473 made `apply`
+    /// runtime-generic so the mock runtime can drive identity tests), and a
+    /// `Wry`-only signature here would have forced one of them back to a concrete runtime.
+    pub fn set<R: Runtime>(&self, app: &AppHandle<R>, key: &str, value: String) {
         self.insert(key, value.clone());
         // A failed broadcast means a registered listener missed the update (no listener is
         // `Ok` in Tauri) — the other windows would silently keep the stale value.
@@ -222,15 +246,19 @@ impl SharedStore {
     }
 
     /// Best-effort write of the whole map as pretty JSON to the backing file.
+    ///
+    /// The snapshot is taken under the same poisoned-lock rule as [`Self::get`]: `.ok()`
+    /// here would make every write after a panic invisible on disk while the in-memory map
+    /// still held them, so the two stores would drift apart and the file would win on the
+    /// next boot.
     fn persist(&self) {
         let Some(path) = &self.path else {
             return;
         };
-        let bytes = self
-            .inner
-            .lock()
-            .ok()
-            .and_then(|g| serde_json::to_vec_pretty(&*g).ok());
+        let bytes = {
+            let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            serde_json::to_vec_pretty(&*g).ok()
+        };
         let Some(bytes) = bytes else {
             tracing::warn!("failed to serialize state for {}", path.display());
             return;
@@ -459,6 +487,52 @@ mod tests {
         // The value is still in the map: "missing" would be a claim about the user's data.
         assert_eq!(s.get("amos.settings").as_deref(), Some("{}"));
         assert_eq!(s.snapshot().len(), 1);
+    }
+
+    /// The read half of this rule is pinned above; this is the **write** half. A poisoned
+    /// lock is not a refusal to write — the map is intact (as `get`/`snapshot` already
+    /// agree), so dropping the mutation silently diverges the durable mirror from what the
+    /// frontend stored and broadcast: on the next boot `hydrateFromSystemStore` copies the
+    /// stale snapshot back over the user's writes.
+    #[test]
+    fn a_poisoned_lock_does_not_swallow_a_write() {
+        let path = temp_path("poison-write");
+        let s = SharedStore::from_file(&path);
+        s.insert("amos.settings", "{}".into());
+
+        // Poison the lock the way a panicking command handler would.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = s.inner.lock().unwrap_or_else(|p| p.into_inner());
+            panic!("a handler panicked while holding the store lock");
+        }));
+        assert!(s.inner.is_poisoned(), "the lock must really be poisoned");
+
+        s.insert("amos.wifi", "{\"on\":true}".into());
+        assert_eq!(
+            s.get("amos.wifi").as_deref(),
+            Some("{\"on\":true}"),
+            "an insert under poison still inserts"
+        );
+        s.remove_key("amos.settings");
+        assert_eq!(
+            s.get("amos.settings"),
+            None,
+            "a removal under poison still removes"
+        );
+        // The disk half matters too: `persist` takes the same lock, so a poison that only
+        // skipped the file write would leave the two stores divergent.
+        let again = SharedStore::from_file(&path);
+        assert_eq!(
+            again.get("amos.wifi").as_deref(),
+            Some("{\"on\":true}"),
+            "the write reached the file"
+        );
+        assert_eq!(
+            again.get("amos.settings"),
+            None,
+            "the removal reached the file"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

@@ -9,14 +9,15 @@
  * Pure logic is exercised via the same lib/ paths the React version uses, so
  * these tests double as the behavioural lock for the port.
  */
-import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { fireEvent, render } from "@testing-library/svelte";
 import { tick } from "svelte";
 import HomeDock from "../src/svelte/HomeDock.svelte";
 import { propsChannel, resetPropsChannels, type PropsChannel } from "../src/svelte/propsBus";
-import { writeStoreValue } from "../src/lib/amosStore";
+import { RECENTS_KEY, writeStoreValue } from "../src/lib/amosStore";
 import { zh } from "../src/i18n/locales/zh";
 import { NOTIF_KEY, SETTINGS_KEY } from "../src/lib/settings";
+import { emitDockBounce } from "../src/lib/dockConfig";
 import type { StoreTile } from "../src/lib/storeApps";
 
 interface HomeProps {
@@ -25,6 +26,7 @@ interface HomeProps {
   pulseId: string | null;
   grid?: { cols: number; rows: number };
   tile?: "regular" | "large";
+  form?: "phone" | "tablet" | "desktop" | "robot";
 }
 
 const channel = (): PropsChannel<HomeProps> => propsChannel<HomeProps>("home");
@@ -354,6 +356,283 @@ describe("HomeDock.svelte — grid-shrink page-index clamp (parity with React)",
 
     // Re-expand to two pages: we must stay on page 0, NOT auto-jump to page 2.
     channel().set({ layout: layout([...twelve, "music"], []), ext: [], pulseId: null });
+    await tick();
+    expect(byLabel(container, label("app.clock"))).toBeTruthy();
+    expect(byLabel(container, label("app.music"))).toBeNull();
+  });
+});
+
+describe("HomeDock.svelte — the iPad Dock's recently-used section (tablet only)", () => {
+  const recents = (ids: string[]) => writeStoreValue(RECENTS_KEY, ids);
+  const section = (el: HTMLElement) => el.querySelector('[data-testid="dock-recents"]');
+
+  test("a tablet shows recently-used apps after a divider; a phone shows no such section", async () => {
+    recents(["notes", "photos"]);
+    channel().set({
+      layout: layout([], ["phone", "mail"]),
+      ext: [],
+      pulseId: null,
+      form: "tablet",
+    });
+    const { container } = render(HomeDock);
+    await tick();
+    const sec = section(container);
+    expect(sec).not.toBeNull();
+    expect(container.querySelector('[data-testid="dock-recents-divider"]')).not.toBeNull();
+    expect(sec!.querySelector(`button[aria-label="${label("app.notes")}"]`)).not.toBeNull();
+    expect(sec!.querySelector(`button[aria-label="${label("app.photos")}"]`)).not.toBeNull();
+
+    // Same recents, a phone: the Dock is pinned-only (its switcher is the Recents
+    // surface), so neither the section nor its divider is drawn.
+    channel().set({ layout: layout([], ["phone", "mail"]), ext: [], pulseId: null, form: "phone" });
+    await tick();
+    expect(section(container)).toBeNull();
+    expect(container.querySelector('[data-testid="dock-recents-divider"]')).toBeNull();
+  });
+
+  test("a payload with no class keeps the phone Dock (a missing field never gains a section)", async () => {
+    recents(["notes"]);
+    channel().set({ layout: layout([], ["mail"]), ext: [], pulseId: null });
+    const { container } = render(HomeDock);
+    await tick();
+    expect(section(container)).toBeNull();
+  });
+
+  test("an app already pinned in the Dock is not repeated in the section", async () => {
+    recents(["mail", "notes"]);
+    channel().set({
+      layout: layout([], ["mail"]),
+      ext: [],
+      pulseId: null,
+      form: "tablet",
+    });
+    const { container } = render(HomeDock);
+    await tick();
+    // One tile for mail (the pinned one), not two.
+    expect(container.querySelectorAll(`button[aria-label="${label("app.mail")}"]`).length).toBe(1);
+    expect(section(container)!.querySelector(`button[aria-label="${label("app.notes")}"]`)).not.toBeNull();
+  });
+
+  test("tapping a recent tile opens the app (same UP channel as any Dock tap)", async () => {
+    recents(["notes"]);
+    channel().set({
+      layout: layout([], ["mail"]),
+      ext: [],
+      pulseId: null,
+      form: "tablet",
+    });
+    const { container } = render(HomeDock);
+    await tick();
+    const opens: unknown[] = [];
+    const un = channel().on((e, d) => {
+      if (e === "open") opens.push(d);
+    });
+    await fireEvent.click(section(container)!.querySelector(`button[aria-label="${label("app.notes")}"]`)!);
+    un();
+    expect(opens).toEqual(["notes"]);
+  });
+});
+
+describe("HomeDock.svelte — a Dock bounce reaches the touch shell's Dock (REQ-A1128)", () => {
+  /**
+   * The `dock-bounce` channel had exactly one subscriber, the **desktop** `Dock.svelte`,
+   * while both of its emitters fire on the touch shell (`PhoneApp.svelte` → `"phone"`,
+   * `MessagesApp.svelte` → `"messages"`) — and the desktop Dock's tile set is
+   * `withoutPhone(layout.dock)`, so the `"phone"` id can never be a tile there. The
+   * tests that held this channel asserted on the **event** (the seam), never on a surface
+   * that renders it, so "the icon bounces when a call arrives" was green and unreachable.
+   */
+  const bounced = (container: HTMLElement, appLabel: string): boolean =>
+    (byLabel(container, appLabel)?.className ?? "").includes("dock-bounce");
+
+  test("the bounced app's tile carries the animation class and an unrelated tile does not", async () => {
+    channel().set({ layout: layout([], ["phone", "messages"]), ext: [], pulseId: null });
+    const { container } = render(HomeDock);
+    await tick();
+    expect(bounced(container, label("app.phone"))).toBe(false);
+
+    emitDockBounce("phone");
+    await tick();
+    expect(bounced(container, label("app.phone"))).toBe(true);
+    expect(bounced(container, label("app.messages"))).toBe(false);
+  });
+
+  test("a bounce for an app that is not on this surface changes nothing (no crash, no class)", async () => {
+    channel().set({ layout: layout([], ["phone"]), ext: [], pulseId: null });
+    const { container } = render(HomeDock);
+    await tick();
+    emitDockBounce("maps"); // not pinned here
+    await tick();
+    expect(bounced(container, label("app.phone"))).toBe(false);
+  });
+});
+
+describe("HomeDock.svelte — long-press an icon enters the Edit (jiggle) surface", () => {
+  // iOS's arrange gesture. Before this the only door to Edit was the
+  // Notification-Center pencil button, so the platform-standard gesture did nothing.
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** Everything the component emits upward, in order. */
+  const watch = () => {
+    const seen: Array<[string, unknown]> = [];
+    const off = channel().on((e, d) => seen.push([e, d]));
+    return { seen, off };
+  };
+
+  test("holding an icon emits 'edit' — and the app does NOT also open", async () => {
+    channel().set({ layout: layout(["notes"], []), ext: [], pulseId: null });
+    const { container } = render(HomeDock);
+    await tick();
+    const { seen, off } = watch();
+
+    const tile = byLabel(container, label("app.notes")) as HTMLButtonElement;
+    await fireEvent.mouseDown(tile);
+    vi.advanceTimersByTime(500);
+    await tick();
+    expect(seen).toEqual([["edit", undefined]]);
+
+    // The browser still synthesizes a click after the press; it must be swallowed,
+    // or the home screen would open the app *and* enter Edit at once.
+    await fireEvent.click(tile);
+    await tick();
+    expect(seen).toEqual([["edit", undefined]]);
+    off();
+  });
+
+  test("a short tap still just opens the app (a press is not a tap)", async () => {
+    channel().set({ layout: layout(["notes"], []), ext: [], pulseId: null });
+    const { container } = render(HomeDock);
+    await tick();
+    const { seen, off } = watch();
+
+    const tile = byLabel(container, label("app.notes")) as HTMLButtonElement;
+    await fireEvent.mouseDown(tile);
+    await fireEvent.mouseUp(tile);
+    await fireEvent.click(tile);
+    vi.advanceTimersByTime(1000);
+    await tick();
+    expect(seen).toEqual([["open", "notes"]]);
+    off();
+  });
+
+  test("moving off the icon before the threshold cancels the press", async () => {
+    channel().set({ layout: layout(["notes"], []), ext: [], pulseId: null });
+    const { container } = render(HomeDock);
+    await tick();
+    const { seen, off } = watch();
+
+    const tile = byLabel(container, label("app.notes")) as HTMLButtonElement;
+    await fireEvent.mouseDown(tile);
+    vi.advanceTimersByTime(200);
+    await fireEvent.mouseLeave(tile);
+    vi.advanceTimersByTime(1000);
+    await tick();
+    expect(seen).toEqual([]);
+    off();
+  });
+});
+
+describe("HomeDock.svelte — a soft launch reveals its tile on the paged grid (REQ-A1361)", () => {
+  // Twelve page apps fill the phone grid exactly; "music" is the 13th and therefore
+  // the whole of page 2. The default layout is far past this: 36 built-ins − 3 dock =
+  // 33 page apps, i.e. 3 phone pages (2 on a tablet at 24/page), so "the pulsed icon
+  // is on a page we are not drawing" is the ordinary case, not an exotic one.
+  const twelve = [
+    "clock", "settings", "calculator", "weather", "notes", "reminders",
+    "vmemos", "photos", "files", "android", "messages", "phone",
+  ];
+  const twoPages = () => layout([...twelve, "music"], []);
+
+  /** One `ext` array for the whole block. The shell re-pushes a payload whose `layout`
+   * and `ext` references are the ones it already holds, and the home screen's `known`
+   * predicate reads `ext` — so a fresh `[]` per push would churn `pageIds`/`gridPages`
+   * by identity and re-run the reveal for a reason no launch is responsible for. */
+  const NO_EXT: StoreTile[] = [];
+
+  /** Push a soft launch the way the shell does: `softLaunch` writes the id AND bumps
+   * the counter, so a payload carrying only a changed `pulseId` is not a launch. */
+  const launch = (id: string, seq: number, base = twoPages()) =>
+    channel().set({ layout: base, ext: NO_EXT, pulseId: id, pulseSeq: seq });
+
+  test("an app on a later page turns the grid to it — the pulse is never drawn off-screen", async () => {
+    launch("music", 1);
+    const { container } = render(HomeDock);
+    await tick();
+
+    // Pre-fix the pulse landed on page 2 while the grid stayed on page 1: the sheet
+    // had closed, home was shown, and nothing on it changed.
+    expect(byLabel(container, label("app.music"))).toBeTruthy();
+    expect(byLabel(container, label("app.clock"))).toBeNull();
+  });
+
+  test("a launch naming a Dock icon — or an app drawn nowhere — does not turn the grid", async () => {
+    launch("music", 1, layout(twelve, ["phone"]));
+    const { container } = render(HomeDock);
+    await tick();
+    expect(byLabel(container, label("app.clock"))).toBeTruthy(); // page 1 of 1
+
+    // "phone" is pinned in the Dock, so it is on screen on every page: there is no
+    // page to turn to, and `findIndex` answering -1 must leave the grid where it is.
+    launch("phone", 2, layout(twelve, ["phone"]));
+    await tick();
+    expect(byLabel(container, label("app.clock"))).toBeTruthy();
+    // The pulse still highlights it, though — the reveal and the highlight are two
+    // different questions.
+    expect(byLabel(container, label("app.phone"))!.innerHTML).toContain("animate-pulse");
+
+    // A hidden app is drawn on no page at all (the App Library is where it lives).
+    launch("vmemos", 3, { page: twelve.filter((id) => id !== "vmemos"), dock: [], hidden: ["vmemos"] });
+    await tick();
+    expect(byLabel(container, label("app.clock"))).toBeTruthy();
+  });
+
+  test("the SAME app launched twice, with a page swipe in between, is revealed again", async () => {
+    // One layout object for both launches: the shell hands the same `_layout`
+    // reference down the channel (it re-pushes the payload, not a new layout), so a
+    // fixture that rebuilt an equal-but-fresh object here would re-run a value-only
+    // effect through `gridPages`' identity and hide the very leaf this test is for.
+    const base = twoPages();
+    launch("music", 1, base);
+    const { container } = render(HomeDock);
+    await tick();
+    expect(byLabel(container, label("app.music"))).toBeTruthy();
+
+    // The user swipes back to page 1 themselves; the pulse is still set (`pulseId` is
+    // only cleared by goHome/open), so re-setting it is not a change at all.
+    const dots = [...container.querySelectorAll('button[data-testid="home-dot"]')];
+    await fireEvent.click(dots[0] as HTMLButtonElement);
+    expect(byLabel(container, label("app.music"))).toBeNull();
+
+    // The second launch writes the id it already holds. It is still a launch, and it
+    // must still take the user to the tile.
+    launch("music", 2, base);
+    await tick();
+    expect(byLabel(container, label("app.music"))).toBeTruthy();
+  });
+
+  test("a layout push after the reveal does not drag the user back to the pulse", async () => {
+    launch("music", 1);
+    const { container } = render(HomeDock);
+    await tick();
+    expect(byLabel(container, label("app.music"))).toBeTruthy();
+
+    const dots = [...container.querySelectorAll('button[data-testid="home-dot"]')];
+    await fireEvent.click(dots[0] as HTMLButtonElement);
+    expect(byLabel(container, label("app.clock"))).toBeTruthy();
+
+    // The shell re-pushes the layout (an install, a reorder) with the SAME launch
+    // still named. The reveal is per-launch, not a standing "keep showing this tile".
+    channel().set({
+      layout: layout([...twelve, "music", "magnifier"], []),
+      ext: [],
+      pulseId: "music",
+      pulseSeq: 1,
+    });
     await tick();
     expect(byLabel(container, label("app.clock"))).toBeTruthy();
     expect(byLabel(container, label("app.music"))).toBeNull();

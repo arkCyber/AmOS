@@ -31,6 +31,27 @@ export function voiceReducer(status: VoiceStatus, action: VoiceAction): VoiceSta
   }
 }
 
+/**
+ * i18n key for each voice status — the **accessible name** of the mic button.
+ *
+ * The button's own content is a bare glyph (`🎤` / `●` / `…`) that carries the
+ * state visually, and a constant `aria-label` would *override* that content for
+ * assistive tech — so a screen-reader user could not tell a recording mic from an
+ * idle one. The name is therefore what carries the state (REQ-A984 / F-SH-311,
+ * the multi-state-cycle family of REQ-A969 / F-SH-305). One map, so the button and
+ * any future surface agree on the vocabulary.
+ *
+ * `error` deliberately shares the idle name: a failed clip renders the same `🎤`
+ * glyph as idle, so naming it anything else would describe a state the button is
+ * not drawing.
+ */
+export const VOICE_STATUS_LABEL_KEY: Record<VoiceStatus, string> = {
+  idle: "a11y.voiceInput",
+  recording: "a11y.voiceInputRecording",
+  transcribing: "a11y.voiceInputTranscribing",
+  error: "a11y.voiceInput",
+};
+
 /** Serialized result of the `transcribe_audio` command. */
 export interface TranscribeOut {
   text: string;

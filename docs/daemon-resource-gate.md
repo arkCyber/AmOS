@@ -2,7 +2,7 @@
 
 > 状态：已实现并有测试锁定
 > 日期：2026-09-11（2026-09-12 增补 REQ-A131 熔断器）
-> 关联：`docs/AEROSPACE_SOFTWARE_AUDIT.md`（Power of 10 #2/#7）、`docs/FUNCTIONAL_GAP_ANALYSIS.md` §35、`docs/TRACEABILITY_MATRIX.md` REQ-A43/A44/A131、`CODE_AUDIT_REPORT.md`（"实现断路器模式"）
+> 关联：`docs/AEROSPACE_SOFTWARE_AUDIT.md`（Power of 10 #2/#7）、`FUNCTIONAL_GAP_ANALYSIS.md` §35、`docs/TRACEABILITY_MATRIX.md` REQ-A43/A44/A131、`CODE_AUDIT_REPORT.md`（"实现断路器模式"）
 
 ## 1. 动机（审计发现）
 

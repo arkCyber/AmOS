@@ -59,7 +59,8 @@ impl StandardDir {
             StandardDir::Recordings => MediaKind::Audio,
             StandardDir::Movies => MediaKind::Video,
             StandardDir::Download => MediaKind::File,
-            StandardDir::Music | StandardDir::Root => MediaKind::File,
+            StandardDir::Music => MediaKind::Audio,
+            StandardDir::Root => MediaKind::File,
         }
     }
 

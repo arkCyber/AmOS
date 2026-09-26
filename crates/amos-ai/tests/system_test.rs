@@ -42,6 +42,11 @@ async fn one_socket_serves_ai_and_android() {
         std::env::temp_dir().join(format!("amos-system-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&path);
 
+    // The AI half of this test needs an engine that streams. With no GGUF staged
+    // the daemon's unset default is an honest `unconfigured` engine (Gap 4) that
+    // streams nothing, so request the deterministic mock explicitly — this test's
+    // subject is "one socket serves both services", not any model.
+    std::env::set_var("AMOS_BACKEND", "mock");
     let server_path = path.clone();
     let server = tokio::spawn(async move {
         amos_ai::server::serve(server_path).await.unwrap();

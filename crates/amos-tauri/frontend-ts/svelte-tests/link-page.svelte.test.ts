@@ -116,6 +116,29 @@ describe("LinkPage (never dresses a quiet link up as a working one)", () => {
     expect(stamp).toMatch(/最近读数：\d\d:\d\d:\d\d（每 10 秒重读）/);
   });
 
+  test("a hand-declared peer says so instead of showing its declaration age as a listen age", async () => {
+    // `beacons === 0` means the entry was configured by hand, and its `last_seen_ms` is the age
+    // of the *declaration*, not of any hearing (`discovery.rs`: 「the declaration for a static
+    // one (`beacons == 0`)」). Rendering it verbatim made a never-heard peer look like a live one.
+    bridgeReturning({
+      ...STATUS,
+      peers: [
+        { id: "gateway", kind: "robot", endpoint: null, last_seen_ms: 259_200_000, beacons: 0 },
+        { id: "dog1", kind: "robot", endpoint: "tcp/10.0.0.7:7447", last_seen_ms: 300, beacons: 7 },
+      ],
+    });
+    const host = render(LinkPage);
+    await vi.waitFor(() =>
+      expect(host.container.querySelector('[data-testid="link-peer-rows"]')).toBeTruthy(),
+    );
+    const rows = host.container.querySelector('[data-testid="link-peer-rows"]')?.textContent ?? "";
+    expect(rows).toContain("手工声明 · 从未广播");
+    // …and the declaration age is not printed beside it as if it were a hearing.
+    expect(rows).not.toContain("259200000ms");
+    // A beaconed peer still gets its own age and count.
+    expect(rows).toContain("300ms · 7×");
+  });
+
   test("no evidence yet is never rendered as healthy", async () => {
     bridgeReturning({ ...STATUS, health: "unknown", health_reasons: [], peers: [] });
     const host = render(LinkPage);
@@ -260,6 +283,65 @@ describe("LinkPage (never dresses a quiet link up as a working one)", () => {
       host.container.querySelector('[data-testid="link-robot-refusal"]')?.textContent ?? "";
     expect(refusal).toContain("#14");
     expect(refusal).toContain("re-arm");
+    // …and the row names *why* torque was cut: `estopped` alone cannot tell the watchdog's cut
+    // from the operator's (the CLI prints the same token as `estopped=true(watchdog)`). Only the
+    // cut robot carries the reason row — the un-cut one gets none, because a blank is not a cause.
+    const reasons = host.container.querySelectorAll('[data-testid="link-robot-estop-reason"]');
+    expect(reasons.length).toBe(1);
+    expect(reasons[0]?.textContent ?? "").toContain("看门狗");
+    const watchdogs = host.container.querySelectorAll('[data-testid="link-robot-watchdog"]');
+    expect(watchdogs.length).toBe(2);
+    expect(watchdogs[0]?.textContent ?? "").toContain("1000ms");
+  });
+
+  test("each row says how many frames the robot's last action put on the bus", async () => {
+    // `frames` reaches the wire documented as "frames written to the bus for that action"
+    // (`robot_link.proto`), mapped by the bridge, documented in `lib/link.ts` as part of the
+    // return path, and printed by the CLI (`render_actuation`: `… gait={} frames={} …`) — but
+    // this page dropped it, so a robot that reported an action which wrote **nothing** to the
+    // bus read the same as one whose action wrote 13. The count is the HAL's measurement
+    // (`docs/amos-link.md` §3), and for a profile machine — `gait` empty by design,
+    // `docs/robot-domains.md` §6.4 — it is the only fact that says the action reached the bus.
+    bridgeReturning({
+      ...STATUS,
+      actuations: [
+        {
+          robot: "dog1",
+          seq: 12,
+          gait: "trot",
+          frames: 13,
+          armed: true,
+          estopped: false,
+          estop_reason: null,
+          watchdog_ms: null,
+          last_refusal: null,
+          stamp_ms: Date.now(),
+        },
+        {
+          robot: "dog2",
+          seq: 13,
+          gait: null,
+          frames: 0,
+          armed: true,
+          estopped: false,
+          estop_reason: null,
+          watchdog_ms: null,
+          last_refusal: null,
+          stamp_ms: Date.now(),
+        },
+      ],
+    });
+    const host = render(LinkPage);
+    await vi.waitFor(() =>
+      expect(host.container.querySelectorAll('[data-testid="link-robot-frames"]').length).toBe(2),
+    );
+    const rows = [...host.container.querySelectorAll('[data-testid="link-robot-frames"]')].map(
+      (n) => n.textContent ?? "",
+    );
+    expect(rows[0]).toContain("写入总线的帧数");
+    expect(rows[0]).toContain("13");
+    // A measured zero is stated, never omitted — an omitted row and a 0 would otherwise read alike.
+    expect(rows[1]).toContain("0");
   });
 
   test("a report whose stamp is unusable says so instead of guessing an age", async () => {

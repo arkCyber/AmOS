@@ -15,7 +15,7 @@
  * localized "daemon not connected" state and fall back to the local ledger cache
  * rather than silently granting or crashing.
  */
-import { bridged, invoke } from "./backend";
+import { bridgeDiag, bridged, invoke } from "./backend";
 import type { Capability } from "./permissions";
 
 /** The subset of capabilities backed by a daemon `Resource` wire key. */
@@ -73,10 +73,21 @@ export async function daemonAuthorize(
 }
 
 /**
- * Submit an authoritative grant to the daemon. The Rust command returns unit
- * (JSON `null`), so we can't distinguish "confirmed" from "resolved to null":
- * return `true` when we're bridged and the request was submitted (the daemon
- * persists best-effort), `null` when offline / local-only capability.
+ * Submit an authoritative grant to the daemon. `true` = the daemon accepted the
+ * write, `false` = it **refused** it, `null` = no claim (offline / local-only
+ * capability, i.e. the daemon was never asked).
+ *
+ * The Rust command returns unit (JSON `null`) on success *and* on failure, so the
+ * reply cannot carry the verdict — `bridgeDiag` can: `invoke` records the outcome of
+ * that command, and a refused `perm_grant` (unknown privacy id, no daemon socket, RPC
+ * error) is `{ ok: false }`. Reading it is the repo's shipped idiom for a unit-returning
+ * mutation (`lib/spaces.ts::unitMutationOk`, REQ-A513), and the gate that books the
+ * "nobody read the verdict" family names this read as the only readable one. This used
+ * to `return true` unconditionally, so a refusal was reported to the caller as an
+ * authoritative, audited grant.
+ *
+ * Caveat (same as every `bridgeDiag(command)` reader): the slot is per *command name*,
+ * so two concurrent `perm_grant` calls are one slot — the last to finish wins.
  */
 export async function daemonGrant(
   appId: string,
@@ -86,7 +97,7 @@ export async function daemonGrant(
   if (!resource) return null;
   if (!bridged()) return null;
   await invoke<null>("perm_grant", { appId, resource });
-  return true;
+  return bridgeDiag("perm_grant").ok;
 }
 
 /** Submit an authoritative revoke to the daemon (same semantics as grant). */
@@ -98,7 +109,7 @@ export async function daemonRevoke(
   if (!resource) return null;
   if (!bridged()) return null;
   await invoke<null>("perm_revoke", { appId, resource });
-  return true;
+  return bridgeDiag("perm_revoke").ok;
 }
 
 /** One app and the resources the daemon says it holds (mirrors `GrantRow`). */

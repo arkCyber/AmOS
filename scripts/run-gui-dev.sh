@@ -40,5 +40,5 @@ fi
 echo "launching amos System UI (features: ${FEAT:-none})..."
 exec env -u ALL_PROXY -u all_proxy \
   AMOS_SHERPA_MODEL_DIR="${AMOS_SHERPA_MODEL_DIR:-$ROOT/models/sherpa-en-20m}" \
-  AMOS_PIPER_MODEL_DIR="${AMOS_PIPER_MODEL_DIR:-$ROOT/models/piper-low}" \
+  AMOS_PIPER_MODEL_DIR="${AMOS_PIPER_MODEL_DIR:-$ROOT/models/piper-en_US-lessac-medium}" \
   ./target/debug/amos-tauri

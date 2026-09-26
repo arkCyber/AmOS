@@ -51,6 +51,44 @@ function failWritesFor(key: string): () => void {
     Object.defineProperty(window, "localStorage", { value: real, configurable: true, writable: true });
 }
 
+/**
+ * A `PointerEvent` shaped closely enough for InkCanvas. happy-dom ships no PointerEvent
+ * constructor, so a plain bubbling `Event` is stamped with the fields the component reads
+ * (`classifyPointer` sees only these plain values — it takes no DOM type on purpose).
+ */
+function pev(type: string, props: Record<string, unknown> = {}): PointerEvent {
+  const e = new Event(type, { bubbles: true, cancelable: true });
+  Object.assign(e, {
+    pointerId: 1,
+    pointerType: "pen",
+    isPrimary: true,
+    width: 1,
+    height: 1,
+    pressure: 0.5,
+    tiltX: 0,
+    tiltY: 0,
+    clientX: 0,
+    clientY: 0,
+    ...props,
+  });
+  return e as unknown as PointerEvent;
+}
+
+/** Draw one stroke on the canvas: down, move(s), up. */
+async function stroke(canvas: Element, moves: PointerEvent[], down?: Record<string, unknown>) {
+  canvas.dispatchEvent(pev("pointerdown", down));
+  await tick();
+  for (const m of moves) {
+    canvas.dispatchEvent(m);
+    await tick();
+  }
+  canvas.dispatchEvent(pev("pointerup"));
+  await tick();
+}
+
+const inkOf = (id: string) =>
+  readStoreValue<{ id: string; ink?: { strokes: unknown[] } }[]>(KEY, []).find((n) => n.id === id)?.ink;
+
 describe("NoteEditor.svelte", () => {
   test("typing + ‹ back flushes the autosave and updates the store", async () => {
     const note = seed();
@@ -201,5 +239,132 @@ describe("NoteEditor.svelte", () => {
       "Rich-text preview", // "富文本预览"
     );
     expect(/[\u4e00-\u9fff]/.test(text)).toBe(false);
+  });
+
+  test("the ink toggle is an alternating view: aria-pressed flips, textarea \u2194 canvas", async () => {
+    const note = seed();
+    const host = render(NoteEditor, { props: { note, onClose: () => {} } });
+    const q = (s: string) => host.container.querySelector(s);
+    const draw = q('[data-testid="note-editor-draw"]')!;
+
+    expect(draw.getAttribute("aria-pressed")).toBe("false");
+    expect(q('[data-testid="note-editor-textarea"]')).toBeTruthy();
+    expect(q('[data-testid="note-ink-canvas"]')).toBeNull();
+
+    await fireEvent.click(draw);
+    expect(draw.getAttribute("aria-pressed")).toBe("true");
+    expect(q('[data-testid="note-ink-canvas"]')).toBeTruthy();
+    expect(q('[data-testid="note-editor-textarea"]')).toBeNull();
+
+    // The eraser button only exists while the drawing surface is up.
+    expect(q('[data-testid="note-editor-eraser"]')).toBeTruthy();
+    await fireEvent.click(draw);
+    expect(q('[data-testid="note-editor-textarea"]')).toBeTruthy();
+    expect(q('[data-testid="note-editor-eraser"]')).toBeNull();
+  });
+
+  test("a synthesized pen stroke is committed to the store after the debounce", async () => {
+    // happy-dom has no `getCoalescedEvents`, so this case *is* the missing-API fallback path.
+    const note = seed();
+    const host = render(NoteEditor, { props: { note, onClose: () => {} } });
+    await fireEvent.click(host.container.querySelector('[data-testid="note-editor-draw"]')!);
+
+    const canvas = host.container.querySelector('[data-testid="note-ink-canvas"]')!;
+    await stroke(canvas, [pev("pointermove", { clientX: 40, clientY: 40 })]);
+    await new Promise((r) => setTimeout(r, 700));
+
+    const ink = inkOf("n1");
+    expect(ink).toBeTruthy();
+    expect(ink!.strokes.length).toBe(1);
+  });
+
+  test("coalesced pointer moves are all sampled in a single handler call", async () => {
+    const note = seed();
+    const host = render(NoteEditor, { props: { note, onClose: () => {} } });
+    await fireEvent.click(host.container.querySelector('[data-testid="note-editor-draw"]')!);
+    const canvas = host.container.querySelector('[data-testid="note-ink-canvas"]')!;
+
+    // One move event carrying three coalesced positions. The zig-zag is deliberate: all three
+    // survive RDP simplification, so the stored point count is a direct read of the batch.
+    const move = pev("pointermove", { clientX: 20, clientY: 20 });
+    Object.assign(move, {
+      getCoalescedEvents: () => [
+        pev("pointermove", { clientX: 20, clientY: 0 }),
+        pev("pointermove", { clientX: 20, clientY: 20 }),
+        pev("pointermove", { clientX: 0, clientY: 20 }),
+      ],
+    });
+    await stroke(canvas, [move]);
+    await new Promise((r) => setTimeout(r, 700));
+
+    const pts = inkOf("n1")?.strokes[0] as { pts: unknown[] } | undefined;
+    expect(pts?.pts.length).toBe(4); // 1 down + 3 coalesced
+  });
+
+  test("a palm contact (wide touch while untouched by a pen) leaves no ink", async () => {
+    const note = seed();
+    const host = render(NoteEditor, { props: { note, onClose: () => {} } });
+    await fireEvent.click(host.container.querySelector('[data-testid="note-editor-draw"]')!);
+    const canvas = host.container.querySelector('[data-testid="note-ink-canvas"]')!;
+
+    await stroke(
+      canvas,
+      [pev("pointermove", { pointerType: "touch", width: 30, clientX: 40, clientY: 40 })],
+      { pointerType: "touch", width: 30 },
+    );
+    await new Promise((r) => setTimeout(r, 700));
+
+    expect(inkOf("n1")).toBeFalsy();
+  });
+
+  test("the palm guard is overridable \u2014 the same contact draws with it off", async () => {
+    const note = seed();
+    const host = render(NoteEditor, {
+      props: { note, onClose: () => {}, palmRejection: false },
+    });
+    await fireEvent.click(host.container.querySelector('[data-testid="note-editor-draw"]')!);
+    const canvas = host.container.querySelector('[data-testid="note-ink-canvas"]')!;
+
+    await stroke(
+      canvas,
+      [pev("pointermove", { pointerType: "touch", width: 30, clientX: 40, clientY: 40 })],
+      { pointerType: "touch", width: 30 },
+    );
+    await new Promise((r) => setTimeout(r, 700));
+
+    expect(inkOf("n1")?.strokes.length).toBe(1);
+  });
+
+  test("\u2039 back flushes a pending ink commit \u2014 the stroke survives leaving", async () => {
+    const note = seed();
+    const host = render(NoteEditor, { props: { note, onClose: () => {} } });
+    await fireEvent.click(host.container.querySelector('[data-testid="note-editor-draw"]')!);
+    const canvas = host.container.querySelector('[data-testid="note-ink-canvas"]')!;
+
+    await stroke(canvas, [pev("pointermove", { clientX: 40, clientY: 40 })]);
+    // No debounce wait: leaving must flush what is pending.
+    await fireEvent.click(host.container.querySelector('[data-testid="note-editor-back"]')!);
+    await tick();
+
+    expect(inkOf("n1")?.strokes.length).toBe(1);
+  });
+
+  test("a rejected ink write is reported as a failed save", async () => {
+    const note = seed();
+    const restore = failWritesFor(KEY);
+    try {
+      const host = render(NoteEditor, { props: { note, onClose: () => {} } });
+      await fireEvent.click(host.container.querySelector('[data-testid="note-editor-draw"]')!);
+      const canvas = host.container.querySelector('[data-testid="note-ink-canvas"]')!;
+
+      await stroke(canvas, [pev("pointermove", { clientX: 40, clientY: 40 })]);
+      await new Promise((r) => setTimeout(r, 700));
+
+      const status = host.container.querySelector('[data-testid="note-editor-status"]');
+      expect(status?.textContent ?? "").toContain("\u672c\u673a\u5b58\u50a8\u5199\u5165\u5931\u8d25");
+      expect(status?.textContent ?? "").not.toContain("\u4fdd\u5b58\u4e8e");
+    } finally {
+      restore();
+    }
   });
 });

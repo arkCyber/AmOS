@@ -334,15 +334,28 @@ impl PlatformProcFs {
     }
 
     /// Whether this build targets a host with `/proc` oom control.
-    #[cfg(target_os = "linux")]
     fn proc_supported() -> bool {
-        true
+        oom_control_supported(std::env::consts::OS)
     }
+}
 
-    #[cfg(not(target_os = "linux"))]
-    fn proc_supported() -> bool {
-        false
-    }
+/// Whether a host whose `target_os` is `os` exposes `/proc/<pid>/oom_score_adj`.
+///
+/// **Android is included, and that is the whole point of this function.** Android
+/// runs a Linux kernel and the file exists there; base A (`deploy/android/amos.rc`,
+/// `user root` + `oom_score_adj -1000`) is the *only* platform this guard was built
+/// to protect. Gating on `#[cfg(target_os = "linux")]` alone silently excluded it —
+/// `target_os` is `"android"`, not `"linux"` — so on the device tier the guard
+/// reported `NotApplicable` ("no oom control on this host") and self-protection was
+/// never once verified. A pure predicate over the OS string (rather than a `cfg`)
+/// keeps that regression testable on a host with no Android toolchain.
+/// (`std::env::consts::OS` is `"linux"` on Linux and `"android"` on Android.)
+///
+/// `peercred.rs`, the sibling kernel-authored seam in this crate, gates the
+/// same way (`any(target_os = "linux", target_os = "android")`); this mirrors it.
+/// (REQ-A537 / FMEA F-SH-068.)
+pub fn oom_control_supported(os: &str) -> bool {
+    matches!(os, "linux" | "android")
 }
 
 impl ProcFs for PlatformProcFs {
@@ -567,6 +580,37 @@ mod tests {
             .contains("cannot verify"));
     }
 
+    /// The platform classification must include **Android**, the tier this guard
+    /// exists for (`deploy/android/amos.rc`). Gating on `"linux"` alone made the
+    /// device report `NotApplicable` and never check protection; this pins both
+    /// members so that regression cannot come back silently. (REQ-A537.)
+    #[test]
+    fn oom_control_supported_includes_linux_and_android() {
+        assert!(
+            oom_control_supported("android"),
+            "Android has a Linux kernel and /proc/<pid>/oom_score_adj — base A \
+             (deploy/android/amos.rc) is exactly what this guard protects"
+        );
+        assert!(oom_control_supported("linux"));
+        // Hosts with no oom control stay honest `Unsupported` (they use a
+        // different mechanism, and inventing one would be a fabrication).
+        for os in ["macos", "ios", "windows", "freebsd"] {
+            assert!(!oom_control_supported(os), "{os} has no oom_score_adj");
+        }
+    }
+
+    /// The real impl must classify the host it is actually running on by the same
+    /// predicate — so the wiring cannot drift from `oom_control_supported` (the
+    /// `cfg` that this replaced was free to drift and did).
+    #[test]
+    fn the_platform_impl_agrees_with_the_classifier_on_this_host() {
+        assert_eq!(
+            PlatformProcFs::new().supported(),
+            oom_control_supported(std::env::consts::OS),
+            "PlatformProcFs::supported must consult oom_control_supported(OS)"
+        );
+    }
+
     #[test]
     fn platform_default_points_at_self_oom_path() {
         let fs = PlatformProcFs::new();
@@ -589,5 +633,29 @@ mod tests {
                 // /proc absent or unreadable here — honest, no panic
             }
         }
+    }
+
+    /// The real `PlatformProcFs` over an **injected** path: the doc on `with_path`
+    /// promises "tests inject a tempdir", and this is that test. It drives the
+    /// concrete impl's *own* file I/O (no fake) — the only coverage that read/write
+    /// path has — and it is the reference that makes `with_path` a live seam rather
+    /// than a constructor nothing can reach. Gated to the hosts where `/proc` oom
+    /// control exists, because the impl honestly refuses every op elsewhere.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn platform_procfs_reads_and_writes_an_injected_tempdir_path() {
+        let dir = std::env::temp_dir().join(format!("amos-life-guard-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tempdir");
+        let path = dir.join("oom_score_adj");
+        std::fs::write(&path, "-1000\n").expect("seed");
+
+        let fs = PlatformProcFs::with_path(path.clone());
+        assert_eq!(fs.oom_path(), path.as_path());
+        assert_eq!(fs.read_oom_score_adj(), Ok(-1000)); // trims the trailing newline
+        assert_eq!(fs.write_oom_score_adj(500), Ok(()));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "500");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
     }
 }

@@ -135,26 +135,22 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-/// `AMOS_LOG_DIR` ⇒ explicit; unset ⇒ `$HOME/.amos/logs`; "off"/`none`/`0`/empty
-/// ⇒ disable; missing `HOME` ⇒ disable. Identical to `logfile.rs::from_vars` so
-/// the two sinks never disagree.
+/// The JSON sink's directory, resolved by the **shared** kernel
+/// [`crate::logfile::resolve_log_dir`] — the same one the human sink uses, so the
+/// two can never disagree on the directory (the property `ENV_OPT_IN`'s docs
+/// promise). [`resolve_dir_from`] is the injectable seam the test binds to.
 fn resolve_dir() -> Option<PathBuf> {
-    match std::env::var("AMOS_LOG_DIR").ok() {
-        Some(d) => {
-            let t = d.trim();
-            if matches!(t.to_ascii_lowercase().as_str(), "off" | "none" | "0" | "") {
-                return None;
-            }
-            Some(PathBuf::from(t))
-        }
-        None => {
-            let h = std::env::var("HOME").ok()?;
-            if h.trim().is_empty() {
-                return None;
-            }
-            Some(PathBuf::from(h.trim()).join(".amos").join("logs"))
-        }
-    }
+    resolve_dir_from(
+        std::env::var("AMOS_LOG_DIR").ok(),
+        std::env::var("HOME").ok(),
+    )
+}
+
+/// `AMOS_LOG_DIR` ⇒ explicit; unset ⇒ `$HOME/.amos/logs`; "off"/`none`/`0`/empty
+/// ⇒ disable; missing `HOME` ⇒ disable. Thin forwarder so the test can prove the
+/// JSON sink and [`crate::logfile::resolve_log_dir`] answer identically.
+fn resolve_dir_from(dir: Option<String>, home: Option<String>) -> Option<PathBuf> {
+    crate::logfile::resolve_log_dir(dir, home)
 }
 
 fn hostname_or_unknown() -> String {
@@ -773,6 +769,49 @@ mod tests {
             service: "amos-ai".into(),
             host: "test-host".into(),
         }
+    }
+
+    /// `ENV_OPT_IN`'s docs promise the JSON sink "never disagree[s] on the
+    /// directory" with the human sink, and this module used to keep its **own**
+    /// copy of the `AMOS_LOG_DIR` / `HOME` policy whose only tie to the human side
+    /// was a comment saying "Identical to `logfile.rs::from_vars`". A one-sided
+    /// edit (add an off spelling, move the `$HOME/.amos/logs` join) sent the two
+    /// sinks to different directories — the operator reads one file and misses the
+    /// other, with no error. This binds them: every input must answer identically
+    /// (REQ-A743 / F-SH-200).
+    #[test]
+    fn the_json_sink_resolves_its_directory_through_the_shared_kernel() {
+        let cases: &[(Option<&str>, Option<&str>)] = &[
+            (Some("/var/log/amos"), Some("/home/op")),
+            (Some("  /var/log/amos  "), Some("/home/op")),
+            (Some("off"), Some("/home/op")),
+            (Some("NONE"), Some("/home/op")),
+            (Some("0"), Some("/home/op")),
+            (Some(""), Some("/home/op")),
+            (Some("   "), Some("/home/op")),
+            (None, Some("/home/op")),
+            (None, Some("  ")),
+            (None, None),
+        ];
+        for (dir, home) in cases {
+            let got = resolve_dir_from(dir.map(str::to_string), home.map(str::to_string));
+            let human =
+                crate::logfile::resolve_log_dir(dir.map(str::to_string), home.map(str::to_string));
+            assert_eq!(
+                got, human,
+                "JSON sink and human sink disagreed on dir={dir:?} home={home:?}"
+            );
+        }
+        // The two sinks must at least have *a* shared explicit answer, not both
+        // collapsing to `None` for every input (which would pass vacuously).
+        assert_eq!(
+            resolve_dir_from(Some("/v".into()), None),
+            Some(PathBuf::from("/v"))
+        );
+        assert_eq!(
+            resolve_dir_from(None, Some("/h".into())),
+            Some(PathBuf::from("/h/.amos/logs"))
+        );
     }
 
     #[test]

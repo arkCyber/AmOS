@@ -77,17 +77,34 @@ fn hash_token(token: &str) -> String {
     hex::encode(Sha256::digest(token.as_bytes()))
 }
 
-/// Generate a 32-byte random admin token, hex-encoded (64 chars).
+/// Generate a 32-byte random secret, hex-encoded (64 chars). Used for both the
+/// admin token and the JWT secret when neither a flag nor an env var supplies
+/// one.
 ///
 /// Uses `uuid::Uuid::new_v4().as_bytes()` (already a project dep via the DB
 /// schema) twice — `getrandom` is also fine but adding a new transitive dep
 /// just for one startup-time call is not worth the audit footprint.
-fn random_admin_token() -> String {
+fn random_token() -> String {
     let mut buf = [0u8; 32];
     let (left, right) = buf.split_at_mut(16);
     left.copy_from_slice(uuid::Uuid::new_v4().as_bytes());
     right.copy_from_slice(uuid::Uuid::new_v4().as_bytes());
     hex::encode(buf)
+}
+
+/// The first candidate that is non-empty **after trimming**, in priority order.
+///
+/// An empty (or whitespace-only) admin secret must never be *used*: the server
+/// stores `sha256(secret)`, and `sha256("")` is a valid 64-char digest, so an
+/// empty bearer would then authenticate against it. Returning `None` here sends
+/// the caller to a freshly-generated random token instead. This is the startup
+/// half of the same fail-open the `admin_auth` middleware now refuses at the
+/// gate.
+fn resolve_admin_token(candidates: impl IntoIterator<Item = Option<String>>) -> Option<String> {
+    candidates
+        .into_iter()
+        .flatten()
+        .find(|t| !t.trim().is_empty())
 }
 
 #[tokio::main]
@@ -117,19 +134,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting AmOS MDM Server");
 
     // Resolve the admin token. Priority:
-    //   1. `--admin-token` / `MDM_ADMIN_TOKEN` (preferred, deterministic across restarts)
+    //   1. `--admin-token`, then `MDM_ADMIN_TOKEN` (preferred, deterministic
+    //      across restarts) — but an empty/whitespace value is ignored, never
+    //      used as the shared secret (see `resolve_admin_token`).
     //   2. Freshly-generated random token — printed to the log exactly once,
     //      operator is expected to capture it before the first admin call.
     //
     // **Never** fall back to a hardcoded literal: the previous default
     // (`amos-mdm-secret-key`) was a publicly-known value committed to the repo.
-    let admin_token = args.admin_token.clone().unwrap_or_else(random_admin_token);
-    if args.admin_token.is_none() {
-        warn!(
-            "No --admin-token supplied. Generated a fresh random admin token. \
-             Capture this NOW — it will not be logged again: {admin_token}"
-        );
-    }
+    let admin_token = match resolve_admin_token([
+        args.admin_token.clone(),
+        std::env::var("MDM_ADMIN_TOKEN").ok(),
+    ]) {
+        Some(t) => t,
+        None => {
+            let t = random_token();
+            warn!(
+                "No usable --admin-token / MDM_ADMIN_TOKEN (unset or empty). Generated a fresh \
+                 random admin token. Capture this NOW — it will not be logged again: {t}"
+            );
+            t
+        }
+    };
     let admin_token_hash = hash_token(&admin_token);
 
     // 构建配置
@@ -138,7 +164,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         database_path: args.database.to_string_lossy().to_string(),
         jwt_secret: args
             .jwt_secret
-            .unwrap_or_else(|| "amos-mdm-secret-key".to_string()),
+            .or_else(|| std::env::var("MDM_JWT_SECRET").ok())
+            .unwrap_or_else(random_token),
         api_key_prefix: args.api_key_prefix,
         default_sync_interval: args.sync_interval,
         token_expiry_secs: 365 * 24 * 60 * 60,
@@ -212,4 +239,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_empty_or_whitespace_admin_token_is_never_used() {
+        // An empty secret must not become the stored hash: `sha256("")` is a
+        // valid digest an empty bearer would match. Every empty candidate
+        // resolves to `None`, which sends `main` to a random token.
+        assert_eq!(resolve_admin_token([Some(String::new())]), None);
+        assert_eq!(resolve_admin_token([Some("   ".into())]), None);
+        assert_eq!(resolve_admin_token([None]), None);
+        assert_eq!(resolve_admin_token([Some(String::new()), None]), None);
+    }
+
+    #[test]
+    fn the_first_non_empty_candidate_wins_in_priority_order() {
+        // An empty flag value falls through to the env var rather than being
+        // used as the secret.
+        assert_eq!(
+            resolve_admin_token([Some(String::new()), Some("from-env".into())]),
+            Some("from-env".into()),
+        );
+        assert_eq!(
+            resolve_admin_token([Some("from-flag".into()), Some("from-env".into())]),
+            Some("from-flag".into()),
+        );
+        // A real value keeps its surrounding whitespace — only *emptiness* is
+        // judged on the trimmed form, so an operator's padding is preserved.
+        assert_eq!(
+            resolve_admin_token([Some(" padded ".into())]),
+            Some(" padded ".into()),
+        );
+    }
+
+    #[test]
+    fn the_random_fallback_is_64_hex_chars_and_differs_each_call() {
+        let a = random_token();
+        assert_eq!(a.len(), 64);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, random_token(), "two calls must not collide");
+    }
 }

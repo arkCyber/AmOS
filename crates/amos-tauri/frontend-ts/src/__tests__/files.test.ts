@@ -16,6 +16,7 @@ import {
   toggleFav,
   recentFiles,
   moveEntries,
+  normalizeFavs,
   normalizeFiles,
   folderTree,
   hasName,
@@ -23,6 +24,8 @@ import {
   restoreFromTrash,
   purgeFromTrash,
   normalizeTrash,
+  normalizeViewIntent,
+  FILES_VIEWS,
   MAX_TRASH_ITEMS,
   type FEntry,
 } from "../lib/files";
@@ -164,6 +167,20 @@ describe("files tree ops", () => {
     expect(folderPath(tree, "f")).toBe("Docs / Media");
     expect(folderPath(tree, "r")).toBe(""); // at root
     expect(folderPath(tree, "nope")).toBe("");
+  });
+
+  test("normalizeFavs turns a corrupted favorites value into an empty list (REQ-A1416)", () => {
+    // `readJson` hands back any *valid* JSON verbatim — a non-array must read as
+    // "no favorites", never reach the render path's `.includes`.
+    expect(normalizeFavs({})).toEqual([]);
+    expect(normalizeFavs(5)).toEqual([]);
+    expect(normalizeFavs(null)).toEqual([]);
+    expect(normalizeFavs("x")).toEqual([]);
+    expect(normalizeFavs(undefined)).toEqual([]);
+    // A well-formed list survives, minus anything that is not an entry id.
+    expect(normalizeFavs(["a", "b"])).toEqual(["a", "b"]);
+    expect(normalizeFavs(["a", 7, null, "b"])).toEqual(["a", "b"]);
+    expect(normalizeFavs([])).toEqual([]);
   });
 
   test("toggleFav toggles an id and recentFiles keeps newest files", () => {
@@ -490,3 +507,41 @@ describe("trash: purgeFromTrash + normalizeTrash", () => {
   });
 });
 
+
+describe("normalizeViewIntent (the cross-window view intent, REQ-A783)", () => {
+  test("keeps a real request and drops the nonce it cannot trust", () => {
+    expect(normalizeViewIntent({ view: "trash", nonce: 7 })).toEqual({ view: "trash", nonce: 7 });
+    // A missing/foreign/NaN nonce is *no clock*, not a reason to refuse the request: the screen
+    // still has to land on the view (the nonce is only the re-fire marker).
+    expect(normalizeViewIntent({ view: "fav" })).toEqual({ view: "fav", nonce: 0 });
+    expect(normalizeViewIntent({ view: "fav", nonce: "now" })).toEqual({ view: "fav", nonce: 0 });
+    expect(normalizeViewIntent({ view: "fav", nonce: Infinity })).toEqual({ view: "fav", nonce: 0 });
+  });
+
+  test("'nothing pending' is null, not a default view", () => {
+    // The key is a command, not state: `null` (and everything that is not a request) must leave
+    // the screen where it is. A default here would mean every Files window opened *later* jumped
+    // to some view on its own — a reveal nobody asked for.
+    expect(normalizeViewIntent(null)).toBeNull();
+    expect(normalizeViewIntent(undefined)).toBeNull();
+    expect(normalizeViewIntent("trash")).toBeNull();
+    expect(normalizeViewIntent(42)).toBeNull();
+    expect(normalizeViewIntent({})).toBeNull();
+    expect(normalizeViewIntent({ view: "" })).toBeNull();
+    expect(normalizeViewIntent({ view: 3 })).toBeNull();
+  });
+
+  test("a view this build does not have is ignored, not switched to", () => {
+    // Forward-compat, and the reason the check is a runtime list and not the type: an older
+    // reader meeting a newer writer's `"shared"` must keep the view it is on. If this returned
+    // the value, `mode` would hold a string no branch of the template renders — an empty screen.
+    expect(normalizeViewIntent({ view: "shared", nonce: 1 })).toBeNull();
+    expect(normalizeViewIntent({ view: "TRASH", nonce: 1 })).toBeNull();
+    // …and the list is the whole set, so the four the screen *does* render all survive.
+    for (const v of FILES_VIEWS) expect(normalizeViewIntent({ view: v, nonce: 1 })).toEqual({
+      view: v,
+      nonce: 1,
+    });
+    expect(FILES_VIEWS).toEqual(["all", "fav", "recent", "trash"]);
+  });
+});

@@ -66,8 +66,8 @@
       "why": "`required-features = [\"ntp\"]` and it queries real NTP servers, so it is a network test rather than an offline smoke (the offline half is `cargo test -p amos-timesync --features amos-timesync/ntp`)."
     },
     {
-      "example": "amos-translate/status_once",
-      "why": "Takes a daemon socket (`usage: status_once <socket>`): the translate daemon's status, which needs that daemon to be running."
+      "example": "amos-translate/translate_status_once",
+      "why": "Takes a daemon socket (`usage: translate_status_once <socket>`): the translate daemon's status, which needs that daemon to be running. (Named for the daemon because `amos-ai` ships a `status_once` too and cargo writes both to one `target/debug/examples/<name>` path — see `scripts/isolation-check.mjs` rule 2.)"
     },
     {
       "example": "amos-translate/translate_once",

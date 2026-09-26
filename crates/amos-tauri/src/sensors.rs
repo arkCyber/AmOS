@@ -26,14 +26,15 @@ async fn build_channel() -> Result<crate::daemon::DaemonChannel, String> {
 /// Wire vocabulary for the sensor bridge. The UI i18n layer branches on these;
 /// renaming a variant is a wire break.
 pub mod codes {
+    use crate::error::ErrorCode;
     /// Caller asked for a sensor mode the daemon does not know.
-    pub const UNKNOWN_MODE: &str = "amos.sensors.unknown_mode";
+    pub const UNKNOWN_MODE: &str = ErrorCode::SensorsUnknownMode.as_str();
     /// Caller asked for a sensor kind the daemon does not know.
-    pub const UNKNOWN_KIND: &str = "amos.sensors.unknown_kind";
+    pub const UNKNOWN_KIND: &str = ErrorCode::SensorsUnknownKind.as_str();
     /// Caller asked for a stream rate outside the supported range.
-    pub const RATE_OUT_OF_RANGE: &str = "amos.sensors.rate_out_of_range";
+    pub const RATE_OUT_OF_RANGE: &str = ErrorCode::SensorsRateOutOfRange.as_str();
     /// Any sensor RPC failed (daemon unreachable / rejected).
-    pub const RPC_FAILED: &str = "amos.sensors.rpc_failed";
+    pub const RPC_FAILED: &str = ErrorCode::SensorsRpcFailed.as_str();
 }
 
 /// Upper bound on a single sensor stream's `rate_hz`.
@@ -58,28 +59,48 @@ pub struct SensorCamera {
 }
 
 /// Serializable GNSS fix (or "no fix yet").
+///
+/// `accuracy_m` / `sats` are `Option` because both wires are **zero-sentinel**: the proto's
+/// `double accuracy_m` and `uint32 sats_in_view` have no field presence, and the producer
+/// writes `0` to mean "not reported". Android's `Location.getAccuracy()` returns `0.0` when
+/// the fix carries no accuracy estimate, and `Location` carries no satellite count at all
+/// (`amos-sensor/src/android.rs` sets `satellites_in_view: 0` with the comment "0 is honest
+/// 'not reported', not a claim of zero sats"). Folding either `0` into a measurement prints
+/// `±0m · 0sats` — a precision the receiver never claimed and a satellite count it never
+/// had (AEROSPACE P0-3). The sibling `lib/gps.ts::accuracyLabel` already renders that same
+/// `0` as `—`, so this mapping is the rule the frontend one field over already follows.
 #[derive(Clone, Debug, Serialize)]
 pub struct SensorGnss {
     pub enabled: bool,
     pub has_fix: bool,
     pub latitude_deg: f64,
     pub longitude_deg: f64,
-    pub accuracy_m: f64,
-    pub sats: u32,
+    pub accuracy_m: Option<f64>,
+    pub sats: Option<u32>,
     pub fix_mode: String,
 }
 
 /// Serializable IMU sample.
 ///
-/// The six axes and the die temperature are `Option`: the proto's `accel_m_s2` /
-/// `gyro_rad_s` are optional, and a sample that was **not** reported must stay
-/// distinguishable from a real measurement. Mapping an absent axis to `0.0` would put a
-/// value on the wire that the device never measured (AEROSPACE P0-3 — the same rule
-/// `SystemStatus` follows), and `0` is the most misleading substitute available: it reads
-/// as "perfectly still". `None` is rendered as `—` by the UI (REQ-A294).
+/// Every field is `Option`: the proto's `accel_m_s2` / `gyro_rad_s` are optional, and a
+/// sample that was **not** reported must stay distinguishable from a real measurement.
+/// Mapping an absent axis to `0.0` would put a value on the wire that the device never
+/// measured (AEROSPACE P0-3 — the same rule `SystemStatus` follows), and `0` is the most
+/// misleading substitute available: it reads as "perfectly still". `None` is rendered as
+/// `—` by the UI (REQ-A294).
 #[derive(Clone, Debug, Serialize)]
 pub struct SensorImu {
-    pub rate_hz: u32,
+    /// The negotiated IMU report rate, in Hz — `None` when the producer has not negotiated
+    /// one yet (REQ-A1612 / F-SH-821).
+    ///
+    /// `0` is **not** a rate here: the producer's own vocabulary defines it as "not
+    /// negotiated yet" (`amos-sensor`'s `LiveSensorProvider::set_imu_rate_hz` —
+    /// "`0` = not negotiated yet", and `AndroidSensorProvider::imu_rate_hz` — "the domain
+    /// core treats 0 as \"unknown\""), and [`MIN_SENSOR_RATE_HZ`] states the same thing for
+    /// the request direction ("Zero is not a meaningful \"off\""). The proto's `uint32
+    /// rate_hz` has **no field presence**, so that "unknown" arrives as `0` — which, left
+    /// unfolded, the panel printed as the measurement `@0 Hz`.
+    pub rate_hz: Option<u32>,
     pub accel_x: Option<f64>,
     pub accel_y: Option<f64>,
     pub accel_z: Option<f64>,
@@ -87,6 +108,14 @@ pub struct SensorImu {
     pub gyro_x: Option<f64>,
     pub gyro_y: Option<f64>,
     pub gyro_z: Option<f64>,
+    /// Die temperature, in °C — `None` when the device reported none.
+    ///
+    /// Like `rate_hz`, the wire's `float temperature_c` has **no field presence**,
+    /// so the producer writes `0` to mean "not reported" — and that is the normal
+    /// case: the Android glue reads only `TYPE_ACCELEROMETER` / `TYPE_GYROSCOPE`
+    /// and has no die-temperature source behind them (`amos-sensor`'s
+    /// `ImuSample::temperature_c` carries that fact as an `Option`). Read as
+    /// **unknown**, never as a measured `0 °C`; the panel prints `—` for it.
     pub temp_c: Option<f32>,
 }
 
@@ -166,8 +195,12 @@ fn gnss_payload(g: &GnssReply) -> SensorGnss {
         has_fix: g.has_fix,
         latitude_deg: g.latitude_deg,
         longitude_deg: g.longitude_deg,
-        accuracy_m: g.accuracy_m,
-        sats: g.sats_in_view,
+        // Both wires are zero-sentinel (no field presence): `0` is the producer's
+        // "not reported", read as **unknown** rather than as a 0 m accuracy / 0 satellites
+        // (see `SensorGnss`). The renderer's `±…` / `…sats` clauses are already gated on
+        // `null`, so an unknown field drops out of the fix line instead of being invented.
+        accuracy_m: (g.accuracy_m != 0.0).then_some(g.accuracy_m),
+        sats: (g.sats_in_view != 0).then_some(g.sats_in_view),
         fix_mode: fix_mode_label(g.fix_mode),
     }
 }
@@ -176,7 +209,11 @@ fn imu_payload(i: &ImuReply) -> SensorImu {
     let acc = i.accel_m_s2.as_ref();
     let gyro = i.gyro_rad_s.as_ref();
     SensorImu {
-        rate_hz: i.rate_hz,
+        // The wire's `uint32 rate_hz` has no field presence, and the producer writes `0`
+        // to mean "not negotiated yet" (see `SensorImu::rate_hz`). So `0` is read as
+        // **not reported** rather than as a 0 Hz rate — otherwise a device whose IMU
+        // listener has not started prints `@0 Hz`, a fabricated measurement (P0-3).
+        rate_hz: (i.rate_hz != 0).then_some(i.rate_hz),
         // Absent stays absent (`None`): the UI prints `—` for it instead of a fabricated
         // `0.0`, which would read as a measurement (REQ-A294 / P0-3).
         accel_x: acc.map(|v| v.x),
@@ -185,7 +222,11 @@ fn imu_payload(i: &ImuReply) -> SensorImu {
         gyro_x: gyro.map(|v| v.x),
         gyro_y: gyro.map(|v| v.y),
         gyro_z: gyro.map(|v| v.z),
-        temp_c: Some(i.temperature_c),
+        // Same zero-sentinel rule as `rate_hz` above: the producer writes `0` for
+        // "not reported", and a die temperature nothing measured must not be
+        // drawn as a measured `0 °C` (P0-3). The mock/sim providers *do* report
+        // one, and it survives this fold.
+        temp_c: (i.temperature_c != 0.0).then_some(i.temperature_c),
     }
 }
 
@@ -357,8 +398,41 @@ mod tests {
         let p = gnss_payload(&g);
         assert!(p.enabled && p.has_fix);
         assert_eq!(p.latitude_deg, 31.23);
-        assert_eq!(p.sats, 11);
+        assert_eq!(p.sats, Some(11));
         assert_eq!(p.fix_mode, "3d");
+    }
+
+    #[test]
+    fn an_unreported_accuracy_and_satellite_count_are_unknown_not_0m_and_0sats() {
+        use amos_proto::amos_sensor::FixMode;
+        // The producer writes `0` for "not reported" on both zero-sentinel wires: Android's
+        // `getAccuracy()` returns `0.0` for a fix with no accuracy estimate, and `Location`
+        // carries no satellite count (`satellites_in_view: 0`). A surface showing `±0m` /
+        // `0sats` would be stating a precision and a count the receiver never gave (P0-3).
+        let g = GnssReply {
+            enabled: true,
+            has_fix: true,
+            latitude_deg: 31.23,
+            longitude_deg: 121.47,
+            altitude_m: 10.0,
+            accuracy_m: 0.0,
+            fix_mode: FixMode::ThreeDim as i32,
+            sats_in_view: 0,
+            timestamp_ms: 1000,
+        };
+        let p = gnss_payload(&g);
+        assert_eq!(p.accuracy_m, None);
+        assert_eq!(p.sats, None);
+
+        // Positive control: a real fix keeps both readings (the fold must not swallow them).
+        let g = GnssReply {
+            accuracy_m: 4.2,
+            sats_in_view: 9,
+            ..g
+        };
+        let p = gnss_payload(&g);
+        assert_eq!(p.accuracy_m, Some(4.2));
+        assert_eq!(p.sats, Some(9));
     }
 
     #[test]
@@ -380,7 +454,7 @@ mod tests {
             rate_hz: 200,
         };
         let p = imu_payload(&with_both);
-        assert_eq!(p.rate_hz, 200);
+        assert_eq!(p.rate_hz, Some(200));
         assert_eq!(p.temp_c, Some(36.5));
         assert_eq!(p.accel_x, Some(0.1));
         assert_eq!(p.accel_y, Some(-9.8));
@@ -427,8 +501,62 @@ mod tests {
             [p.accel_x, p.accel_y, p.accel_z, p.gyro_x, p.gyro_y, p.gyro_z],
             [None, None, None, None, None, None]
         );
-        assert_eq!(p.rate_hz, 200);
+        assert_eq!(p.rate_hz, Some(200));
         assert_eq!(p.temp_c, Some(36.5));
+    }
+
+    /// The wire writes `0` to mean "the IMU rate is not negotiated yet", so it must not
+    /// become the measurement `0 Hz` (REQ-A1612 / F-SH-821).
+    ///
+    /// The producer's own vocabulary is the authority: `LiveSensorProvider::set_imu_rate_hz`
+    /// documents "`0` = not negotiated yet" and `MIN_SENSOR_RATE_HZ` says "Zero is not a
+    /// meaningful \"off\"". `uint32 rate_hz` has no field presence, so an un-negotiated
+    /// device sends `0`, and a raw pass-through put `@0 Hz` on the settings panel — a
+    /// fabricated sample rate, read as a measurement (the P0-3 shape this module's doc
+    /// already states for the axes). The positive control is the `None`-free case: a real
+    /// rate must survive, or "always report unknown" would pass this test too.
+    #[test]
+    fn an_unnegotiated_imu_rate_is_unknown_not_zero_hz() {
+        let base = ImuReply {
+            timestamp_ms: 0,
+            accel_m_s2: None,
+            gyro_rad_s: None,
+            temperature_c: 36.5,
+            rate_hz: 0,
+        };
+        assert_eq!(imu_payload(&base).rate_hz, None);
+
+        // …and a negotiated rate is still reported, so the fold is not "always None".
+        let negotiated = ImuReply {
+            rate_hz: 100,
+            ..base
+        };
+        assert_eq!(imu_payload(&negotiated).rate_hz, Some(100));
+    }
+
+    /// The wire writes `0` for "no die temperature" — the **normal** case, since
+    /// the Android glue reads only the accelerometer and gyroscope and has no
+    /// die-temperature source — so it must not become the measurement `0 °C`. The
+    /// same zero-sentinel rule as `rate_hz` above, on the same message.
+    ///
+    /// The mock/sim providers *do* report a temperature, so the positive control
+    /// is a real value surviving the fold (otherwise "always None" would pass).
+    #[test]
+    fn an_unreported_die_temperature_is_unknown_not_zero_degrees() {
+        let base = ImuReply {
+            timestamp_ms: 0,
+            accel_m_s2: None,
+            gyro_rad_s: None,
+            temperature_c: 0.0,
+            rate_hz: 200,
+        };
+        assert_eq!(imu_payload(&base).temp_c, None);
+
+        let reported = ImuReply {
+            temperature_c: 36.5,
+            ..base
+        };
+        assert_eq!(imu_payload(&reported).temp_c, Some(36.5));
     }
 
     #[test]

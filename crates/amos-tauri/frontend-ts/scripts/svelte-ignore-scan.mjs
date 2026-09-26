@@ -58,10 +58,29 @@
  *       sanctioned way to relax one is to write the reason at that code.
  *
  * Usage (from frontend-ts):
- *   node scripts/svelte-ignore-scan.mjs              # gate (R0–R6, non-zero on finding)
- *   node scripts/svelte-ignore-scan.mjs --no-live    # R0–R4, R6 only (triage / offline)
+ *   node scripts/svelte-ignore-scan.mjs              # full gate (R0–R7; needs the installed svelte)
+ *   node scripts/svelte-ignore-scan.mjs --static     # R0–R4, R6 only (no node_modules needed)
+ *   node scripts/svelte-ignore-scan.mjs --no-live    # full static rules, skip the R5 probe
  *   node scripts/svelte-ignore-scan.mjs --json       # machine-readable report
  *   node scripts/svelte-ignore-scan.mjs --selftest   # pin the parsers first
+ *
+ * Two modes, because this gate has two halves with different input needs (REQ-A473):
+ *
+ *   • `--static` needs **only the working tree** — it is what `make lint` runs, because
+ *     `make lint` is the repository's *clean-checkout* gate (no `bun install` anywhere in
+ *     the Makefile, the workflows or `deploy.sh`; every other frontend step there is a
+ *     dependency-free `node` script). The carrier rules are exactly the cross-file contract,
+ *     so they must hold in a checkout that has never been installed.
+ *   • the full run additionally needs the installed compiler: R5 (liveness) spawns
+ *     `svelte-check`, and R7 classifies codes against Svelte's own code list. It is what
+ *     `bun run check` runs, where `svelte-check` has just run anyway.
+ *
+ * Measured 2026-09-19: the first version of this gate read `node_modules/svelte/...`
+ * unconditionally, so on a clean checkout (and therefore in CI, whose lint step is
+ * `make lint`) it died with `ENOENT ... /node_modules/svelte/src/compiler/warnings.js`
+ * instead of reporting anything — a gate that cannot run where the repository runs it.
+ * `--static` closes that, and the full mode now fails with an actionable message (R8)
+ * rather than a stack trace.
  */
 import { readFileSync, readdirSync, existsSync, writeFileSync } from "node:fs";
 import { join, dirname, relative } from "node:path";
@@ -84,6 +103,11 @@ const MIN_REASON = 24;
 
 const normWS = (s) => s.replace(/\s+/g, " ").trim();
 const sha256 = (buf) => createHash("sha256").update(buf).digest("hex");
+
+/** Is the liveness probe's instrument installed? (A clean checkout: no.) */
+export function hasSvelteCheck(bin = SVELTE_CHECK_BIN) {
+  return existsSync(bin);
+}
 
 // --- file discovery ---------------------------------------------------------
 function walkSvelte(dir, acc = []) {
@@ -281,6 +305,9 @@ export function probeLiveness(site, baseCount = null) {
   if (!isTsconfigCovered(site.file)) {
     return { status: "skipped", why: "outside tsconfig.json include (svelte-check does not check it)" };
   }
+  if (!hasSvelteCheck()) {
+    return { status: "skipped", why: "node_modules/.bin/svelte-check is not installed" };
+  }
   const abs = join(root, site.file);
   const original = readFileSync(abs);
   const before = sha256(original);
@@ -314,7 +341,7 @@ export function probeLiveness(site, baseCount = null) {
 const key = (file, code) => `${file}::${code}`;
 
 /** R0–R4 + R6 (+R5 when `live`). Reads the tree; only the probe writes (and restores). */
-export function runChecks({ live = true, rootDir = root, allowlistPath = ALLOWLIST_PATH } = {}) {
+export function runChecks({ live = true, staticMode = false, rootDir = root, allowlistPath = ALLOWLIST_PATH } = {}) {
   const { sites, malformed } = collectSites(rootDir);
   const { ignores, compilerWarnings } = loadAllowlist(allowlistPath);
   const findings = [];
@@ -325,6 +352,37 @@ export function runChecks({ live = true, rootDir = root, allowlistPath = ALLOWLI
 
   // Codes Svelte actually knows — the difference between a suppression and a word.
   const compiler = loadSvelteWarningCodes(rootDir);
+
+  // R8 — the full gate's own input is missing. A clean checkout is a legitimate state
+  // (CI's `make lint` runs on one, and no Makefile/workflow/`deploy.sh` line ever runs
+  // `bun install`), so this must be one actionable sentence rather than an ENOENT stack
+  // trace: measured 2026-09-19, the first version of this gate died exactly that way.
+  if (!compiler && !staticMode) {
+    add(
+      "R8",
+      "the installed Svelte compiler is missing (node_modules/svelte/src/compiler/warnings.js): R5 liveness spawns `svelte-check` " +
+        "and R7 classifies codes against Svelte's own code list. Run `bun install` in crates/amos-tauri/frontend-ts, or run " +
+        "`--static` for the dependency-free half (carrier, reason, drift, stale entries, flag sync). `make lint` runs `--static` " +
+        "on purpose: a clean checkout has no node_modules.",
+    );
+    return {
+      sites,
+      ignores,
+      compilerWarnings,
+      findings,
+      liveness: [],
+      live,
+      staticMode,
+      compilerFound: false,
+      notClassified: [],
+    };
+  }
+
+  // In the full mode a suppression is a code Svelte knows; on a clean checkout
+  // (`--static`) it is a code-*shaped* token — `--selftest` asserts that every code the
+  // installed Svelte knows has that shape, so the fallback is checked, not assumed.
+  const isSuppression = compiler ? (code) => compiler.codes.has(code) : matchesCodeShape;
+  const notClassified = [];
 
   const declared = new Map();
   for (const e of ignores) {
@@ -343,16 +401,22 @@ export function runChecks({ live = true, rootDir = root, allowlistPath = ALLOWLI
 
   const seen = new Set();
   for (const s of sites) {
-    // R7 — a token that is not a Svelte warning code suppresses nothing. Reporting
-    // it here is not redundant with svelte-check: this message carries the file
-    // and line, and it is the reason no allow-list entry is demanded below.
-    if (!compiler.codes.has(s.code)) {
-      add(
-        "R7",
-        `${s.file}:${s.line} names \`${s.code}\`, which is not a Svelte warning code` +
-          (compiler.legacy.has(s.code) ? " (legacy code: svelte-check reports `legacy_code`)" : "") +
-          ` — nothing is suppressed here (svelte-check reports \`unknown_code\`)`,
-      );
+    if (!isSuppression(s.code)) {
+      // R7 — a token that is not a Svelte warning code suppresses nothing. Reporting it
+      // here is not redundant with svelte-check: this message carries the file and line,
+      // and it is the reason no allow-list entry is demanded below. On a clean checkout
+      // there is no code list to judge against, so the token is recorded as
+      // "not classified" and reported as a note instead of an invented finding.
+      if (compiler) {
+        add(
+          "R7",
+          `${s.file}:${s.line} names \`${s.code}\`, which is not a Svelte warning code` +
+            (compiler.legacy.has(s.code) ? " (legacy code: svelte-check reports `legacy_code`)" : "") +
+            ` — nothing is suppressed here (svelte-check reports \`unknown_code\`)`,
+        );
+      } else {
+        notClassified.push(`${s.file}:${s.line} \`${s.code}\``);
+      }
       continue;
     }
     const k = key(s.file, s.code);
@@ -419,15 +483,16 @@ export function runChecks({ live = true, rootDir = root, allowlistPath = ALLOWLI
     );
   }
 
-  // R5 — liveness, last: no point probing a site the carrier has not accepted.
+  // R5 — liveness, last: no point probing a site the carrier has not accepted, and the
+  // probe cannot run at all without the installed `svelte-check` (--static, clean checkout).
   const liveness = [];
-  if (live) {
+  if (live && !staticMode) {
     const baseCounts = new Map();
     for (const s of sites) {
       if (!seen.has(key(s.file, s.code))) continue;
       const k = key(s.file, s.code);
       let base = null;
-      if (isTsconfigCovered(s.file)) {
+      if (isTsconfigCovered(s.file) && hasSvelteCheck()) {
         if (!baseCounts.has(k)) baseCounts.set(k, countCodeDiagnostics(s.file, s.code));
         base = baseCounts.get(k);
       }
@@ -444,24 +509,47 @@ export function runChecks({ live = true, rootDir = root, allowlistPath = ALLOWLI
     }
   }
 
-  return { sites, ignores, compilerWarnings, findings, liveness, live };
+  return { sites, ignores, compilerWarnings, findings, liveness, live, staticMode, compilerFound: true, notClassified };
 }
 
 // --- "what is a suppression?" ------------------------------------------------
 /**
- * The set of codes Svelte itself recognises, read **from the installed compiler**
- * rather than hard-coded here. This is not about catching typos (svelte-check
- * already reports `unknown_code` and `--fail-on-warnings` makes it fatal): it is
- * what lets this scanner tell a *suppression* from a word. The grammar alone
- * cannot — `<!-- svelte-ignore a11y_x, because …, -->` yields the token `because`,
- * and treating that as a code would demand an allow-list entry for prose.
+ * The **shape** of a Svelte warning code, used only when the installed compiler is
+ * unavailable (`--static`, i.e. a clean checkout): `a11y_media_has_caption`,
+ * `css_unused_selector`, `unknown_code`, the legacy dashed `unused-export-let`.
  *
- * @returns {{ codes: Set<string>, legacy: Set<string> }}
+ * Why a shape instead of nothing: without it the grammar alone cannot tell a code
+ * from a word (`<!-- svelte-ignore a11y_x, because … -->` yields `because`), and every
+ * word would demand an allow-list entry. Why it is safe: with the compiler present the
+ * gate uses the **exact** code list instead, and `--selftest` asserts that every code
+ * the installed Svelte knows matches this shape — so the heuristic is validated against
+ * reality whenever reality is available rather than being trusted.
+ */
+export const CODE_SHAPE = /^[a-z][a-z0-9]*(?:[_-][a-z0-9]+)+$/;
+
+export function matchesCodeShape(code) {
+  return CODE_SHAPE.test(code);
+}
+
+/**
+ * The set of codes Svelte itself recognises, read **from the installed compiler**
+ * rather than hard-coded here. This is what lets the gate tell a *suppression* from a
+ * word, and (in the full mode) what makes a renamed or removed upstream code a finding.
+ *
+ * Returns `null` — **never throws** — when this checkout has no installed Svelte: a
+ * clean checkout is a legitimate state (CI's `make lint` runs on one), and the caller
+ * decides whether that is "run `--static`" or "this gate cannot answer here" (R8).
+ *
+ * @returns {null | { codes: Set<string>, legacy: Set<string> }}
  */
 export function loadSvelteWarningCodes(rootDir = root) {
-  const warningsSrc = readFileSync(join(rootDir, "node_modules/svelte/src/compiler/warnings.js"), "utf8");
-  const constantsSrc = readFileSync(join(rootDir, "node_modules/svelte/src/constants.js"), "utf8");
-  const extractSrc = readFileSync(join(rootDir, "node_modules/svelte/src/compiler/utils/extract_svelte_ignore.js"), "utf8");
+  const files = [
+    "node_modules/svelte/src/compiler/warnings.js",
+    "node_modules/svelte/src/constants.js",
+    "node_modules/svelte/src/compiler/utils/extract_svelte_ignore.js",
+  ].map((p) => join(rootDir, p));
+  if (!files.every((f) => existsSync(f))) return null;
+  const [warningsSrc, constantsSrc, extractSrc] = files.map((f) => readFileSync(f, "utf8"));
   return { codes: extractWarningCodes(warningsSrc, constantsSrc), legacy: extractLegacyCodes(extractSrc) };
 }
 
@@ -559,6 +647,30 @@ function runSelftest() {
 
   check("tsconfig coverage predicate", isTsconfigCovered("src/svelte/A.svelte") && !isTsconfigCovered("svelte-tests/fixtures/A.svelte"));
 
+  // --static's classifier (REQ-A473): the shape must accept every real Svelte code and
+  // must not swallow prose, or a clean checkout would invent allow-list demands for words.
+  for (const code of ["a11y_media_has_caption", "css_unused_selector", "unknown_code", "await_waterfall", "unused-export-let"]) {
+    check(`code shape accepts ${code}`, matchesCodeShape(code));
+  }
+  for (const word of ["because", "track", "hello", "a11y_", "A11y_x"]) {
+    check(`code shape rejects ${JSON.stringify(word)}`, !matchesCodeShape(word));
+  }
+
+  // The dependency-free contract, pinned: with no installed Svelte this must be `null`,
+  // never a throw (measured 2026-09-19: the first version died with ENOENT here).
+  check("missing svelte ⇒ null, not a throw", loadSvelteWarningCodes("/nonexistent-checkout-xyz") === null);
+
+  // …and the heuristic above is validated against reality whenever reality is present:
+  // every code the installed compiler knows must have the shape `--static` relies on.
+  const installed = loadSvelteWarningCodes(root);
+  if (installed) {
+    const offShape = [...installed.codes, ...installed.legacy].filter((c) => !matchesCodeShape(c));
+    check(`every installed Svelte code matches CODE_SHAPE (${installed.codes.size} codes)`, offShape.length === 0);
+    if (offShape.length > 0) console.error(`       off-shape codes: ${offShape.join(", ")}`);
+  } else {
+    console.log("[svelte-ignore-scan] selftest note: the installed Svelte is absent, so the CODE_SHAPE ⇄ real code-list assertion was skipped.");
+  }
+
   console.log(`[svelte-ignore-scan] selftest: ${total} assertion(s), ${failed} failure(s).`);
   process.exit(failed === 0 ? 0 : 1);
 }
@@ -567,12 +679,26 @@ function runSelftest() {
 // --- CLI ---------------------------------------------------------------------
 function main() {
   const asJson = process.argv.includes("--json");
+  const staticMode = process.argv.includes("--static");
   const live = !process.argv.includes("--no-live");
-  const report = runChecks({ live });
+  const report = runChecks({ live, staticMode });
 
   if (asJson) {
     console.log(JSON.stringify(report, null, 2));
     process.exit(report.findings.length === 0 ? 0 : 1);
+  }
+
+  // What this run did NOT check is printed **before** the verdict, in both directions:
+  // a green line that silently omits half the gate is the defect this whole gate exists
+  // to fight (REQ-A471's record), so `--static` must not read as "everything passed".
+  if (staticMode) {
+    console.log(
+      `[svelte-ignore-scan] mode: --static (no node_modules needed) — R5 liveness is NOT probed and code classification uses the ` +
+        `code *shape*, not the installed compiler's list. Run \`bun run check\` (full mode) for both.`,
+    );
+  }
+  for (const n of report.notClassified) {
+    console.log(`[svelte-ignore-scan] note: ${n} not classified (no installed Svelte compiler in this checkout)`);
   }
 
   if (report.findings.length === 0) {
@@ -582,7 +708,11 @@ function main() {
     console.log(
       `[svelte-ignore-scan] OK — ${report.sites.length} suppression(s) in ${files.size} file(s), each declared in ` +
         `scripts/svelte-ignore-allowlist.json with a reason; 0 undeclared, 0 stale, 0 dead` +
-        (live ? `; liveness probed: ${probed} live` : " (liveness not probed: --no-live)") +
+        (staticMode
+          ? "; liveness not probed (--static)"
+          : live
+            ? `; liveness probed: ${probed} live`
+            : " (liveness not probed: --no-live)") +
         `; --compiler-warnings relaxations declared: ${report.compilerWarnings.length}.`,
     );
     for (const s of skipped) {

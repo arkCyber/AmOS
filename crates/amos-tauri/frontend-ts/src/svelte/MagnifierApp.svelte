@@ -12,6 +12,8 @@
     LENS_R,
     MIN_ZOOM,
     MAX_ZOOM,
+    MIN_TONE,
+    MAX_TONE,
     MAGNIFIER_SETTINGS_KEY,
     clampCenter,
     centredLens,
@@ -24,9 +26,12 @@
   import { capSet, loadLedger } from "../lib/permissions";
   import { grantCapability } from "./osPermissions";
   import { t } from "./locale.svelte";
+  import StoreErrorBar from "./StoreErrorBar.svelte";
 
   const LENS_SIZE = LENS_R * 2;
   type SceneMode = "live" | "demo";
+  /** Which of the three footer sentences to draw — a *key*, never a translated string. */
+  type HintKey = "starting" | "live" | "demo";
 
   // ---- settings (persisted) ----
   const init = normalizeMagnifierSettings(readStoreValue<unknown>(MAGNIFIER_SETTINGS_KEY, {}));
@@ -46,14 +51,27 @@
 
   // ---- camera permission gate (OS ledger, like the Camera app) ----
   let granted = $state(capSet(loadLedger(), "magnifier", "camera"));
+  /** The ledger write's refusal, shown inside the still-open gate (`StoreErrorBar`). */
+  let storeErr = $state("");
+  // `granted` is seeded from the persisted ledger (`capSet(loadLedger(), …)`), so it is a
+  // *display of* `amos.permissions` — the ledger every OS capability gate reads back, and the
+  // one the live-camera effect below is gated on. The answer must adopt the **write's own
+  // verdict**: on a refused write `grantCapability` answers the ledger the store still holds, so
+  // drawing a granted camera off the intent would start live capture for a permission the next
+  // boot does not have. A still-ungranted ledger keeps the gate up and says why.
   const allowCamera = () => {
-    grantCapability("magnifier", "camera");
-    granted = true;
+    const res = grantCapability("magnifier", "camera");
+    granted = capSet(res.ledger, "magnifier", "camera");
+    if (!granted) {
+      storeErr = t("common.storeWriteFailed");
+      return;
+    }
+    storeErr = "";
   };
 
   // ---- scene / lens state ----
   let mode = $state<SceneMode>("demo");
-  let hint = $state(t("magnifier.starting"));
+  let hintKey = $state<HintKey>("starting");
   let center = $state({ x: 0, y: 0 });
   const pct = (v: number) => `${v}%`;
 
@@ -69,8 +87,23 @@
 
   const mark = (live: boolean) => {
     mode = live ? "live" : "demo";
-    hint = live ? t("magnifier.live") : t("magnifier.demo");
+    hintKey = live ? "live" : "demo";
   };
+
+  // The footer sentence is a **key**, not a stored translation. `t()` reads the
+  // reactive locale, so a `$state` holding the translated *string* can only be
+  // re-keyed by re-running whatever wrote it — and the only writers are the camera
+  // effect below. That made the locale a dependency of camera acquisition: switching
+  // UI language tore the live `MediaStream` down and re-opened the camera. Deriving
+  // the copy here keeps the footer locale-reactive without putting `t()` inside the
+  // acquisition effect.
+  const hintText = $derived(
+    hintKey === "starting"
+      ? t("magnifier.starting")
+      : hintKey === "live"
+        ? t("magnifier.live")
+        : t("magnifier.demo"),
+  );
 
   // Attempt live camera; otherwise fall back to demo scene.
   $effect(() => {
@@ -86,7 +119,7 @@
       mark(false);
       return;
     }
-    hint = t("magnifier.starting");
+    hintKey = "starting";
     navigator.mediaDevices!
       .getUserMedia({ video: { facingMode: "environment" } })
       .then((s) => {
@@ -273,6 +306,7 @@
       <button onclick={allowCamera} class="rounded-full bg-accent px-4 py-1.5 text-sm text-white active:scale-95">
         {t("perm.allow")}
       </button>
+      <StoreErrorBar message={storeErr} />
     </div>
   {:else}
     <div class="flex h-full flex-col">
@@ -300,8 +334,8 @@
         >
           <canvas bind:this={lensCanvas} width={LENS_SIZE} height={LENS_SIZE} class="h-full w-full" data-testid="magnifier-lens"></canvas>
         </div>
-        {#if hint}
-          <p class="absolute bottom-1 left-0 right-0 text-center text-[11px] text-white/40">{hint}</p>
+        {#if hintText}
+          <p class="absolute bottom-1 left-0 right-0 text-center text-[11px] text-white/40">{hintText}</p>
         {/if}
       </div>
 
@@ -311,8 +345,8 @@
           <input
             id="magnifier-brightness"
             type="range"
-            min={0}
-            max={200}
+            min={MIN_TONE}
+            max={MAX_TONE}
             step={1}
             value={bright}
             oninput={(e) => (bright = Number((e.target as HTMLInputElement).value))}
@@ -326,8 +360,8 @@
           <input
             id="magnifier-contrast"
             type="range"
-            min={0}
-            max={200}
+            min={MIN_TONE}
+            max={MAX_TONE}
             step={1}
             value={contrast}
             oninput={(e) => (contrast = Number((e.target as HTMLInputElement).value))}

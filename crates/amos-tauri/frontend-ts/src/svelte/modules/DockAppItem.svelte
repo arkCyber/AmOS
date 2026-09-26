@@ -17,22 +17,33 @@
    * around this widget (see `Dock.svelte`), so the tile stays a plain tile and the
    * geometry the container measures cannot feed back on itself.
    */
-  import { wmOpen } from "../../lib/wm";
+  import { wmOpenReported } from "../../lib/wm";
+  import { badgeText } from "../../lib/dockBadge";
+  import { t } from "../locale.svelte";
   import DockTileButton from "./DockTileButton.svelte";
 
   let {
     id,
     icon,
     label,
+    /** Unread count for this app (0 ⇒ no badge). Computed by the container from the
+     * shared notification store, so the tile only *renders* what the shell decided. */
+    unread = 0,
   }: {
     id: string;
     icon: string;
     label: string;
+    unread?: number;
   } = $props();
 
   function open() {
-    void wmOpen(id);
+    void wmOpenReported(id, "Dock");
   }
+
+  const badge = $derived(badgeText(unread));
+  /** The spelled-out count for assistive tech (uses the **real** count, not the `99+`
+   * text: a screen reader can say the number a sighted user only sees capped). */
+  const badgeAria = $derived(badge ? t("desktop.dockBadgeAria", { n: unread }) : null);
 </script>
 
-<DockTileButton {label} testId="dock-app-{id}" glyph={icon} onclick={open} />
+<DockTileButton {label} testId="dock-app-{id}" glyph={icon} onclick={open} {badge} {badgeAria} />

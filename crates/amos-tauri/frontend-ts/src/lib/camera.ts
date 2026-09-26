@@ -2,14 +2,13 @@
  * toggle/capture math is unit-testable headlessly. Mirrors common phone-camera
  * options: lens flip, flash, timer, aspect ratio, zoom and rule-of-thirds grid. */
 
-export type CamFacing = "back" | "front";
-export type CamFlash = "auto" | "on" | "off";
-export type CamRatio = "4:3" | "square" | "16:9";
+export const FACING_ORDER = ["back", "front"] as const;
+export type CamFacing = (typeof FACING_ORDER)[number];
+export const FLASH_ORDER = ["auto", "on", "off"] as const;
+export type CamFlash = (typeof FLASH_ORDER)[number];
+export const RATIO_ORDER = ["4:3", "square", "16:9"] as const;
+export type CamRatio = (typeof RATIO_ORDER)[number];
 export type CamZoom = number; // 1 = no zoom
-
-export const FACING_ORDER: CamFacing[] = ["back", "front"];
-export const FLASH_ORDER: CamFlash[] = ["auto", "on", "off"];
-export const RATIO_ORDER: CamRatio[] = ["4:3", "square", "16:9"];
 /** Timer presets in seconds (0 = capture immediately). */
 export const TIMER_PRESETS = [0, 3, 10];
 export const ZOOM_STEPS = [1, 2, 3];
@@ -182,4 +181,34 @@ export function afTap(s: AfState, p: FocusPoint, tol = 0.04): AfState {
 /** The iOS "AE/AF LOCK" caption when a locked point is shown. */
 export function afCaption(state: AfState): string {
   return state.locked ? "AE/AF LOCKED" : "AF";
+}
+
+/* ---- Tap vs double-tap gesture (iOS: a single tap aims focus; a rapid second
+ *      tap is the zoom gesture and must NOT leave the first tap's focus) ---- */
+/** The iOS double-tap window (ms): two taps closer than this are one gesture. */
+export const DOUBLE_TAP_MS = 300;
+
+export type TapKind = "focus" | "double";
+
+/**
+ * Classify a completed tap against the previous one. Two folds matter:
+ *
+ *  • `"double"` when a prior tap happened within `windowMs` — the pair is the
+ *    zoom gesture, and the caller must **undo** whatever focus the first tap of
+ *    the pair applied (focus and double-tap-zoom are mutually exclusive).
+ *  • `lastTapMs` is the *consumed* clock: a double-tap resets it to `null`, so a
+ *    third tap starts a fresh gesture instead of chaining into a second double
+ *    off the middle tap. A single (`"focus"`) tap arms the clock at `now`.
+ *
+ * Pure so the "which gesture was that?" decision is testable without a DOM.
+ */
+export function classifyTap(
+  prevTapMs: number | null,
+  now: number,
+  windowMs = DOUBLE_TAP_MS,
+): { kind: TapKind; lastTapMs: number | null } {
+  if (prevTapMs !== null && now - prevTapMs < windowMs) {
+    return { kind: "double", lastTapMs: null };
+  }
+  return { kind: "focus", lastTapMs: now };
 }

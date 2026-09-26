@@ -159,12 +159,26 @@ fn build_source(server: Option<String>) -> Result<Arc<dyn TimeSource>> {
 /// One-line human summary of a clock's current state.
 pub fn render(clock: &SyncedClock) -> String {
     let corrected_ms = epoch_ms(clock.now());
-    let offset_ms = clock.offset_ns().map(|ns| ns / 1_000_000).unwrap_or(0);
+    // `None` (never synced) is **not** `0`: `0` is a measurement — "the host clock is
+    // already correct" — and an uncalibrated clock has never established one. The
+    // sibling `freshness` below already refuses that fold for the age; the offset is
+    // the same kind of fact. (REQ-A1703 / F-SUP-002.)
+    let offset = clock.offset_ns().map(|ns| ns / 1_000_000);
+    let offset_text = match offset {
+        Some(ms) => format!("offset {ms}ms"),
+        None => "offset unavailable".to_string(),
+    };
     let freshness = match clock.staleness() {
         Some(d) => format!("last synced {}ms ago", d.as_millis()),
+        // A *synced* clock whose last-sync stamp is ahead of the host clock has no
+        // establishable age: "never synced" would be false, and "0ms ago" would be
+        // the most reassuring possible lie. (REQ-A539.)
+        None if clock.synced() => {
+            "sync age unavailable (last-sync stamp is ahead of the host clock)".to_string()
+        }
         None => "never synced (using host clock)".to_string(),
     };
-    format!("corrected now = epoch {corrected_ms}ms (offset {offset_ms}ms), {freshness}")
+    format!("corrected now = epoch {corrected_ms}ms ({offset_text}), {freshness}")
 }
 
 /// Run the requested command.
@@ -295,5 +309,15 @@ mod tests {
         assert!(!clock.synced());
         let text = render(&clock);
         assert!(text.contains("never synced"), "got: {text}");
+        // The offset is the same kind of fact as the age, and the age already refuses
+        // the fold ("0ms ago" would be "the most reassuring possible lie" —
+        // `SyncedClock::staleness`, REQ-A539). `offset 0ms` is that same lie one field
+        // over: it is a *measurement* ("the host clock is already correct"), and this
+        // clock has never been calibrated. (REQ-A1703)
+        assert!(
+            !text.contains("offset 0ms"),
+            "an unsynced clock must not claim a measured zero offset: {text}"
+        );
+        assert!(text.contains("offset unavailable"), "got: {text}");
     }
 }

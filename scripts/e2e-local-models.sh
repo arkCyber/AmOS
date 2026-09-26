@@ -16,8 +16,17 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SENT="${1:-The yellow lamps would light up here and there.}"
 SHERPA_DIR="${SHERPA_MODEL_DIR:-$ROOT/models/sherpa-en-20m}"
-PIPER_ONNX="$ROOT/models/piper-low/en_US-lessac-low.onnx"
-PIPER_JSON="$ROOT/models/piper-low/en_US-lessac-low.onnx.json"
+# Piper voice: same candidate stems/order as the Rust loader (`amos_tts::VOICE_STEMS`),
+# so the voice `scripts/fetch-models.sh` provisions (medium) is found here too —
+# the harness and the loader must not disagree on which voice is "provisioned".
+PIPER_STEM=""
+for cand in "$ROOT/models/piper-en_US-lessac-medium/en_US-lessac-medium" \
+            "$ROOT/models/piper-low/en_US-lessac-low"; do
+  if [ -f "$cand.onnx" ] && [ -f "$cand.onnx.json" ]; then PIPER_STEM="$cand"; break; fi
+done
+[ -n "$PIPER_STEM" ] || { echo "missing Piper voice (run bash scripts/fetch-models.sh)"; exit 2; }
+PIPER_ONNX="$PIPER_STEM.onnx"
+PIPER_JSON="$PIPER_STEM.onnx.json"
 SRC_WAV="/tmp/amos_e2e_src.wav"
 LIVE_SOCKET="${AMOS_TRANSLATE_SOCKET:-}"
 SOCKET="${LIVE_SOCKET:-/tmp/amos-e2e.sock}"

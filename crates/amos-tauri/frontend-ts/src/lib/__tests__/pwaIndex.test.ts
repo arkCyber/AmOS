@@ -12,6 +12,7 @@ import {
   pwaIndexBaseUrl,
   indexDocumentUrlFor,
   fetchPwaIndex,
+  openRemotePwa,
   pwaEntryGlyph,
   pwaEntryIconUrl,
   pwaAllTools,
@@ -179,6 +180,71 @@ describe("pwaIndexBaseUrl / fetchPwaIndex 结果分支", () => {
       expect(ok.base).toBe("https://pwa.host");
       expect(ok.doc.apps[0]!.id).toBe("app.a");
     }
+  });
+});
+
+describe("openRemotePwa —— 远程清单（Gap 6，REQ-A560）", () => {
+  /** Point the bridge at a stub that records every call, so "no IPC was attempted" is assertable. */
+  function bridgeWith(impl: (command: string) => unknown) {
+    const calls: Array<{ command: string; args?: Record<string, unknown> }> = [];
+    (globalThis as { window?: unknown }).window = {
+      __TAURI_INTERNALS__: {
+        invoke: async (command: string, args?: Record<string, unknown>) => {
+          calls.push({ command, args });
+          return impl(command);
+        },
+      },
+    };
+    return calls;
+  }
+
+  it("空网址：不发 IPC，直接如实拒绝", async () => {
+    const calls = bridgeWith(() => ({ app: { id: "x" } }));
+    const r = await openRemotePwa("   ");
+    expect(r).toEqual({ kind: "failed", reason: "refused", detail: "no manifest URL" });
+    expect(calls).toEqual([]);
+  });
+
+  it("成功：只回报宿主真的送来的身份，并把网址去掉首尾空白", async () => {
+    const calls = bridgeWith(() => ({
+      app: { id: "org.amos.demo", name: "Demo", version: "1.2.0", description: "d" },
+      display: { url: "https://demo.example/app", icon: null },
+      mcp_tools: [],
+      permissions: {},
+    }));
+    const r = await openRemotePwa("  https://demo.example/manifest.toml  ");
+    expect(r).toEqual({ kind: "ok", app: { id: "org.amos.demo", name: "Demo", version: "1.2.0" } });
+    expect(calls).toEqual([
+      { command: "pwa_open_remote", args: { url: "https://demo.example/manifest.toml" } },
+    ]);
+  });
+
+  it("宿主拒绝：把宿主自己那句话原样带出来（运营者要能据此行动）", async () => {
+    bridgeWith(() => {
+      throw {
+        code: "amos.appstore.install_failed",
+        message: "no remote PWA host is allow-listed: set AMOS_PWA_REMOTE_ALLOW to a comma-separated list",
+      };
+    });
+    const r = await openRemotePwa("https://evil.example/manifest.toml");
+    expect(r.kind).toBe("failed");
+    if (r.kind === "failed") {
+      expect(r.reason).toBe("refused");
+      expect(r.detail).toContain("AMOS_PWA_REMOTE_ALLOW");
+    }
+  });
+
+  it("宿主答了但读不出 id：拒绝，而不是交回一个没名字的条目", async () => {
+    bridgeWith(() => ({ app: { name: "no id here" } }));
+    const r = await openRemotePwa("https://demo.example/manifest.toml");
+    expect(r.kind).toBe("failed");
+    if (r.kind === "failed") expect(r.reason).toBe("refused");
+  });
+
+  it("没有桥：offline（不是 refused —— 两件事要说得出区别）", async () => {
+    delete (globalThis as { window?: unknown }).window;
+    const r = await openRemotePwa("https://demo.example/manifest.toml");
+    expect(r).toEqual({ kind: "failed", reason: "offline", detail: "no Tauri bridge" });
   });
 });
 

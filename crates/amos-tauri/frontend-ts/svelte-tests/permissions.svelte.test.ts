@@ -18,6 +18,7 @@ import { appTitleKey } from "../src/lib/appMeta";
 import { zh } from "../src/i18n/locales/zh";
 import { translate } from "../src/svelte/i18n";
 import { DEFAULT_ON_CAPABILITIES, defaultAppsFor } from "../src/svelte/osCapabilities";
+import { mirrorRefused } from "../src/svelte/osPermissions";
 
 function candidates(h: { container: HTMLElement }): HTMLButtonElement[] {
   return [...h.container.querySelectorAll("button[aria-pressed]")];
@@ -196,6 +197,46 @@ describe("PermissionsApp.svelte (daemon ↔ ledger drift)", () => {
     });
     // Give the async verdict a chance to land, then assert it stayed clean.
     await new Promise<void>((r) => setTimeout(r, 0));
+    expect(host.container.querySelector('[data-testid^="perm-drift-"]')).toBeNull();
+  });
+
+  /**
+   * Bridge that refuses every `perm_*` RPC (a daemon socket that is not there). The
+   * *write* and the *read* therefore both fail — which is the case a read-only drift
+   * check can never see.
+   */
+  function refusePermissions() {
+    (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string) => {
+        if (cmd.startsWith("perm_")) throw new Error(`${cmd} refused`);
+        return null;
+      },
+      listen: async () => () => {},
+    };
+  }
+
+  test("flags a grant whose mirror the daemon refused, even when it cannot answer", async () => {
+    // The user presses the button: the local ledger grants immediately, the mirror is
+    // fire-and-forget. When the write itself fails, the drift check cannot report it —
+    // `perm_authorize` fails too, and `null` means "no claim" (by design). So the mark
+    // must also carry the *write's* verdict, or a grant that never reached the
+    // authoritative, audited store is shown as a clean green grant.
+    refusePermissions();
+    const host = render(PermissionsApp);
+    const cam = cameraCandidate(host)!;
+    await fireEvent.click(cam);
+    expect(cameraCandidate(host)!.getAttribute("aria-pressed")).toBe("true");
+    // The seam first, the DOM second: this separates "the refusal was never recorded" from
+    // "it was recorded but not rendered" (the second is a rendering bug, the first is not).
+    await vi.waitFor(() => {
+      expect(mirrorRefused("camera", "camera")).toBe(true);
+    });
+    await vi.waitFor(() => {
+      expect(
+        host.container.querySelector('[data-testid="perm-mirror-camera-camera"]'),
+      ).toBeTruthy();
+    });
+    // The daemon answered nothing → no *drift* claim; the two marks have different causes.
     expect(host.container.querySelector('[data-testid^="perm-drift-"]')).toBeNull();
   });
 });

@@ -46,7 +46,12 @@ did:key:z…  ◀── did:key_from_public_key(curve, pubkey)
   rejected, never silently remapped. ECDSA nonces are deterministic (RFC 6979)
   and signatures are canonical **low-s**, `v ∈ {27, 28}`. There is **no
   randomness inside the crate** — generating a new wallet means the caller
-  supplies 32 OS-entropy bytes.
+  supplies 32 OS-entropy bytes. On the **parse** side the crate accepts either
+  valid encoding — the canonical `(r, s, v)` and its malleable twin
+  `(r, n-s, v⊕1)`, which `ecrecover` (hence every conformant verifier) also
+  accepts — normalising a high-`s` twin back to low-`s`; only encodings that
+  are not signatures of any form (wrong length, `v ∉ {27,28}`, `r`/`s` of `0`
+  or `≥ n`) are rejected.
 - **API** (`crates/amos-web3/src`): `hash::keccak256`, `secp::{SecretKey,
   PublicKey, RecoverableSignature, SECP256K1_ORDER}`, `eip191::{sign_personal,
   recover_signer, verify_signer}`, `eip712::{TypedData, …}` (parse the canonical
@@ -108,10 +113,22 @@ did:key:z…  ◀── did:key_from_public_key(curve, pubkey)
 ## Verification
 
 ```bash
-cargo test -p amos-web3 -p amos-identity          # 41 unit tests + doctests
+cargo test -p amos-web3 -p amos-identity          # 45 unit tests + 2 doctests
 cargo clippy -p amos-web3 -p amos-identity --all-targets -- -D warnings  # clean
 ```
 
 Both crates honor the repo P0-1 gate (no `unwrap`/`expect`/`panic` in
 non-test code; the single documented exception is `sign_statement`'s
 infallible digest-sign).
+
+### Audit notes (REQ-A561, 2026-09-20)
+
+* `DEFAULT_PBKDF2_ROUNDS` was **210 000** under a doc comment that attributed it
+  to OWASP's PBKDF2-**SHA256** guidance — that figure is OWASP's **SHA-512**
+  guidance; the SHA-256 figure is **600 000**. Corrected the value and the
+  comment. (`rounds` is a per-call parameter, not baked into the at-rest wire
+  format, so existing blobs sealed with an explicit round count still open.)
+* `Error::InvalidSeed` was **never constructed**. It is now returned by
+  `IdentityKey::from_seed` when a secp256k1 seed is zero or out of range, so
+  callers can match a crate-native variant instead of the opaque
+  `Error::Web3(String)` catch-all.

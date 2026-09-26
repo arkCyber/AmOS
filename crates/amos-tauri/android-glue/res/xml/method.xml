@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  AmOS 输入法 — the input-method *subtype* declaration the Android platform reads when
+  it enumerates this IME in Settings → 语言与输入法 → 键盘 (REQ-A1893).
+
+  Why a tracked file at all: `AndroidManifest.components.xml`'s `<meta-data
+  android:name="android.view.im" android:resource="@xml/method">` points the platform at
+  `res/xml/method.xml`, and the generated Android project (`crates/amos-tauri/gen/`,
+  git-ignored) is machine-owned. Without this file in the tracked tree, a clean checkout
+  would build an APK whose IME has **no subtype** — installable, selectable, and typing
+  nothing Chinese. `scripts/android-glue-mirror.sh` copies it into the generated
+  project's `res/xml/` (by name — that directory also holds Tauri's own
+  `file_paths.xml`, which must not be wiped) and fails loud when a fragment names an
+  `@xml/<n>` no tracked file answers.
+
+  The label is a **literal**, not `@string/…`, for the same reason
+  `ScreenRecordService.kt`'s notification copy is: `res/values/strings.xml` is a
+  git-ignored generated file, so a resource here would be a tracked file depending on an
+  untracked one. Honest consequence: the subtype shows as "AmOS 拼音" rather than a
+  localized label on a non-Chinese device — the in-app Settings page is the localized
+  surface.
+-->
+<input-method xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- One subtype: pinyin, zh_CN, the ordinary keyboard mode. `imeSubtypeLocale` is
+         what the platform keys its per-subtype selection on, so it must be a real locale
+         tag (`zh_CN`), not a display name. -->
+    <subtype
+        android:label="AmOS 拼音"
+        android:imeSubtypeLocale="zh_CN"
+        android:imeSubtypeMode="keyboard" />
+</input-method>

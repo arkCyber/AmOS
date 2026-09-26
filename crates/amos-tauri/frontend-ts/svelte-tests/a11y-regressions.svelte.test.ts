@@ -51,6 +51,31 @@ const CONTRAST_CHIPS: Array<[string, string, string]> = [
   ["NotificationCenter.svelte", "bg-accent/10", "推送徽标"],
   ["PhoneApp.svelte", "bg-accent/10", "accent chip"],
   ["PhoneApp.svelte", "bg-danger/8", "danger chip"],
+  // REQ-A565: A387 定下的档位规则此前只在上面 5 处被强制。R6 的「字号 token 遮蔽颜色」漏报
+  // （`text-xs text-accent` 的"颜色"被解析成 `text-xs`，整对静默跳过）让下面这些同形 chip 的
+  // /15 档位从未被扫描器看见 —— 规则在 4 个文件里从未生效。修好漏报后逐一改到过 AA 的档位。
+  ["CalendarApp.svelte", "bg-accent/10", "today chip"],
+  ["MailApp.svelte", "bg-accent/10", "restore / markUnread chip"],
+  ["MailApp.svelte", "bg-danger/8", "delete-permanently chip"],
+  ["PlayerApp.svelte", "bg-accent/10", "origin chip"],
+  ["PlayerApp.svelte", "bg-danger/8", "too-large chip"],
+  ["RemindersApp.svelte", "bg-accent/10", "reminder chip"],
+  ["WeatherApp.svelte", "bg-danger/8", "city-remove chip（原为灰底红字 4.27:1）"],
+  // REQ-A1004: 上一轮把「反向断言只在 CONTRAST_CHIPS 枚举到的文件里跑」这件事留在了原地 ——
+  // App Library 的「编辑成员」行没被枚举，于是它的 `bg-danger/15 text-danger`（4.10:1）与
+  // `bg-accent/15 text-accent`（4.46:1）两个档位一直在 AA 线下。写进枚举即被那条反向断言覆盖。
+  ["AppLibrary.svelte", "bg-danger/8 text-danger", "分组编辑的移除 chip"],
+  ["AppLibrary.svelte", "bg-accent/10 text-accent", "分组编辑的加入 chip"],
+];
+
+/**
+ * 弱色文字在浅底上必须够深（REQ-A565）。与 chip 不同：这里没有色相，是**前景太浅**——
+ * 联系人分区页眉 `text-neutral-400 on bg-neutral-100/90` = 2.33:1；`neutral-600` 在浅底
+ * 7.23:1，`dark:text-neutral-400` 在 `dark:bg-black/60` 上 ≈ 8.5:1。
+ */
+const CONTRAST_TEXT: Array<[string, string, string]> = [
+  ["ContactsApp.svelte", "tracking-widest text-neutral-600", "联系人分区页眉（浅底够深）"],
+  ["ContactsApp.svelte", "dark:bg-black/60 dark:text-neutral-400", "联系人分区页眉（深底够亮）"],
 ];
 
 describe("REQ-A387: 修掉的 a11y 缺口不许回退", () => {
@@ -82,5 +107,13 @@ describe("REQ-A387: 修掉的 a11y 缺口不许回退", () => {
         /bg-(?:accent|danger)\/15/,
       );
     }
+  });
+
+  test("弱色文字在浅底上够深（REQ-A565）", () => {
+    const bad: string[] = [];
+    for (const [file, fragment, what] of CONTRAST_TEXT) {
+      if (!read(file).includes(fragment)) bad.push(`${file}: ${what}`);
+    }
+    expect(bad, "muted foreground too light (ratio would drop below 4.5:1)").toEqual([]);
   });
 });

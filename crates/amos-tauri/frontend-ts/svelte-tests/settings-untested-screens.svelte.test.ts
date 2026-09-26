@@ -16,6 +16,7 @@ import { tick } from "svelte";
 import QuarantinePanel from "../src/svelte/settings/QuarantinePanel.svelte";
 import NetGuardPage from "../src/svelte/settings/NetGuardPage.svelte";
 import { CORRUPT_SUFFIX } from "../src/lib/amosStore";
+import { zh } from "../src/i18n/locales/zh";
 
 beforeEach(() => {
   window.localStorage.clear();
@@ -99,6 +100,44 @@ describe("QuarantinePanel (the read side of the corrupt-value quarantine)", () =
     await settle();
     expect(host.container.textContent ?? "").not.toContain("已复制");
     expect(btn.textContent ?? "").toContain("复制");
+  });
+
+  test("a refused copy must say so, not just reset the label (REQ-A1539)", async () => {
+    // `copySelection`'s own contract: "`false` means nothing was copied and the caller
+    // must say so". The two other callers do (`contacts.clipOffline`,
+    // `note.exportCopyFailed`); this panel used to fold the refusal into "the label did
+    // not change" — and its button is the **only** way to rescue the preserved bytes, so
+    // a silent refusal reads as "the panel is broken", not "the clipboard refused".
+    window.localStorage.setItem(`amos.notes${CORRUPT_SUFFIX}`, "broken");
+    (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {
+      invoke: async () => null,
+      listen: async () => () => {},
+    };
+    const host = render(QuarantinePanel);
+    await settle();
+    await fireEvent.click(
+      host.container.querySelector('button[data-testid="quarantine-copy"]') as HTMLButtonElement,
+    );
+    await settle();
+    const alert = host.container.querySelector('[role="alert"]');
+    expect(alert).toBeTruthy();
+    expect(alert?.textContent ?? "").toBe(zh["settings.quarantineCopyFailed"]);
+  });
+
+  test("对照组：复制真的落地时不报错，只报「已复制」", async () => {
+    window.localStorage.setItem(`amos.notes${CORRUPT_SUFFIX}`, "broken");
+    (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string) => (cmd === "clipboard_write" ? { seq: 1 } : null),
+      listen: async () => () => {},
+    };
+    const host = render(QuarantinePanel);
+    await settle();
+    await fireEvent.click(
+      host.container.querySelector('button[data-testid="quarantine-copy"]') as HTMLButtonElement,
+    );
+    await settle();
+    expect(host.container.querySelector('[role="alert"]')).toBeNull();
+    expect(host.container.textContent ?? "").toContain("已复制");
   });
 });
 
@@ -197,6 +236,60 @@ describe("NetGuardPage (never claims enforcement it does not have)", () => {
     // Still "intent, armed" — unchanged, because nothing changed at the daemon.
     expect(host.container.textContent ?? "").toContain("仅记录意图");
     expect(calls.filter((c) => c === "netguard_status").length).toBe(1);
+  });
+
+  /**
+   * REQ-A998 — "the switch sprang back" is not a report.
+   *
+   * `netguardArm` answers `null` for a refusal, which is also what "the daemon said
+   * nothing" looks like, so `if (r)` made a rejected arm/disarm completely silent:
+   * the switch returned to its old position and the page said **nothing**. On a
+   * security control (the egress guard) that is indistinguishable from "still
+   * working". The sibling surfaces read `bridgeDiag(command)` and say the host's own
+   * words (F-SH-236 family); this page now does too.
+   */
+  test("a refused arm says so in the host's own words instead of only springing back", async () => {
+    (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string) => {
+        if (cmd === "netguard_status")
+          return { enabled: false, backend: "mock", enforced: false, policy_rules: 0, top_egress: [] };
+        if (cmd === "netguard_toggle")
+          throw { code: "amos.netguard.toggle_failed", message: "netguard toggle: daemon unreachable" };
+        return null;
+      },
+      listen: async () => () => {},
+    };
+    const host = render(NetGuardPage);
+    await vi.waitFor(() => expect(host.container.textContent ?? "").toContain("后端: mock"));
+    await fireEvent.click(host.container.querySelector('[role="switch"]') as HTMLButtonElement);
+    await vi.waitFor(() => expect(host.container.querySelector('[role="alert"]')).toBeTruthy());
+
+    const alert = host.container.querySelector('[role="alert"]')!;
+    expect(alert.textContent).toContain("daemon unreachable"); // the host's own words
+    expect(alert.textContent).toContain(zh["guard.toggleFailed"].split("{detail}")[0]);
+    // …and the switch is still telling the truth: disarmed, not "armed".
+    expect(host.container.textContent ?? "").toContain(zh["guard.valDisarmed"]);
+  });
+
+  test("a refusal carrying no words still says so, not as the raw failure value", async () => {
+    (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string) => {
+        if (cmd === "netguard_status")
+          return { enabled: false, backend: "mock", enforced: false, policy_rules: 0, top_egress: [] };
+        // A machine token with no sentence: the fold must not print the token.
+        if (cmd === "netguard_toggle") throw { code: "amos.netguard.toggle_failed" };
+        return null;
+      },
+      listen: async () => () => {},
+    };
+    const host = render(NetGuardPage);
+    await vi.waitFor(() => expect(host.container.textContent ?? "").toContain("后端: mock"));
+    await fireEvent.click(host.container.querySelector('[role="switch"]') as HTMLButtonElement);
+    await vi.waitFor(() => expect(host.container.querySelector('[role="alert"]')).toBeTruthy());
+
+    const alert = host.container.querySelector('[role="alert"]')!;
+    expect(alert.textContent).toContain(zh["guard.toggleNoReason"]);
+    expect(alert.textContent).not.toContain("amos.netguard.toggle_failed");
   });
 
   test("an enforced backend is reported as enforced (the label is not always 'intent')", async () => {

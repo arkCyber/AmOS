@@ -59,6 +59,45 @@ export const HOST_RADIO_COMMANDS: RadioCommands = {
   openSettings: (key) => radioOpenSettings(key),
 };
 
+/**
+ * Does airplane mode own this radio **right now**? (REQ-A1082)
+ *
+ * Airplane mode owns the others: switching Wi-Fi on while the airplane bit is set is a
+ * no-op in the Rust policy too, so it is not even attempted. This predicate is the gate
+ * `tapRadio` applies below — exported so a *screen* can say the same thing **before** the
+ * tap instead of guessing at it. It must be the same predicate for both: a view that
+ * re-derives "is this gated?" from `settings` itself is a second answer that can drift
+ * from the rule that decides what a tap does (and it did — the quick panels drew a live
+ * Wi-Fi tile under airplane mode, which `tapRadio` then answered with `gated`, so the tap
+ * did nothing at all and nothing said why).
+ *
+ * `key` is a `RadioKey`, not a `QuickKey`: every radio but `airplane` is gated, but a
+ * non-radio tile (`darkmode`, `location`) is **not**, so a caller must first know it is
+ * looking at a radio.
+ */
+export function radioGated(settings: QuickSettings, key: RadioKey): boolean {
+  return key !== "airplane" && !!settings.airplane;
+}
+
+/**
+ * What a radio switch should **read**: `on` only when the radio is really on (REQ-A1082,
+ * REQ-A1143).
+ *
+ * The companion to `radioGated`, and for the same reason. Airplane mode cascades the other
+ * radios off in the Rust policy, so a gated radio is **off** — not "on, but unusable". A
+ * surface that drew the stored bit instead answered the same question a second way, and it
+ * diverged: the quick settings' Wi-Fi tile and the Wi-Fi/Bluetooth settings rows read
+ * *pressed* under airplane mode while the sentence rendered **on the same screen**
+ * (`settings.airplaneBlocks`) says those radios are closed, and while the desktop Control
+ * Center, the settings index rows and the status bar all said off. The stored bit is the
+ * user's *intent*, and intent is exactly what survives airplane mode (REQ-A185 draws the
+ * same line for the device read) — so the switch asks this predicate, and the fact has one
+ * owner instead of one per screen.
+ */
+export function radioDisplayOn(settings: QuickSettings, key: RadioKey): boolean {
+  return !radioGated(settings, key) && !!settings[key];
+}
+
 /** Pure: the device's radio snapshot written over the persisted quick settings. */
 export function mergeRadioQuick(s: QuickSettings, r: RadioPayload): QuickSettings {
   return {
@@ -166,8 +205,9 @@ export async function tapRadio(input: RadioTapInput): Promise<RadioTapOutcome> {
   const cmds = input.cmds ?? HOST_RADIO_COMMANDS;
 
   // Airplane mode owns the others: switching Wi-Fi on while the airplane bit is set is a
-  // no-op in the Rust policy too, so it is not even attempted.
-  if (key !== "airplane" && settings.airplane) {
+  // no-op in the Rust policy too, so it is not even attempted. The gate is the **same**
+  // predicate the screens mark their tiles with (`radioGated`) — one rule, two readers.
+  if (radioGated(settings, key)) {
     return { kind: "gated", next: settings, persist: false };
   }
 

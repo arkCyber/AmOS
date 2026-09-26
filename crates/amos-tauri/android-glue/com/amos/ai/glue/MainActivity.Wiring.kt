@@ -31,6 +31,16 @@ import org.json.JSONArray
  *   3. A `getUserMedia` call → the Activity's `WebChromeClient.onPermissionRequest`
  *      → [mediaChrome] grants `RESOURCE_VIDEO_CAPTURE` (because CAMERA is held).
  *
+ * **Imports are the copy's job, not this file's.** This template declares
+ * `package com.amos.ai.glue`, so every glue class it names is in *its* package and it needs no
+ * imports of its own. The generated Activity is `package com.amos.ai` — a different package — so
+ * each class it names must be imported there (`import com.amos.ai.glue.RotationGlue`, …). Copy the
+ * calls **and** their imports; a call without its import does not compile, and an APK that does not
+ * compile binds nothing at all. `scripts/android-activity-wiring-check.sh` verifies both the call
+ * and its resolvability (measured 2026-09-21: `RotationGlue.bind(this)` was copied without the
+ * import and the check stayed green while the Kotlin build died on
+ * `Unresolved reference: RotationGlue`).
+ *
  * Structural delivery only — verify/compile at device time once the Tauri-Android
  * project exists (this module is kept under android-glue for that reason).
  */
@@ -47,11 +57,59 @@ object PermissionWire {
         // Rust mic_permission_request can drive isGranted()/request() on demand,
         // independent of the WebView CAMERA grant path.
         MicPermissionGlue.ensureBound(activity)
+        // Bind the native-only location glue (real LocationManager GNSS read) so the
+        // Rust location_permission_request can drive grantLevel()/request() on demand.
+        // It is deliberately NOT part of the up-front `want` list below: a location
+        // prompt belongs to the moment an app asks to be located, not to first launch
+        // (REQ-A772 / F-SH-228).
+        LocationPermissionGlue.ensureBound(activity)
+        // Bind the native-only SMS glue (READ_SMS / SEND_SMS / RECEIVE_SMS) so the Rust
+        // sms_permission_request can drive allGranted()/request() on demand. Like location
+        // it is deliberately NOT in the up-front `want` list below: the SMS dialog belongs
+        // to the moment the user opens Messages, not to first launch — and until this
+        // seam existed nothing ever asked at all, so a normal install reported a
+        // permission error with no way to fix it from inside AmOS (REQ-A1577 / F-TEL-037).
+        SmsPermissionGlue.ensureBound(activity)
         val want = listOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO).filter {
             ContextCompat.checkSelfPermission(activity, it) != PackageManager.PERMISSION_GRANTED
-        } + bluetoothConnectIfNeeded(activity) + bluetoothScanIfNeeded(activity) + notificationsIfNeeded(activity)
+        } + bluetoothConnectIfNeeded(activity) + bluetoothScanIfNeeded(activity) + notificationsIfNeeded(activity) +
+            activityRecognitionIfNeeded(activity) + bodySensorsIfNeeded(activity)
         if (want.isEmpty()) return
         ActivityCompat.requestPermissions(activity, want.toTypedArray(), REQ_CAMERA)
+    }
+
+    /**
+     * `ACTIVITY_RECOGNITION` — the API 29+ **runtime** permission Android gates the
+     * step counter behind (`SensorManager.TYPE_STEP_COUNTER`). Without it,
+     * `registerListener` throws `SecurityException` on API 29+ ROMs, so the Health
+     * screen's step reading stays absent. Requested up front with the others;
+     * `SensorGlue` guards the registration, so a denial degrades to an honest `—`
+     * rather than a crash. Below API 29 the sensor needs no permission.
+     */
+    private fun activityRecognitionIfNeeded(activity: Activity): List<String> {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return emptyList()
+        val perm = Manifest.permission.ACTIVITY_RECOGNITION
+        return if (ContextCompat.checkSelfPermission(activity, perm) == PackageManager.PERMISSION_GRANTED) {
+            emptyList()
+        } else {
+            listOf(perm)
+        }
+    }
+
+    /**
+     * `BODY_SENSORS` — the API 31+ **runtime** permission the heart-rate sensor
+     * (`SensorManager.TYPE_HEART_RATE`) requires. Below API 31 the sensor was
+     * reachable without a runtime grant. A denial leaves the heart-rate reading
+     * absent (`—`), never a fabricated `0`.
+     */
+    private fun bodySensorsIfNeeded(activity: Activity): List<String> {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return emptyList()
+        val perm = Manifest.permission.BODY_SENSORS
+        return if (ContextCompat.checkSelfPermission(activity, perm) == PackageManager.PERMISSION_GRANTED) {
+            emptyList()
+        } else {
+            listOf(perm)
+        }
     }
 
     /**
@@ -156,6 +214,24 @@ object PermissionWire {
                     Toast.makeText(activity, "Media access denied — external collections unavailable", Toast.LENGTH_LONG).show()
                 }
             }
+            LocationPermissionGlue.REQ_LOCATION -> {
+                // Native-only location result (the real LocationManager GNSS read behind the
+                // sensor snapshot's `gnss`, requested by location_permission_request — NOT the
+                // WebView navigator.geolocation path). Resolve the pending Rust request with
+                // the *level* the user actually gave (none / coarse / fine), so the screen can
+                // say "approximate" instead of pretending the fix is precise (REQ-A772).
+                LocationPermissionGlue.onLocationResult()
+            }
+            SmsPermissionGlue.REQ_SMS -> {
+                // Native-only SMS result (READ/SEND/RECEIVE, requested by
+                // sms_permission_request). Resolve the pending Rust request so the JS await
+                // returns granted/incomplete — the verdict is re-read from the platform
+                // inside onSmsResult, not guessed from this array's order.
+                SmsPermissionGlue.onSmsResult()
+                if (!SmsPermissionGlue.allGranted()) {
+                    Toast.makeText(activity, "SMS permission incomplete — inbox read/send unavailable", Toast.LENGTH_LONG).show()
+                }
+            }
             MicPermissionGlue.REQ_MIC -> {
                 // Native-only RECORD_AUDIO result (always-on AAudio mic, requested by
                 // mic_permission_request — NOT the WebView getUserMedia path). Resolve
@@ -215,11 +291,19 @@ object NativeBootGuard {
  * ```
  * NativeBootGuard.quiet("telephony") {
  *   TelephonyGlue.bind(applicationContext)
+ *   TelephonyGlue.attachActivity(this)
  *   TelephonyGlue.ensureCallPermission(this)
  * }
  * NativeBootGuard.quiet("home") { onPhysicalHome() }
  * ```
  * Kept here so it survives Tauri regenerating `MainActivity.kt`.
+ *
+ * `attachActivity` matters for the **default-phone-app** role dialog
+ * (`telephony_request_default_dialer`, REQ-A1180): the ROLE_DIALER UI resolves the
+ * requesting package from the caller identity, and `BlocklistGlue` proved on the API 34
+ * target that a plain application-context `startActivity` can be posted and silently
+ * dropped. Without the Activity the request still falls back to the app context (logged),
+ * but the reliable path is the foreground one.
  *
  * **Spam blocking (re-apply after a regen, alongside [AlwaysOn]):** the generated
  * `MainActivity.onStart` must call [`BlocklistGlue.bind`] **unconditionally** — NOT
@@ -313,6 +397,30 @@ object NativeBootGuard {
  * (`scheduled` / `disallowed` / `unavailable` / `denied`) the host surfaces verbatim.
  */
 
+/**
+ * AmOS **device-orientation binding** (rotation lock / forced orientation, REQ-A677) — the
+ * device half of the quick-settings "rotation lock" tile. The generated `MainActivity.onStart`
+ * hands the glue the foreground Activity (and, through `bind`, installs the JavaVM so Rust can
+ * call back by name):
+ * ```
+ * try {
+ *   RotationGlue.bind(this)
+ * } catch (t: Throwable) { Log.w(TAG, "rotation glue unavailable: $t") }
+ * ```
+ * Why it has to be there: `RotationGlue.attach` installs the JavaVM through the
+ * `Java_com_amos_ai_glue_RotationGlue_attach` upcall, and the glue holds the **foreground
+ * Activity** that `Activity#setRequestedOrientation` needs — the only thing that actually turns
+ * the display. Without it `rotation_set` can only store the intent (the Rust side reports
+ * `Unattached` or `Unavailable`) and a lock the user set would never be applied. Call it
+ * **unconditionally** (NOT behind the CAMERA gate): the stored lock is re-applied at boot and no
+ * camera is involved. `bind` is idempotent and fails soft, so an APK built without the `android`
+ * native feature logs a warning instead of crashing boot.
+ *
+ * The *decision* of which mode means which `ActivityInfo.SCREEN_ORIENTATION_*` code is NOT in
+ * the Kotlin: it lives in the pure, unit-tested `amos_display::orientation` kernel, and the
+ * glue only forwards the integer it is handed.
+ */
+
 object AlwaysOn {
 
   private const val TAG = "AmosAlwaysOn"
@@ -360,3 +468,42 @@ object AlwaysOn {
  * (BLE, NFC, Biometric) can use the same binding.
  */
 
+
+/**
+ * AmOS **whole-screen capture binding** (REQ-A1582 / F-DEV-141) — the device half of the
+ * host's `screen_record_*` commands. Two calls, in two different Activity methods, because
+ * a capture spans a *user decision*:
+ *
+ * ```
+ * override fun onStart() {
+ *   super.onStart()
+ *   ScreenRecordGlue.attachActivity(this)   // the Activity the consent dialog is posted from
+ * }
+ *
+ * // Added to the wired Activity (alongside onRequestPermissionsResult, which the media /
+ * // SMS / telephony glues already need):
+ * override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+ *   super.onActivityResult(requestCode, resultCode, data)
+ *   if (requestCode == ScreenRecordGlue.REQ_SCREEN_RECORD) {
+ *     ScreenRecordGlue.onConsentResult(this, resultCode, data)
+ *   }
+ * }
+ * ```
+ *
+ * Why each half is load-bearing:
+ *   * `attachActivity` is the only place the glue gets the Context/Activity it needs at all.
+ *     Without it `screen_record_start` answers `unavailable` and nothing can be captured.
+ *   * `onActivityResult` is what turns an *approval* into a session. Android has no way to
+ *     ask for a screen capture other than `createScreenCaptureIntent()` +
+ *     `startActivityForResult`, so a build without this override compiles, ships, opens the
+ *     system dialog on start — and then does nothing whatever the user taps. That silent
+ *     no-op is precisely the defect `scripts/android-activity-wiring-check.sh` exists to
+ *     refuse a build for.
+ *
+ * Note the **request-code dispatch**: `onActivityResult` is shared with anything else in the
+ * Activity that uses it (Tauri's own file pickers among them), so the branch must test
+ * `REQ_SCREEN_RECORD` rather than assume it is the only caller.
+ *
+ * Honest boundary: no device has run this. `ScreenRecordGlue`'s own KDoc states the
+ * unverified parts; the FMEA row for F-DEV-141 records them as device-only work.
+ */

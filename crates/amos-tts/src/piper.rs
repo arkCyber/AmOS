@@ -73,26 +73,16 @@ mod tests {
 
     /// Real Piper synthesis: model dir must exist on disk and the `piper` native
     /// deps must be linked. Run with:
-    ///   AMOS_PIPER_MODEL_DIR=$PWD/models/piper-low \
+    ///   AMOS_PIPER_MODEL_DIR=$PWD/models/piper-en_US-lessac-medium \
     ///     cargo test -p amos-tts --features piper -- --ignored synthesizes_real_pcm
     #[tokio::test]
     #[ignore = "requires AMOS_PIPER_MODEL_DIR with a Piper onnx+json + native libs"]
     async fn synthesizes_real_pcm() {
         let dir = std::env::var("AMOS_PIPER_MODEL_DIR").expect("set AMOS_PIPER_MODEL_DIR");
-        let base = PathBuf::from(&dir);
-        let mut onnx: Option<PathBuf> = None;
-        let mut json: Option<PathBuf> = None;
-        for stem in ["en_US-lessac-medium", "en_US-lessac-low"] {
-            let o = base.join(format!("{stem}.onnx"));
-            let j = base.join(format!("{stem}.onnx.json"));
-            if o.exists() && j.exists() {
-                onnx = Some(o);
-                json = Some(j);
-                break;
-            }
-        }
-        let onnx = onnx.expect("found a .onnx + .onnx.json pair in AMOS_PIPER_MODEL_DIR");
-        let json = json.unwrap();
+        // Resolve through the shared list so this test and the loader agree on
+        // which voices count as provisioned (REQ-A750 / F-SH-207).
+        let (onnx, json) = crate::resolve_voice(std::path::Path::new(&dir))
+            .expect("found a provisioned voice (.onnx + .onnx.json) in AMOS_PIPER_MODEL_DIR");
         let provider = PiperProvider::new(onnx, json).expect("load piper model");
         let audio = provider
             .synthesize("hello amos world", &Language::new("en"))

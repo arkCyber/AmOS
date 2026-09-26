@@ -93,6 +93,14 @@ pub struct Call {
     pub ended_reason: Option<EndReason>,
     /// Whether the call is being recorded (always [`RecordingState::Off`] once ended).
     pub recording: RecordingState,
+    /// Whether the caller's own outbound audio is muted (always `false` once ended).
+    ///
+    /// This is the *call-state* flag every surface reads (in-call screen, Watch
+    /// subscribers, the lock screen); it is deliberately **not** forbidden on an
+    /// emergency call — silencing your own microphone on a 110 call is the caller's
+    /// decision, unlike *recording* one, which is a hard legal rule. Physically
+    /// cutting the microphone is the audio pipeline's job (see `docs/telephony.md`).
+    pub muted: bool,
 }
 
 /// One call's legal state machine.
@@ -113,6 +121,7 @@ impl CallSession {
                 emergency,
                 ended_reason: None,
                 recording: RecordingState::Off,
+                muted: false,
             },
         }
     }
@@ -128,6 +137,7 @@ impl CallSession {
                 emergency: false,
                 ended_reason: None,
                 recording: RecordingState::Off,
+                muted: false,
             },
         }
     }
@@ -138,6 +148,10 @@ impl CallSession {
 
     pub fn recording(&self) -> RecordingState {
         self.call.recording
+    }
+
+    pub fn muted(&self) -> bool {
+        self.call.muted
     }
 
     pub fn snapshot(&self) -> Call {
@@ -186,6 +200,8 @@ impl CallSession {
                 self.call.ended_reason = Some(reason);
                 // No recording may outlive the call it captured.
                 self.call.recording = RecordingState::Off;
+                // Neither may a mute: a call that is over has no microphone to mute.
+                self.call.muted = false;
                 Ok(())
             }
             CallState::Ended => Err(self.illegal("end")),
@@ -249,6 +265,27 @@ impl CallSession {
             RecordingState::Off | RecordingState::Failed => Err(
                 TelephonyError::RecordingForbidden("no active recording to mark failed"),
             ),
+        }
+    }
+
+    /// Set whether the caller's outbound audio is muted.
+    ///
+    /// Legal on any **live** call (`Dialing`/`Ringing`/`Active`) — muting before the
+    /// far side picks up is how a user answers without their room hearing it — and
+    /// idempotent (setting the state it already has is `Ok`, unlike `start_recording`,
+    /// because "mute is on" is a *state*, not a one-shot action). Refused once the call
+    /// has ended or was never live: there is no microphone to mute on a call that is
+    /// over, and silently accepting it would leave a straggler flag behind.
+    ///
+    /// Deliberately **not** forbidden on an emergency call: cutting your own microphone
+    /// on a 110 call is the caller's decision (see [`Call::muted`]).
+    pub fn set_muted(&mut self, muted: bool) -> Result<()> {
+        match self.call.state {
+            CallState::Dialing | CallState::Ringing | CallState::Active => {
+                self.call.muted = muted;
+                Ok(())
+            }
+            CallState::Ended | CallState::Idle => Err(self.illegal("set_muted")),
         }
     }
 
@@ -407,6 +444,84 @@ mod tests {
         // No active recording -> cannot mark failed.
         let mut fresh = active();
         assert!(fresh.recording_failed().is_err());
+    }
+
+    #[test]
+    fn new_call_is_not_muted() {
+        assert!(!outgoing().muted());
+        assert!(!CallSession::start_incoming(
+            CallId::new("i"),
+            Number::new("02112345678").unwrap()
+        )
+        .muted());
+    }
+
+    #[test]
+    fn mute_is_legal_on_every_live_state() {
+        // Dialing.
+        let mut d = outgoing();
+        assert!(d.set_muted(true).is_ok());
+        assert!(d.muted());
+        // Ringing.
+        let mut r =
+            CallSession::start_incoming(CallId::new("i"), Number::new("02112345678").unwrap());
+        assert!(r.set_muted(true).is_ok());
+        assert!(r.muted());
+        // Active.
+        let mut a = active();
+        assert!(a.set_muted(true).is_ok());
+        assert!(a.muted());
+    }
+
+    #[test]
+    fn mute_is_idempotent() {
+        let mut s = active();
+        assert!(s.set_muted(true).is_ok());
+        assert!(
+            s.set_muted(true).is_ok(),
+            "re-setting the same state is not an error"
+        );
+        assert!(s.muted());
+        assert!(s.set_muted(false).is_ok());
+        assert!(!s.muted());
+    }
+
+    #[test]
+    fn mute_after_end_is_illegal() {
+        let mut s = active();
+        assert!(s.end(EndReason::Local).is_ok());
+        let err = s.set_muted(true).unwrap_err();
+        assert!(matches!(
+            err,
+            TelephonyError::IllegalState {
+                from: CallState::Ended,
+                event: "set_muted"
+            }
+        ));
+        assert!(!s.muted(), "a refused mute must not leave the flag set");
+    }
+
+    #[test]
+    fn emergency_call_may_be_muted() {
+        // The deliberate asymmetry with recording: silencing your own microphone on a
+        // 110 call is the caller's decision, not a legal prohibition.
+        let mut s =
+            CallSession::start_outgoing(CallId::new("e1"), Number::new("110").unwrap(), true);
+        assert!(s.connect().is_ok());
+        assert!(s.set_muted(true).is_ok());
+        assert!(s.muted(), "an emergency call can be muted");
+        assert!(
+            s.start_recording().is_err(),
+            "…while recording it still cannot"
+        );
+    }
+
+    #[test]
+    fn ending_a_call_resets_muted() {
+        let mut s = active();
+        assert!(s.set_muted(true).is_ok());
+        assert!(s.end(EndReason::Local).is_ok());
+        assert!(!s.muted(), "mute must not outlive call");
     }
 
     #[test]

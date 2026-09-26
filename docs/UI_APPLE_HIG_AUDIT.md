@@ -68,7 +68,7 @@ iOS 的真相是：**应用全屏、edge-to-edge、分层堆叠**；系统不会
 
 - 🟠 **顶部“🔍 悬浮搜索胶囊 + 底部 Dock”**（`HomeDock.svelte` L301-306）：iOS 主屏无此元素（iOS 是下滑唤出 Spotlight）。可用的快捷入口，但会削弱“iPhone”印象；建议改为下滑手势打开。
 - 🟠 **底部 Tab Bar 缺失**：iOS 的 Phone/Music/Mail 用底部标签栏；本项目 Phone 用顶部分段控件（`PhoneApp.svelte` L230）、Music 为单一播放页——结构仿 iOS，但信息架构更偏“单屏工具”。
-- 🟡 **依赖 `hover:` 才显示的隐藏控件**（`MessagesApp.svelte` L141-143 `opacity-0 group-hover:opacity-60`）：触屏不可达；iOS 以长按上下文菜单呈现，更像桌面 Web。
+- ✅ **依赖 `hover:` 才显示的隐藏控件**（`MessagesApp.svelte` 每条消息的 删除/引用回复按钮）：原为 `opacity-0 group-hover:opacity-60`，触屏 **不可达**（`hover-scan` 规则 2 只强制 `pointer-events-none` 那一半，「有触屏路径」那一半是散文，故门禁当时是绿的）。**已修**（REQ-A1026，2026-09-22）：改为 iOS 自己的两扇门 —— **长按气泡** 或 **左滑**（需水平占优）**滑出**该行按钮，**再点才生效**；手势本身**不再**执行任何动作（旧代码左滑**直接删除**该条消息，无确认、无撤销，是当时唯一一条触屏可达的破坏性路径）。
 - 🟡 工程卫生：仓库根 `frontend-ts/preview6.js` 为数十 MB 旧打包产物，干扰审计与检索，建议清理（非风格问题）。
 
 ---

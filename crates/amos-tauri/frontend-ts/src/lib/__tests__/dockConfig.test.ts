@@ -10,7 +10,6 @@ import {
   dockRevealZone,
   dockWrapperStyle,
   emitDockBounce,
-  isFullscreen,
   onDockBounce,
   type DockPosition,
 } from "../dockConfig";
@@ -106,32 +105,6 @@ describe("dock geometry per edge (REQ-A414)", () => {
     expect(dockCapacityExtent("bottom", 900, 68)).toBe(900);
     expect(dockCapacityExtent("left", 68, 600)).toBe(600);
     expect(dockCapacityExtent("right", 68, 600)).toBe(600);
-  });
-});
-
-describe("isFullscreen", () => {
-  const originalDescriptor = Object.getOwnPropertyDescriptor(document, "fullscreenElement");
-
-  afterEach(() => {
-    if (originalDescriptor) {
-      Object.defineProperty(document, "fullscreenElement", originalDescriptor);
-    }
-  });
-
-  it("returns true when document.fullscreenElement is set", () => {
-    Object.defineProperty(document, "fullscreenElement", {
-      configurable: true,
-      value: document.createElement("div"),
-    });
-    expect(isFullscreen()).toBe(true);
-  });
-
-  it("returns false when document.fullscreenElement is null", () => {
-    Object.defineProperty(document, "fullscreenElement", {
-      configurable: true,
-      value: null,
-    });
-    expect(isFullscreen()).toBe(false);
   });
 });
 

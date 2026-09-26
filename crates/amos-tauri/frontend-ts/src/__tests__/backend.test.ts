@@ -9,6 +9,8 @@ import {
   deviceMicStop,
   micPermissionRequest,
   micPermissionState,
+  locationPermissionRequest,
+  locationPermissionState,
   bridged,
   bridgeDiag,
   cancelAiSession,
@@ -36,8 +38,10 @@ import {
   mailRead,
   mailSearch,
   mailSend,
+  mailSetAnswered,
   mailSetFlagged,
   mailSetSeen,
+  mailStatus,
   cancelNativeAlarm,
   exportTxtFile,
   pollNativeAlarms,
@@ -100,8 +104,9 @@ describe("backend bridge", () => {
     expect(await invoke("get_status")).toBeNull();
     expect(await sendChat("hi", "s")).toBeNull();
     expect(await getAiStatus()).toBeNull();
-    const un = await subscribe("x", () => {});
-    un();
+    // REQ-A838: outside Tauri there is no bridge at all, so there is no subscription to
+    // release — `null`, not a no-op that reads like one.
+    expect(await subscribe("x", () => {})).toBeNull();
     expect(conversationId().length).toBeGreaterThan(0);
   });
 
@@ -127,7 +132,8 @@ describe("backend bridge", () => {
     await sendChat("hello", "conv-1");
     expect(calls).toContain("chat_agent");
     const un = await subscribe("ai-token-received", () => {});
-    un();
+    expect(un).not.toBeNull(); // REQ-A838：宿主接了监听，才给出可退订的句柄
+    un!();
     expect(typeof handlers["ai-token-received"]).toBe("function");
   });
 
@@ -210,7 +216,7 @@ describe("backend bridge", () => {
     cb?.({ event: "sms-received", id: 42, payload: { address: "10086" } });
     expect(got).toEqual([{ address: "10086" }]);
     // Unsubscribing releases both the callback and the host registration.
-    un();
+    un!();
     expect(unregistered).toContain(listen?.args?.handler as number);
     expect(calls.some((c) => c.cmd === "plugin:event|unlisten")).toBe(true);
   });
@@ -423,12 +429,14 @@ describe("backend bridge", () => {
 
     // Mail RPC wrappers (both cc-present and cc-absent shapes of mailSend).
     await mailMailboxes();
+    await mailStatus();
     await mailList("INBOX", 10);
     await mailSearch("INBOX", "hello");
     await mailRead("INBOX", "m1");
     await mailSend({ to: ["a@x.com"], subject: "s", body: "b" });
     await mailSend({ to: ["a@x.com"], subject: "s", body: "b", cc: ["c@x.com"] });
     await mailSetFlagged("INBOX", "m1", true);
+    await mailSetAnswered("INBOX", "m1", true);
     await mailSetSeen("INBOX", "m1", false);
     await mailDelete("INBOX", "m1");
     await mailMove("INBOX", "m1", "Archive");
@@ -474,8 +482,8 @@ describe("backend bridge", () => {
     await systemStoreSet("amos.k", "1");
 
     for (const cmd of [
-      "mail_mailboxes", "mail_list", "mail_search", "mail_read",
-      "mail_send", "mail_set_flagged", "mail_set_seen", "mail_delete", "mail_move",
+      "mail_mailboxes", "mail_status", "mail_list", "mail_search", "mail_read",
+      "mail_send", "mail_set_flagged", "mail_set_answered", "mail_set_seen", "mail_delete", "mail_move",
       "appstore_catalog", "appstore_search", "appstore_find", "appstore_installed",
       "appstore_updatable", "appstore_status", "appstore_install", "appstore_upgrade",
       "appstore_uninstall",
@@ -587,16 +595,66 @@ describe("backend bridge", () => {
     const fake = {
       invoke: async (cmd: string) => {
         calls.push(cmd);
-        if (cmd === "mic_permission_request") return { native: true, granted: true };
-        return { native: true, granted: false };
+        if (cmd === "mic_permission_request") return { native: true, granted: true, state: "granted" };
+        return { native: true, granted: false, state: "denied" };
       },
       listen: async () => async () => {},
     };
     setWindow({ __TAURI_INTERNALS__: fake, localStorage: new Map() as unknown as Storage });
     expect(bridged()).toBe(true);
 
-    expect(await micPermissionState()).toEqual({ native: true, granted: false });
-    expect(await micPermissionRequest()).toEqual({ native: true, granted: true });
+    expect(await micPermissionState()).toEqual({ native: true, granted: false, state: "denied" });
+    expect(await micPermissionRequest()).toEqual({ native: true, granted: true, state: "granted" });
     expect(calls).toEqual(["mic_permission_state", "mic_permission_request"]);
+  });
+
+  // REQ-A787 / F-AND-010: the reply is a state, not a bare bit — and the host's own
+  // words for a failed read must survive the bridge intact rather than being re-worded.
+  test("a failed OS read keeps its own words and its own state", async () => {
+    const fake = {
+      invoke: async (cmd: string) =>
+        cmd === "mic_permission_state"
+          ? { native: true, granted: false, state: "unreadable", detail: "glue threw in isGranted" }
+          : { native: true, granted: false, state: "timed-out" },
+      listen: async () => async () => {},
+    };
+    setWindow({ __TAURI_INTERNALS__: fake, localStorage: new Map() as unknown as Storage });
+
+    const read = await micPermissionState();
+    expect(read?.state).toBe("unreadable");
+    expect(read?.detail).toBe("glue threw in isGranted");
+    // The bit the old callers read is still false — but `state` says why.
+    expect(read?.granted).toBe(false);
+
+    const asked = await micPermissionRequest();
+    expect(asked?.state).toBe("timed-out");
+    expect(asked?.detail).toBeUndefined();
+  });
+
+  test("device native-location is an honest no-op (null) outside the bridge", async () => {
+    setWindow({ localStorage: new Map() as unknown as Storage });
+    expect(bridged()).toBe(false);
+    expect(await locationPermissionState()).toBeNull();
+    expect(await locationPermissionRequest()).toBeNull();
+  });
+
+  test("location grant wrappers route to state/request and keep the level three-state", async () => {
+    const calls: string[] = [];
+    const fake = {
+      invoke: async (cmd: string) => {
+        calls.push(cmd);
+        // The approximate answer, not the precise one: a wrapper that collapsed this to a
+        // boolean would report "granted" and the UI would promise a precision nobody offered.
+        if (cmd === "location_permission_request") return { native: true, grant: "coarse" };
+        return { native: true, grant: "none" };
+      },
+      listen: async () => async () => {},
+    };
+    setWindow({ __TAURI_INTERNALS__: fake, localStorage: new Map() as unknown as Storage });
+    expect(bridged()).toBe(true);
+
+    expect(await locationPermissionState()).toEqual({ native: true, grant: "none" });
+    expect(await locationPermissionRequest()).toEqual({ native: true, grant: "coarse" });
+    expect(calls).toEqual(["location_permission_state", "location_permission_request"]);
   });
 });

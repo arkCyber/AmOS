@@ -71,31 +71,28 @@ describe("sound / alert policy", () => {
     expect(effectiveAlert(vibOnly, true)).toEqual({ ring: false, vibrate: false, volume: 0.25 });
   });
 
-  test("shouldVibrateOnArrival requires growth AND allowed vibration", () => {
+  test("shouldVibrateOnArrival requires an arrival AND allowed vibration", () => {
     const normal = { ring: true, vibrate: true, volume: 1 };
-    expect(shouldVibrateOnArrival(2, 3, normal)).toBe(true); // growth + allowed
-    expect(shouldVibrateOnArrival(3, 3, normal)).toBe(false); // no growth
-    expect(shouldVibrateOnArrival(3, 2, normal)).toBe(false); // shrink
-    expect(shouldVibrateOnArrival(0, 1, normal)).toBe(true); // first arrival
+    expect(shouldVibrateOnArrival(true, normal)).toBe(true); // arrived + allowed
+    expect(shouldVibrateOnArrival(false, normal)).toBe(false); // nothing arrived
 
     // DND mutes vibration (effective all-false).
     const dnd = { ring: false, vibrate: false, volume: 1 };
-    expect(shouldVibrateOnArrival(2, 3, dnd)).toBe(false);
+    expect(shouldVibrateOnArrival(true, dnd)).toBe(false);
     // Policy with vibration off but ring on.
     const ringOnly = { ring: true, vibrate: false, volume: 1 };
-    expect(shouldVibrateOnArrival(2, 3, ringOnly)).toBe(false);
+    expect(shouldVibrateOnArrival(true, ringOnly)).toBe(false);
   });
 
-  test("shouldRingOnArrival requires growth AND audible alerts allowed", () => {
+  test("shouldRingOnArrival requires an arrival AND audible alerts allowed", () => {
     const normal = { ring: true, vibrate: true, volume: 1 };
-    expect(shouldRingOnArrival(1, 2, normal)).toBe(true); // growth + ring allowed
-    expect(shouldRingOnArrival(2, 2, normal)).toBe(false); // no growth
-    expect(shouldRingOnArrival(0, 1, normal)).toBe(true); // first arrival
+    expect(shouldRingOnArrival(true, normal)).toBe(true); // arrived + ring allowed
+    expect(shouldRingOnArrival(false, normal)).toBe(false); // nothing arrived
     // DND mutes ring; vibrate-only policy has ring off.
     const dnd = { ring: false, vibrate: false, volume: 1 };
-    expect(shouldRingOnArrival(1, 2, dnd)).toBe(false);
+    expect(shouldRingOnArrival(true, dnd)).toBe(false);
     const vibOnly = { ring: false, vibrate: true, volume: 1 };
-    expect(shouldRingOnArrival(1, 2, vibOnly)).toBe(false);
+    expect(shouldRingOnArrival(true, vibOnly)).toBe(false);
   });
 
   test("normalizeSound reads through the legacy {notify,haptics} schema", () => {
@@ -158,5 +155,43 @@ describe("sound / alert policy", () => {
     expect(loadSound()).toEqual(DEFAULT_SOUND);
     expect(globalThis.window && (window as unknown as Record<string, unknown>).localStorage).toBeTruthy();
     expect(SOUND_KEY).toBe("amos.sound");
+  });
+
+  test("saveSound returns the store's verdict — false (and nothing persisted) when it refuses", () => {
+    // The policy has readers other than the page that writes it (the arrival ring/haptic and
+    // the incoming-call path), so a caller must be able to see a refused write. A `void`
+    // return made that structurally impossible; this pins the verdict now that it exists.
+    const store = new Map<string, string>([["amos.sound", JSON.stringify({ ring: true, vibrate: true, volume: 1 })]]);
+    (globalThis as { window?: unknown }).window = {
+      localStorage: {
+        getItem: (k: string) => store.get(k) ?? null,
+        setItem: () => {
+          throw new Error("QuotaExceededError");
+        },
+        removeItem: (k: string) => void store.delete(k),
+      },
+      dispatchEvent: () => false,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    };
+
+    expect(saveSound({ ring: true, vibrate: false, volume: 1 })).toBe(false);
+    // Nothing was persisted: the old policy is still exactly what a reader would load.
+    expect(loadSound()).toEqual({ ring: true, vibrate: true, volume: 1 });
+
+    // And a store that accepts the write answers true.
+    const ok = new Map<string, string>();
+    (globalThis as { window?: unknown }).window = {
+      localStorage: {
+        getItem: (k: string) => ok.get(k) ?? null,
+        setItem: (k: string, v: string) => void ok.set(k, v),
+        removeItem: (k: string) => void ok.delete(k),
+      },
+      dispatchEvent: () => false,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    };
+    expect(saveSound({ ring: true, vibrate: false, volume: 1 })).toBe(true);
+    expect(loadSound()).toEqual({ ring: true, vibrate: false, volume: 1 });
   });
 });

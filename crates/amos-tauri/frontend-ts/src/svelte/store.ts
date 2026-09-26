@@ -67,6 +67,12 @@ export function createStoreValue<T>(key: string, fallback: T): StoreValue<T> {
     let unsubBridge: (() => void) | null = null;
     if (bridged()) {
       void subscribe("store-updated", onStoreUpdated).then((u) => {
+        // REQ-A838: `null` = the host-side listen was refused, so no cross-window store change
+        // will be pushed to us. The teardown already skips a null handle, which is correct —
+        // but say *why* out loud: this store keeps working through its own two local listeners
+        // above (`STORE_CHANGED_EVENT` for this window, `storage` for sibling webviews), so the
+        // loss is narrower than it looks and must not be described as "the store is broken".
+        // The verdict is `bridgeDiag("store-updated")`.
         unsubBridge = u;
       });
     }

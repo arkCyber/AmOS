@@ -9,8 +9,12 @@ use amos_profiling::PowerSource;
 
 /// What the battery / charger / thermal subsystem reported on this tick.
 ///
-/// `None` on the optionals means "unknown / not sampled yet" — the policy treats
-/// an absent reading conservatively (it never *assumes* a healthy battery).
+/// `None` on `level_pct` / `temperature_c` means "unknown / not sampled yet". The
+/// policy resolves that unknown **without asserting anything it cannot see**: an
+/// absent reading never *starts* a protective throttle (it is not a fabricated low
+/// or hot reading), never *ends* one a real reading already started (it is not a
+/// recovery — see [`crate::decide`]'s latch), and never grants Performance (it is
+/// not evidence of headroom). Unknown is held at the middle tier. (REQ-A525.)
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub struct BatteryState {
     /// State of charge, 0.0–100.0 percent. `None` when the reading is unavailable.
@@ -90,8 +94,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_are_conservative_not_healthy() {
-        // Unknown battery level off-charger is the conservative baseline.
+    fn defaults_carry_no_readings() {
+        // `Telemetry::default()` asserts *nothing* — every optional is unknown.
+        // The policy consequence (unknown resolves to the middle tier, never a
+        // fabricated fault and never Performance) is pinned in `policy.rs` by
+        // `cold_start_unknown_enters_no_tier_and_never_performance`; this test
+        // only holds the constructors to "no readings". (Renamed in REQ-A525: its
+        // old name claimed a policy property this test never exercised.)
         let t = Telemetry::default();
         assert_eq!(t.battery.level_pct, None);
         assert!(!t.battery.charging);

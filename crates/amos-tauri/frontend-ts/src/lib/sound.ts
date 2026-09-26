@@ -17,7 +17,7 @@
  * ourselves* (lib/notifyTone), 0..1. It is honored at every play site of that
  * tone; it is not a claim about any system audio stream.
  */
-import { readStoreValue, writeStoreValue } from "./amosStore";
+import { readStoreValue, writeStoreValueChecked } from "./amosStore";
 
 /** Shared-store key under which the sound policy is persisted. */
 export const SOUND_KEY = "amos.sound";
@@ -71,9 +71,18 @@ export function loadSound(): SoundPolicy {
   return normalizeSound(readStoreValue<unknown>(SOUND_KEY, DEFAULT_SOUND));
 }
 
-/** Persist the policy to the (durable) shared store. */
-export function saveSound(policy: SoundPolicy): void {
-  writeStoreValue(SOUND_KEY, normalizeSound(policy));
+/**
+ * Persist the policy to the (durable) shared store, and **return whether it landed**.
+ *
+ * The verdict matters to every caller: this policy has readers other than the page that
+ * writes it — the notification-arrival ring/haptic (`shouldRingOnArrival` /
+ * `shouldVibrateOnArrival`) and the incoming-call path (`lib/callTone`) — so a screen that
+ * adopts a flip the store refused will show 「振动」ON while a call still does not vibrate.
+ * A `void` return made that verdict structurally unseeable from the call sites; the fix is
+ * here, at the single owner, not repeated at each caller.
+ */
+export function saveSound(policy: SoundPolicy): boolean {
+  return writeStoreValueChecked(SOUND_KEY, normalizeSound(policy));
 }
 
 /**
@@ -101,27 +110,30 @@ export function effectiveAlert(policy: SoundPolicy, dnd: boolean): SoundPolicy {
 }
 
 /**
- * Pure gate for a haptic "notification arrived" pulse: vibrate only when the
- * unread count actually grew AND vibration is allowed by the effective policy.
+ * Pure gate for a haptic "notification arrived" pulse: vibrate only when a delivery
+ * actually **arrived** AND vibration is allowed by the effective policy.
+ *
+ * `arrived` is the **id-set** verdict (`settings.ts::newestAddedNotif` — a row whose id
+ * was not in the previous list), never a length or unread delta. `amos.notifications` is
+ * capped at `NOTIF_CAP` (`settings.ts`), so at the cap a delivery that really landed
+ * leaves the list exactly as long as it was: the old `currentUnread > previousUnread`
+ * gate, fed `prev.length` / `notifs.length` by both arrival banners, read that as "nothing
+ * arrived" and went **silent for good** once the list filled. That is the same
+ * length-delta fold `osPushWatcher.ts` records replacing for its own arrival count
+ * (REQ-A589) — the count there was fixed, this gate was left reading the proxy.
  */
-export function shouldVibrateOnArrival(
-  previousUnread: number,
-  currentUnread: number,
-  effective: SoundPolicy,
-): boolean {
-  return currentUnread > previousUnread && normalizeSound(effective).vibrate;
+export function shouldVibrateOnArrival(arrived: boolean, effective: SoundPolicy): boolean {
+  return arrived && normalizeSound(effective).vibrate;
 }
 
 /**
- * Pure gate for an audible "notification arrived" ring: ring only when the
- * unread count actually grew AND audible alerts are allowed by the effective
- * policy.
+ * Pure gate for an audible "notification arrived" ring: ring only when a delivery
+ * actually **arrived** AND audible alerts are allowed by the effective policy.
+ *
+ * See [`shouldVibrateOnArrival`] for why the argument is the arrival verdict and not a
+ * count delta — at `NOTIF_CAP` the two disagree, and the count delta is the one that lies.
  */
-export function shouldRingOnArrival(
-  previousUnread: number,
-  currentUnread: number,
-  effective: SoundPolicy,
-): boolean {
-  return currentUnread > previousUnread && normalizeSound(effective).ring;
+export function shouldRingOnArrival(arrived: boolean, effective: SoundPolicy): boolean {
+  return arrived && normalizeSound(effective).ring;
 }
 

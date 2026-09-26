@@ -63,13 +63,15 @@ FINAL: THE YELLOW LAMPS WOULD LIGHT UP HERE AND THERE THE SQUALID QUARTER
 已实测（macOS，本地无外网时用 `env -u ALL_PROXY -u all_proxy` 走 HTTP 代理）：
 
 ```bash
-# ① Piper 真实合成（需 espeak-ng；low 音色 ~63MB）
+# ① Piper 真实合成（需 espeak-ng；medium 音色，由 scripts/fetch-models.sh 下发）
 brew install espeak-ng
-bash scripts/fetch-models.sh   # 或手动下载 en_US-lessac-low.{onnx,onnx.json} 到 models/piper-low/
+bash scripts/fetch-models.sh   # 下发 en_US-lessac-medium.{onnx,onnx.json} 到 models/piper-en_US-lessac-medium/
+# 加载器（PiperProvider / tts.rs）经 amos_tts::resolve_voice 解析 VOICE_STEMS 中首个已下发的音色，
+# 故 provisioned 的 medium 与可选的 low 都被接受——不再有「脚本下 A、加载器找 B」的漂移。
 cargo run -p amos-tts --example piper_tts --features piper -- \
-    'This is a real test.' models/piper-low/en_US-lessac-low.onnx \
-    models/piper-low/en_US-lessac-low.onnx.json /tmp/piper_out.wav
-# → synthesized 43520 samples @ 16000Hz -> /tmp/piper_out.wav (2.7s)
+    'This is a real test.' models/piper-en_US-lessac-medium/en_US-lessac-medium.onnx \
+    models/piper-en_US-lessac-medium/en_US-lessac-medium.onnx.json /tmp/piper_out.wav
+# → synthesized <count> samples @ 16000Hz -> /tmp/piper_out.wav（16k 单声道，可供 sherpa 消费）
 
 # ② sherpa 识别合成音频（文本→语音→文本）
 cargo run -p amos-asr --example sherpa_asr --features sherpa -- /tmp/piper_out.wav
@@ -102,11 +104,12 @@ AMOS_SHERPA_MODEL_DIR=$PWD/models/sherpa-en-20m \
 
 对称地，`amos-tauri` 可选 feature `piper-tts`（开启 `amos-tts/piper`，链接 piper-rs/onnxruntime/espeak-ng）。
 开启时 `tts_synthesize` 会经 `TtsBridge` 自动选用**本地 Piper 音色**（默认 mock 不变）：
-启动时读 `AMOS_PIPER_MODEL_DIR`（内含 `en_US-lessac-low.onnx` + `.onnx.json`），模型缺失/加载失败回退 mock。
+启动时读 `AMOS_PIPER_MODEL_DIR`，经 `amos_tts::resolve_voice` 解析 `VOICE_STEMS`（`en_US-lessac-medium` → `en_US-lessac-low`）
+中首个 `<stem>.onnx` + `<stem>.onnx.json` 都齐全的音色；模型缺失/加载失败回退 mock。
 
 ```bash
 AMOS_SHERPA_MODEL_DIR=$PWD/models/sherpa-en-20m \
-AMOS_PIPER_MODEL_DIR=$PWD/models/piper-low \
+AMOS_PIPER_MODEL_DIR=$PWD/models/piper-en_US-lessac-medium \
   cargo tauri dev --features sherpa-asr,piper-tts    # 本地 ASR + 本地 TTS 同时启用
 ```
 

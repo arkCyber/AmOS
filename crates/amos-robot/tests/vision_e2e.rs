@@ -16,17 +16,6 @@
 
 use amos_robot::vision::{optical_flow_sparse, FastConfig, FastDetector, LkConfig, LkOutcome};
 
-fn gradient_image(width: usize, height: usize) -> Vec<u8> {
-    // A horizontal gradient so features have a strong |∇I|.
-    let mut p = Vec::with_capacity(width * height);
-    for _y in 0..height {
-        for x in 0..width {
-            p.push(((x as i32 * 4).min(255)) as u8);
-        }
-    }
-    p
-}
-
 fn random_image(width: usize, height: usize, seed: u64) -> Vec<u8> {
     // A pseudo-random image with both x- and y-gradients so the LK 2×2
     // has a non-singular determinant. The LCG is deterministic across
@@ -46,8 +35,9 @@ fn random_image(width: usize, height: usize, seed: u64) -> Vec<u8> {
     p
 }
 
-fn shifted_horizontal(width: usize, height: usize, dx: i32) -> Vec<u8> {
-    let src = gradient_image(width, height);
+/// Translate `src` left by `dx` pixels: `dst(x) = src(x + dx)`. A feature at `x` in `src`
+/// therefore reappears at `x − dx` in the result, so the true flow is `−dx`.
+fn shifted(src: &[u8], width: usize, height: usize, dx: i32) -> Vec<u8> {
     let mut dst = vec![0u8; src.len()];
     for y in 0..height {
         for x in 0..width {
@@ -64,82 +54,111 @@ fn shifted_horizontal(width: usize, height: usize, dx: i32) -> Vec<u8> {
 fn a_horizontal_shift_is_recovered_by_lk() {
     let width = 64usize;
     let height = 64usize;
+    // `next` must be a translation of **the same** `prev` (an earlier version shifted a
+    // *different* image, so the recovered flow was meaningless noise that the test never
+    // checked). `random_image` is used because a pure horizontal gradient has no y-variation
+    // and makes the LK 2×2 system singular.
     let prev = random_image(width, height, 1);
-    let next = shifted_horizontal(width, height, 2);
+    // A **1-px** shift, which is the limit of this single-resolution LK's capture range
+    // (`src/vision/lk.rs` documents it: a 2-px or larger displacement is outside the
+    // linearisation and the solver returns a *wrong* non-converged-looking number rather than
+    // refusing, so a larger shift is not something this test can assert).
+    let next = shifted(&prev, width, height, 1);
     let cfg = LkConfig::conservative(width as u32);
     // Features in the middle of the image — away from the edges so the
     // 3×3 stencil always fits.
     let features = vec![(16u16, 32u16), (24, 32), (40, 32), (48, 32)];
     let outcomes = optical_flow_sparse(&prev, &next, &features, &cfg);
     assert_eq!(outcomes.len(), features.len());
-    let meaningful = outcomes
-        .iter()
-        .filter(|o| matches!(o, LkOutcome::Converged(_) | LkOutcome::NotConverged(_)))
-        .count();
-    assert!(
-        meaningful >= 1,
-        "at least one feature must produce a flow vector, got {outcomes:?}"
+
+    // The claim is not "a vector came out" but "the correct vector came out": every feature
+    // must recover dx = −1. (The previous version shifted a *different* image and asserted
+    // only that one outcome existed, so it passed even when the flow was pure noise.)
+    let mut converged = 0;
+    for outcome in &outcomes {
+        if let LkOutcome::Converged(f) = outcome {
+            converged += 1;
+            assert!(
+                (f.dx + 1.0).abs() < 0.25 && f.dy.abs() < 0.25,
+                "a 1-px left shift must be recovered as dx ≈ −1, dy ≈ 0, got ({}, {})",
+                f.dx,
+                f.dy
+            );
+        }
+    }
+    assert_eq!(
+        converged,
+        features.len(),
+        "every interior, texture-rich feature must converge, got {outcomes:?}"
     );
 }
 
 #[test]
 fn fast_detector_finds_corners_in_a_high_contrast_image() {
-    // FAST is most reliable on high-contrast images with sharp edges. The
-    // detector may legitimately return an empty list on synthetic data
-    // (the 9-of-16 arc test is stricter than a gradient). The structural
-    // check is: no panic, every reported corner is in-bounds.
+    // FAST must actually *find* corners on a fixture that has them (and every corner it
+    // reports must be in-bounds with a positive score).
     let width = 32u32;
     let height = 32u32;
     let cfg = FastConfig::conservative(width, height);
     let detector = FastDetector::new();
-    // A centred bright blob against a dark background: the textbook FAST
-    // fixture. (Width/height 32 means the detector is comfortably in-bounds.)
-    let mut blob = vec![0u8; (width * height) as usize];
-    let cx = width as i32 / 2;
-    let cy = height as i32 / 2;
-    for y in 0..height as i32 {
-        for x in 0..width as i32 {
-            let dx = x - cx;
-            let dy = y - cy;
-            let dist2 = dx * dx + dy * dy;
-            if dist2 > 2 * 2 && dist2 <= 5 * 5 {
-                blob[y as usize * width as usize + x as usize] = 255;
+    // A grid of isolated 3×3 bright dots on black. FAST detects *isolated* corners, not
+    // edges: on a checkerboard every ring pixel alternates bright/dark, so no 9-pixel arc
+    // ever passes and `detect` correctly returns nothing (verified). The dots fixture gives
+    // each corner a clean bright arc. (An earlier version used a thin bright *ring* and
+    // then never asserted a non-empty result, so its loop body ran zero times and the test
+    // passed no matter what.)
+    let mut dots = vec![0u8; (width * height) as usize];
+    for gy in (4..height - 4).step_by(8) {
+        for gx in (4..width - 4).step_by(8) {
+            for dy in 0..3 {
+                for dx in 0..3 {
+                    dots[((gy + dy) * width + (gx + dx)) as usize] = 255;
+                }
             }
         }
     }
-    let corners = detector.detect(&blob, &cfg);
-    // Structural smoke-check: every returned corner is in-bounds with
-    // a positive score. Whether FAST finds corners on a synthetic
-    // fixture is sensitive to the exact threshold; the deployment
-    // tunes the threshold, the test does not pin a count.
+    let corners = detector.detect(&dots, &cfg);
+    assert!(
+        corners.len() >= 8,
+        "a grid of high-contrast dots must yield many corners; got {}",
+        corners.len()
+    );
     for c in &corners {
-        assert!(c.x < width as u16);
-        assert!(c.y < height as u16);
-        assert!(c.score > 0);
+        assert!(c.x < width as u16, "corner x out of bounds: {c:?}");
+        assert!(c.y < height as u16, "corner y out of bounds: {c:?}");
+        assert!(
+            c.score > 0,
+            "a reported corner must carry a positive score: {c:?}"
+        );
     }
 }
 
 #[test]
-fn a_static_pair_does_not_panic() {
+fn a_static_pair_yields_zero_flow_for_interior_features() {
     let width = 32usize;
     let height = 32usize;
     let prev = random_image(width, height, 42);
     let cfg = LkConfig::conservative(width as u32);
     let features = vec![(8u16, 16u16), (16, 16), (24, 16)];
     let outcomes = optical_flow_sparse(&prev, &prev, &features, &cfg);
-    // One outcome per feature, all are well-defined.
     assert_eq!(outcomes.len(), features.len());
+    // The claim is stronger than "no panic": on a static pair with a texture-rich interior,
+    // every feature must converge to **zero** flow. (The previous assertion was
+    // `Converged | NotConverged | Singular | Lost` — every variant, i.e. a tautology that
+    // could never fail, so it pinned nothing.)
     for outcome in &outcomes {
-        let is_known = matches!(
-            outcome,
-            LkOutcome::Converged(_) | LkOutcome::NotConverged(_) | LkOutcome::Singular
-        );
-        let is_lost = matches!(outcome, LkOutcome::Lost);
-        // An edge feature with `Lost` is correct (the 3×3 stencil crossed
-        // the image boundary). An interior feature marked `Lost` is a
-        // regression. The middle of the image has plenty of gradient, so
-        // `Singular` is the only legitimate non-convergent outcome.
-        assert!(is_known || is_lost, "unexpected outcome: {outcome:?}");
+        match outcome {
+            LkOutcome::Converged(f) => assert!(
+                f.dx.abs() < 0.5 && f.dy.abs() < 0.5,
+                "a static pair must give ~zero flow, got dx = {}, dy = {}",
+                f.dx,
+                f.dy
+            ),
+            other => panic!(
+                "an interior, texture-rich feature on a static pair must converge to zero \
+                 flow, got {other:?}"
+            ),
+        }
     }
 }
 

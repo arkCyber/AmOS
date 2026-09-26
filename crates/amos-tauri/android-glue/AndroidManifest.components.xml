@@ -77,4 +77,64 @@
         android:enabled="true"
         android:exported="false" />
 
+    <!-- Whole-screen capture (REQ-A1582 / F-DEV-141). Android requires a foreground
+         service of type `mediaProjection` to be running while a `MediaProjection` is
+         live — without one, `getMediaProjection` is refused, so this registration is
+         part of the capture path rather than decoration. `ScreenRecordGlue` starts it
+         from the consent result and stops it when the session ends.
+         `exported="false"`: nothing outside the app may start it. The type's own
+         permission (`FOREGROUND_SERVICE_MEDIA_PROJECTION`) lives in the permissions
+         fragment, and the two have to agree — which is exactly what
+         `scripts/android-component-scan.mjs` (K2, the Kotlin → fragment direction) and
+         `scripts/android-permission-scan.mjs` (the `screen-record` family) check. -->
+    <service
+        android:name="com.amos.ai.glue.ScreenRecordService"
+        android:enabled="true"
+        android:exported="false"
+        android:foregroundServiceType="mediaProjection" />
+
+    <!-- The **system input method** (REQ-A1893, `docs/input-method.md` §System IME).
+         Until this entry existed, `amos-ime` had one exit only — the System UI's own WebView — and
+         no app on the device (a legacy app in the container, or any app on the no-UI
+         Android base) could select the pinyin keyboard. This is the platform binding
+         that makes the engine reachable from any app.
+
+         `exported="true"` — deliberate, and the opposite of every other service here:
+         the **platform** (InputMethodManager, on behalf of the app the user is typing
+         into) is the caller that binds it, so it cannot be app-private. `BIND_INPUT_METHOD`
+         is the permission the *system* must hold to bind — a signature|privileged
+         permission a normal app cannot hold, which is what stops a third-party app from
+         binding this service itself. It is therefore **not** a `<uses-permission>` on our
+         side (see `scripts/android-permission-scan.mjs`'s `ime` family, whose permission
+         list is deliberately empty for exactly that reason; declaring it here as a
+         `<uses-permission>` would be judged undeclared).
+
+         `<meta-data android:name="android.view.im">` is what points the platform at
+         `res/xml/method.xml` (the subtype list). That resource is a **tracked** file
+         (`android-glue/res/xml/method.xml`) mirrored into the generated project by
+         `scripts/android-glue-mirror.sh`, which also fails loud when a fragment's
+         `@xml/<n>` has no tracked file — a missing resource is an AAPT build error, but a
+         *stale* one is a silently wrong subtype.
+
+         The action is `android.view.InputMethod` — the literal value of
+         `android.view.inputmethod.InputMethod.SERVICE_INTERFACE`, and the one string in this
+         block a reader will get wrong: the platform's discovery query is
+         `new Intent(InputMethod.SERVICE_INTERFACE)`, so the package-shaped spelling
+         `android.view.inputmethod.InputMethod` (which looks right and is what this file said
+         until 2026-09-26) matches nothing, and the IME installs, resolves in `dumpsys
+         package`, and is still missing from the method map the Settings keyboard list reads.
+         `scripts/ime-action-scan.mjs` compares this literal to the SDK's own constant. -->
+    <service
+        android:name="com.amos.ai.glue.AmosImeService"
+        android:enabled="true"
+        android:exported="true"
+        android:permission="android.permission.BIND_INPUT_METHOD">
+        <intent-filter>
+            <action android:name="android.view.InputMethod" />
+        </intent-filter>
+        <meta-data
+            android:name="android.view.im"
+            android:resource="@xml/method" />
+    </service>
+
 </manifest>

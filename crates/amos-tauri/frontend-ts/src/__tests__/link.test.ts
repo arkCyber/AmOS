@@ -2,9 +2,11 @@ import { describe, expect, test } from "bun:test";
 import {
   actuationAgeMs,
   counterSummary,
+  estopReasonKey,
   formatUptime,
   healthKey,
   linkLevel,
+  peerDeclared,
   peerSummary,
   reportAgeKey,
   reportAgeText,
@@ -13,6 +15,7 @@ import {
   robotLevel,
   robotLevelKey,
   robotSummary,
+  watchdogText,
   type LinkActuation,
   type LinkStatus,
 } from "../lib/link";
@@ -120,6 +123,14 @@ describe("robot-link client (pure helpers)", () => {
     ).toBe("dog1 (robot), mini-brain (brain)");
   });
 
+  test("a zero beacon count is the one that means “declared by hand”", () => {
+    // Every other count is a peer that announced itself; only a zero is a static entry that
+    // was configured and will never TTL-expire. Feeding a *heard* peer proves the predicate is
+    // not just `() => true`.
+    expect(peerDeclared({ id: "dog1", kind: "robot", endpoint: null, last_seen_ms: 0, beacons: 0 })).toBe(true);
+    expect(peerDeclared({ id: "dog1", kind: "robot", endpoint: null, last_seen_ms: 20, beacons: 1 })).toBe(false);
+  });
+
   test("the counter readout prints every counter with its wire name", () => {
     const line = counterSummary(DEGRADED.metrics);
     for (const token of [
@@ -198,5 +209,26 @@ describe("robot rows (the control loop's return path)", () => {
     expect(reportAgeText(2_500)).toBe("2s");
     expect(reportAgeText(125_000)).toBe("2m 05s");
     expect(reportAgeText(3 * 3_600_000)).toBe("3h 00m");
+  });
+
+  test("a latched e-stop says *why* — the operator's cut and the watchdog's are told apart", () => {
+    // `estopped: true` alone cannot answer the first question a stopped robot raises. The two
+    // tokens are the robot's own (`EstopReason::key()`); the bridge drops a token this build does
+    // not know, so nothing here is guessed at — an unrecognized string is `null`, like no reason.
+    expect(estopReasonKey("commanded")).toBe("link.estopReasonCommanded");
+    expect(estopReasonKey("watchdog")).toBe("link.estopReasonWatchdog");
+    expect(estopReasonKey(null)).toBeNull();
+    expect(estopReasonKey("")).toBeNull();
+    expect(estopReasonKey("summoned")).toBeNull();
+  });
+
+  test("the deadman period is printed as a duration, and its absence is not `0ms`", () => {
+    // `null` is the bridge's "no watchdog configured" (the proto's `0` sentinel, folded away).
+    // Printing `0ms` would describe a watchdog nobody set, so the absence gets its own mark.
+    expect(watchdogText(1_000)).toBe("1000ms");
+    expect(watchdogText(250)).toBe("250ms");
+    expect(watchdogText(null)).toBe("-");
+    expect(watchdogText(0)).toBe("-");
+    expect(watchdogText(Number.NaN)).toBe("-");
   });
 });

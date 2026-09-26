@@ -21,6 +21,7 @@
  * module stays framework-agnostic and unit-testable.
  */
 import { readStoreValue, writeStoreValueChecked } from "./amosStore";
+import { amosWarn } from "./debugLog";
 
 export type DesktopView = {
   showWallpaper: boolean;
@@ -74,12 +75,24 @@ export function toggleInView(view: DesktopView, what: ViewToggle): DesktopView {
   }
 }
 
-/** Convenience: flip + persist. The caller subscribes to changes via the
- * shared store; we don't try to publish events here (writeJson already emits
- * `store-updated` through the existing channel). */
+/**
+ * Convenience: flip + persist. The caller subscribes to changes via the shared store; we don't try
+ * to publish events here (`writeJson` already emits `store-updated` through the existing channel).
+ *
+ * **The return value is what the store holds**, not what we intended (REQ-A492): a refused write
+ * (storage full/unavailable) used to be discarded while this function still handed back the toggled
+ * view, so the caller rendered a state that would be gone on reload. Publishing `next` on that path
+ * was the same lie the keyboard page told with its 「已保存」 toast; re-reading costs one lookup and
+ * makes the caller's state equal the store's, whatever happened.
+ */
 export function toggleDesktopView(what: ViewToggle): DesktopView {
   const cur = readDesktopView();
   const next = toggleInView(cur, what);
-  writeDesktopView(next);
+  if (!writeDesktopView(next)) {
+    // The store refused it: report it (the ledger is the surface for "why is my setting back after a
+    // reload") and hand back what is actually stored.
+    amosWarn("desktop", "desktop view toggle was not persisted", { what });
+    return readDesktopView();
+  }
   return next;
 }

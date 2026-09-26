@@ -1,9 +1,11 @@
 //! `amos-notifier` end-to-end: alerts → dispatch → channels → metrics.
 //!
 //! Why this lives in tests/: the per-channel tests cover "the webhook
-//! POSTs JSON"; they do not prove "a P0 alert always reaches at least one
-//! channel". That is **dispatch policy** — a join test, and joins earn
-//! their own file.
+//! POSTs JSON"; they do not prove "a P0 alert reaches every configured
+//! channel, and reaches the operator when none of them takes it". That is
+//! **dispatch policy** — a join test, and joins earn their own file. (The
+//! "no channel took it ⇒ the operator still sees it" half is REQ-A769,
+//! pinned by [`a_p0_that_every_channel_fails_still_surfaces_to_the_operator`].)
 //!
 //! Each test is offline (no HTTP, no SMTP, no clock that matters). The
 //! dispatcher is synchronous; the recorder channel sinks everything it
@@ -143,6 +145,39 @@ fn send_outcome_pathology_does_not_crash_the_dispatcher() {
     let m = d.metrics();
     let (_, cm) = &m.channels[0];
     assert_eq!(cm.failed, 5);
+    // Each of the five reached no channel, so each is surfaced to the operator
+    // rather than only counted (REQ-A769) — the failure and the fallback are the
+    // two halves of the same event, and both must be visible.
+    assert_eq!(m.fallbacks, 5);
+}
+
+/// REQ-A769 — the join the crate *promised* but never proved: a P0 whose every
+/// configured transport fails still reaches the operator.
+///
+/// Before this, `Dispatcher::fire` wrote the stderr/tracing fallback only when
+/// `channels.is_empty()`, so a box with one webhook pointed at a dead host had
+/// every P0 counted in `failed` and shown to **nobody**. `lib.rs` claimed the
+/// fallback applied "when no transports are configured **or every transport
+/// fails**"; only the first half was true in the code. This is the test that
+/// holds the second half: the alert is delivered to at least one place — the
+/// operator fallback — whenever the fan-out delivers it nowhere.
+#[test]
+fn a_p0_that_every_channel_fails_still_surfaces_to_the_operator() {
+    let d = Dispatcher::builder()
+        .with_stderr_fallback(true)
+        .with_channel(AlwaysFail)
+        .build();
+    d.fire(Alert::p0("daemon.crash", "restart budget exhausted"));
+    let m = d.metrics();
+    // The transport half: the failure is recorded honestly…
+    assert_eq!(m.global.failed, 1);
+    assert_eq!(m.global.sent, 0);
+    // …and the operator half: the alert reached *somewhere*, so it was not
+    // silently lost. `fallbacks` is the count the stderr/tracing line mirrors.
+    assert_eq!(
+        m.fallbacks, 1,
+        "an undeliverable P0 must reach the operator"
+    );
 }
 
 #[test]

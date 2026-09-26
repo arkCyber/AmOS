@@ -32,6 +32,7 @@ import DockLaunchpadItem from "./modules/DockLaunchpadItem.svelte";
 import DockTrashItem from "./modules/DockTrashItem.svelte";
 import LaunchpadTrigger from "./modules/LaunchpadTrigger.svelte";
 import RadiosWidget from "./modules/RadiosWidget.svelte";
+import ScreenRecordIndicator from "./modules/ScreenRecordIndicator.svelte";
 import SpotlightTrigger from "./modules/SpotlightTrigger.svelte";
 import StageClock from "./modules/StageClock.svelte";
 import TopbarAppleMenu from "./modules/TopbarAppleMenu.svelte";
@@ -40,6 +41,7 @@ import TopbarMainMenu from "./modules/TopbarMainMenu.svelte";
 import Launchpad from "./Launchpad.svelte";
 import DesktopNotificationCenter from "./DesktopNotificationCenter.svelte";
 import MissionControl from "./MissionControl.svelte";
+import AppExpose from "./AppExpose.svelte";
 import SpotlightOverlay from "./SpotlightOverlay.svelte";
 import SpacesPanel from "./SpacesPanel.svelte";
 
@@ -105,6 +107,14 @@ export const SHELL_MODULES: ShellModule[] = [
     component: ControlCenterButton,
   },
   {
+    id: "screen-record",
+    slot: "topbar-right",
+    order: 35,
+    titleKey: "cc.record.title",
+    testId: "chrome-record",
+    component: ScreenRecordIndicator,
+  },
+  {
     id: "radios",
     slot: "topbar-right",
     order: 40,
@@ -162,7 +172,7 @@ export const SHELL_MODULES: ShellModule[] = [
     id: "dock-trash",
     slot: "dock",
     order: 30,
-    titleKey: "desktop.trashInFiles",
+    titleKey: "desktop.trash",
     testId: "dock-trash",
     separatorBefore: true,
     component: DockTrashItem,
@@ -245,6 +255,32 @@ export const SHELL_MODULES: ShellModule[] = [
     // (§4.3 7-knock audit) made this invariant load-bearing for the
     // accessibility-first keyboard contract.
     component: SpacesPanel,
+  },
+  /**
+   * AppExpose — macOS's **Application Windows** (`⌃↓`): the focused app's windows, tiled
+   * (REQ-A476).
+   *
+   * Order 40 puts it between `mission-control (30)` and `spaces-panel (50)`: the three are
+   * one keyboard family (`⌃↑` / `F3` = every window, `⌃↓` = this app's windows, `⌃←/→` =
+   * desktops), so the registry reads in the order macOS documents them.
+   *
+   * **No `shortcuts:` row** — like `spaces-panel`, and for the same reason: the registry's
+   * overlay-shortcut set (`F3 / F4 / ⌘Space / ⌘Tab`) is a documented, test-pinned invariant
+   * (`__tests__/shellModule.test.ts`), and `⌃↓` belongs to the Control-arrow family that is
+   * configured in the keyboard-config `spaces` domain (`SPACES_DEFAULTS.appExpose`) — which
+   * also makes it **rebindable** in Settings, unlike the four registry keys.
+   *
+   * The chord is handled in `DesktopShell` (it needs the focused app's window count before
+   * opening: an app with one window has nothing to tile, and the shell says so instead of
+   * opening an empty panel — `desktopSystemKeys.appExposeRefusal`).
+   */
+  {
+    id: "app-expose",
+    slot: "overlay",
+    order: 40,
+    titleKey: "desktop.appExpose",
+    testId: "app-expose",
+    component: AppExpose,
   },
   /**
    * DesktopNotificationCenter — macOS's right-hand notification panel (REQ-A417).

@@ -7,15 +7,42 @@
  * maps the structured reply into the kind of plan the Svelte surface needs.
  *
  * The pure-JS fallback path (`planPreviewLocal`) only fires when the host
- * bridge is unavailable (browser preview / happy-dom test environment).
+ * bridge is **unavailable** (browser preview / happy-dom test environment).
+ * That word used to be an aspiration rather than a description: the code fell
+ * through to it on *any* `null` from the host, including a host that was
+ * **present and refused**, so the shell's own tables would silently answer in
+ * the host's place and the 256 KiB text cap (`PREVIEW_TEXT_MAX`, which this
+ * module has no equivalent of — see `decodeTextSafely`'s own warning about
+ * large inputs) would be discarded with it. A present host that produced no
+ * plan now yields an explicit `unavailable` plan instead (F-SH-281); only
+ * `not-bridged` still licenses the shell to classify by itself.
+ *
+ * The sibling that already had this right is `PlayerApp.svelte`'s resolve
+ * path: any bridge / store / blob failure is surfaced as 「无法播放」 rather
+ * than rendered as a file that plays. Reading bytes off the host has three
+ * distinct outcomes — *read*, *refused*, and *could not be read* — and only
+ * the first one is a fact about the file.
  */
 
 import {
+  bridgeDiag,
   filesPreviewBytes as rustFilesPreview,
+  type BridgeDiag,
   type FilesPreviewResult,
 } from "./backend";
 
-export type PreviewKind = "text" | "image" | "audio" | "video" | "binary" | "empty";
+export type PreviewKind = "text" | "image" | "audio" | "video" | "binary" | "empty" | "unavailable";
+
+/**
+ * Why no plan could be made, as data rather than as a sentence.
+ *
+ * Structured on purpose: the shell translates its own text (`t()` at the view), while the
+ * host's `error` field carries sentences the Rust side authored. A module-level English
+ * sentence here would be a third register and would be untranslatable by construction.
+ * The three are kept apart for the reason `printRefusalMessage` states: one sentence for
+ * every refusal makes three different facts read identically in the log and on screen.
+ */
+export type PreviewRefusalReason = "no-bridge" | "refused" | "unreadable";
 
 /** A renderer's view of a preview: kind + source + size. */
 export interface PreviewPlan {
@@ -32,6 +59,8 @@ export interface PreviewPlan {
   sizeLabel: string;
   /** MIME the renderer should declare. */
   mime: string | null;
+  /** Present **only** on `kind: "unavailable"` — see [`PreviewRefusalReason`]. */
+  reason?: PreviewRefusalReason;
 }
 
 function hostAvailable(): boolean {
@@ -74,8 +103,56 @@ export async function planPreview(
   if (hostAvailable()) {
     const r = await rustFilesPreview(name, mime, bytes);
     if (r) return toPlan(r);
+    // A **present** host that produced no plan is not a licence to answer with the other
+    // classifier. `invoke` resolves `null` both when there is no bridge at all and when a
+    // bridge refused the call, so the verdict is read rather than inferred (F-SH-281).
+    const diag = bridgeDiag("files_preview_bytes");
+    if (!isNotBridged(diag)) return previewUnavailablePlan(mime, previewRefusalReason(diag));
   }
   return planPreviewLocal(name, mime, bytes);
+}
+
+/**
+ * The one place a preview refusal becomes a plan, so its two call sites cannot describe the
+ * same non-event differently — `print.ts`'s rule for its refusal codes, applied to a plan.
+ *
+ * The reason is passed in rather than derived from a diagnostic here, because the two front
+ * doors learn it differently: this module reads `files_preview_bytes`' verdict, while
+ * `FilesApp.svelte`'s MediaStore path calls `media_load` through `media.ts`, whose own
+ * `call` does **not** go through `backend.ts::invoke` and so never reaches the diagnostic
+ * ledger at all. Its doc states the mapping those call sites rely on — "offline (no bridge)
+ * → `null`; with a bridge present, a real command error **rejects**".
+ */
+export function previewUnavailablePlan(mime: string | null, reason: PreviewRefusalReason): PreviewPlan {
+  return {
+    kind: "unavailable",
+    src: "",
+    bytes: 0,
+    isText: false,
+    // The *reason* is structured and rendered by the view; the host-authored `error`
+    // sentence is not ours to invent here.
+    error: null,
+    sizeLabel: "—",
+    mime,
+    reason,
+  };
+}
+
+/** The `not-bridged` case, spelled once: it is the **only** one that licenses the fallback. */
+function isNotBridged(diag: BridgeDiag): boolean {
+  return diag.ok === false && diag.kind === "not-bridged";
+}
+
+/**
+ * Which of the three "we have no preview" facts a diagnostic describes.
+ *
+ * `ok: true` here means a host **did** answer and the reply was not a plan (`null` under a
+ * type that is never null) — a wire violation rather than a refusal, and it is named as such
+ * instead of being folded into one.
+ */
+export function previewRefusalReason(diag: BridgeDiag): PreviewRefusalReason {
+  if (diag.ok) return "unreadable";
+  return diag.kind === "not-bridged" ? "no-bridge" : "refused";
 }
 
 // ---- JS fallback (only used when the host bridge is unavailable) -----------
@@ -102,8 +179,11 @@ const AUDIO_MIMES = new Set([
   "audio/flac",
   "audio/webm",
   "audio/x-m4a",
-  // NOTE: `audio/mp4` is NOT a standard IANA MIME type; `.m4a` is `audio/x-m4a`.
-  // Adding it here is harmless (files declared with it render as audio) but non-standard.
+  // `audio/mp4` is the MIME amos-media's MediaStore mapping (`mapping.rs`) produces for
+  // `.m4a`/`.m4b`, and the player/voice-recorder/media-export modules treat it as audio.
+  // It must classify as audio here too, or a MediaStore `.m4a` previews as audio over the
+  // host bridge but as `binary` (no <audio> element) on this fallback path.
+  "audio/mp4",
 ]);
 const VIDEO_MIMES = new Set([
   "video/mp4",
@@ -252,7 +332,8 @@ export function previewBytesLabel(n: number): string {
   }
   // Prefer integer form for exact boundaries ("1 KB"); fall back to one decimal
   // for fractional values below 100 ("1.5 KB"); round large numbers to avoid
-  // trailing decimals ("256 KB").  This mirrors the Rust `size_label` function.
+  // trailing decimals ("256 KB").  This is the one JS implementation of the Rust
+  // `size_label` rule; `filesPreview.test.ts` binds it to `size_label`'s vectors.
   const s =
     Number.isInteger(v)
       ? String(v)

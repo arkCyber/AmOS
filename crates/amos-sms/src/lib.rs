@@ -30,7 +30,7 @@ pub mod android;
 
 pub use error::SmsError;
 pub use folder::{SmsFolder, SmsFolderCounts};
-pub use provider::{MockSms, SmsProvider, MOCK_PROVIDER};
+pub use provider::{MockSms, SmsProvider, SmsSendOutcome, MOCK_PROVIDER};
 // Balance redaction on the display path (REQ-A41): domain-level so every
 // consumer (Tauri bridge, tests, future surfaces) inherits the same policy.
 pub use redact::{is_bank_sender, redact_balances, redact_for, REDACTION};

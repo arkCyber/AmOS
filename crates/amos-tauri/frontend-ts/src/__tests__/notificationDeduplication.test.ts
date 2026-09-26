@@ -6,6 +6,7 @@
  */
 
 import { describe, test, expect } from "bun:test";
+import { fastest, PERF_ATTEMPTS } from "./perfBudget";
 import {
   mergePushHistory,
   pushRecordToNotif,
@@ -393,9 +394,12 @@ describe("mergePushHistory - 性能", () => {
       makeRecord({ id: `new_${i}`, received_at: new Date(NOW + i * 1000).toISOString() })
     );
 
-    const start = performance.now();
+    // REQ-A850 / F-DEV-106：取 K 次最小值（抢占只会给某一次**加**时间）。`mergePushHistory`
+    // 是纯函数（返回值参与断言），重复执行安全。
     const result = mergePushHistory(existing, records, NOW, 1000);
-    const duration = performance.now() - start;
+    const duration = fastest(PERF_ATTEMPTS, () => {
+      mergePushHistory(existing, records, NOW, 1000);
+    });
 
     expect(result.length).toBe(1000);
     expect(duration).toBeLessThan(100);
@@ -409,9 +413,12 @@ describe("mergePushHistory - 性能", () => {
       })
     );
 
-    const start = performance.now();
     const result = mergePushHistory([], records, NOW, 20000);
-    const duration = performance.now() - start;
+    // 同族第二条。输入仍是 `Math.random()` 造的乱序时间戳 —— 排序耗时与顺序无关，
+    // 保留随机不影响判据（要的是「1 万条的排序快得不正常」这件事被测到）。
+    const duration = fastest(PERF_ATTEMPTS, () => {
+      mergePushHistory([], records, NOW, 20000);
+    });
 
     expect(result.length).toBe(10000);
     expect(duration).toBeLessThan(500);

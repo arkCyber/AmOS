@@ -11,9 +11,11 @@
  * What this file pins, and why each is a contract rather than taste:
  *   • every tile has a name and a tooltip, and carries the shared dock look
  *     (`lib/shellChrome.ts`) — the drift this round removed;
- *   • the **Trash** is disabled and says why. Its handler used to be
- *     `if (id === "trash") return;` — a tile that looks pressable, is announced as
- *     pressable, and does nothing (FMEA F-SH-001).
+ *   • the **Trash** opens Files *on its trash pane* (REQ-A783) — the tile's handler used to be
+ *     `if (id === "trash") return;` (FMEA F-SH-001), and the round that greyed it instead did so
+ *     on the claim that `wm_open`'s label was the only channel into the target window. It is the
+ *     only *window* channel; the pane travels on the shared store, so the tile is live again and
+ *     this file pins both halves of the route.
  *   • the Finder tile opens the real window (`wm_open`), and the app tiles pass their own
  *     id — no "open or focus?" decision in the frontend (`wm_open` is create + focus).
  */
@@ -26,6 +28,7 @@ import DockLaunchpadItem from "../src/svelte/modules/DockLaunchpadItem.svelte";
 import DockTrashItem from "../src/svelte/modules/DockTrashItem.svelte";
 import { setLocale } from "../src/svelte/locale.svelte";
 import { DOCK_ITEM_TILE } from "../src/lib/shellChrome";
+import { normalizeViewIntent } from "../src/lib/files";
 import { zh } from "../src/i18n/locales/zh";
 
 afterEach(cleanup);
@@ -35,15 +38,24 @@ beforeEach(() => window.localStorage.clear());
 /** A fake host, so the tiles' `wm_open` calls can be observed. */
 function installHost(): string[] {
   const commands: string[] = [];
+  hostCalls = [];
   (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
-    invoke: async (cmd: string) => {
+    invoke: async (cmd: string, args: unknown) => {
       commands.push(cmd);
+      hostCalls.push({ cmd, args });
       return null;
     },
     listen: async () => () => {},
   };
   return commands;
 }
+
+/**
+ * Every `invoke` since the last `installHost()`, **with its payload** — the command name alone
+ * cannot tell "opened Files" from "opened Notes", and the trash tile's whole contract is *which*
+ * window it opens (the view it lands on rides the store, not this call).
+ */
+let hostCalls: Array<{ cmd: string; args: unknown }> = [];
 
 afterEach(() => {
   delete (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
@@ -88,20 +100,42 @@ describe("dock widgets (mounted alone)", () => {
     expect(commands).toContain("wm_open");
   });
 
-  test("the Trash is disabled and says why (an inert control would be worse)", async () => {
+  test("the Trash tile opens Files ON ITS TRASH PANE (the label was never the whole channel)", async () => {
+    const commands = installHost();
     const { container } = render(DockTrashItem);
     await tick();
     const tile = container.querySelector<HTMLButtonElement>('[data-testid="dock-trash"]')!;
-    expect(tile.disabled).toBe(true);
-    expect(tile.getAttribute("aria-disabled")).toBe("true");
-    expect(tile.getAttribute("aria-label")).toBe(zh["desktop.trashInFiles"]);
-    // The name says **where the trash is**. REQ-A455 shipped the trash (inside Files) and
-    // made the old reason — "not wired up yet: there is no trash view" — **untrue**; a
-    // reason that has stopped being true is worse than none, because it sends the reader
-    // looking for a feature that already exists.
-    expect(tile.getAttribute("aria-label")).toContain("文件");
-    // Dimmed rather than invisible: the slot is still part of the dock's shape.
-    expect(tile.className).toContain("opacity-40");
+
+    // Live, and named for what it opens. REQ-A455 shipped the trash and made the old
+    // "not wired up yet: there is no trash view" reason untrue; the round after that greyed
+    // the tile on a *second* reason — "`wm_open(label)` carries a label and nothing else, so a
+    // Dock tile cannot open the trash pane". That is true of `wm_open` and false about the
+    // shell: the cross-window intent (REQ-A458) already carries a destination *inside* the
+    // target window through the shared store, so the label was never the whole channel.
+    //
+    // REQ-A783: the tile now does what a trash tile should, and this test pins **both halves**
+    // of the two-part route — the window (by label, through the host) and the pane (through
+    // the store). Pinning only the first is how the old reasoning survived: opening Files and
+    // landing on the user's last view is exactly the "Files opened, not the trash" failure.
+    expect(tile.disabled).toBe(false);
+    expect(tile.getAttribute("aria-disabled")).not.toBe("true");
+    expect(tile.getAttribute("aria-label")).toBe(zh["desktop.trash"]);
+    // The new name is no longer a direction. "…（在「文件」里查看）" told the user where to go;
+    // on a control that already takes them there, that is a label that contradicts its button.
+    expect(tile.getAttribute("aria-label")).not.toContain("里查看");
+    // No longer dimmed: nothing about it is unavailable any more.
+    expect(tile.className).not.toContain("opacity-40");
+
+    await fireEvent.click(tile);
+
+    expect(commands).toContain("wm_open");
+    expect(hostCalls.find((c) => c.cmd === "wm_open")?.args).toEqual({ label: "files" });
+
+    // Pinned against the **literal** key, not the constant: this is the wire name two windows
+    // agree on, and a rename has to be a deliberate, visible edit here too.
+    const raw = window.localStorage.getItem("amos.files.view");
+    expect(raw).toBeTruthy();
+    expect(normalizeViewIntent(JSON.parse(raw as string))?.view).toBe("trash");
   });
 
   test("an app tile is named with its translated label and opens its own id", async () => {

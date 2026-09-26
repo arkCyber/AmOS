@@ -20,6 +20,11 @@ mod airplay_tests;
 pub mod alarm_sched;
 #[cfg(feature = "android")]
 pub mod android_glue;
+/// The Android **system IME** (`InputMethodService`) glue: JNI trampolines the
+/// Kotlin `AmosImeService` calls so a real Android app can type with the `amos-ime`
+/// pinyin engine (`docs/input-method.md` §System IME).
+#[cfg(feature = "android")]
+pub mod android_ime;
 pub mod android_lmk;
 pub mod appstore;
 pub mod assistant_voice;
@@ -28,6 +33,10 @@ pub mod ble;
 /// call-screening JNI hook.
 pub mod blocklist;
 pub mod buttons;
+/// Cellular signal strength (the missing host half of the honest bars tile):
+/// `TelephonyManager` presence + signal level, folded into the frontend's
+/// `RadioSignal` seam. See the module header.
+pub mod cellular;
 pub mod clipboard;
 #[cfg(feature = "android")]
 pub mod clipboard_glue;
@@ -51,6 +60,7 @@ pub mod devcare;
 pub mod devcare_device;
 pub mod display;
 pub mod files;
+pub mod podcast;
 // The macOS Dock badge + attention request. Written ahead of its consumer: nothing
 // paints a badge yet, but the host API is registered (REQ-A389).
 pub mod dock_badge;
@@ -60,6 +70,14 @@ pub mod dock_badge;
 pub mod error;
 pub mod flashlight;
 pub mod host_battery;
+/// Host filesystem access (REQ-A526 follow-up: real filesystem chokepoint).
+///
+/// `host_fs` is the bridge that turns the WebView sandbox's "no real filesystem"
+/// posture into typed commands the WebView can call. The allowed root is
+/// `AMOS_HOST_FS_ROOT` at process start; every command goes through one
+/// canonicalize-then-starts_with chokepoint before any syscall. See the module
+/// header for the wire shape and the env-var contract.
+pub mod host_fs;
 pub mod host_log;
 
 /// The **embedded frontend bundle's fingerprint** — which UI this binary carries
@@ -84,16 +102,20 @@ pub mod interpret;
 #[cfg(feature = "android")]
 pub mod jni_glue;
 pub mod link;
+pub mod location_permission;
 pub mod mail;
 pub mod media;
 pub mod mic_permission;
 pub mod netguard;
 pub mod note_export;
+pub mod ota;
 pub mod privacy_client;
 pub mod push_notifications;
 pub mod radio;
 pub mod rag_client;
 pub mod real_dial;
+pub mod rotation;
+pub mod screenshot;
 pub mod sensor_host;
 pub mod sensors;
 // Shortcut automation triggers: the wall-clock side of "run this shortcut at 08:00".
@@ -103,8 +125,21 @@ pub mod shortcut_triggers;
 // Spaces (virtual desktops): the manager plus its Tauri commands. The shell mounts
 // `SpacesPanel`, so these have to be compiled and registered (REQ-A389).
 pub mod sms;
+pub mod sms_permission;
 pub mod spaces;
 pub mod spaces_commands;
+// Stage Manager: the rail that parks windows off-stage, plus the one-shot tidy. The
+// geometry is `amos-wm`'s; this module is the ledger half and the Tauri commands the
+// desktop shell calls (REQ-A1545/A1546).
+pub mod stage;
+// System-level screen recording: spawn the platform tool, keep the child between
+// commands, seal on stop and confirm the file (REQ-A1578).
+pub mod screen_record;
+// The Android half of screen recording: `MediaProjection` lives in Kotlin
+// (`android-glue/…/ScreenRecordGlue.kt`), so the host is a thin typed seam over it rather
+// than the process-owning state machine the macOS path needs (REQ-A1582 / F-DEV-141).
+#[cfg(feature = "android")]
+pub mod screen_record_android;
 pub mod store;
 pub mod system;
 pub mod taskmgr;
@@ -114,6 +149,10 @@ pub mod terminal;
 pub mod translate;
 pub mod tts;
 pub mod watch_backoff;
+/// WebMan browser: the **real** download pipeline (ureq streaming to disk, with
+/// progress events, cancellation and a persistent cookie jar). See the module
+/// header for what is real and what is still an `<iframe>` limitation.
+pub mod webman_download;
 pub mod wm;
 // Desktop-only native-application surfaces (runtime availability, never a `cfg`:
 // `wine_is_available` / `linux_is_available` answer for the host they run on).
@@ -124,16 +163,70 @@ pub mod wine;
 // The freedesktop `.desktop` entry format, shared by both surfaces above (pure).
 #[cfg(desktop)]
 pub mod desktop_entry;
-// Call recording storage and metadata (used by telephony).
+// Host power / session actions (restart / shut down / sleep) — REQ-A515. Like the two
+// modules above, the commands are registered under `#[cfg(desktop)]` and **availability is
+// answered at runtime** by `session::invocation` (a host with no `osascript`/`pmset`/
+// `systemctl` gets a named `amos.session.unsupported_host` refusal, never a missing command).
+#[cfg(desktop)]
+pub mod session;
+// Call-recording storage and metadata (both halves of call recording).
+//
+// **Both halves are wired (REQ-A1334 → REQ-A1579).** `recordings_list` / `recording_delete` /
+// `recordings_capture_status` below are invoked by the recordings settings page, so the storage
+// contract authored under REQ-A480 finally has a reader; and on Android the file a row points at
+// is now really produced — `AmosInCallService.setRecording` drives a `MediaRecorder` and
+// `incall.rs` files the finished recording through `add_recording`. `recordings_capture_status`
+// answers from **runtime** facts (this build / a bound default dialer / granted `RECORD_AUDIO`),
+// so the page says why capture is off instead of letting an empty list imply recordings exist.
+// REQ-A480's orphan entry in `scripts/rust-unwired-baseline.json` was removed once these callers
+// landed. The `crates/amos-telephony` provider still refuses `start_recording` by name, but that
+// crate is not linked into the APK — see its module header. This comment used to say "used by
+// telephony" before that, which was false — a comment is a claim; this one now has a caller
+// behind it.
 pub mod recording;
-// macOS menu bar (Aqua Global Menu) — REQ-A275.
-#[cfg(target_os = "macos")]
+// The native menu bar (Aqua Global Menu on macOS) — REQ-A275.
+//
+// **No `cfg` here, on purpose, and this is a fix rather than an oversight.** All three
+// modules below used to be declared `#[cfg(target_os = "macos")]`, while their *call
+// sites* were not: `menu::menu_set_locale` / `menu::menu_set_shortcuts` sit in the
+// `generate_handler!` list below, `menu::sync_window_items` in the window-event handler,
+// and `wm.rs` imports `window_background` / `window_state` at its top. A `use`/path to a
+// module that the cfg removed is E0432/E0433 — so the crate did **not compile off macOS
+// at all**, which is the platform the only CI runner uses (`ubuntu-24.04`). Measured by
+// making these three predicates false on a macOS host (the same shape a Linux build sees):
+// 13 errors, all of them exactly these module references.
+//
+// Each module is cross-platform **by its own design**, so the gate was the defect and not
+// a platform constraint:
+//   * `menu` — every macOS-only item has a `#[cfg(not(target_os = "macos"))]` twin
+//     (`install`, `on_menu_event`, `sync_window_items`, `set_locale`, `apply_accelerators`),
+//     written so the wiring is one line on every target (`menu.rs` says so itself);
+//   * `window_background` — pure (mode + OS answer → colour) and uses **no** Tauri API;
+//   * `window_state` — a JSON ledger plus `outer_position` / `outer_size` / `is_visible` /
+//     `app_data_dir`, all of which exist on every target in Tauri 2.11 (they answer `Err`
+//     where unsupported, which the module already treats as "nothing to remember").
+//
+// Honest boundary: this restores *compilation* off macOS. It is not a claim that the
+// desktop shell has been run on Linux/Windows — no such run exists (see `docs/GATES.md`).
 pub mod menu;
-// macOS window title-bar colour (REQ-A326).
-#[cfg(target_os = "macos")]
+// The **system tray** (REQ-A864) — the status item that keeps AmOS reachable while no shell
+// window is in front. Declared with no `cfg`, like `menu` above and for the same reason:
+// `install` has a `#[cfg(not(desktop))]` twin, so the boot path is one line everywhere,
+// while everything that touches `tauri::tray` sits behind `#[cfg(desktop)]` — the feature
+// `tauri/tray-icon` is compiled only for desktop targets (see `Cargo.toml`), so a mobile
+// build must not reach into that module at all.
+pub mod tray;
+// The host **print** path (REQ-A869) — File ▸ Print / ⌘P, and the focused-window rule that
+// decides what is printed. Declared with no `cfg`, like `menu` / `tray` above and for the
+// same reason: `print_document` is registered on **every** target and answers a named
+// refusal (`amos.print.unsupported_platform`) where no print dialog exists, so the shell
+// never has to tell "this platform cannot print" apart from "the command is missing" —
+// while everything that touches `WebviewWindow::print()` (itself `#[cfg(desktop)]` in
+// tauri 2.11) sits behind `#[cfg(desktop)]` inside the module.
+pub mod print;
+// Window title-bar colour (REQ-A326; the decision is pure — no Tauri API).
 pub mod window_background;
 // Persist window position/size across launches (REQ-A249).
-#[cfg(target_os = "macos")]
 pub mod window_state;
 
 use ai_bridge::AiBridge;
@@ -142,12 +235,97 @@ use store::SharedStore;
 use tauri::{Emitter, Manager};
 use wm::{SystemContext, WmState};
 
+/// How often the geometry-memory poller asks the store to write (REQ-A478).
+///
+/// Above the store's own 250 ms debounce, so a drag still collapses into one write per
+/// debounce window, and short enough that letting go of a window is reflected on disk within
+/// about a second. See the comment at the `spawn` in `run` for why a poller is needed at all.
+const FLUSH_TICK_MS: u64 = 500;
+
+/// Remember an app window's rectangle (REQ-A478), skipping the cases where the geometry is
+/// not the user's choice.
+///
+/// Called for the **platform events** a user's drag produces (`Moved` / `Resized`), never for
+/// geometry this host itself applied: the writer is the OS telling us what the user did.
+///
+/// Deliberate exclusions, each because the rectangle would be a lie:
+/// * a **split pane** is placed by the split session (see `apply_split_to_real`) — its half
+///   screen is the split's shape, not the user's choice;
+/// * a rectangle the user dragged **off the screen** is still written (it is what they did),
+///   but it is bounded by `sanitize` (`MAX_COORD`) and clamped into the screen when it is
+///   used again — `WmState::reclamp_windows` owns the same rule for a live window.
+///
+/// One correction is applied *before* the write rather than after it: a rectangle that
+/// covers the Stage Manager rail is pushed out of it first (REQ-A1564), and it is the
+/// corrected rectangle that is remembered. See the call to `stage_clamp_moved` below.
+///
+/// A store that is not armed drops the write silently by design (`queue`'s contract) — and
+/// `install` logs whether it is armed, so "it forgot my window" stays diagnosable.
+fn remember_window_geometry<R: tauri::Runtime>(window: &tauri::Window<R>) {
+    let Some(state) = window.app_handle().try_state::<WmState>() else {
+        return;
+    };
+    // A split pane's rectangle belongs to the split.
+    if state.is_in_split(window.label()).unwrap_or(false) {
+        return;
+    }
+    let Some(mut captured) = window_state::snapshot(window) else {
+        tracing::debug!(
+            target: "amos::window_state",
+            label = %window.label(),
+            "window geometry could not be read; nothing remembered this time"
+        );
+        return;
+    };
+    // **Clamp, then remember** (REQ-A1564). The order is the whole point of this call site:
+    // the Stage rail is protected by geometry everywhere the host places a window, so the
+    // only way a window covers it is a drag — and a drag that ended inside the band would
+    // otherwise be written to disk as the window's position and restored there at the next
+    // launch, where no drag exists to explain it. `stage_clamp_moved` rewrites `captured`
+    // with the rectangle it applied, because re-reading the platform here races its own
+    // asynchronous `set_position` and can hand back the very position being corrected.
+    //
+    // `Err` is a poisoned `WmState` lock, and the uncorrected rectangle is remembered: the
+    // honest outcome, since the host could not decide otherwise.
+    match state.stage_clamp_moved(window, window.label(), &mut captured) {
+        Ok(true) => tracing::info!(
+            target: "amos::wm",
+            window = %window.label(),
+            "a moved window was pushed out of the Stage rail"
+        ),
+        Ok(false) => {}
+        Err(e) => tracing::warn!(
+            target: "amos::wm",
+            window = %window.label(),
+            error = %e,
+            "the Stage rail's exclusion could not be decided for a moved window"
+        ),
+    }
+    let Some(store) = window
+        .app_handle()
+        .try_state::<window_state::WindowStateStore>()
+    else {
+        return;
+    };
+    store.queue(window.label(), captured);
+    // Flush on the same beat: the store's own debounce turns a drag's storm of events into
+    // one write per `DEBOUNCE_MS`, so this needs no timer of its own.
+    let written = store.flush_due();
+    if written > 0 {
+        tracing::debug!(
+            target: "amos::window_state",
+            written,
+            "window geometry remembered"
+        );
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
-// Boot boundary: if the GUI event loop cannot start, exiting the process is the
-// intended loud failure (nothing sensible can run without it). This is the
-// single allowed expect in production — everything else is gated (P0-1).
 #[allow(clippy::expect_used)]
 pub fn run() {
+    // Boot boundary: if the GUI event loop cannot start, exiting the process is the
+    // intended loud failure (nothing sensible can run without it). This is the
+    // single allowed expect in production — everything else is gated (P0-1).
     // Install the `tracing` sink **first**: every report below (boot facts, a shell
     // window that could not be sized, a screen that could not be measured, a degraded
     // provider) is a no-op without a subscriber. On device that is logcat; on desktop
@@ -171,13 +349,32 @@ pub fn run() {
         flashlight::seed_from_settings(shared_store.get(flashlight::FLASHLIGHT_KEY).as_deref());
     let flashlight_bridge = flashlight::boot_bridge(flashlight_seed);
 
+    // The IME bridge is managed here *and* published process-wide: the Android
+    // system IME (`crate::android_ime`) is bound by the platform in this same
+    // process and must drive the very same engine, learner and profile file as the
+    // WebView's on-screen keyboard. The managed handle stays the type every
+    // `ime_*` command injects; the shared handle is a clone of the same `Arc`
+    // (REQ-A1880).
+    let ime_bridge = ime::ImeBridge::boot();
+    ime::install_shared(ime_bridge.clone());
+
     tauri::Builder::default()
         .manage(AiBridge::new())
+        .manage(screen_record::ScreenRecorder::new())
         .manage(airplay::AirPlayState::new())
         .manage(assistant_voice::VoiceSession::new())
         .manage(assistant_voice::DeviceMic::new())
         .manage(WmState::new())
+        // REQ-A478: the window-geometry memory (REQ-A249) — **wired at last**. It had been
+        // declared and unit-tested since it was written, with **no production caller** at
+        // all: nothing constructed the store, nothing recorded a move, and no window ever
+        // came back where it was left (its own tests were the only callers, which is why
+        // `rust-unwired-scan` — "every `pub fn` needs a caller" — stayed green). `install`
+        // points it at `app_data_dir()` in `setup`; the window-event handler records moves
+        // and resizes, and `WmState::apply`'s `Created` branch restores them.
+        .manage(window_state::WindowStateStore::new())
         .manage(SystemContext::new())
+        .manage(host_fs::HostFsState::new())
         .manage(alarm_sched::AlarmSchedState::new())
         .manage(shortcut_triggers::ShortcutTriggerState::new())
         .manage(clipboard.clone())
@@ -187,6 +384,7 @@ pub fn run() {
         .manage(std::sync::Mutex::new(spaces::SpaceManager::load(
             &shared_store,
         )))
+        .manage(webman_download::WebmanDownloads::boot())
         .manage(dock_badge::DockBadgeState::new())
         .manage(shared_store)
         .manage(radio_bridge)
@@ -198,16 +396,22 @@ pub fn run() {
         .manage(tts::TtsBridge::new())
         .manage(mail::MailBridge::new())
         .manage(appstore::StoreBridge::new())
+        .manage(podcast::PodcastBridge::new())
         .manage(sensor_host::SensorHost::new())
-        .manage(ble::BleState::new())
         .manage(sms::SmsBridge::boot())
         .manage(sms::trash_shared())
         .manage(blocklist::shared())
         .manage(devcare::DevCareBridge::new())
+        // System update (OTA) decision layer: the Settings「关于本机」check.
+        .manage(ota::OtaBridge::new())
         // Input method (IME): the on-screen pinyin keyboard's session + learner.
-        .manage(ime::ImeBridge::boot())
+        // The same instance is published process-wide for the Android system IME.
+        .manage(ime_bridge)
         // Push notifications: APNs-compatible service for remote notifications
         .manage(push_notifications::PushNotificationState::new())
+        // The robot console's heartbeat forwarder handle — kept so its never-ending
+        // `StreamHeartbeats` task can be aborted when the console closes.
+        .manage(link::HeartbeatWatch::default())
         // The `amos-app://` gateway: one custom-protocol handler for every system
         // asset the WebView may read — the compiled PWA index
         // (`amos-app://index/apps.json` + its icons) and any installed web-bundle
@@ -233,7 +437,30 @@ pub fn run() {
                 responder.respond(appstore::protocol_response(reply));
             }));
         })
+        .register_asynchronous_uri_scheme_protocol(amos_media::SCHEME, |ctx, request, responder| {
+            let uri = request.uri().to_string();
+            // The `Range` header is the whole point of this gateway: a media element asks
+            // for `bytes=…` and gets a bounded `206` instead of the file (docs/media.md §6).
+            // It is read here — the handler owns the request — and parsed by
+            // `amos_media::serve`, never by hand.
+            let range = request
+                .headers()
+                .get("range")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            let app = ctx.app_handle().clone();
+            // Detached on purpose, as above: the responder answers when the read ends.
+            drop(tauri::async_runtime::spawn_blocking(move || {
+                let bridge = app.state::<media::MediaBridge>();
+                let reply = amos_media::serve(bridge.manager(), &uri, range.as_deref());
+                responder.respond(media::protocol_response(reply));
+            }));
+        })
         .invoke_handler(tauri::generate_handler![
+            webman_download::webman_download_start,
+            webman_download::webman_download_cancel,
+            webman_download::webman_cookies_list,
+            webman_download::webman_cookies_clear,
             dock_badge::dock_badge_set,
             dock_badge::dock_request_attention,
             spaces_commands::spaces_list,
@@ -244,6 +471,13 @@ pub fn run() {
             spaces_commands::spaces_rename,
             spaces_commands::spaces_move_window,
             spaces_commands::spaces_unfile_window,
+            // Stage Manager (REQ-A1545/A1546). The rail view is *derived* from the
+            // `wm-changed` snapshot, so these commands add no new event.
+            stage::stage_snapshot,
+            stage::stage_set_enabled,
+            stage::stage_park,
+            stage::stage_bring,
+            stage::stage_arrange,
             ai_bridge::ask_ai_agent,
             ai_bridge::chat_agent,
             ai_bridge::cancel_ai_session,
@@ -262,6 +496,9 @@ pub fn run() {
             assistant_voice::device_mic_status,
             mic_permission::mic_permission_state,
             mic_permission::mic_permission_request,
+            location_permission::location_permission_state,
+            location_permission::location_permission_request,
+            sms_permission::sms_permission_request,
             ai_bridge::get_android_apps,
             ai_bridge::launch_android_app,
             ai_bridge::get_android_app_icon,
@@ -270,8 +507,11 @@ pub fn run() {
             buttons::simulate_button,
             buttons::take_pending_hardware_button,
             wm::wm_open,
+            wm::wm_new_window,
+            wm::wm_cycle_app,
             wm::wm_focus,
             wm::wm_hide,
+            wm::wm_minimize,
             wm::wm_zoom,
             wm::wm_maximize,
             wm::wm_fullscreen,
@@ -287,8 +527,12 @@ pub fn run() {
             wm::wm_split_move,
             wm::wm_split_swap,
             wm::wm_split_exit,
+            wm::wm_snap,
+            wm::wm_displays,
             wm::wm_split_candidates,
             wm::wm_split_demo,
+            wm::wm_pane_rects,
+            wm::wm_slide_over_rect,
             wm::system_set_context,
             wm::system_clear_context,
             wm::system_peek_context,
@@ -296,6 +540,7 @@ pub fn run() {
             clipboard::clipboard_read,
             clipboard::clipboard_history,
             clipboard::clipboard_clear,
+            clipboard::clipboard_subscribe,
             clipboard_guest_link::clipboard_guest_status,
             ime::ime_status,
             ime::ime_key,
@@ -309,6 +554,7 @@ pub fn run() {
             store::store_get,
             store::store_set,
             menu::menu_set_locale,
+            menu::menu_set_shortcuts,
             store::store_remove,
             store::store_snapshot,
             note_export::notes_export_txt,
@@ -322,6 +568,7 @@ pub fn run() {
             media::media_save,
             media::media_load,
             media::media_read_range,
+            media::media_stream_url,
             files::files_preview_bytes,
             files::files_bundle_export,
             files::files_bundle_import,
@@ -340,12 +587,14 @@ pub fn run() {
             interpret::interpret_status,
             tts::tts_synthesize,
             mail::mail_mailboxes,
+            mail::mail_status,
             mail::mail_list,
             mail::mail_search,
             mail::mail_inbox,
             mail::mail_read,
             mail::mail_send,
             mail::mail_set_flagged,
+            mail::mail_set_answered,
             mail::mail_set_seen,
             mail::mail_delete,
             mail::mail_move,
@@ -359,15 +608,40 @@ pub fn run() {
             appstore::appstore_upgrade,
             appstore::appstore_uninstall,
             appstore::pwa_index_url,
+            appstore::pwa_open_remote,
             appstore::appstore_bundle_entry,
             appstore::csp_probe,
+            podcast::podcast_backend_name,
+            podcast::podcast_subscriptions,
+            podcast::podcast_subscribe,
+            podcast::podcast_add,
+            podcast::podcast_refresh,
+            podcast::podcast_feed,
+            podcast::podcast_unsubscribe,
+            podcast::podcast_set_position,
+            podcast::podcast_set_speed,
+            podcast::podcast_set_played,
+            podcast::podcast_download,
+            podcast::podcast_download_state,
+            podcast::podcast_remove_download,
             telephony::telephony_dial,
             telephony::telephony_end,
             telephony::telephony_status,
+            telephony::telephony_backend_kind,
             telephony::telephony_answer,
             telephony::telephony_simulate_incoming,
             telephony::telephony_start_recording,
             telephony::telephony_stop_recording,
+            telephony::telephony_set_muted,
+            telephony::telephony_set_speaker,
+            telephony::telephony_set_hold,
+            telephony::telephony_play_dtmf,
+            // The call-recording ledger's real readers (REQ-A1334). Until this round the
+            // module had none and was recorded as an orphan; the capture half is still
+            // device-pending, and `recordings_capture_status` is how the page is told so.
+            recording::recordings_list,
+            recording::recording_delete,
+            recording::recordings_capture_status,
             radio::radio_status,
             radio::radio_set,
             radio::radio_control,
@@ -381,6 +655,9 @@ pub fn run() {
             radio::bluetooth_pair,
             flashlight::flashlight_status,
             flashlight::flashlight_set,
+            rotation::rotation_get,
+            rotation::rotation_set,
+            cellular::cellular_signal,
             ble::ble_connect,
             ble::ble_disconnect,
             ble::ble_discover_services,
@@ -402,11 +679,19 @@ pub fn run() {
             sensor_host::sensor_host_snapshot,
             sensor_host::sensor_host_set_mode,
             sensor_host::sensor_host_record_imu,
+            sensor_host::sensor_host_record_vitals,
             sensor_host::sensor_host_record_frame,
             sensor_host::sensor_host_record_video,
             sensor_host::sensor_host_acquire,
             system::system_health,
             host_battery::system_host_battery,
+            screenshot::screenshot_capture,
+            // System-level screen recording (REQ-A1578). Capability is a plain value
+            // (a fact, not a failed read); start/stop share one recorder slot.
+            screen_record::screen_record_start,
+            screen_record::screen_record_stop,
+            screen_record::screen_record_status,
+            screen_record::screen_record_capability,
             display::screen_state_set,
             display::screen_state_get,
             privacy_client::perm_authorize,
@@ -420,6 +705,10 @@ pub fn run() {
             netguard::netguard_toggle,
             netguard::netguard_status,
             link::link_status,
+            link::link_publish,
+            link::link_topics,
+            link::link_watch_heartbeats,
+            link::link_stop_heartbeats,
             rag_client::rag_status,
             rag_client::rag_query,
             rag_client::rag_index,
@@ -460,6 +749,20 @@ pub fn run() {
             terminal::term_read,
             terminal::term_kill,
             terminal::term_resize,
+            host_fs::host_fs_root_status,
+            host_fs::host_fs_read_dir,
+            host_fs::host_fs_read_text,
+            host_fs::host_fs_read_bytes,
+            host_fs::host_fs_write_text,
+            host_fs::host_fs_write_bytes,
+            host_fs::host_fs_stat,
+            host_fs::host_fs_create_dir,
+            host_fs::host_fs_rename,
+            host_fs::host_fs_remove,
+            host_fs::host_fs_copy,
+            host_fs::host_fs_watch_subscribe,
+            host_fs::host_fs_watch_unsubscribe,
+            host_fs::host_fs_watch_list,
             alarm_sched::scheduler_alarm_register,
             alarm_sched::scheduler_alarm_cancel,
             alarm_sched::scheduler_alarm_poll,
@@ -467,6 +770,9 @@ pub fn run() {
             shortcut_triggers::shortcuts_trigger_sync,
             shortcut_triggers::shortcuts_trigger_poll,
             real_dial::real_dial,
+            real_dial::telephony_real_dial_status,
+            real_dial::telephony_default_dialer_status,
+            real_dial::telephony_request_default_dialer,
             #[cfg(desktop)]
             wine::wine_is_available,
             #[cfg(desktop)]
@@ -479,6 +785,24 @@ pub fn run() {
             linux_apps::linux_apps,
             #[cfg(desktop)]
             linux_apps::linux_launch,
+            #[cfg(desktop)]
+            session::session_restart,
+            #[cfg(desktop)]
+            session::session_shutdown,
+            #[cfg(desktop)]
+            session::session_sleep,
+            // The shell's Apple menu asks for the platform About panel (REQ-A796). Registered
+            // on every desktop target — the command answers `unsupported_host` where the
+            // platform has no such panel, rather than being absent (`session.rs` rule 2).
+            #[cfg(desktop)]
+            menu::shell_about_panel,
+            // File ▸ Print / ⌘P (REQ-A869). **Not** under `#[cfg(desktop)]`, unlike the
+            // desktop-only surfaces above: a print dialog is a desktop concept, but
+            // "this host has no print dialog" is an *answer*, and a mobile build that
+            // omitted the command would hand the shell Tauri's opaque "command not found"
+            // where it could say `amos.print.unsupported_platform` (`print.rs` header,
+            // rule 2).
+            print::print_document,
             airplay::airplay_available,
             airplay::airplay_discover,
             airplay::airplay_stop_discovery,
@@ -498,9 +822,13 @@ pub fn run() {
             push_notifications::push_set_badge,
             push_notifications::push_get_history,
             push_notifications::push_mark_read,
+            push_notifications::push_delete_notification,
             push_notifications::push_clear_history,
             push_notifications::push_get_statistics,
             push_notifications::push_get_status,
+            ota::ota_status,
+            ota::ota_check,
+            ota::ota_install,
         ])
         .on_window_event(|window, event| {
             // REQ-A433: the window-related menu items (Close / Minimize / Zoom / Enter Full
@@ -518,6 +846,22 @@ pub fn run() {
             // `finish_layout` re-places — is positioned *inside* it, so reacting to
             // their resizes would feed the pane-writing loop back into itself.
             if !wm::is_screen_window(window.label()) {
+                // REQ-A478: an **app window** that the user moves or resizes is remembered
+                // (REQ-A249), so it opens where it was left. Two deliberate exclusions:
+                //
+                //   * the Launcher is the *screen* (the branch below owns it) — remembering
+                //     "where the shell was" would fight the class's `ShellFit` rule;
+                //   * a window that is currently a **split pane** is placed by the split
+                //     (`apply_split_to_real`), so its half-screen rectangle is the split's
+                //     geometry, not the user's choice — restoring it later would open a
+                //     window at half size with no split to explain it (the same reasoning
+                //     `zoomable_window` uses to refuse a pane).
+                if matches!(
+                    event,
+                    tauri::WindowEvent::Moved(_) | tauri::WindowEvent::Resized(_)
+                ) {
+                    remember_window_geometry(window);
+                }
                 return;
             }
             // The event's **own** reading: at `ScaleFactorChanged` the window has
@@ -623,6 +967,42 @@ pub fn run() {
                     "the WebView loads the embedded frontend bundle (production mode)"
                 );
             }
+            // Re-apply the stored rotation lock / forced-orientation intent. An
+            // Activity's requested orientation does not survive a process restart,
+            // so a lock the user set must be re-applied here or the display would
+            // silently unlock. Desktop is an honest no-op (no orientation control).
+            {
+                let store = app.state::<SharedStore>();
+                rotation::apply_persisted(&store);
+            }
+            // Re-apply the stored Stage Manager mode (REQ-A1755). It is a **preference**
+            // (`docs/stage-manager.md` §3.2), so `stage_set_enabled` persists it and this is
+            // what makes it outlive a restart — without it the mode silently reset to OFF
+            // every launch, which is exactly what `ErrorCode::StagePersistFailed` names.
+            // Seeding it here, before the shell reads `LayoutSnapshot::rail_width`, means the
+            // very first placement already knows the stage's width. A stored `true` on a
+            // class with no rail is refused by `set_stage_enabled` and only warned about
+            // (`apply_persisted`), never fatal to the launch.
+            {
+                let store = app.state::<SharedStore>();
+                stage::apply_persisted(&store, &app.state::<WmState>());
+            }
+            // Install the system tray (REQ-A864) — the menu bar's counterpart on the way
+            // *out*: the menu bar is how a user reaches the shell while it is in front, the
+            // tray is how they reach it when it is not. Gated `desktop` because that is the
+            // predicate `tauri::tray` itself is gated by (and the one `tray::install`'s twin
+            // answers to), and the failure is **reported**: a tray that silently is not there
+            // leaves a build that looks exactly like this call was never written.
+            #[cfg(desktop)]
+            {
+                if let Err(e) = tray::install(app.handle()) {
+                    tracing::warn!(
+                        target: "amos::tray",
+                        error = %e,
+                        "installing the system tray failed; the app runs without one"
+                    );
+                }
+            }
             // Install the native macOS menu bar (REQ-A418). `menu::install` is
             // documented as a no-op off macOS, but the **module** is `cfg(target_os="macos")`,
             // so the call site MUST be gated by the same predicate — a non-macOS build
@@ -663,6 +1043,39 @@ pub fn run() {
                             error = %e,
                             "device glue event could not be delivered to the UI"
                         );
+                    }
+                });
+            }
+            // REQ-A478: arm the window-geometry memory. This is the step that was missing
+            // since REQ-A249 — `install` resolves `app_data_dir()/amos.window-state.json`
+            // and **says so** (an unarmed store drops every write, and that silence is
+            // exactly how a feature can be "implemented" yet never running).
+            app.state::<window_state::WindowStateStore>()
+                .install(app.handle());
+            // …and **keep asking it to write**. The store is debounced *by design* ("flush
+            // when `DEBOUNCE_MS` has elapsed"), which means someone has to ask once the user
+            // stops dragging — and nothing did. Measured on device after wiring the store:
+            // the `Moved` event arrived, every input the recorder needs was present
+            // (`PROBE: geometry-memory inputs … snap=true has_store=true`), the entry was
+            // queued, and **no file was ever written**; the exit hook is not a substitute
+            // either, because a native quit does not deliver `RunEvent::ExitRequested` on
+            // macOS (also measured: quitting produced neither the flush nor the file).
+            //
+            // So the poller is what makes the debounce real. One thread, 500 ms, under the
+            // debounce plus scheduling jitter: a gesture lands about a second after the user
+            // lets go, and a drag's storm of events still collapses into one write. The
+            // thread ends when the app state is gone (it is not detached from the app's
+            // lifetime in any other way, and it never blocks the UI thread — the store's own
+            // lock is held for the length of a small JSON write).
+            {
+                let handle = app.handle().clone();
+                std::thread::spawn(move || loop {
+                    std::thread::sleep(std::time::Duration::from_millis(FLUSH_TICK_MS));
+                    match handle.try_state::<window_state::WindowStateStore>() {
+                        Some(store) => {
+                            store.flush_due();
+                        }
+                        None => break,
                     }
                 });
             }
@@ -950,6 +1363,36 @@ pub fn run() {
                     "app data dir unavailable — input-method preferences and learning will not persist"
                 );
             }
+            // Where do WebMan downloads come to rest? On Android there is **no**
+            // browsable Downloads directory: `dirs::download_dir()` and
+            // `dirs::home_dir()` both answer `None`, so the pipeline used to fall
+            // through to `temp_dir()/amos-downloads` (= `/data/local/tmp/...`, which
+            // an app cannot even write) — the file was invisible to the user and
+            // pruned by the system, or the download simply failed. The destination
+            // is the MediaStore `Download` collection: stage app-privately under
+            // `app_cache_dir()`, then stream into MediaStore at completion.
+            //
+            // Installed here (not in `boot()`) because `app.path()` does not exist
+            // until the app does — `manage()` runs first. The sink delegates through
+            // the media bridge's live backend, so a transfer that finishes after the
+            // Kotlin glue attaches still lands in MediaStore instead of the mock.
+            #[cfg(feature = "android")]
+            {
+                match app.path().app_cache_dir() {
+                    Ok(cache) => app
+                        .state::<webman_download::WebmanDownloads>()
+                        .configure(std::sync::Arc::new(webman_download::MediaStoreSink::new(
+                            app.state::<media::MediaBridge>().backend(),
+                            cache.join("webman-staging"),
+                        ))),
+                    Err(e) => tracing::warn!(
+                        target: "amos::webman",
+                        error = %e,
+                        "app cache dir unavailable — downloads fall back to the \
+                         process-wide download directory (which is not user-visible on Android)"
+                    ),
+                }
+            }
             // Real in-call bridge (default-dialer / InCallService): give the Rust side
             // an AppHandle so Kotlin-pushed real call states reach the WebView as
             // `telephony-event`, and so telephony answer/end can drive the real call.
@@ -969,6 +1412,21 @@ pub fn run() {
             devcare_device::install_android_app(app.handle().clone());
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running amos System UI");
+        .build(tauri::generate_context!())
+        .expect("error while building the amos System UI")
+        .run(|app_handle, event| {
+            // REQ-A478: the store's debounce holds up to `DEBOUNCE_MS` of writes, and this is
+            // the last chance to land them — the module's own doc has claimed since it was
+            // written that `flush_all` is "called from `RunEvent::ExitRequested`", which was
+            // true of nothing until now.
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                if let Some(store) = app_handle.try_state::<window_state::WindowStateStore>() {
+                    store.flush_all();
+                    tracing::info!(
+                        target: "amos::window_state",
+                        "final window-state flush on exit"
+                    );
+                }
+            }
+        });
 }
