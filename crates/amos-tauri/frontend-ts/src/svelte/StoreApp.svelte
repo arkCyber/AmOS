@@ -178,6 +178,8 @@
         return t("store.errorUpgradeFailed");
       case "amos.appstore.uninstall_failed":
         return t("store.errorUninstallFailed");
+      case "amos.appstore.persist_failed":
+        return t("store.errorPersistFailed");
       case "amos.appstore.rpc_failed":
         return t("store.errorRpcFailed");
       default:

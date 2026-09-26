@@ -146,6 +146,10 @@
       "kind": "configuration"
     },
     {
+      "key": "amos.appstore.persist_failed",
+      "kind": "configuration"
+    },
+    {
       "key": "amos.appstore.rpc_failed",
       "kind": "configuration"
     },

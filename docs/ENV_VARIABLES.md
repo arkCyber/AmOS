@@ -122,7 +122,7 @@
 |------|------|------|----------|------|
 | `AMOS_SHERPA_MODEL_DIR` | path | (none) | `→ no-sherpa` | sherpa-onnx 模型目录 |
 | `AMOS_PIPER_MODEL_DIR` | path | (none) | `→ no-piper` | Piper TTS 模型目录 |
-| `AMOS_ASR_BACKEND` | enum | (none) | `→ mock` | ASR 后端 |
+| `AMOS_ASR_BACKEND` | enum | (none) | `→ 默认识别器`（集合外值告警一次后回退） | ASR 后端:`off`/`none`/`disabled`/`sherpa`/`mock`（未设静默；拼错 ∕ 空白 ∕ 非 Unicode 报告一次） |
 | `AMOS_ASR_ENDPOINT` | url | (none) | `→ mock` | ASR 服务地址 |
 | `AMOS_ASR_MODEL` | string | (none) | `→ mock` | ASR 模型 |
 | `AMOS_ASR_API_KEY` | secret | - | `→ no-auth` | ASR 鉴权 |

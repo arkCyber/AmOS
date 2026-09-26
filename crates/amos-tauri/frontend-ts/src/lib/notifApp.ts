@@ -86,5 +86,6 @@ export function replaceAppNotifs(
   fresh: Notif[],
   dicts: readonly Record<string, string>[],
 ): Notif[] {
-  return [...withoutAppNotifs(list, appId, dicts), ...fresh];
+  const ordered = [...fresh].sort((a, b) => b.time - a.time);
+  return [...ordered, ...withoutAppNotifs(list, appId, dicts)];
 }

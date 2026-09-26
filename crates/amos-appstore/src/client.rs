@@ -174,6 +174,42 @@ impl<P: StoreProvider> AppStore<P> {
         crate::atomic::write_atomic(path, &bytes)
     }
 
+    /// Serialize the in-memory registry to the same bytes [`save_file`](Self::save_file)
+    /// would write — the **undo image** a caller takes *before* a mutation so it can put
+    /// the registry back when the write fails.
+    ///
+    /// A caller that reports "installed" while the disk refused the change would leave
+    /// the record only in memory: any consumer that re-reads (the store UI calls
+    /// `appstore_installed` after every action) sees the intended value, and the install
+    /// vanishes on restart. Pair this with [`restore_registry`](Self::restore_registry)
+    /// so a failed [`save_file`](Self::save_file) answers with the pre-mutation registry
+    /// rather than a success the disk never accepted.
+    pub fn snapshot_registry(&self) -> Result<Vec<u8>> {
+        let registry = self
+            .installed
+            .lock()
+            .map_err(|_| StoreError::Provider("registry poisoned".into()))?;
+        serde_json::to_vec_pretty(&*registry)
+            .map_err(|e| StoreError::Provider(format!("serialize: {e}")))
+    }
+
+    /// Replace the in-memory registry with one previously produced by
+    /// [`snapshot_registry`](Self::snapshot_registry).
+    ///
+    /// Used to undo a mutation whose persist failed. The bytes came from this type,
+    /// but they are re-parsed defensively: a poisoned/foreign blob is a
+    /// [`StoreError::Provider`], never a silent empty registry.
+    pub fn restore_registry(&self, bytes: &[u8]) -> Result<()> {
+        let registry: Registry = serde_json::from_slice(bytes)
+            .map_err(|e| StoreError::Provider(format!("undo image parse: {e}")))?;
+        let mut guard = self
+            .installed
+            .lock()
+            .map_err(|_| StoreError::Provider("registry poisoned".into()))?;
+        *guard = registry;
+        Ok(())
+    }
+
     /// Backend display name (e.g. `"mock-store"`).
     pub fn provider_name(&self) -> &'static str {
         self.provider.name()
@@ -683,6 +719,34 @@ mod tests {
         assert!(err.to_string().contains("parse"), "{err}");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn snapshot_and_restore_round_trip_the_registry() {
+        let store = AppStore::new(MockStoreProvider::new());
+        store.record(app("org.amos.keep", "Keep", "1.0.0")).unwrap();
+
+        // The undo image is taken *before* a later mutation.
+        let before = store.snapshot_registry().unwrap();
+        store
+            .record(app("org.amos.later", "Later", "1.0.0"))
+            .unwrap();
+        assert!(store.is_installed("org.amos.later").unwrap());
+
+        // Restoring the image drops the mutation and keeps the earlier state.
+        store.restore_registry(&before).unwrap();
+        assert!(store.is_installed("org.amos.keep").unwrap());
+        assert!(
+            !store.is_installed("org.amos.later").unwrap(),
+            "the undo image predates the second install"
+        );
+
+        // A foreign blob is a loud error, never a silent empty registry.
+        assert!(store.restore_registry(b"{ not json at all").is_err());
+        assert!(
+            store.is_installed("org.amos.keep").unwrap(),
+            "a refused restore must leave the live registry untouched"
+        );
     }
 
     #[tokio::test]

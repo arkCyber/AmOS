@@ -15,7 +15,10 @@
 //! An unreachable/broken model is a surfaced error, never a silent mock.
 //! Passages + vectors are in-memory unless
 //! `AMOS_RAG_STATE` names a durable base path, in which case every Index/Remove
-//! atomically persists both and a restart re-hydrates them (see `docs/vector-db-rag.md`).
+//! persists both (the passages file via a temp+rename; the vector snapshot via
+//! `FlatIndex::save_to`) and a restart re-hydrates them. A state pair that cannot
+//! be read back is kept aside — never overwritten — before a fresh engine starts
+//! (see `docs/vector-db-rag.md`).
 //! "Retrieve-then-answer" is composed by the caller:
 //! `Rag.Query` (ids + passage text for citations) then `AiAgent.StreamChat` with
 //! that context dropped into the prompt.
@@ -102,6 +105,76 @@ impl Persist {
             idx: sibling(Path::new(base), ".idx"),
             passages: sibling(Path::new(base), ".passages.json"),
         })
+    }
+}
+
+/// Build the engine from a persisted state pair, or a fresh in-memory one.
+///
+/// A persisted snapshot that **cannot be read back** is not silently discarded:
+/// [`keep_rag_state_aside`] moves the unreadable `.idx` and its `.passages.json`
+/// sibling out of the way **before** the fresh engine starts, so the next
+/// `index` / `remove` — whose `persist_best_effort` overwrites exactly those two
+/// paths — can no longer destroy the operator's only copy (REQ-A1958 / F-AI-041).
+///
+/// The passages half is the easy one to miss: `load_passages` runs *only* on the
+/// success arm, so a corrupt `.idx` leaves the fresh engine with an **empty**
+/// passage map, and the next ingest's `write_passages` would replace every indexed
+/// passage with just the new one — even though the `.passages.json` on disk was
+/// perfectly readable.
+fn engine_from_persist(
+    persist: Option<Persist>,
+    make_embedder: impl Fn() -> anyhow::Result<Box<dyn Embedder + Send>>,
+) -> anyhow::Result<RagEngine> {
+    let engine = match persist.as_ref() {
+        Some(p) if p.idx.exists() => {
+            match RagStore::<Box<dyn Embedder + Send>>::load(make_embedder()?, &p.idx) {
+                Ok(store) => RagEngine {
+                    store,
+                    passages: load_passages(&p.passages),
+                    persist,
+                },
+                Err(e) => {
+                    keep_rag_state_aside(p, &e);
+                    RagEngine::new(make_embedder()?, persist)
+                }
+            }
+        }
+        _ => RagEngine::new(make_embedder()?, persist),
+    };
+    Ok(engine)
+}
+
+/// Move an unreadable persisted RAG state pair aside so the next
+/// `persist_best_effort` cannot overwrite the operator's only copy. Mirrors the
+/// workspace's `preserve_unreadable_state` bridges: a `rename` to a
+/// `.corrupt-<nonce>` sibling, best-effort per file — a read-only directory yields
+/// a "could not be moved aside" warning rather than a false claim of safety.
+fn keep_rag_state_aside(p: &Persist, err: &VectorDbError) {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    for (label, path) in [("snapshot", &p.idx), ("passages", &p.passages)] {
+        if !path.is_file() {
+            continue;
+        }
+        let mut aside = path.as_os_str().to_owned();
+        aside.push(format!(".corrupt-{nonce}"));
+        let aside = PathBuf::from(aside);
+        match std::fs::rename(path, &aside) {
+            Ok(()) => tracing::warn!(
+                path = %path.display(),
+                kept_at = %aside.display(),
+                err = %err,
+                "rag {label} state is unreadable; kept it aside and starting fresh"
+            ),
+            Err(e) => tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "rag {label} state is unreadable and could not be moved aside; \
+                 the next persist would overwrite it"
+            ),
+        }
     }
 }
 
@@ -199,23 +272,8 @@ impl RagSvc {
     pub fn from_env() -> anyhow::Result<Self> {
         let persist = Persist::from_env();
         let label = label_from_env();
-        let make_embedder = || embedder_from_env().map_err(anyhow::Error::msg);
-        let engine = match persist.as_ref() {
-            Some(p) if p.idx.exists() => {
-                match RagStore::<Box<dyn Embedder + Send>>::load(make_embedder()?, &p.idx) {
-                    Ok(store) => RagEngine {
-                        store,
-                        passages: load_passages(&p.passages),
-                        persist,
-                    },
-                    Err(e) => {
-                        tracing::warn!(err = %e, "rag state unreadable; starting fresh");
-                        RagEngine::new(make_embedder()?, persist)
-                    }
-                }
-            }
-            _ => RagEngine::new(make_embedder()?, persist),
-        };
+        let engine =
+            engine_from_persist(persist, || embedder_from_env().map_err(anyhow::Error::msg))?;
         Ok(RagSvc {
             engine: Arc::new(Mutex::new(engine)),
             label,
@@ -1166,5 +1224,132 @@ mod tests {
             warns, 1,
             "a present-but-unreadable value must not read as `absent`"
         );
+    }
+
+    // --- F-AI-041 (REQ-A1958): an unreadable persisted state pair is kept aside,
+    // so the next ingest can neither overwrite the corrupt snapshot nor the
+    // (readable) passages sibling the fresh engine no longer holds. ---
+
+    /// A `Persist` pair rooted at `dir`, with the documented sibling names.
+    fn state_pair(dir: &Path) -> Persist {
+        Persist {
+            idx: dir.join("rag.idx"),
+            passages: dir.join("rag.passages.json"),
+        }
+    }
+
+    fn mock_embedder() -> anyhow::Result<Box<dyn Embedder + Send>> {
+        Ok(Box::new(
+            MockEmbedder::new(DEFAULT_DIM).map_err(|e| anyhow::anyhow!(e.to_string()))?,
+        ))
+    }
+
+    /// A fresh scratch dir; each call is unique so parallel tests never collide.
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "amos-rag-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Files in `dir` whose name starts with `prefix` (the kept-aside siblings).
+    fn asides(dir: &Path, prefix: &str) -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(prefix))
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn an_unreadable_snapshot_is_kept_aside_before_the_next_ingest_overwrites_it() {
+        let dir = scratch("corrupt");
+        let (idx, passages) = (dir.join("rag.idx"), dir.join("rag.passages.json"));
+        const ORIGINAL_IDX: &[u8] = b"{ not a snapshot at all";
+        const ORIGINAL_PASSAGES: &[u8] =
+            r#"{"version":1,"passages":{"note:a":"旧正文"}}"#.as_bytes();
+        std::fs::write(&idx, ORIGINAL_IDX).unwrap();
+        std::fs::write(&passages, ORIGINAL_PASSAGES).unwrap();
+
+        let mut engine = engine_from_persist(Some(state_pair(&dir)), mock_embedder)
+            .expect("a corrupt snapshot still yields a fresh engine");
+
+        // The unreadable snapshot is already out of the way…
+        let idx_asides = asides(&dir, "rag.idx.corrupt-");
+        assert_eq!(
+            idx_asides.len(),
+            1,
+            "the unreadable snapshot must be kept aside before anything can overwrite it"
+        );
+        assert_eq!(std::fs::read(&idx_asides[0]).unwrap(), ORIGINAL_IDX);
+        // …and so is the *readable* passages sibling: the fresh engine holds an
+        // EMPTY passage map, so the next write would flush over every old passage.
+        let p_asides = asides(&dir, "rag.passages.json.corrupt-");
+        assert_eq!(
+            p_asides.len(),
+            1,
+            "the passages sibling must be kept aside too, or the next write destroys it"
+        );
+        assert_eq!(std::fs::read(&p_asides[0]).unwrap(), ORIGINAL_PASSAGES);
+
+        // Now the destructive write: the fresh engine ingests one passage.
+        engine.ingest("note:new".into(), "新正文".into()).unwrap();
+
+        // The live paths carry the fresh state…
+        assert!(
+            idx.is_file(),
+            "the fresh snapshot is written to the live path"
+        );
+        assert!(passages.is_file(), "the fresh passages are written too");
+        // …and the operator's original bytes survive verbatim.
+        assert_eq!(std::fs::read(&idx_asides[0]).unwrap(), ORIGINAL_IDX);
+        assert_eq!(std::fs::read(&p_asides[0]).unwrap(), ORIGINAL_PASSAGES);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_readable_state_pair_is_rehydrated_without_being_moved_aside() {
+        let dir = scratch("intact");
+        let (idx, passages) = (dir.join("rag.idx"), dir.join("rag.passages.json"));
+
+        // Write a real state pair by ingesting through a persisted engine.
+        {
+            let mut seed = RagEngine::new(mock_embedder().unwrap(), Some(state_pair(&dir)));
+            seed.ingest("note:a".into(), "旧正文".into()).unwrap();
+        }
+        assert!(idx.is_file() && passages.is_file());
+
+        let engine = engine_from_persist(Some(state_pair(&dir)), mock_embedder)
+            .expect("a readable pair rehydrates");
+        assert_eq!(engine.len(), 1, "the snapshot is loaded, not discarded");
+        assert_eq!(
+            engine.passages.get("note:a").map(String::as_str),
+            Some("旧正文"),
+            "the passages map is rehydrated alongside the snapshot"
+        );
+        assert!(
+            asides(&dir, "rag.idx.corrupt-").is_empty(),
+            "a readable snapshot must not be moved aside"
+        );
+        assert!(
+            asides(&dir, "rag.passages.json.corrupt-").is_empty(),
+            "a readable passages file must not be moved aside"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

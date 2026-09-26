@@ -23,7 +23,7 @@
     type MailStatus,
     type MailSummary,
   } from "../lib/backend";
-  import { readStoreValue, writeStoreValue } from "../lib/amosStore";
+  import { readStoreValue, writeStoreValueChecked } from "../lib/amosStore";
   import { iconSvg } from "../lib/sysIcons";
   import { NOTIF_KEY, normalizeNotifs, type Notif } from "../lib/settings";
   import { replaceAppNotifs } from "../lib/notifApp";
@@ -307,7 +307,12 @@
         body: s.from ? fmtAddr(s.from) : undefined,
         time: s.date * 1000,
       }));
-    writeStoreValue(NOTIF_KEY, replaceAppNotifs(existing, "mail", fresh, ALL_LABEL_DICTS));
+    // The badge mirror is a store write like any other: `writeStoreValue` is `void`, so a
+    // refused one would leave the dock showing a stale unread count with nothing saying
+    // why. `listNote` is this screen's one quiet-refusal surface (REQ-A1954 / F-SH-947).
+    if (!writeStoreValueChecked(NOTIF_KEY, replaceAppNotifs(existing, "mail", fresh, ALL_LABEL_DICTS))) {
+      listNote = t("common.storeWriteFailed");
+    }
   });
 
   /**

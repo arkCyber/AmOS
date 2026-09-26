@@ -490,6 +490,39 @@ fn built_for_form_factor() -> FormFactor {
     }
 }
 
+/// Read the raw `AMOS_FORM_FACTOR` value, keeping **never set** apart from **set
+/// but not valid Unicode**.
+///
+/// The caller hands the result to [`resolve_host_form_factor`], which reports any
+/// value it cannot *use*. A typo or a blank arrives as a `String` and is reported
+/// there; a value that is not valid Unicode cannot be a `&str` at all, and
+/// `std::env::var(..).ok()` folded it into plain absence — so the operator's knob
+/// was ignored in total silence, the one outcome [`resolve_hint`]'s own doc calls
+/// out as worse than a missing one. That is the same over-claim
+/// [`crate::ota::env_value`] refuses for `AMOS_OTA_*`, and it is refused the same
+/// way: a warning that names the variable.
+///
+/// Pure (the raw `OsString` is injected) so the non-Unicode arm is reachable in a
+/// test, where a process can only hold one value per key at a time.
+///
+/// REQ-A1959 ∕ F-WM-029.
+fn form_factor_hint(raw: Option<std::ffi::OsString>) -> Option<String> {
+    let Some(os) = raw else {
+        return None; // never set: the silent case
+    };
+    match os.to_str() {
+        Some(text) => Some(text.to_owned()),
+        None => {
+            tracing::warn!(
+                hint = FORM_FACTOR_ENV,
+                "form-factor hint is set but not valid Unicode; ignoring it and using \
+                 the build's own class"
+            );
+            None
+        }
+    }
+}
+
 /// Resolve the host's form factor from an optional `AMOS_FORM_FACTOR` hint.
 ///
 /// Pure (the raw value is injected) so the fallback path is testable without
@@ -1179,7 +1212,7 @@ impl WmState {
     /// own class plus `AMOS_FORM_FACTOR`, then build the state for it.
     pub fn new() -> Self {
         let built_for = built_for_form_factor();
-        let raw = std::env::var(FORM_FACTOR_ENV).ok();
+        let raw = form_factor_hint(std::env::var_os(FORM_FACTOR_ENV));
         let (form, source, unusable) = resolve_host_form_factor(built_for, raw.as_deref());
         if let Some(message) = unusable {
             tracing::warn!(
@@ -4566,6 +4599,85 @@ mod tests {
             warn.contains("AMOS_FORM_FACTOR") && warn.contains("\"pc\""),
             "the warning names the variable and the rejected value: {warn}"
         );
+    }
+
+    /// A value that is set but is not valid Unicode — the third state
+    /// `std::env::var(..).ok()` folds into "unset".
+    #[cfg(unix)]
+    fn non_unicode_hint() -> std::ffi::OsString {
+        use std::os::unix::ffi::OsStringExt;
+        std::ffi::OsString::from_vec(vec![b't', b'a', b'b', 0xff, 0xfe])
+    }
+
+    /// Counts WARN events, so an assertion is on the *observable* diagnostic and not
+    /// on a re-statement of the code. Mirrors `ota.rs::WarnProbe`.
+    struct WarnProbe(std::sync::Arc<std::sync::atomic::AtomicU64>);
+    impl tracing::Subscriber for WarnProbe {
+        fn enabled(&self, _m: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _s: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _id: &tracing::span::Id, _r: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _a: &tracing::span::Id, _b: &tracing::span::Id) {}
+        fn event(&self, ev: &tracing::Event<'_>) {
+            if ev.metadata().level() == &tracing::Level::WARN {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        fn enter(&self, _id: &tracing::span::Id) {}
+        fn exit(&self, _id: &tracing::span::Id) {}
+    }
+
+    /// Run `f` under a WARN probe and report its result plus how many WARNs it made.
+    fn warns_of<T>(f: impl FnOnce() -> T) -> (T, u64) {
+        let warns = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let out = {
+            let _probe = tracing::subscriber::set_default(WarnProbe(warns.clone()));
+            f()
+        };
+        (out, warns.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// REQ-A1952 / F-WM-029: the reader used `std::env::var(..).ok()`, which folds
+    /// **never set** together with **set but not valid Unicode**. A typo (`AMOS_FORM_FACTOR=pc`)
+    /// *is* reported — it is a `String` `resolve_hint` can reject — but a mojibake value
+    /// cannot be a `&str` at all, so `.ok()` erased it and the operator's knob was
+    /// ignored in total silence. `resolve_hint`'s own doc calls a silently-ignored knob
+    /// worse than a missing one, which is why it reports every value it cannot use.
+    #[test]
+    #[cfg(unix)]
+    fn a_non_unicode_form_factor_hint_is_reported_not_read_as_unset() {
+        let (hint, warns) = warns_of(|| form_factor_hint(Some(non_unicode_hint())));
+        assert_eq!(
+            hint, None,
+            "an unreadable hint cannot name a form factor; the build's class applies"
+        );
+        assert_eq!(
+            warns, 1,
+            "an ignored knob must be visible — the fold from `set but unreadable` to \
+             `unset` was silent"
+        );
+    }
+
+    /// The other arm of the same rule: a genuinely unset variable is the silent case.
+    /// Without the `.ok()` fold, "absent" and "unreadable" are no longer one answer.
+    #[test]
+    fn an_unset_form_factor_hint_stays_silent() {
+        let (hint, warns) = warns_of(|| form_factor_hint(None));
+        assert_eq!(hint, None);
+        assert_eq!(warns, 0, "an unset variable is not a finding");
+    }
+
+    /// A value that *is* valid Unicode is passed through untouched: an unrecognised
+    /// one is not this reader's business — `resolve_hint` reports it with the raw
+    /// value in hand, and that must not turn into two warnings for one mistake.
+    #[test]
+    fn a_usable_form_factor_hint_passes_through_without_a_warning() {
+        let (hint, warns) = warns_of(|| form_factor_hint(Some("tablet".into())));
+        assert_eq!(hint.as_deref(), Some("tablet"));
+        assert_eq!(warns, 0);
     }
 
     #[test]

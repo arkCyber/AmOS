@@ -171,6 +171,12 @@ pub enum ErrorCode {
     /// Uninstall failed (installed registry write error, bundle cleanup error). The
     /// uninstall is idempotent — retrying after a failure will still attempt removal.
     AppStoreUninstallFailed,
+    /// The engine carried the change out (in memory) but its durable registry could not
+    /// be written — the change was **undone** and this reports why, so a consumer that
+    /// re-reads (`appstore_installed`) sees it did not land. The engine did not refuse
+    /// anything — the disk did. Same shape as [`Self::MailPersistFailed`] (audit PH-P2-02)
+    /// and [`Self::StagePersistFailed`].
+    AppStorePersistFailed,
     /// Generic appstore RPC failure (status / catalog / find — surface as data so the
     /// UI can show a translated message instead of swallowing it into `null`).
     AppStoreRpcFailed,
@@ -624,6 +630,7 @@ impl ErrorCode {
             Self::AppStoreInstallFailed => "amos.appstore.install_failed",
             Self::AppStoreUpgradeFailed => "amos.appstore.upgrade_failed",
             Self::AppStoreUninstallFailed => "amos.appstore.uninstall_failed",
+            Self::AppStorePersistFailed => "amos.appstore.persist_failed",
             Self::AppStoreRpcFailed => "amos.appstore.rpc_failed",
             Self::PodcastUrlInvalid => "amos.podcast.url_invalid",
             Self::PodcastUrlSchemeUnsupported => "amos.podcast.url_scheme_unsupported",
@@ -889,6 +896,7 @@ mod tests {
         ErrorCode::AppStoreInstallFailed,
         ErrorCode::AppStoreUpgradeFailed,
         ErrorCode::AppStoreUninstallFailed,
+        ErrorCode::AppStorePersistFailed,
         ErrorCode::AppStoreRpcFailed,
         ErrorCode::PodcastUrlInvalid,
         ErrorCode::PodcastUrlSchemeUnsupported,
@@ -1019,7 +1027,7 @@ mod tests {
     /// its old value kept this test green. The set comparison against [`ALL_VARIANTS`] below
     /// closes that direction; the enum→list link stays a human obligation (see
     /// [`ALL_VARIANTS`]' doc for why stable Rust cannot close it here).
-    const FROZEN_VARIANT_COUNT: usize = 159;
+    const FROZEN_VARIANT_COUNT: usize = 160;
 
     #[test]
     fn wire_codes_are_frozen() {
@@ -1185,6 +1193,10 @@ mod tests {
             (
                 ErrorCode::AppStoreUninstallFailed,
                 "amos.appstore.uninstall_failed",
+            ),
+            (
+                ErrorCode::AppStorePersistFailed,
+                "amos.appstore.persist_failed",
             ),
             (ErrorCode::AppStoreRpcFailed, "amos.appstore.rpc_failed"),
             (ErrorCode::PodcastUrlInvalid, "amos.podcast.url_invalid"),
@@ -1481,6 +1493,7 @@ mod tests {
         assert_eq!(ErrorCode::RagRpcFailed.group(), "rag");
         assert_eq!(ErrorCode::RagForegroundRequired.group(), "rag");
         assert_eq!(ErrorCode::AppStoreInstallFailed.group(), "appstore");
+        assert_eq!(ErrorCode::AppStorePersistFailed.group(), "appstore");
         assert_eq!(ErrorCode::PodcastFetchFailed.group(), "podcast");
         assert_eq!(ErrorCode::PodcastUnknownFeed.group(), "podcast");
         assert_eq!(ErrorCode::SpacesLockFailed.group(), "spaces");
@@ -1534,8 +1547,8 @@ mod tests {
     /// truth (the enum itself), so an edit on only one side is caught here.
     #[test]
     fn wm_frozen_count_is_pinned() {
-        // Total variants = 156 (this run). 18 are window manager.
-        assert_eq!(FROZEN_VARIANT_COUNT, 159);
+        // Total variants = 160 (this run). 18 are window manager.
+        assert_eq!(FROZEN_VARIANT_COUNT, 160);
         let wm = ALL_VARIANTS
             .iter()
             // Match `amos.wm.<kind>` exactly — anything starting with `amos.wm.`

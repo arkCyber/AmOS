@@ -85,6 +85,14 @@ object ImeLayout {
      */
     fun shiftAllowed(chineseMode: Boolean): Boolean = !chineseMode
 
+    /**
+     * The glyph a letter key types with the one-shot shift armed — the WebView's `tap`
+     * (`upper ? glyph.toUpperCase() : glyph`). Applied to the label the key **shows** and
+     * the glyph it **routes** alike, so the two cannot disagree, and a no-op for the
+     * digits/punctuation keys, which have no case.
+     */
+    fun shifted(ch: String, upper: Boolean): String = if (upper) ch.uppercase() else ch
+
     /** Number of candidate pages for [total] candidates (always at least 1). */
     fun pageCount(total: Int): Int = maxOf(1, ceilDiv(maxOf(0, total), PAGE_SIZE))
 

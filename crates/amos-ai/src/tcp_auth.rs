@@ -41,8 +41,14 @@ pub enum TcpPolicy {
 }
 
 impl TcpPolicy {
-    /// Read `AMOS_TCP_TOKEN`. An empty value counts as unset (a blank secret is not a
-    /// secret) and is reported rather than silently accepted.
+    /// Read `AMOS_TCP_TOKEN`. Three outcomes, not two, so the operator can tell the
+    /// documented bring-up apart from a token that was **set and discarded**:
+    ///  - **absent** ⇒ `Open` silently (the bring-up flow sets only `AMOS_TCP_ADDR`);
+    ///  - **set but empty** ⇒ `Open`, warned (a blank secret is not a secret);
+    ///  - **set but not valid Unicode** ⇒ `Open`, warned — the value is a token the
+    ///    operator meant to require, but a header value must be a `str`, so no client
+    ///    could send it. Folding this into "absent" would serve the loopback transport
+    ///    **unauthenticated** without ever saying why.
     pub fn from_env() -> Self {
         match std::env::var("AMOS_TCP_TOKEN") {
             Ok(v) if !v.trim().is_empty() => TcpPolicy::Token(v),
@@ -52,7 +58,16 @@ impl TcpPolicy {
                 );
                 TcpPolicy::Open
             }
-            Err(_) => TcpPolicy::Open,
+            // The one silent case: the variable is genuinely unset.
+            Err(std::env::VarError::NotPresent) => TcpPolicy::Open,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                tracing::warn!(
+                    "AMOS_TCP_TOKEN is set but is not valid Unicode; treating it as unset \
+                     (TCP stays unauthenticated) — a token travels as an http header value, \
+                     which must be a `str`, so no client could present it"
+                );
+                TcpPolicy::Open
+            }
         }
     }
 
@@ -183,6 +198,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(tcp_token_env_lock)]
     fn an_empty_env_value_counts_as_unset_and_is_reported() {
         std::env::set_var("AMOS_TCP_TOKEN", "");
         assert_eq!(TcpPolicy::from_env(), TcpPolicy::Open);
@@ -212,5 +228,113 @@ mod tests {
         let mut r = Request::new(42u8);
         r.metadata_mut().insert("x-other", "1".parse().unwrap());
         assert!(gate.authorize(r).is_err());
+    }
+
+    // --- REQ-A1955 (F-AI-039): "unset" and "set but unreadable" stay apart ---
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    const TOKEN_ENV: &str = "AMOS_TCP_TOKEN";
+
+    /// Counts WARN events on this thread (via `set_default`), so an assertion lands on the
+    /// operator's only view of a discarded token rather than on a restatement of the code.
+    struct WarnProbe(Arc<AtomicU64>);
+    impl tracing::Subscriber for WarnProbe {
+        fn enabled(&self, _m: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _s: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _id: &tracing::span::Id, _r: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _a: &tracing::span::Id, _b: &tracing::span::Id) {}
+        fn event(&self, ev: &tracing::Event<'_>) {
+            if ev.metadata().level() == &tracing::Level::WARN {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        fn enter(&self, _id: &tracing::span::Id) {}
+        fn exit(&self, _id: &tracing::span::Id) {}
+    }
+
+    /// Run `f` under a WARN probe and report its result plus how many WARNs it produced.
+    fn warns_of<T>(f: impl FnOnce() -> T) -> (T, u64) {
+        let warns = Arc::new(AtomicU64::new(0));
+        let out = {
+            let _probe = tracing::subscriber::set_default(WarnProbe(warns.clone()));
+            f()
+        };
+        (out, warns.load(Ordering::Relaxed))
+    }
+
+    /// Save/wipe/restore the token variable for the duration of a test. Saves the raw
+    /// `OsString` so even a pre-existing non-Unicode value is restored byte-for-byte.
+    struct TokenEnv {
+        saved: Option<std::ffi::OsString>,
+    }
+    impl TokenEnv {
+        fn wipe() -> Self {
+            let saved = std::env::var_os(TOKEN_ENV);
+            std::env::remove_var(TOKEN_ENV);
+            Self { saved }
+        }
+        fn set(&self, value: &str) {
+            std::env::set_var(TOKEN_ENV, value);
+        }
+    }
+    impl Drop for TokenEnv {
+        fn drop(&mut self) {
+            match self.saved.take() {
+                Some(s) => std::env::set_var(TOKEN_ENV, s),
+                None => std::env::remove_var(TOKEN_ENV),
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(tcp_token_env_lock)]
+    fn an_unset_token_keeps_open_without_a_warning() {
+        let _env = TokenEnv::wipe();
+        let (policy, warns) = warns_of(TcpPolicy::from_env);
+        assert_eq!(policy, TcpPolicy::Open);
+        assert_eq!(
+            warns, 0,
+            "a genuinely absent token is the documented bring-up, not a finding"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(tcp_token_env_lock)]
+    fn a_real_token_is_adopted_without_a_warning() {
+        let env = TokenEnv::wipe();
+        env.set("s3cret");
+        let (policy, warns) = warns_of(TcpPolicy::from_env);
+        assert_eq!(policy, TcpPolicy::Token("s3cret".into()));
+        assert_eq!(warns, 0);
+    }
+
+    /// The defect this round fixes: `Err(_)` folded `NotPresent` with `NotUnicode`, so a
+    /// token the operator *did* set — but which is not valid Unicode — was read as an
+    /// absent one and the TCP transport served **unauthenticated** with no line saying the
+    /// token was discarded. Unix-only: env vars are byte strings there.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(tcp_token_env_lock)]
+    fn a_token_set_to_non_unicode_is_reported_not_silently_read_as_unset() {
+        use std::os::unix::ffi::OsStrExt;
+        let _env = TokenEnv::wipe();
+        std::env::set_var(TOKEN_ENV, std::ffi::OsStr::from_bytes(&[0xff, 0xfe, 0xfd]));
+        let (policy, warns) = warns_of(TcpPolicy::from_env);
+        assert_eq!(
+            policy,
+            TcpPolicy::Open,
+            "an unreadable token cannot be required"
+        );
+        assert_eq!(
+            warns, 1,
+            "the operator set AMOS_TCP_TOKEN and it was discarded — TCP goes unauthenticated, \
+             which must be reported, not folded into a silent unset"
+        );
     }
 }

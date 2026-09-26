@@ -406,8 +406,14 @@ re-asked on `visibilitychange` when the user comes back from the platform screen
   construction — `ime::install_shared` + `shared_or_boot` — but no device read
   traversed both surfaces). The Latin direct-insert path, the punctuation page's
   Chinese-glyph commit and the pager are pinned by the host JUnit suite
-  (`ImeRoutingTest`/`ImeLayoutTest`) and exercised by tap on device, but the
-  host-JVM suite remains their authority.
+  (`ImeRoutingTest`/`ImeLayoutTest`), **and were exercised by tap on device**
+  (2026-09-27, Chrome omnibox as the host field): 中→EN then `abc` landed literally
+  as `abc` with no candidate bar; the symbol page's keys render full-width
+  `，。？！、：；""…` and tapping them committed `，。！`; the `⌫` key shrank
+  `，。！`→`，`; and `shi` raised `1/8` (是 时 事 实 十 试 师 市), `›` advanced it to
+  `2/8` (使 世 失 食 式 始 室 视) with `‹` becoming active; tapping the `严格` chip
+  flipped it to `模糊` and re-ran the engine (`1/1`). The host-JVM suite remains
+  their authority — the device taps confirm the wiring end to end, not the rules.
 * **The platform's picker draws only while a connection is being served, and the glue
   now answers that precondition instead of claiming success (REQ-A1904, REQ-A1915).**
   `showInputMethodPicker()` hangs its 「选择输入法」 window on the serving IME's window,

@@ -124,6 +124,7 @@ export const zh = {
   "store.errorInstallFailed": "安装失败（网络或校验错误）",
   "store.errorUpgradeFailed": "更新失败",
   "store.errorUninstallFailed": "卸载失败",
+  "store.errorPersistFailed": "无法保存变更（磁盘写入失败），已撤销",
   "store.errorRpcFailed": "无法连接应用商店",
   // REQ-A315: catalog search. The daemon owns the matching; these are the four things the
   // screen may say — and "no match" must never sound like "the catalog is empty".

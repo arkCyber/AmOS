@@ -59,14 +59,25 @@ class AmosImeService : InputMethodService() {
     /** `false` until the engine answers; the keyboard then degrades to literal typing. */
     private var engineUp = false
 
+    /** One-shot shift: applies to the *next* letter, and only in English mode (see [upper]). */
+    private var shift = false
+
     /** The mode actually in force: Chinese only while the engine can compose for it. */
     private val zhActive: Boolean get() = chineseMode && engineUp
+
+    /**
+     * Whether the letter keys should type their uppercase glyph. Mirrors the WebView's
+     * `upper = mode === "en" && shift && !symbols`: the arm means nothing off the letter
+     * page, and nothing while the keyboard is typing Chinese (pinyin is case-insensitive).
+     */
+    private val upper: Boolean get() = !zhActive && shift && layer == Layer.LETTERS
 
     private var candidateBar: LinearLayout? = null
     private var keysContainer: LinearLayout? = null
     private var pagerLabel: TextView? = null
     private var prevKey: Button? = null
     private var nextKey: Button? = null
+    private var shiftKey: Button? = null
     private var modeKey: Button? = null
     private var layerKey: Button? = null
     private var fuzzyKey: Button? = null
@@ -128,6 +139,7 @@ class AmosImeService : InputMethodService() {
 
     private fun bottomRow(): LinearLayout = LinearLayout(this).apply {
         orientation = LinearLayout.HORIZONTAL
+        addView(chip(SHIFT_LABEL) { toggleShift() }.also { shiftKey = it })
         addView(chip(MODE_ZH) { toggleMode() }.also { modeKey = it })
         addView(chip(LAYER_SYMBOLS) { toggleLayer() }.also { layerKey = it })
         addKey(this, " ", 2f) { onKey(ImeRouting.Key(ImeRouting.KeyKind.SPACE, " ")) }
@@ -170,7 +182,7 @@ class AmosImeService : InputMethodService() {
             is ImeRouting.Action.CommitThenInsert -> commitThenInsert(decision.text)
             is ImeRouting.Action.Insert -> insert(decision.text)
             is ImeRouting.Action.Backspace -> backspace()
-            is ImeRouting.Action.DeleteInField -> currentInputConnection?.deleteSurroundingText(1, 0)
+            is ImeRouting.Action.DeleteInField -> deleteInField()
             is ImeRouting.Action.Enter -> performEnter()
         }
     }
@@ -239,6 +251,21 @@ class AmosImeService : InputMethodService() {
     }
 
     /**
+     * Delete one character from the target field, counting a **non-BMP glyph as one**.
+     *
+     * `deleteSurroundingText(1, 0)` counts UTF-16 **code units**, so ⌫ over an emoji (or any
+     * astral-plane character) removes only the low half of the surrogate pair and leaves a
+     * lone high surrogate in the field — a broken string the host then stores (JSON
+     * round-trips a lone surrogate). `deleteSurroundingTextInCodePoints` is the platform's
+     * own code-point spelling of the same edit (API 24; this app's `minSdk` is 26), the
+     * identical hazard the WebView keyboard's `deleteBeforeCaret` refuses at its own
+     * boundary (REQ-A1931 ∕ F-SH-931). One ⌫ removes one *character*.
+     */
+    private fun deleteInField() {
+        currentInputConnection?.deleteSurroundingTextInCodePoints(1, 0)
+    }
+
+    /**
      * Enter with nothing to commit: a multiline field gets a real newline, anything else
      * gets its own editor action — and a field with neither has none to give, so nothing
      * is inserted rather than a phantom newline.
@@ -258,9 +285,24 @@ class AmosImeService : InputMethodService() {
         chineseMode = !chineseMode
         page = 0
         layer = Layer.LETTERS
+        // A one-shot modifier must not outlive the mode it belongs to (the WebView's
+        // `$effect`): a stale ⇧ can never uppercase the first letter after the user
+        // switches back.
+        if (zhActive) shift = false
         // Leaving Chinese mode abandons the in-flight code rather than carrying it — the
         // rule the WebView overlay follows.
         if (!zhActive) clearComposition() else render()
+        renderKeys()
+    }
+
+    /**
+     * Arm / disarm the one-shot shift. It means nothing in Chinese mode, so the chip is
+     * disabled there and this refuses rather than arming a modifier that could not apply
+     * ([ImeLayout.shiftAllowed]).
+     */
+    private fun toggleShift() {
+        if (!ImeLayout.shiftAllowed(zhActive)) return
+        shift = !shift
         renderKeys()
     }
 
@@ -344,6 +386,14 @@ class AmosImeService : InputMethodService() {
                             label.firstOrNull()?.isDigit() == true -> ImeRouting.KeyKind.DIGIT
                             else -> ImeRouting.KeyKind.PUNCTUATION
                         }
+                        // One glyph for both the label and the routed key, so what the key
+                        // shows can never disagree with what the field receives.
+                        val typed =
+                            if (kind == ImeRouting.KeyKind.LETTER) {
+                                ImeLayout.shifted(label, upper)
+                            } else {
+                                label
+                            }
                         addKey(this, label) { onKey(ImeRouting.Key(kind, label)) }
                     }
                 },
@@ -354,6 +404,16 @@ class AmosImeService : InputMethodService() {
         // every letter is worse than no toggle at all.
         modeKey?.isEnabled = engineUp
         layerKey?.text = if (letters) LAYER_SYMBOLS else LAYER_LETTERS
+        // ⇧ is offered only where it can apply (English mode) — the WebView's
+        // `disabled={mode !== "en"}` + `opacity-30`. Its armed state is read off the
+        // letter keys' case; the chip itself is fully opaque while armed.
+        shiftKey?.isEnabled = ImeLayout.shiftAllowed(zhActive)
+        shiftKey?.isActivated = shift
+        shiftKey?.alpha = when {
+            !ImeLayout.shiftAllowed(zhActive) -> 0.3f
+            shift -> 1f
+            else -> 0.6f
+        }
     }
 
     /** A chrome chip (pager arrows, mode / layer / fuzzy toggles, forget) with its handler. */
@@ -411,6 +471,7 @@ class AmosImeService : InputMethodService() {
     private companion object {
         private const val TAG = "AmosImeService"
         private const val CHIP_PAD = 24
+        private const val SHIFT_LABEL = "⇧"
         private const val MODE_ZH = "中"
         private const val MODE_EN = "EN"
         private const val LAYER_SYMBOLS = "?123"

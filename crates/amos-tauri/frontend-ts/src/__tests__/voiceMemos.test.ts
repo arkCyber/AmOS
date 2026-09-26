@@ -86,6 +86,38 @@ describe("voice memos domain", () => {
     expect(normalizeVoiceMemos(null)).toEqual([]);
   });
 
+  test("normalizeVoiceMemos caps a pathologically large store at VMEMO_CAP (keeps newest)", () => {
+    // REQ-A1953 / F-SH-946: the cap used to keep the tail (the OLDEST rows) while the store is
+    // newest-first, so the newest recordings were the ones dropped.
+    // The store is newest-first (`prependMemo` — pinned by the test above), so a
+    // real over-cap array has the newest row at index 0. Each memo carries a
+    // distinct `createdAt` so "by time" is distinguishable from "by position".
+    const newestFirst = Array.from({ length: VMEMO_CAP + 3 }, (_, i) =>
+      memo({ id: `x${i}`, createdAt: T - i * 1000 }),
+    );
+    const capped = normalizeVoiceMemos(newestFirst);
+    expect(capped).toHaveLength(VMEMO_CAP);
+    // The newest rows survive, in newest-first order — not the oldest tail.
+    expect(capped.map((m) => m.id)).toEqual(
+      Array.from({ length: VMEMO_CAP }, (_, i) => `x${i}`),
+    );
+  });
+
+  test("normalizeVoiceMemos caps by createdAt, not by array position", () => {
+    // A stored array is not required to be in canonical order — `restoreStores`
+    // writes a backup's value back verbatim. The cap must therefore decide which
+    // rows are the newest by `createdAt`, not by where they sit in the array.
+    const oldestFirst = Array.from({ length: VMEMO_CAP + 3 }, (_, i) =>
+      memo({ id: `y${i}`, createdAt: T - (VMEMO_CAP + 2 - i) * 1000 }),
+    ); // y0 oldest … y26 newest
+    const capped = normalizeVoiceMemos(oldestFirst);
+    expect(capped).toHaveLength(VMEMO_CAP);
+    // The newest `VMEMO_CAP` rows by time survive, whatever their original slots.
+    expect(capped.map((m) => m.id).sort()).toEqual(
+      Array.from({ length: VMEMO_CAP }, (_, i) => `y${i + 3}`).sort(),
+    );
+  });
+
   test("seeds are regenerable WAV clips — no audio bytes stored", () => {
     const s = seedVoiceMemos(T);
     expect(s).toHaveLength(2);

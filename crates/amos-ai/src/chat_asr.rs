@@ -49,6 +49,43 @@ pub const MAX_MODEL_DIR_BYTES: usize = 4096;
 /// daemon at `/data/amos/sherpa`).
 pub const BUNDLED_SHERPA_DIRS: &[&str] = &["/data/amos/sherpa", "/system/share/amos/sherpa"];
 
+/// The env key that selects the recognizer backend (see [`ChatAsr::from_env`]).
+const BACKEND_ENV: &str = "AMOS_ASR_BACKEND";
+
+/// The `AMOS_ASR_BACKEND` tokens this reader understands. A value that is present
+/// but outside this set (a typo, a blank, a case variant, a non-Unicode byte
+/// string) is **not** the same fact as "unset": it is reported once and only then
+/// falls through to the documented default.
+const KNOWN_BACKENDS: [&str; 5] = ["off", "none", "disabled", "sherpa", "mock"];
+
+/// The `(value)` strings already reported as an unrecognised `AMOS_ASR_BACKEND`.
+/// [`ChatAsr::from_env`] can run per connection, so an un-deduplicated warning
+/// would repeat forever — log flooding is its own defect.
+fn reported_backends() -> &'static std::sync::Mutex<std::collections::BTreeSet<String>> {
+    static REPORTED: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeSet<String>>> =
+        std::sync::OnceLock::new();
+    REPORTED.get_or_init(Default::default)
+}
+
+/// Report (once per distinct value, per process) an `AMOS_ASR_BACKEND` value that
+/// this reader does not understand, before the caller falls back to the default
+/// recognizer. Mirrors `energy::warn_once_bad_flag`'s "no silently inert
+/// configuration" rule for the crate's enum-typed env reads.
+fn report_unrecognised_backend(value: &str) {
+    let first = reported_backends()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(value.to_owned());
+    if first {
+        tracing::warn!(
+            env = BACKEND_ENV,
+            value,
+            "amos-ai voice input: unrecognised ASR backend — using the default recognizer \
+             (expected `off`, `none`, `disabled`, `sherpa` or `mock`; a truly unset variable is silent)"
+        );
+    }
+}
+
 /// Wraps a [`StreamingRecognizer`] for one bidi connection.
 pub struct ChatAsr {
     rec: Box<dyn StreamingRecognizer>,
@@ -87,25 +124,47 @@ impl ChatAsr {
     ///   we warn and return `None` so `Payload::Audio` falls back to the honest
     ///   "voice not configured" path instead of silently degrading to the mock.
     /// * `AMOS_ASR_BACKEND=mock` → the deterministic mock.
-    /// * unset (or an unrecognised value) → [`Self::default_asr`]: a real
-    ///   on-device sherpa recognizer *when the daemon was built with the
-    ///   `asr-sherpa` feature and a model dir resolves* (override or bundled);
-    ///   otherwise the deterministic mock, with an explicit `error!` log.
+    /// * unset → [`Self::default_asr`]: a real on-device sherpa recognizer *when
+    ///   the daemon was built with the `asr-sherpa` feature and a model dir
+    ///   resolves* (override or bundled); otherwise the deterministic mock, with
+    ///   an explicit `error!` log.
+    /// * a value **outside the known set above** — a typo, a blank, or a
+    ///   non-Unicode byte string — is not silently folded into "unset": it is
+    ///   reported once and then also falls through to `default_asr`. The previous
+    ///   reader matched `std::env::var(..)` with a `_` arm, so `AMOS_ASR_BACKEND=ofl`
+    ///   (meaning "off") quietly left voice input **on** with no word.
     pub fn from_env() -> Option<Self> {
-        match std::env::var("AMOS_ASR_BACKEND").as_deref() {
-            Ok("off") | Ok("none") | Ok("disabled") => {
+        let choice = match std::env::var_os(BACKEND_ENV) {
+            // Truly unset — the ordinary, silent case.
+            None => None,
+            Some(raw) => match raw.to_str() {
+                Some(v) => {
+                    if !KNOWN_BACKENDS.contains(&v) {
+                        report_unrecognised_backend(v);
+                    }
+                    Some(v.to_owned())
+                }
+                None => {
+                    report_unrecognised_backend("<non-Unicode>");
+                    None
+                }
+            },
+        };
+        match choice.as_deref() {
+            Some("off") | Some("none") | Some("disabled") => {
                 tracing::debug!("voice input disabled (AMOS_ASR_BACKEND)");
                 None
             }
             // Explicit real on-device ASR: honest "None" (not mock) when the
             // feature or model files are missing.
-            Ok("sherpa") => sherpa_recognizer_from_env(),
+            Some("sherpa") => sherpa_recognizer_from_env(),
             // Explicit deterministic mock (tests / offline / dev).
-            Ok("mock") => {
+            Some("mock") => {
                 tracing::info!("voice input: deterministic mock ASR (AMOS_ASR_BACKEND=mock)");
                 Some(Self::with_label(Box::new(mock_recognizer()), "mock"))
             }
-            // Default: real sherpa when the chain resolves one, else mock.
+            // Unset (or a value already reported above): real sherpa when the
+            // chain resolves one, else mock.
             _ => Some(Self::default_asr()),
         }
     }
@@ -560,6 +619,129 @@ mod tests {
 
         // The recognizer/session remains fully usable afterwards.
         assert_eq!(asr.finish().as_deref(), Some("你好，Amos"));
+    }
+
+    // --- F-AI-038 (REQ-A1956): "unset" and "set but unrecognised" stay apart ---
+
+    use std::sync::{Arc, Mutex};
+
+    /// Captures the `message` text of every event on this thread (via `set_default`).
+    /// A bare WARN count is not enough here: the default recognizer path emits its own
+    /// unrelated WARN ("no sherpa model dir resolves…"), so the assertion must land on
+    /// the discarded-value message specifically rather than on whatever the default
+    /// branch happens to log.
+    #[derive(Default)]
+    struct Messages(Mutex<Vec<String>>);
+    struct MsgProbe(Arc<Messages>);
+    impl tracing::Subscriber for MsgProbe {
+        fn enabled(&self, _m: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _s: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _id: &tracing::span::Id, _r: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _a: &tracing::span::Id, _b: &tracing::span::Id) {}
+        fn event(&self, ev: &tracing::Event<'_>) {
+            let mut v = MsgVisitor(String::new());
+            ev.record(&mut v);
+            self.0 .0.lock().unwrap().push(v.0);
+        }
+        fn enter(&self, _id: &tracing::span::Id) {}
+        fn exit(&self, _id: &tracing::span::Id) {}
+    }
+    struct MsgVisitor(String);
+    impl tracing::field::Visit for MsgVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = format!("{value:?}");
+            }
+        }
+    }
+
+    /// The phrase unique to the discarded-value report; the default path's own WARN
+    /// does not contain it, so a count of it isolates *our* diagnostic.
+    const NEEDLE: &str = "unrecognised ASR backend";
+
+    /// Run `f` under a message probe and report its result plus how many emitted
+    /// messages contain `needle`.
+    fn messages_of<T>(f: impl FnOnce() -> T, needle: &str) -> (T, usize) {
+        let msgs = Arc::new(Messages::default());
+        let out = {
+            let _probe = tracing::subscriber::set_default(MsgProbe(msgs.clone()));
+            f()
+        };
+        let n = msgs
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|m| m.contains(needle))
+            .count();
+        (out, n)
+    }
+
+    #[test]
+    #[serial_test::serial(env_lock)]
+    fn an_unrecognised_backend_is_reported_not_silently_folded_to_the_default() {
+        let mut env = EnvGuard::wipe(ASR_ENV_KEYS);
+        env.set("AMOS_ASR_BACKEND", "sherpaa"); // a typo of `sherpa`
+        let (asr, reported) = messages_of(ChatAsr::from_env, NEEDLE);
+        assert!(
+            asr.is_some(),
+            "an unknown backend still yields a working default"
+        );
+        assert_eq!(
+            reported, 1,
+            "the operator set AMOS_ASR_BACKEND and it was discarded — that must be reported"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(env_lock)]
+    fn an_unset_backend_stays_silent_and_yields_the_default() {
+        let _env = EnvGuard::wipe(ASR_ENV_KEYS);
+        let (asr, reported) = messages_of(ChatAsr::from_env, NEEDLE);
+        assert!(asr.is_some());
+        assert_eq!(
+            reported, 0,
+            "a genuinely unset variable is the silent case — the default branch's own \
+             diagnostics are not a discarded-value report"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(env_lock)]
+    fn the_known_backend_tokens_are_not_reported() {
+        let mut env = EnvGuard::wipe(ASR_ENV_KEYS);
+        // `sherpa` is deliberately absent: its branch builds a recognizer whose own
+        // diagnostics would colour the probe. The four tokens below have pure branches.
+        for tok in ["mock", "off", "none", "disabled"] {
+            env.set("AMOS_ASR_BACKEND", tok);
+            let (_asr, reported) = messages_of(ChatAsr::from_env, NEEDLE);
+            assert_eq!(
+                reported, 0,
+                "AMOS_ASR_BACKEND={tok:?} names a real backend and must not be reported"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(env_lock)]
+    fn a_non_unicode_backend_is_reported_not_silently_folded_to_the_default() {
+        use std::os::unix::ffi::OsStrExt;
+        let _env = EnvGuard::wipe(ASR_ENV_KEYS);
+        std::env::set_var(
+            "AMOS_ASR_BACKEND",
+            std::ffi::OsStr::from_bytes(b"sherpa\xff"),
+        );
+        let (asr, reported) = messages_of(ChatAsr::from_env, NEEDLE);
+        assert!(asr.is_some());
+        assert_eq!(
+            reported, 1,
+            "a present-but-unreadable value must not read as `unset`"
+        );
     }
 }
 

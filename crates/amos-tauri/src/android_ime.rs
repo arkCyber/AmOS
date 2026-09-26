@@ -519,6 +519,91 @@ mod tests {
         );
     }
 
+    /// The service's own ⌫ over the target field must delete one **code point**, not one
+    /// UTF-16 code unit (REQ-A1951). `deleteSurroundingText(1, 0)` counts code units, so
+    /// backspacing a non-BMP glyph (an emoji, an astral-plane CJK character) removes only
+    /// the low half of the surrogate pair and leaves a lone high surrogate in the field —
+    /// a broken string the host then stores (JSON round-trips a lone surrogate).
+    /// `deleteSurroundingTextInCodePoints` is the platform's own code-point spelling of the
+    /// same edit (API 24; this app's `minSdk` is 26). The WebView keyboard's
+    /// `deleteBeforeCaret` refuses the identical hazard at its own boundary
+    /// (`frontend-ts/src/lib/ime.ts`, REQ-A1931 ∕ F-SH-931); this is the platform-side
+    /// sibling. A host JVM cannot drive an `InputConnection`, so the *wiring* is pinned
+    /// here — the arm routes through one helper, no bare code-unit call survives, and the
+    /// helper makes the code-point call.
+    #[test]
+    fn the_services_backspace_deletes_a_code_point_not_a_code_unit() {
+        const KOTLIN: &str = include_str!("../android-glue/com/amos/ai/glue/AmosImeService.kt");
+        let arm = KOTLIN
+            .lines()
+            .find(|l| l.contains("ImeRouting.Action.DeleteInField ->"))
+            .expect("the service must handle the DeleteInField action");
+        assert!(
+            arm.contains("deleteInField()"),
+            "DeleteInField must route through deleteInField(), got: {arm}"
+        );
+        // Prose in the helper's KDoc *names* the old call (to explain why it is wrong), so
+        // the ban is on **code** lines only: strip `*`/`//` comment lines before looking.
+        let code: String = KOTLIN
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with('*') && !t.starts_with("//")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code.contains("deleteSurroundingText(1, 0)"),
+            "the code-unit deleteSurroundingText(1, 0) splits a surrogate pair"
+        );
+        assert!(
+            code.contains("deleteSurroundingTextInCodePoints(1, 0)"),
+            "deleteInField must make the code-point call"
+        );
+    }
+
+    /// The system IME's English mode must be able to type an **uppercase** letter, the way
+    /// the WebView keyboard can (REQ-A1957). `ImeLayout.shiftAllowed` states the one-shot
+    /// Shift rule and `ImeLayoutTest.shiftIsOfferedOnlyInEnglishMode` pins the helper's own
+    /// answer — but nothing consumed it, so the service drew no ⇧ key, held no shift state
+    /// and always routed a lowercase glyph: its English mode could not produce `A`, while
+    /// the surface it mirrors (`ImeKeyboard.svelte`, `tap`) could. A helper whose only
+    /// consumer is its own test is a claim, not a feature (the F-AUD-002 family).
+    ///
+    /// A host JVM cannot drive an `InputMethodService`, so the **wiring** is pinned here:
+    /// the ⇧ chip is gated by `shiftAllowed`, the routed glyph goes through the pure
+    /// `ImeLayout.shifted`, and switching to Chinese drops the arm (a stale ⇧ must never
+    /// uppercase the first letter after the user comes back — `docs/input-method.md`
+    /// §Key behaviours).
+    #[test]
+    fn the_services_english_mode_offers_the_one_shot_shift() {
+        const KOTLIN: &str = include_str!("../android-glue/com/amos/ai/glue/AmosImeService.kt");
+        let gate = KOTLIN
+            .lines()
+            .find(|l| l.contains("ImeLayout.shiftAllowed(") && l.contains("shiftKey"))
+            .expect("the ⇧ chip must be gated by ImeLayout.shiftAllowed — the rule exists to be consumed");
+        assert!(
+            gate.contains("shiftKey?.isEnabled"),
+            "the shiftAllowed gate must drive the chip's enabled state, got: {gate}"
+        );
+        assert!(
+            KOTLIN.contains("ImeLayout.shifted("),
+            "the routed letter must be cased through the pure ImeLayout.shifted"
+        );
+        let routed = KOTLIN
+            .lines()
+            .find(|l| l.contains("ImeRouting.Key(kind,"))
+            .expect("the key grid must build an ImeRouting.Key");
+        assert!(
+            routed.contains("typed"),
+            "the routed glyph must be the shift-cased `typed`, not the raw label, got: {routed}"
+        );
+        assert!(
+            KOTLIN.contains("if (zhActive) shift = false"),
+            "leaving English mode must drop the shift arm (the WebView's mode-change effect)"
+        );
+    }
+
     /// The trampolines drive the *shared* bridge under [`ANDROID_WINDOW`]; a key
     /// pressed "by the service" is therefore visible to a `snapshot` on that same
     /// window, and the encoder accepts the real engine's answer.

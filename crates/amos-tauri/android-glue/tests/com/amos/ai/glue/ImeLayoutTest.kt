@@ -99,6 +99,19 @@ class ImeLayoutTest {
         assertTrue(ImeLayout.shiftAllowed(chineseMode = false))
     }
 
+    /**
+     * A shifted letter types (and shows) its uppercase glyph — the WebView's
+     * `upper ? glyph.toUpperCase() : glyph`. A key with no case is unchanged rather
+     * than thrown on (the digits/punctuation pages share this code path).
+     */
+    @Test
+    fun aShiftedLetterBecomesUppercase() {
+        assertEquals("Q", ImeLayout.shifted("q", upper = true))
+        assertEquals("q", ImeLayout.shifted("q", upper = false))
+        assertEquals("7", ImeLayout.shifted("7", upper = true))
+        assertEquals("，", ImeLayout.shifted("，", upper = true))
+    }
+
     @Test
     fun thePagerAlwaysOffersAtLeastOnePage() {
         assertEquals(1, ImeLayout.pageCount(0))

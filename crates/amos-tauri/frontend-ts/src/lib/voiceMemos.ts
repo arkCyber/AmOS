@@ -199,7 +199,15 @@ export function normalizeVoiceMemos(v: unknown): VoiceMemo[] {
     }
     out.push(m);
   }
-  return out.length > VMEMO_CAP ? out.slice(out.length - VMEMO_CAP) : out;
+  // The store is **newest-first** (`prependMemo` puts a new memo at the head), so the cap
+  // must drop the *oldest* rows — keeping the tail kept the oldest and dropped the newest
+  // (REQ-A1953 / F-SH-946), the same wrong end `normalizeNotifs` kept before REQ-A1940. Which rows are the oldest is
+  // decided by `createdAt`, not by array position: `restoreStores` writes a backup's value
+  // back verbatim, so an over-cap store need not be in canonical order. `createdAt` is finite
+  // and numeric on every surviving row (coerced above). Within the cap the caller's order is
+  // preserved untouched.
+  if (out.length <= VMEMO_CAP) return out;
+  return out.sort((a, b) => b.createdAt - a.createdAt).slice(0, VMEMO_CAP);
 }
 
 /* ---- pure WAV generator (demo seeds + headless tests) ---- */

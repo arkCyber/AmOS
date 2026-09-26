@@ -820,7 +820,11 @@
     const existing = normalizeNotifs(readStoreValue<unknown>(NOTIF_KEY, []));
     if (smsMode === "real") {
       if (hasNotifsOfApp(existing, "messages", ALL_LABEL_DICTS)) {
-        writeStoreValue(NOTIF_KEY, withoutAppNotifs(existing, "messages", ALL_LABEL_DICTS));
+        // A refused retraction is not a silent no-op: the notice it meant to take back
+        // still claims a message the user can find nowhere (REQ-A1954 / F-SH-947).
+        if (!writeStoreValueChecked(NOTIF_KEY, withoutAppNotifs(existing, "messages", ALL_LABEL_DICTS))) {
+          storeErr = t("common.storeWriteFailed");
+        }
       }
       return;
     }
@@ -840,7 +844,12 @@
       title: m.text.length > 40 ? `${m.text.slice(0, 40)}…` : m.text,
       time: m.ts,
     }));
-    writeStoreValue(NOTIF_KEY, replaceAppNotifs(existing, "messages", fresh, ALL_LABEL_DICTS));
+    // The badge mirror is a store write like any other: `writeStoreValue` is `void`, so a
+    // refused one would cost the notice silently while the page still reported the send
+    // (REQ-A1954 / F-SH-947).
+    if (!writeStoreValueChecked(NOTIF_KEY, replaceAppNotifs(existing, "messages", fresh, ALL_LABEL_DICTS))) {
+      storeErr = t("common.storeWriteFailed");
+    }
   });
 
   const send = () => {

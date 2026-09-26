@@ -256,7 +256,7 @@ impl StoreBridge {
     /// before starting empty: [`AppStore::open`] refuses a corrupt registry and
     /// [`save_file`](amos_appstore::AppStore::save_file) is atomic precisely because this
     /// file's loss is unrecoverable, so starting empty *on top of* it — while keeping
-    /// `path` for the next `persist_best_effort` — would silently destroy the user's
+    /// `path` for the next `persist_or_undo` — would silently destroy the user's
     /// installed-app list.
     pub fn from_store(path: &Path) -> Self {
         match AppStore::open(provider(), path) {
@@ -285,13 +285,54 @@ impl StoreBridge {
         }
     }
 
-    /// Best-effort: write the installed registry to disk when a path is set.
-    fn persist_best_effort(&self) {
-        if let Some(p) = &self.path {
-            if let Err(e) = self.store.save_file(p) {
-                tracing::warn!("failed to persist appstore registry {}: {e}", p.display());
+    /// Take the undo image of the durable registry **before** a mutation.
+    ///
+    /// Three answers, not two: `Ok(None)` when there is no registry file (an ephemeral
+    /// bridge has nothing to roll back), `Ok(Some(bytes))` when the pre-mutation registry
+    /// was snapshotted, and `Err` when it could not be taken at all — in which case the
+    /// caller must refuse **before** mutating, because a change it cannot undo and cannot
+    /// persist would be reported as success the disk never accepted.
+    fn undo_image(&self) -> Result<Option<Vec<u8>>, String> {
+        if self.path.is_none() {
+            return Ok(None);
+        }
+        self.store
+            .snapshot_registry()
+            .map(Some)
+            .map_err(|e| format!("appstore registry could not be snapshotted: {e}"))
+    }
+
+    /// Write the installed registry to disk, undoing the in-memory mutation on failure.
+    ///
+    /// All-or-nothing. The store UI re-reads `appstore_installed` after every action to
+    /// decide what landed, so merely returning an error is **invisible** while the
+    /// registry still holds the change: the re-read would show the intended value. The
+    /// rollback is what makes the refusal observable — the re-read then sees a registry
+    /// without the change, and the command answers `AppStorePersistFailed`.
+    fn persist_or_undo(&self, before: Option<Vec<u8>>) -> Result<(), String> {
+        let Some(p) = &self.path else {
+            return Ok(());
+        };
+        match self.store.save_file(p) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let msg = format!("failed to persist appstore registry {}: {e}", p.display());
+                tracing::warn!("{msg}");
+                if let Some(bytes) = before {
+                    if let Err(re) = self.store.restore_registry(&bytes) {
+                        tracing::error!(
+                            "appstore registry undo failed after a persist error: {re}"
+                        );
+                    }
+                }
+                Err(msg)
             }
         }
+    }
+
+    /// Map a persist/undo failure string onto the typed envelope the UI reads.
+    fn persist_error(e: String) -> AmosError {
+        AmosError::new(ErrorCode::AppStorePersistFailed, e)
     }
 
     /// The display name of an installed app, if it is installed.
@@ -343,8 +384,9 @@ impl StoreBridge {
     ///
     /// [`PackageSource`]: crate::devcare::PackageSource
     pub fn uninstall_by_id(&self, id: &str) -> Result<(), String> {
+        let before = self.undo_image()?;
         self.store.uninstall(id).map_err(|e| e.to_string())?;
-        self.persist_best_effort();
+        self.persist_or_undo(before)?;
         Ok(())
     }
 }
@@ -424,6 +466,7 @@ pub async fn appstore_install(
     id: String,
 ) -> AppStoreResult<InstalledApp> {
     validate_appstore_id(&id)?;
+    let before = state.undo_image().map_err(StoreBridge::persist_error)?;
     let app = state.store.install(&id).await.map_err(|e| {
         AmosError::with_cause(
             ErrorCode::AppStoreInstallFailed,
@@ -431,7 +474,9 @@ pub async fn appstore_install(
             e,
         )
     })?;
-    state.persist_best_effort();
+    state
+        .persist_or_undo(before)
+        .map_err(StoreBridge::persist_error)?;
     Ok(app)
 }
 
@@ -442,6 +487,7 @@ pub async fn appstore_upgrade(
     id: String,
 ) -> AppStoreResult<InstalledApp> {
     validate_appstore_id(&id)?;
+    let before = state.undo_image().map_err(StoreBridge::persist_error)?;
     let app = state.store.upgrade(&id).await.map_err(|e| {
         AmosError::with_cause(
             ErrorCode::AppStoreUpgradeFailed,
@@ -449,7 +495,9 @@ pub async fn appstore_upgrade(
             e,
         )
     })?;
-    state.persist_best_effort();
+    state
+        .persist_or_undo(before)
+        .map_err(StoreBridge::persist_error)?;
     Ok(app)
 }
 
@@ -457,6 +505,7 @@ pub async fn appstore_upgrade(
 #[tauri::command]
 pub async fn appstore_uninstall(state: State<'_, StoreBridge>, id: String) -> AppStoreResult<()> {
     validate_appstore_id(&id)?;
+    let before = state.undo_image().map_err(StoreBridge::persist_error)?;
     state.store.uninstall(&id).map_err(|e| {
         AmosError::with_cause(
             ErrorCode::AppStoreUninstallFailed,
@@ -464,7 +513,9 @@ pub async fn appstore_uninstall(state: State<'_, StoreBridge>, id: String) -> Ap
             e,
         )
     })?;
-    state.persist_best_effort();
+    state
+        .persist_or_undo(before)
+        .map_err(StoreBridge::persist_error)?;
     // Drop the app's declared egress from the netguard registry so a removed app
     // stops contributing rules. Best-effort on purpose: uninstall must succeed
     // even with no daemon attached (the registry then keeps a stale entry until
@@ -892,16 +943,18 @@ mod tests {
 
         // Install on a store-backed bridge and persist.
         let b = StoreBridge::from_store(&path);
+        let before = b.undo_image().unwrap();
         b.store.install("org.amos.pomodoro").await.unwrap();
-        b.persist_best_effort();
+        b.persist_or_undo(before).unwrap();
 
         // A fresh bridge over the same path sees the install (cross-restart).
         let again = StoreBridge::from_store(&path);
         assert!(again.store.is_installed("org.amos.pomodoro").unwrap());
 
         // Uninstall + persist + reopen → empty.
+        let before = again.undo_image().unwrap();
         again.store.uninstall("org.amos.pomodoro").unwrap();
-        again.persist_best_effort();
+        again.persist_or_undo(before).unwrap();
         let third = StoreBridge::from_store(&path);
         assert!(third.store.installed().unwrap().is_empty());
 
@@ -960,7 +1013,7 @@ mod tests {
 
         // A later successful write makes a *fresh* registry at the original path — beside,
         // not over, the kept file.
-        b.persist_best_effort();
+        b.persist_or_undo(None).unwrap();
         assert!(
             path.exists(),
             "a fresh registry is written at the original path"
@@ -988,6 +1041,95 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Red-first: when the registry cannot be written, the install must be **undone** and
+    /// the failure reported — not left in memory under a success. The store UI re-reads
+    /// `appstore_installed` after every action, so an in-memory-only install would be shown
+    /// as landed and then vanish on restart (REQ-A1950 / F-STORE-007).
+    #[tokio::test]
+    async fn a_failed_registry_persist_undoes_the_install_and_reports_it() {
+        let dir = scratch_dir("persist-fail-install");
+        // The parent directory is never created, so `write_atomic`'s `File::create` is an
+        // ENOENT — a stand-in for the disk refusing the write (full / read-only).
+        let path = dir.join("no-such-subdir").join("registry.json");
+        let b = StoreBridge::from_store(&path);
+
+        let before = b.undo_image().unwrap();
+        b.store.install("org.amos.pomodoro").await.unwrap();
+        let err = b
+            .persist_or_undo(before)
+            .expect_err("a persist to an unwritable path must not answer Ok");
+        assert!(err.contains("failed to persist"), "{err}");
+        assert!(
+            !b.store.is_installed("org.amos.pomodoro").unwrap(),
+            "the failed persist must undo the install, not leave the registry claiming it landed"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Red-first, second route: the uninstall path (`uninstall_by_id`) has the same
+    /// all-or-nothing rule — a failed persist must put the app *back*, so the re-read does
+    /// not show it gone while the disk still holds it.
+    #[tokio::test]
+    async fn a_failed_registry_persist_undoes_the_uninstall_and_reports_it() {
+        let dir = scratch_dir("persist-fail-uninstall");
+        let path = dir.join("no-such-subdir").join("registry.json");
+        let b = StoreBridge::from_store(&path);
+        // Seed the app in memory only (the path is unwritable, so nothing persists yet).
+        b.store.install("org.amos.pomodoro").await.unwrap();
+
+        let err = b
+            .uninstall_by_id("org.amos.pomodoro")
+            .expect_err("a persist to an unwritable path must not answer Ok");
+        assert!(err.contains("failed to persist"), "{err}");
+        assert!(
+            b.store.is_installed("org.amos.pomodoro").unwrap(),
+            "the failed persist must undo the uninstall, not leave the app gone in memory"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Positive control: the same sequence over a **writable** registry answers `Ok` and
+    /// keeps the change — so the rollback is driven by the write's own verdict, not by a
+    /// blanket refusal.
+    #[tokio::test]
+    async fn a_writable_registry_keeps_the_install_and_answers_ok() {
+        let dir = scratch_dir("persist-ok");
+        let path = dir.join("registry.json");
+        let b = StoreBridge::from_store(&path);
+
+        let before = b.undo_image().unwrap();
+        b.store.install("org.amos.pomodoro").await.unwrap();
+        b.persist_or_undo(before).unwrap();
+        assert!(
+            b.store.is_installed("org.amos.pomodoro").unwrap(),
+            "a successful persist keeps the install"
+        );
+
+        // And it survives a reopen — the disk really accepted it.
+        let again = StoreBridge::from_store(&path);
+        assert!(again.store.is_installed("org.amos.pomodoro").unwrap());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Positive control, the third state: an ephemeral bridge (no registry file) has
+    /// nothing to roll back, so `undo_image` answers `Ok(None)` and `persist_or_undo`
+    /// answers `Ok` — the "no store" case is not folded into the "cannot snapshot" one.
+    #[tokio::test]
+    async fn an_ephemeral_bridge_needs_no_undo_and_never_refuses() {
+        let b = StoreBridge::ephemeral();
+        assert!(
+            b.undo_image().unwrap().is_none(),
+            "no registry file means there is no undo image to take"
+        );
+        b.store.install("org.amos.pomodoro").await.unwrap();
+        b.persist_or_undo(None)
+            .expect("an ephemeral bridge has nothing to persist and never refuses");
+        assert!(b.store.is_installed("org.amos.pomodoro").unwrap());
     }
 
     #[test]

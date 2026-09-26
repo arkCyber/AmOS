@@ -126,6 +126,7 @@ export const en: Record<MessageKey, string> = {
   "store.errorInstallFailed": "Install failed (network or verification error)",
   "store.errorUpgradeFailed": "Upgrade failed",
   "store.errorUninstallFailed": "Uninstall failed",
+  "store.errorPersistFailed": "Couldn't save the change (disk write failed) — it was undone",
   "store.errorRpcFailed": "Couldn't reach the store",
   // REQ-A315: see the zh locale.
   "store.searchPlaceholder": "Search apps (name, summary, author, category)",

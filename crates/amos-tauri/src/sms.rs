@@ -471,6 +471,16 @@ impl SmsTrashState {
         }
     }
 
+    /// Empty state at an explicit cap, so a test can reach the eviction path
+    /// without writing `DEFAULT_TRASH_CAP` entries first.
+    #[cfg(test)]
+    fn with_cap(cap: usize) -> Self {
+        Self {
+            inner: RwLock::new(SmsTrash::with_cap(cap)),
+            path: Mutex::new(None),
+        }
+    }
+
     /// Point the state at a file and load it (once per path). Three outcomes, not two:
     /// an **absent** file is simply "no trash yet" (a silent first run); a file that is
     /// **present but unreadable** (corrupt / truncated / non-UTF-8 / permission) is
@@ -2098,6 +2108,75 @@ mod tests {
     }
 
     // ---- View-layer trash (REQ-A42) -----------------------------------------
+
+    /// At the cap, trashing one more message pushes the oldest entry out, which
+    /// makes that message visible again. `SmsTrash::add` returns it as a value
+    /// (REQ-A1799 / FMEA F-SH-893), and the bridge's `warn!` is the **only**
+    /// place that fact becomes observable — the `trashed_count` on the sibling
+    /// `info!` is pinned at the cap and so reads identically whether a message
+    /// was just evicted or the list merely filled up. Pin the bridge half.
+    #[test]
+    fn the_bridge_reports_the_evicted_entry_when_the_cap_forces_churn() {
+        /// A `MakeWriter` sink that keeps every formatted line in memory.
+        struct Captured(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || Captured(sink.clone()))
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .finish();
+
+        let p = MockSms::seeded();
+        let state = SmsTrashState::with_cap(1);
+        tracing::subscriber::with_default(subscriber, || {
+            // First trash: fits, no eviction.
+            trash_message(
+                &state,
+                &p,
+                "1",
+                "m2",
+                Some(amos_sms::SmsFolder::Inbox),
+                5_000,
+            )
+            .unwrap();
+            // Second trash: over the cap of 1, so the first entry is pushed out.
+            trash_message(
+                &state,
+                &p,
+                "1",
+                "m1",
+                Some(amos_sms::SmsFolder::Inbox),
+                6_000,
+            )
+            .unwrap();
+        });
+
+        let logged = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        // Positive control that the capture is wired: the ordinary "moved to the
+        // trash" line is present (it is emitted on every first insert).
+        assert!(
+            logged.contains("message moved to the trash"),
+            "the capture must see the bridge's own info line; got: {logged:?}"
+        );
+        assert!(
+            logged.contains("trash cap reached"),
+            "the eviction must be reported, not left to the pinned count; got: {logged:?}"
+        );
+        assert!(
+            logged.contains("evicted_msg_id=m2"),
+            "the report must name the message that became visible again; got: {logged:?}"
+        );
+    }
 
     #[test]
     fn trashing_the_latest_message_swaps_the_preview_to_the_previous_visible_row() {

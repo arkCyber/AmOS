@@ -151,11 +151,20 @@ pub struct RotatingFile {
     size: u64,
     /// Completed roll-overs (including the "keep nothing" truncation) since open.
     rotations: u64,
+    /// Shared with the owning `TeeWriter` so rotation-time IO failures land in the
+    /// same `report().write_failures` counter as write failures. One counter, one
+    /// place to read — the FMEA item here is "the rotation chain breaks silently and
+    /// the operator's next read-out still says the sink is healthy". Mirrors
+    /// `jsonlog::JsonRotatingFile`, which carries the same field for the same reason.
+    health: Arc<SinkHealth>,
 }
 
 impl RotatingFile {
     /// Create `cfg.dir` if needed and open the active file in append mode.
-    pub fn open(cfg: &LogFileConfig) -> io::Result<Self> {
+    ///
+    /// `health` is the sink-wide failure cell, so a rotation-time IO error is
+    /// reported through the same counter as a write-time one (REQ-A1954).
+    pub(crate) fn open(cfg: &LogFileConfig, health: &Arc<SinkHealth>) -> io::Result<Self> {
         fs::create_dir_all(&cfg.dir)?;
         let path = cfg.path();
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
@@ -167,6 +176,7 @@ impl RotatingFile {
             file,
             size,
             rotations: 0,
+            health: Arc::clone(health),
         })
     }
 
@@ -192,6 +202,15 @@ impl RotatingFile {
     }
 
     /// Shift `.<k>` → `.<k+1>`, drop the oldest, then `log` → `.1` and reopen empty.
+    ///
+    /// Rotation is a three-step chain: drop the oldest, rename `.N-1` → `.N` down to
+    /// `.1` → `.2`, then rename the active file to `.1`. The first two steps are
+    /// best-effort — the worst case ("disk full so remove fails", or a `.2` occupied by
+    /// something that is not a file) leaves the next rotation with the wrong oldest file
+    /// or a broken chain — but we **MUST NOT swallow it**: the operator has no other
+    /// signal. One counter, one stderr latch — the same `health.note()` contract the
+    /// write path follows, and the same one `jsonlog::JsonRotatingFile::rotate` already
+    /// implements for the identical chain (REQ-A1954 / F-AI-040).
     fn rotate(&mut self) -> io::Result<()> {
         if self.keep == 0 {
             // Keep no history: start the active file over.
@@ -204,11 +223,33 @@ impl RotatingFile {
             self.rotations += 1;
             return Ok(());
         }
-        let _ = fs::remove_file(rotated_path(&self.path, self.keep));
+        let oldest = rotated_path(&self.path, self.keep);
+        if let Err(e) = fs::remove_file(&oldest) {
+            // ENOENT is the expected case ("we don't have a .N yet") and is NOT a
+            // failure — but `remove_file` returns Err for it, so filter by kind. Any
+            // other error must be reported.
+            if e.kind() != io::ErrorKind::NotFound && self.health.note() {
+                eprintln!(
+                    "amos-ai: log rotation could not drop oldest {} ({e}); \
+                     continuing — chain may collide on next rotation",
+                    oldest.display(),
+                );
+            }
+        }
         for k in (1..self.keep).rev() {
             let from = rotated_path(&self.path, k);
             if from.exists() {
-                let _ = fs::rename(&from, rotated_path(&self.path, k + 1));
+                let to = rotated_path(&self.path, k + 1);
+                if let Err(e) = fs::rename(&from, &to) {
+                    if self.health.note() {
+                        eprintln!(
+                            "amos-ai: log rotation could not move {} → {} ({e}); \
+                             continuing — chain is broken, next rotate may double-rename",
+                            from.display(),
+                            to.display(),
+                        );
+                    }
+                }
             }
         }
         fs::rename(&self.path, rotated_path(&self.path, 1))?;
@@ -327,7 +368,7 @@ impl LogSinkHandle {
 /// would re-enter this writer and could recurse. One line on stderr, then silence —
 /// the counter keeps counting for diagnostics (`TeeWriter::write_failures`).
 #[derive(Debug, Default)]
-struct SinkHealth {
+pub(crate) struct SinkHealth {
     failures: AtomicU64,
     reported: AtomicBool,
 }
@@ -348,8 +389,11 @@ impl TeeWriter {
     /// Build the sink. An unavailable/unopenable file is reported once on stderr and
     /// then ignored — logging must never take the daemon down.
     pub fn new(cfg: Option<LogFileConfig>) -> Self {
+        // The health cell exists before the file is opened so the file's own
+        // rotation-time failures report into the same counter this writer exposes.
+        let health = Arc::new(SinkHealth::default());
         let mut opened_path: Option<PathBuf> = None;
-        let file = cfg.and_then(|c| match RotatingFile::open(&c) {
+        let file = cfg.and_then(|c| match RotatingFile::open(&c, &health) {
             Ok(f) => {
                 opened_path = Some(c.path());
                 Some(f)
@@ -365,7 +409,7 @@ impl TeeWriter {
         Self {
             file: Arc::new(Mutex::new(file)),
             path: opened_path,
-            health: Arc::new(SinkHealth::default()),
+            health,
             bytes: Arc::new(AtomicU64::new(0)),
             lost: Arc::new(AtomicU64::new(0)),
         }
@@ -487,6 +531,12 @@ mod tests {
         }
     }
 
+    /// Open a `RotatingFile` with a throwaway health cell — for tests about the file's
+    /// own behaviour, not the sink-wide failure counter.
+    fn openf(c: &LogFileConfig) -> RotatingFile {
+        RotatingFile::open(c, &Arc::new(SinkHealth::default())).unwrap()
+    }
+
     #[test]
     fn config_policy_prefers_explicit_dir_else_home() {
         let explicit =
@@ -532,7 +582,7 @@ mod tests {
     #[test]
     fn append_creates_the_file_and_counts_bytes() {
         let dir = tmpdir("append");
-        let mut f = RotatingFile::open(&cfg(&dir, 1024, 3)).unwrap();
+        let mut f = openf(&cfg(&dir, 1024, 3));
         f.append(b"hello\n").unwrap();
         assert_eq!(f.size(), 6);
         assert_eq!(
@@ -546,7 +596,7 @@ mod tests {
     fn rotates_on_a_line_boundary_and_keeps_at_most_keep_files() {
         let dir = tmpdir("rotate");
         // 16-byte records, rotate at 32 bytes ⇒ every 2 records.
-        let mut f = RotatingFile::open(&cfg(&dir, 32, 2)).unwrap();
+        let mut f = openf(&cfg(&dir, 32, 2));
         for i in 0..6 {
             f.append(format!("line-{i:0>10}\n").as_bytes()).unwrap();
             assert!(f.size() < 32, "rotation must leave a small active file");
@@ -569,7 +619,7 @@ mod tests {
     #[test]
     fn a_giant_write_without_newline_does_not_rotate_mid_record() {
         let dir = tmpdir("partial");
-        let mut f = RotatingFile::open(&cfg(&dir, 8, 1)).unwrap();
+        let mut f = openf(&cfg(&dir, 8, 1));
         f.append(b"no-newline-yet").unwrap(); // 14 > 8 but unfinished
         assert_eq!(f.size(), 14);
         assert!(!dir.join("amos-ai.log.1").exists());
@@ -629,7 +679,7 @@ mod tests {
         fs::create_dir_all(dir.join(format!("{LOG_FILE_NAME}.1")).join("occupied")).unwrap();
 
         // The sink itself surfaces the error…
-        let mut f = RotatingFile::open(&cfg(&dir, 4, 1)).unwrap();
+        let mut f = openf(&cfg(&dir, 4, 1));
         assert!(
             f.append(b"hello\n").is_err(),
             "an impossible rotation must be reported, not discarded"
@@ -644,9 +694,16 @@ mod tests {
             w.write_all(b"event\n").unwrap(); // 6 bytes → triggers the failing rotation
             w.flush().unwrap();
         }
-        assert_eq!(tee.write_failures(), 1, "the failure must be counted");
+        // Two rotation steps failed here (drop-oldest `.1`, then the final `log → .1`),
+        // and each failed IO step is counted once — the same per-step accounting
+        // `jsonlog::JsonRotatingFile::rotate` uses (REQ-A1954).
+        assert_eq!(
+            tee.write_failures(),
+            2,
+            "each failed rotation step is counted"
+        );
         // Cloned handles share the accounting (the MakeWriter contract).
-        assert_eq!(tee.clone().write_failures(), 1);
+        assert_eq!(tee.clone().write_failures(), 2);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -692,13 +749,81 @@ mod tests {
         fs::create_dir_all(dir.join(format!("{LOG_FILE_NAME}.1")).join("occupied")).unwrap();
         tee.make_writer().write_all(b"deadbeefdead\n").unwrap(); // 13 ≥ 12
         let after = tee.report();
-        assert_eq!(after.write_failures, 1, "the failed rotation is counted");
+        // Two steps of that rotation failed (`remove_file(.1)` and the final `log → .1`);
+        // each is counted once now that the intermediate step is no longer swallowed
+        // (REQ-A1954).
+        assert_eq!(
+            after.write_failures, 2,
+            "each failed rotation step is counted"
+        );
         assert_eq!(after.lost_bytes, 13, "the bytes that never made it to disk");
         assert_eq!(
             after.bytes_written, 15,
             "…and they are not counted as written"
         );
         assert_eq!(after.rotations, 1, "a failed rotation is not a rotation");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// REQ-A1954 / F-AI-040 — the rotation chain's **intermediate** steps must not be
+    /// swallowed. The existing test above blocks only the *final* rename (`log` → `.1`),
+    /// which the `?` already propagates; the two best-effort steps before it (`remove_file`
+    /// of the oldest, and each `.k` → `.k+1`) were `let _ = …`, so a broken chain left
+    /// `write_failures == 0` and `rotations` incremented — the operator's `get_status`
+    /// read-out said the sink was healthy while history was being lost. This is the same
+    /// contract `jsonlog::JsonRotatingFile::rotate` implements for the identical chain.
+    #[test]
+    fn a_failed_intermediate_rotation_step_is_counted_not_swallowed() {
+        let dir = tmpdir("rot-mid-fail");
+        // keep = 2 so there IS an intermediate step (`.1` → `.2`).
+        let tee = TeeWriter::new(Some(cfg(&dir, 12, 2)));
+        // First roll-over: creates `.1`.
+        {
+            let mut w = tee.make_writer();
+            w.write_all(b"first\n").unwrap(); // 6 bytes
+            w.write_all(b"second\n").unwrap(); // 12 ≥ 12 ⇒ rotates
+        }
+        assert_eq!(
+            tee.report().rotations,
+            1,
+            "precondition: one roll-over happened"
+        );
+
+        // Block the NEXT rotation's intermediate steps: `.2` is occupied by a *non-empty
+        // directory*, so both `remove_file(.2)` and `rename(.1 → .2)` fail.
+        let dot2 = dir.join(format!("{LOG_FILE_NAME}.2"));
+        fs::create_dir_all(dot2.join("occupied")).unwrap();
+
+        tee.make_writer().write_all(b"third-roll!\n").unwrap(); // 12 ≥ 12 ⇒ rotate
+
+        let after = tee.report();
+        assert!(
+            after.write_failures >= 1,
+            "a failed intermediate rotation step must be counted, not swallowed \
+             (write_failures = {}, rotations = {})",
+            after.write_failures,
+            after.rotations,
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The reverse guard: a **clean** rotation whose `.N` does not exist yet is the
+    /// expected case (ENOENT), not a failure — the fix must not turn it red.
+    #[test]
+    fn a_clean_rotation_whose_oldest_is_absent_is_not_a_failure() {
+        let dir = tmpdir("rot-clean");
+        let tee = TeeWriter::new(Some(cfg(&dir, 12, 2)));
+        {
+            let mut w = tee.make_writer();
+            w.write_all(b"first\n").unwrap(); // 6 bytes
+            w.write_all(b"second\n").unwrap(); // 12 ≥ 12 ⇒ rotates; `.2` is absent (ENOENT)
+        }
+        let r = tee.report();
+        assert_eq!(r.rotations, 1, "the roll-over itself succeeded");
+        assert_eq!(
+            r.write_failures, 0,
+            "an absent `.N` (ENOENT) is the expected case, not a rotation failure"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }
