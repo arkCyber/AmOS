@@ -75,6 +75,54 @@ impl Default for RateLimitConfig {
     }
 }
 
+/// The env keys this module's config readers consult (see the `from_env` builders).
+const RPS_ENV: &str = "AMOS_RATE_LIMIT_RPS";
+const TPH_ENV: &str = "AMOS_RATE_LIMIT_TPH";
+const AUDIT_MAX_ENV: &str = "AMOS_AUDIT_MAX_ENTRIES";
+
+/// The keys already reported as a non-Unicode env read, so a reader that runs per
+/// restart (or per request) does not repeat the same warning.
+fn reported_non_unicode() -> &'static std::sync::Mutex<std::collections::BTreeSet<&'static str>> {
+    static REPORTED: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeSet<&'static str>>,
+    > = std::sync::OnceLock::new();
+    REPORTED.get_or_init(Default::default)
+}
+
+/// Read an operator-set numeric knob as **text**, keeping apart the two env facts
+/// `std::env::var(key).ok()` folds into one `None`:
+///
+///  - **absent** ⇒ `None` — no preference; the documented default applies; silent.
+///  - **set, valid Unicode** ⇒ `Some(value)` (the caller parses and validates it).
+///  - **set, not valid Unicode** ⇒ `None`, **reported once** — a value the operator
+///    *did* set but which is not a `str` and so can name no limit; folding it into
+///    "unset" would make an unreadable value the quieter of the two.
+fn env_numeric_str(key: &'static str, raw: Option<std::ffi::OsString>) -> Option<String> {
+    let raw = raw?;
+    match raw.into_string() {
+        Ok(s) => Some(s),
+        Err(_) => {
+            report_non_unicode(key);
+            None
+        }
+    }
+}
+
+/// Report (once per key, per process) an env value the operator set but which is not
+/// valid Unicode, before the caller falls back to the documented default.
+fn report_non_unicode(key: &'static str) {
+    let first = reported_non_unicode()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(key);
+    if first {
+        tracing::warn!(
+            env = key,
+            "amos-ai security: value is not valid Unicode — using the documented default"
+        );
+    }
+}
+
 impl RateLimitConfig {
     /// Overlay the documented env knobs on the defaults.
     ///
@@ -98,11 +146,13 @@ impl RateLimitConfig {
         cfg
     }
 
-    /// [`Self::from_vars`] with the values read from the environment.
+    /// [`Self::from_vars`] with the values read from the environment. Read via
+    /// `var_os` so a value the operator set but that is not valid Unicode stays
+    /// distinct from a truly unset variable (the latter is the only silent state).
     pub fn from_env() -> Self {
         Self::from_vars(
-            std::env::var("AMOS_RATE_LIMIT_RPS").ok().as_deref(),
-            std::env::var("AMOS_RATE_LIMIT_TPH").ok().as_deref(),
+            env_numeric_str(RPS_ENV, std::env::var_os(RPS_ENV)).as_deref(),
+            env_numeric_str(TPH_ENV, std::env::var_os(TPH_ENV)).as_deref(),
         )
     }
 }
@@ -472,12 +522,13 @@ impl SecurityManager {
     /// Build the manager the **daemon** runs with, honouring the documented knobs
     /// `AMOS_RATE_LIMIT_RPS` / `AMOS_RATE_LIMIT_TPH` / `AMOS_AUDIT_MAX_ENTRIES`.
     /// Unset/garbage/zero values fall back to the defaults, so the bounds are never
-    /// silently disabled by a typo.
+    /// silently disabled by a typo. A value that is set but **not valid Unicode** is
+    /// reported once (it is not the same fact as "unset").
     pub fn from_env() -> Self {
         Self {
             rate_limiter: RateLimiter::new(RateLimitConfig::from_env()),
             audit_logger: AuditLogger::new(audit_max_entries_from(
-                std::env::var("AMOS_AUDIT_MAX_ENTRIES").ok().as_deref(),
+                env_numeric_str(AUDIT_MAX_ENV, std::env::var_os(AUDIT_MAX_ENV)).as_deref(),
             )),
             permission_manager: PermissionManager::default(),
         }
@@ -653,6 +704,117 @@ fn current_timestamp() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::sync::Mutex;
+
+    /// Captures the `message` text of every event on this thread (via `set_default`).
+    #[derive(Default)]
+    struct Messages(Mutex<Vec<String>>);
+    struct MsgProbe(Arc<Messages>);
+    impl tracing::Subscriber for MsgProbe {
+        fn enabled(&self, _m: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _s: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _id: &tracing::span::Id, _r: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _a: &tracing::span::Id, _b: &tracing::span::Id) {}
+        fn event(&self, ev: &tracing::Event<'_>) {
+            let mut v = MsgVisitor(String::new());
+            ev.record(&mut v);
+            self.0 .0.lock().unwrap().push(v.0);
+        }
+        fn enter(&self, _id: &tracing::span::Id) {}
+        fn exit(&self, _id: &tracing::span::Id) {}
+    }
+    struct MsgVisitor(String);
+    impl tracing::field::Visit for MsgVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = format!("{value:?}");
+            }
+        }
+    }
+
+    /// Run `f` under a message probe and report its result plus how many emitted
+    /// messages contain `needle`.
+    fn messages_of<T>(f: impl FnOnce() -> T, needle: &str) -> (T, usize) {
+        let msgs = Arc::new(Messages::default());
+        let out = {
+            let _probe = tracing::subscriber::set_default(MsgProbe(msgs.clone()));
+            f()
+        };
+        let n = msgs
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|m| m.contains(needle))
+            .count();
+        (out, n)
+    }
+
+    #[cfg(unix)]
+    fn non_unicode() -> std::ffi::OsString {
+        use std::os::unix::ffi::OsStringExt;
+        std::ffi::OsString::from_vec(vec![0xff, 0xfe])
+    }
+
+    // --- F-AI-047 (REQ-A1968): "unset" and "set but unreadable" stay apart ---
+
+    #[test]
+    fn an_unset_numeric_knob_is_silent_and_keeps_the_default() {
+        let cfg = RateLimitConfig::from_vars(
+            env_numeric_str(RPS_ENV, None).as_deref(),
+            env_numeric_str(TPH_ENV, None).as_deref(),
+        );
+        let d = RateLimitConfig::default();
+        assert_eq!(cfg.requests_per_second, d.requests_per_second);
+        assert_eq!(cfg.tokens_per_hour, d.tokens_per_hour);
+    }
+
+    #[test]
+    fn a_unicode_numeric_knob_is_read_without_a_warning() {
+        let (rps, warned) = messages_of(
+            || env_numeric_str(RPS_ENV, Some("25".into())),
+            "not valid Unicode",
+        );
+        assert_eq!(rps.as_deref(), Some("25"));
+        assert_eq!(warned, 0, "a readable value must not be reported");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_unicode_numeric_knob_is_reported_not_silently_read_as_unset() {
+        let (val, warned) = messages_of(
+            || env_numeric_str("TEST_NON_UNICODE_KNOB", Some(non_unicode())),
+            "not valid Unicode",
+        );
+        assert_eq!(val, None, "an unreadable value cannot name a limit");
+        assert_eq!(
+            warned, 1,
+            "the operator set the knob and it was discarded — that must be reported"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_repeated_non_unicode_knob_is_reported_once() {
+        const K: &str = "TEST_DEDUP_KNOB";
+        // The first read may report (once); not asserted here, so this test isolates
+        // *deduplication* and stays green whether or not the report itself is present.
+        let _ = messages_of(
+            || env_numeric_str(K, Some(non_unicode())),
+            "not valid Unicode",
+        );
+        // A second read of the same key must add nothing: the report is per-key, per process.
+        let (_, again) = messages_of(
+            || env_numeric_str(K, Some(non_unicode())),
+            "not valid Unicode",
+        );
+        assert_eq!(again, 0, "a per-restart reader must not flood the log");
+    }
 
     #[test]
     fn rate_limit_config_reads_documented_env_knobs() {

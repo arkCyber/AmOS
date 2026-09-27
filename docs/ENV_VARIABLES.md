@@ -49,8 +49,8 @@
 | `AMOS_RESPONSE_CACHE` | bool | `0` | `→ disabled` | 是否启用响应缓存(进程内,重启即空) |
 | `AMOS_SESSION_TIMEOUT_SECS` | int | `3600` | `→ 3600` | 会话超时 |
 | `AMOS_SESSIONS_PATH` | path | (回退) | - | 会话持久化文件 |
-| `AMOS_RATE_LIMIT_RPS` | int | `10` | `→ 10` | 每客户端请求速率上限 |
-| `AMOS_RATE_LIMIT_TPH` | int | `1000` | `→ 1000` | 每客户端每小时配额 |
+| `AMOS_RATE_LIMIT_RPS` | int | `10` | `→ 10`（非 Unicode 告警一次后回退） | 每客户端请求速率上限 |
+| `AMOS_RATE_LIMIT_TPH` | int | `100000` | `→ 100000`（非 Unicode 告警一次后回退） | 每客户端每小时配额 |
 | `AMOS_BREAKER` | bool | `1` | `→ enabled`（集合外值告警一次后回退 enabled） | 后端熔断器开关（未设静默；拼错 ∕ 空白 ∕ 非 Unicode 报告一次） |
 | `AMOS_BREAKER_FAILS` | int | `3` | `→ 3`（非 Unicode 告警一次后回退） | 熔断器失败阈值（未设 ∕ 不可解析 ∕ <1 静默回退默认） |
 | `AMOS_BREAKER_COOLDOWN_SECS` | int | `30` | `→ 30`（非 Unicode 告警一次后回退） | 熔断器冷却时间（未设 ∕ 不可解析 ∕ <1 静默回退默认） |
@@ -58,7 +58,7 @@
 | `AMOS_AUDIT_PATH` | path | `~/.amos/audit.jsonl` | `→ mkdir-p` | 通用审计落盘 |
 | `AMOS_AUDIT_MAX_BYTES` | int | `5_000_000` | `→ 5MB` | 单个审计文件上限 |
 | `AMOS_AUDIT_KEEP` | int | `3` | `→ 3` | 审计文件保留数 |
-| `AMOS_AUDIT_MAX_ENTRIES` | int | `10000` | `→ 10000` | 审计条目上限 |
+| `AMOS_AUDIT_MAX_ENTRIES` | int | `10000` | `→ 10000`（非 Unicode 告警一次后回退） | 审计条目上限 |
 
 ---
 
