@@ -35,30 +35,97 @@ pub struct PodcastPaths {
     pub downloads: Option<PathBuf>,
 }
 
+/// `AMOS_PODCAST_DIR`: one directory holding all four store files.
+pub const DIR_ENV: &str = "AMOS_PODCAST_DIR";
+/// Per-store overrides of [`DIR_ENV`]; a usable value wins over the directory.
+pub const SUBSCRIPTIONS_ENV: &str = "AMOS_PODCAST_SUBSCRIPTIONS";
+pub const LIBRARY_ENV: &str = "AMOS_PODCAST_LIBRARY";
+pub const PROGRESS_ENV: &str = "AMOS_PODCAST_PROGRESS";
+pub const DOWNLOADS_ENV: &str = "AMOS_PODCAST_DOWNLOADS";
+
+/// Three-state read of a podcast store-path knob.
+///
+/// Unset, or set to whitespace only, is `None` **silently** — the documented
+/// "ephemeral store" state. A value that is set but cannot be read back as
+/// Unicode is a *different* fact: it is reported once with the key named and
+/// then treated as unset, because an operator who configured a store directory
+/// must not be told their stores are merely unconfigured.
+///
+/// Both readers outside this crate (`amos-tauri`'s `podcast::store_dir` and
+/// `amos-podcast-cli`'s `--dir` fallback) go through this seam, so the rule has
+/// exactly one home.
+pub fn path_knob(key: &str, raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let raw = raw?;
+    match raw.into_string() {
+        Ok(s) if !s.trim().is_empty() => Some(PathBuf::from(s)),
+        Ok(_) => None,
+        Err(_) => {
+            report_unusable_path_knob(key);
+            None
+        }
+    }
+}
+
+/// [`path_knob`] over the process environment.
+pub fn path_knob_from_env(key: &str) -> Option<PathBuf> {
+    path_knob(key, std::env::var_os(key))
+}
+
+fn unusable_path_knobs_seen(
+) -> &'static std::sync::Mutex<std::collections::BTreeSet<(String, String)>> {
+    static SEEN: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeSet<(String, String)>>,
+    > = std::sync::OnceLock::new();
+    SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeSet::new()))
+}
+
+#[cfg(test)]
+fn unusable_path_knob_reports_for(key: &str) -> usize {
+    unusable_path_knobs_seen()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .filter(|(seen_key, _)| seen_key == key)
+        .count()
+}
+
+fn report_unusable_path_knob(key: &str) {
+    let mut seen = unusable_path_knobs_seen()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if seen.insert((key.to_owned(), "<non-Unicode>".to_owned())) {
+        tracing::warn!(
+            "podcast store path {key} is set but is not valid Unicode; treating it as unset \
+             (the stores stay in memory)"
+        );
+    }
+}
+
 impl PodcastPaths {
     /// Resolve paths from the environment.
     ///
     /// `AMOS_PODCAST_DIR` sets the directory for all four; the individual
     /// `AMOS_PODCAST_SUBSCRIPTIONS` / `_LIBRARY` / `_PROGRESS` / `_DOWNLOADS`
-    /// override it. With neither set, every store is in memory only (nothing is
-    /// written to a user's disk without being asked).
+    /// override it. With neither set — **or with a value that is set but cannot
+    /// be read back as Unicode, which is reported once and then treated as
+    /// unset** — every store is in memory only (nothing is written to a user's
+    /// disk without being asked).
     pub fn from_env() -> Self {
-        let dir = std::env::var("AMOS_PODCAST_DIR")
-            .ok()
-            .filter(|s| !s.is_empty());
+        Self::from_env_with(|name| std::env::var_os(name))
+    }
+
+    /// [`Self::from_env`] with the environment read injected, so the rule can be
+    /// pinned without mutating process-global state.
+    pub fn from_env_with(read: impl Fn(&str) -> Option<std::ffi::OsString>) -> Self {
+        let dir = path_knob(DIR_ENV, read(DIR_ENV));
         let pick = |name: &str, file: &str| -> Option<PathBuf> {
-            if let Ok(v) = std::env::var(name) {
-                if !v.is_empty() {
-                    return Some(PathBuf::from(v));
-                }
-            }
-            dir.as_ref().map(|d| PathBuf::from(d).join(file))
+            path_knob(name, read(name)).or_else(|| dir.as_ref().map(|d| d.join(file)))
         };
         PodcastPaths {
-            subscriptions: pick("AMOS_PODCAST_SUBSCRIPTIONS", "subscriptions.json"),
-            library: pick("AMOS_PODCAST_LIBRARY", "library.json"),
-            progress: pick("AMOS_PODCAST_PROGRESS", "progress.json"),
-            downloads: pick("AMOS_PODCAST_DOWNLOADS", "downloads.json"),
+            subscriptions: pick(SUBSCRIPTIONS_ENV, "subscriptions.json"),
+            library: pick(LIBRARY_ENV, "library.json"),
+            progress: pick(PROGRESS_ENV, "progress.json"),
+            downloads: pick(DOWNLOADS_ENV, "downloads.json"),
         }
     }
 }
@@ -855,5 +922,164 @@ mod tests {
             Err(PodcastError::UrlSchemeUnsupported)
         );
         let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    /// `OsString` holding bytes that are not valid UTF-8 (tests only).
+    #[cfg(unix)]
+    fn non_unicode_path(raw: &[u8]) -> std::ffi::OsString {
+        use std::os::unix::ffi::OsStrExt;
+        std::ffi::OsString::from(std::ffi::OsStr::from_bytes(raw))
+    }
+
+    fn env_from(
+        pairs: &'static [(&'static str, &'static str)],
+    ) -> impl Fn(&str) -> Option<std::ffi::OsString> {
+        move |name: &str| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| std::ffi::OsString::from(*v))
+        }
+    }
+
+    #[test]
+    fn an_unset_path_knob_is_none_and_silent() {
+        assert_eq!(path_knob("TEST_PODCAST_UNSET", None), None);
+        assert_eq!(unusable_path_knob_reports_for("TEST_PODCAST_UNSET"), 0);
+    }
+
+    #[test]
+    fn a_usable_path_knob_is_taken_as_given() {
+        assert_eq!(
+            path_knob(
+                "TEST_PODCAST_USABLE",
+                Some(std::ffi::OsString::from("/srv/amos-podcast"))
+            ),
+            Some(PathBuf::from("/srv/amos-podcast"))
+        );
+        assert_eq!(unusable_path_knob_reports_for("TEST_PODCAST_USABLE"), 0);
+    }
+
+    #[test]
+    fn a_blank_path_knob_keeps_the_ephemeral_default() {
+        let blank = path_knob("TEST_PODCAST_BLANK", Some("   ".into()));
+        assert_eq!(blank, None);
+        // The pre-fix read only rejected the *empty* string, so `"   "` became a
+        // literal relative directory made of spaces — assert against it directly.
+        assert_ne!(blank, Some(PathBuf::from("   ")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_unicode_path_knob_is_reported_not_read_as_unset() {
+        let key = "TEST_PODCAST_NONUNICODE";
+        assert_eq!(path_knob(key, Some(non_unicode_path(b"/srv/\xff"))), None);
+        assert_eq!(
+            unusable_path_knob_reports_for(key),
+            1,
+            "a set-but-unreadable store path must be named once, not folded into unset"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_repeated_bad_path_knob_is_reported_once() {
+        let key = "TEST_PODCAST_DEDUP";
+        assert_eq!(path_knob(key, Some(non_unicode_path(b"/srv/\xfe"))), None);
+        assert_eq!(path_knob(key, Some(non_unicode_path(b"/srv/\xfe"))), None);
+        assert_eq!(unusable_path_knob_reports_for(key), 1);
+    }
+
+    #[test]
+    fn the_directory_places_all_four_stores() {
+        let paths = PodcastPaths::from_env_with(env_from(&[(DIR_ENV, "/srv/pc")]));
+        assert_eq!(
+            paths.subscriptions,
+            Some(PathBuf::from("/srv/pc/subscriptions.json"))
+        );
+        assert_eq!(paths.library, Some(PathBuf::from("/srv/pc/library.json")));
+        assert_eq!(paths.progress, Some(PathBuf::from("/srv/pc/progress.json")));
+        assert_eq!(
+            paths.downloads,
+            Some(PathBuf::from("/srv/pc/downloads.json"))
+        );
+    }
+
+    #[test]
+    fn a_per_store_override_wins_over_the_directory() {
+        let paths = PodcastPaths::from_env_with(env_from(&[
+            (DIR_ENV, "/srv/pc"),
+            (PROGRESS_ENV, "/var/pc/progress.json"),
+        ]));
+        assert_eq!(paths.progress, Some(PathBuf::from("/var/pc/progress.json")));
+        assert_eq!(paths.library, Some(PathBuf::from("/srv/pc/library.json")));
+    }
+
+    #[test]
+    fn a_blank_override_falls_through_to_the_directory() {
+        // A whitespace-only override is "not set", not a directory of spaces.
+        let paths =
+            PodcastPaths::from_env_with(env_from(&[(DIR_ENV, "/srv/pc"), (DOWNLOADS_ENV, "   ")]));
+        assert_eq!(
+            paths.downloads,
+            Some(PathBuf::from("/srv/pc/downloads.json"))
+        );
+    }
+
+    #[test]
+    fn no_directory_at_all_keeps_every_store_ephemeral() {
+        let paths = PodcastPaths::from_env_with(env_from(&[]));
+        assert_eq!(paths.subscriptions, None);
+        assert_eq!(paths.library, None);
+        assert_eq!(paths.progress, None);
+        assert_eq!(paths.downloads, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_unicode_directory_keeps_the_stores_ephemeral_but_is_reported() {
+        let bad = non_unicode_path(b"/srv/\xfd");
+        let paths = PodcastPaths::from_env_with(move |name: &str| {
+            if name == DIR_ENV {
+                Some(bad.clone())
+            } else {
+                None
+            }
+        });
+        assert_eq!(paths.subscriptions, None);
+        assert_eq!(paths.library, None);
+        assert_eq!(
+            unusable_path_knob_reports_for(DIR_ENV),
+            1,
+            "the operator named a store directory; unset is the wrong story"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_unicode_override_falls_through_but_is_reported() {
+        let bad = non_unicode_path(b"/var/\xfc");
+        let paths = PodcastPaths::from_env_with(move |name: &str| match name {
+            DIR_ENV => Some(std::ffi::OsString::from("/srv/pc")),
+            PROGRESS_ENV => Some(bad.clone()),
+            _ => None,
+        });
+        assert_eq!(paths.progress, Some(PathBuf::from("/srv/pc/progress.json")));
+        assert_eq!(unusable_path_knob_reports_for(PROGRESS_ENV), 1);
+    }
+
+    #[test]
+    fn the_path_knobs_are_read_via_var_os_not_var() {
+        let src = include_str!("manager.rs");
+        let production = src
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("production half");
+        let needle = format!("std::env::var(\"{}\")", DIR_ENV);
+        assert!(
+            !production.contains(&needle),
+            "a store-path knob must not be read with the folding `std::env::var`"
+        );
+        assert!(production.contains("std::env::var_os(name)"));
     }
 }

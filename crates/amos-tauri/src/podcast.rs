@@ -809,10 +809,15 @@ fn now_unix() -> i64 {
 
 /// The directory the four stores live in, for diagnostics (`None` = ephemeral).
 pub fn store_dir() -> Option<PathBuf> {
-    std::env::var("AMOS_PODCAST_DIR")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
+    store_dir_from(std::env::var_os(amos_podcast::manager::DIR_ENV))
+}
+
+/// [`store_dir`] over an injected raw value. The rule itself lives in
+/// [`amos_podcast::manager::path_knob`], shared with the CLI, so this is only
+/// the env read plus that call — and it is pinned without mutating the
+/// process-global `AMOS_PODCAST_DIR` that other podcast tests share.
+fn store_dir_from(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    amos_podcast::manager::path_knob(amos_podcast::manager::DIR_ENV, raw)
 }
 
 /// Where downloaded audio is written: `<store dir>/audio`, or `None` when no
@@ -1646,5 +1651,42 @@ mod tests {
                 .subscriptions()
                 .to_vec()
         }
+    }
+
+    #[test]
+    fn an_unset_store_dir_is_ephemeral() {
+        assert_eq!(store_dir_from(None), None);
+    }
+
+    #[test]
+    fn a_usable_store_dir_is_taken_as_given() {
+        assert_eq!(
+            store_dir_from(Some(std::ffi::OsString::from("/srv/amos-podcast"))),
+            Some(PathBuf::from("/srv/amos-podcast"))
+        );
+    }
+
+    #[test]
+    fn a_blank_store_dir_is_ephemeral_not_a_directory_of_spaces() {
+        // Goes through the shared `amos_podcast::manager::path_knob`, so this is
+        // also the cross-crate proof that the rule is not re-implemented here.
+        let dir = store_dir_from(Some("   ".into()));
+        assert_eq!(dir, None);
+        assert_ne!(dir, Some(PathBuf::from("   ")));
+    }
+
+    #[test]
+    fn the_store_dir_goes_through_the_shared_seam() {
+        let src = include_str!("podcast.rs");
+        let production = src
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("production half");
+        assert!(production.contains("amos_podcast::manager::path_knob("));
+        let needle = format!("std::env::var(\"{}\")", amos_podcast::manager::DIR_ENV);
+        assert!(
+            !production.contains(&needle),
+            "the store directory must not be re-read with the folding `std::env::var`"
+        );
     }
 }

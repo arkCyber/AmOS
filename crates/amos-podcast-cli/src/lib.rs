@@ -178,12 +178,17 @@ fn scan_flag<'a>(args: &'a [String], flag: &str) -> Option<&'a String> {
 /// The persistent store directory from `--dir <PATH>` (appearing anywhere in the
 /// raw args) or `$AMOS_PODCAST_DIR`. `None` keeps every store in memory.
 fn store_dir(args: &[String]) -> Option<PathBuf> {
-    scan_flag(args, "--dir").map(PathBuf::from).or_else(|| {
-        std::env::var("AMOS_PODCAST_DIR")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
-    })
+    store_dir_from(args, std::env::var_os(amos_podcast::manager::DIR_ENV))
+}
+
+/// [`store_dir`] over an injected raw value, so the `--dir`-wins rule and the
+/// shared env rule can be pinned without touching the process environment. The
+/// env rule itself is [`amos_podcast::manager::path_knob`], shared with the
+/// Tauri bridge.
+fn store_dir_from(args: &[String], raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    scan_flag(args, "--dir")
+        .map(PathBuf::from)
+        .or_else(|| amos_podcast::manager::path_knob(amos_podcast::manager::DIR_ENV, raw))
 }
 
 /// Whether the raw args ask for the real HTTP backend.
@@ -1707,5 +1712,50 @@ mod tests {
         assert!(list[0].contains("0 feed(s)"), "{list:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unset_dir_flag_and_env_keep_every_store_in_memory() {
+        assert_eq!(store_dir_from(&[], None), None);
+    }
+
+    #[test]
+    fn the_dir_flag_wins_over_the_environment() {
+        assert_eq!(
+            store_dir_from(&s(&["--dir", "/flag"]), Some("/env".into())),
+            Some(PathBuf::from("/flag"))
+        );
+    }
+
+    #[test]
+    fn a_usable_env_dir_is_used_when_no_flag_is_given() {
+        assert_eq!(
+            store_dir_from(&[], Some("/env".into())),
+            Some(PathBuf::from("/env"))
+        );
+    }
+
+    #[test]
+    fn a_blank_env_dir_keeps_every_store_in_memory() {
+        // Goes through the shared `amos_podcast::manager::path_knob`, so this is
+        // also the cross-crate proof that the rule is not re-implemented here.
+        let dir = store_dir_from(&[], Some("   ".into()));
+        assert_eq!(dir, None);
+        assert_ne!(dir, Some(PathBuf::from("   ")));
+    }
+
+    #[test]
+    fn the_cli_store_dir_goes_through_the_shared_seam() {
+        let src = include_str!("lib.rs");
+        let production = src
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("production half");
+        assert!(production.contains("amos_podcast::manager::path_knob("));
+        let needle = format!("std::env::var(\"{}\")", amos_podcast::manager::DIR_ENV);
+        assert!(
+            !production.contains(&needle),
+            "the store directory must not be re-read with the folding `std::env::var`"
+        );
     }
 }
