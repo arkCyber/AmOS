@@ -156,7 +156,7 @@
 | `AMOS_DEVCARE_ROOT` | path | (none) | `→ refuse-clean` | DevCare 主机根目录(root 部署时) |
 | `AMOS_HOST_FS_ROOT` | path | (none) | `→ refuse-all` | `host_fs_*` 命令允许的根目录(启动期取一次、强校验)。未设/空 ⇒ 每个命令都 `amos.host_fs.root_not_configured`(最常见的失败,不是「路径太短」);设置了但不存在 ⇒ `root_not_found`;设置成非目录 ⇒ `root_not_a_dir` |
 | `AMOS_SCREEN_STATE_PATH` | path | (none) | `→ in-memory` | 屏幕状态文件(amoS-display) |
-| `AMOS_STATE_FILE` | path | (none) | `→ in-memory` | 通用状态文件 |
+| `AMOS_STATE_FILE` | path | (none) | `→ in-memory` | 通用状态文件（`amos.*` 持久化 map）。未设或纯空白 ⇒ 回退 `$HOME/.amos/state.json`（静默）；`$HOME` 也未设 ⇒ 仅内存（文档承诺的 fallback，静默）；**设了但读不回（非 Unicode）⇒ `warn!` 点名变量一次后按未设处理**（REQ-A2011 ∕ F-SH-956 —— 旧读取 `std::env::var(..).ok()` 把此态静默折成「未设」，使整个持久 map 静默降级为内存）。读取点:`crates/amos-tauri/src/store.rs::resolve_state_file` → `usable_path` |
 | `AMOS_GUEST_CLIPBOARD_SOCKET` | path | (none) | `→ no-guest-link`（非 Unicode 告警一次后按 inert） | 容器剪贴板通道;未设 ∕ 空白静默 inert;设了但读不回(非 Unicode)报告一次后仍 inert——状态据此区分「未设置」与「设了但读不回」(REQ-A1995) |
 
 ---

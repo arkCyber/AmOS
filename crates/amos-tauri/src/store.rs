@@ -86,16 +86,86 @@ pub struct SharedStore {
 /// Resolve the persistence file: `AMOS_STATE_FILE` wins, then `~/.amos/state.json`
 /// (via `$HOME`), else memory-only.
 fn resolve_state_file() -> Option<PathBuf> {
-    if let Some(p) = std::env::var("AMOS_STATE_FILE")
-        .ok()
-        .filter(|s| !s.is_empty())
-    {
+    resolve_state_file_from(
+        std::env::var_os("AMOS_STATE_FILE"),
+        std::env::var_os("HOME"),
+    )
+}
+
+/// Pure resolution of the persistence file (both raw values are injected so
+/// every arm is reachable in a test). The knob is read as **three** facts, not
+/// two: an **absent** (or blank) `AMOS_STATE_FILE` falls through to `$HOME`,
+/// and an absent `$HOME` is the documented memory-only fallback — both silent;
+/// a value the operator *did* set but which cannot be read as UTF-8 is reported
+/// once, then treated as absent, so an unreadable path is never silently
+/// mistaken for "no state file" (which would make the whole durable `amos.*`
+/// map memory-only). (REQ-A2011 / F-SH-956)
+fn resolve_state_file_from(
+    file: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    resolve_state_file_with("AMOS_STATE_FILE", "HOME", file, home)
+}
+
+/// The key names are parameters as well as the raw values, so a test can drive
+/// every arm — including the warn-once dedup table — without touching the
+/// process environment or colliding with a sibling test's key.
+fn resolve_state_file_with(
+    state_key: &str,
+    home_key: &str,
+    file: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    if let Some(p) = usable_path(state_key, file) {
         return Some(PathBuf::from(p));
     }
-    std::env::var("HOME")
-        .ok()
-        .filter(|h| !h.is_empty())
-        .map(|home| Path::new(&home).join(DEFAULT_RELATIVE))
+    usable_path(home_key, home).map(|h| Path::new(&h).join(DEFAULT_RELATIVE))
+}
+
+/// Pure three-state read of one path knob: **absent** (or blank) ⇒ `None`
+/// silently; a **usable** path ⇒ `Some`; a value that *is* present but cannot be
+/// read as UTF-8 ⇒ reported once, then `None`.
+fn usable_path(key: &str, raw: Option<std::ffi::OsString>) -> Option<String> {
+    let raw = raw?;
+    match raw.into_string() {
+        Ok(s) if !s.is_empty() => Some(s),
+        // Blank is a legitimate "unset": silent.
+        Ok(_) => None,
+        Err(_) => {
+            report_unusable_state_path(key);
+            None
+        }
+    }
+}
+
+fn unusable_state_path_seen() -> &'static Mutex<std::collections::BTreeSet<(String, String)>> {
+    static SEEN: std::sync::OnceLock<Mutex<std::collections::BTreeSet<(String, String)>>> =
+        std::sync::OnceLock::new();
+    SEEN.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+fn unusable_state_path_reports_for(key: &str) -> usize {
+    unusable_state_path_seen()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .filter(|(k, _)| k == key)
+        .count()
+}
+
+fn report_unusable_state_path(key: &str) {
+    let first = unusable_state_path_seen()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert((key.to_owned(), "<non-Unicode>".to_owned()));
+    if first {
+        tracing::warn!(
+            env = key,
+            "amos-tauri: a state-path variable is set but is not valid Unicode; ignoring it — \
+             fix or unset the variable"
+        );
+    }
 }
 
 /// Move a state file that could not be read back aside so the store's next write
@@ -760,5 +830,135 @@ mod tests {
         // Control characters cannot be a valid JSON key fragment.
         assert!(!check_store_key("amos.\nbad"));
         assert!(!check_store_key("amos.\0bad"));
+    }
+
+    #[cfg(unix)]
+    fn non_unicode(raw: &[u8]) -> std::ffi::OsString {
+        use std::os::unix::ffi::OsStringExt;
+        std::ffi::OsString::from_vec(raw.to_vec())
+    }
+
+    #[test]
+    fn an_unset_state_file_and_home_are_memory_only_and_silent() {
+        let resolved = resolve_state_file_with("TEST_SF_NONE", "TEST_HOME_NONE", None, None);
+        assert_eq!(resolved, None);
+        assert_eq!(unusable_state_path_reports_for("TEST_SF_NONE"), 0);
+        assert_eq!(unusable_state_path_reports_for("TEST_HOME_NONE"), 0);
+    }
+
+    #[test]
+    fn a_blank_state_file_falls_through_to_home() {
+        let resolved = resolve_state_file_with(
+            "TEST_SF_BLANK",
+            "TEST_HOME_BLANK",
+            Some("".into()),
+            Some("/home/op".into()),
+        );
+        assert_eq!(
+            resolved,
+            Some(PathBuf::from("/home/op").join(DEFAULT_RELATIVE))
+        );
+        assert_eq!(
+            unusable_state_path_reports_for("TEST_SF_BLANK"),
+            0,
+            "a blank AMOS_STATE_FILE is a legitimate 'unset', not a reportable one"
+        );
+    }
+
+    #[test]
+    fn a_usable_state_file_wins_over_home() {
+        let resolved = resolve_state_file_with(
+            "TEST_SF_OK",
+            "TEST_HOME_OK",
+            Some("/var/amos/state.json".into()),
+            Some("/home/op".into()),
+        );
+        assert_eq!(resolved, Some(PathBuf::from("/var/amos/state.json")));
+        assert_eq!(unusable_state_path_reports_for("TEST_SF_OK"), 0);
+    }
+
+    #[test]
+    fn a_usable_home_is_the_documented_relative_default() {
+        let resolved = resolve_state_file_with(
+            "TEST_SF_HOME",
+            "TEST_HOME_OK2",
+            None,
+            Some("/home/op".into()),
+        );
+        assert_eq!(
+            resolved,
+            Some(Path::new("/home/op").join(DEFAULT_RELATIVE)),
+            "an unset AMOS_STATE_FILE under a usable HOME is ~/.amos/state.json"
+        );
+        assert_eq!(unusable_state_path_reports_for("TEST_HOME_OK2"), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_unicode_state_file_is_reported_not_read_as_unset() {
+        let resolved = resolve_state_file_with(
+            "TEST_SF_MOJIBAKE",
+            "TEST_HOME_MOJIBAKE",
+            Some(non_unicode(b"/var/amos/\xff-state.json")),
+            Some("/home/op".into()),
+        );
+        assert_eq!(
+            resolved,
+            Some(Path::new("/home/op").join(DEFAULT_RELATIVE)),
+            "an unreadable AMOS_STATE_FILE still falls back to HOME"
+        );
+        assert_eq!(
+            unusable_state_path_reports_for("TEST_SF_MOJIBAKE"),
+            1,
+            "a set-but-unreadable AMOS_STATE_FILE must be reported, not silently read as unset"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_unicode_home_is_reported_not_read_as_memory_only() {
+        let resolved = resolve_state_file_with(
+            "TEST_SF_HOME_NONE",
+            "TEST_HOME_MOJIBAKE",
+            None,
+            Some(non_unicode(b"/home/\xfe")),
+        );
+        assert_eq!(resolved, None);
+        assert_eq!(
+            unusable_state_path_reports_for("TEST_HOME_MOJIBAKE"),
+            1,
+            "a set-but-unreadable HOME must be reported, not silently degrade to memory-only"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_repeated_bad_state_path_is_reported_once() {
+        let key = "TEST_SF_DEDUP";
+        let _ =
+            resolve_state_file_with(key, "TEST_HOME_DEDUP", Some(non_unicode(b"\xfe\xff")), None);
+        let _ =
+            resolve_state_file_with(key, "TEST_HOME_DEDUP", Some(non_unicode(b"\xfe\xff")), None);
+        assert_eq!(unusable_state_path_reports_for(key), 1);
+    }
+
+    /// The production reader must inject the raw `OsString` for **both** keys:
+    /// a `std::env::var(..)` read can never see the `NotUnicode` case, so a
+    /// non-Unicode state path would silently degrade the whole durable store.
+    #[test]
+    fn the_state_file_reader_injects_both_raw_values_via_var_os() {
+        let src = include_str!("store.rs");
+        assert!(src.contains("std::env::var_os(\"AMOS_STATE_FILE\")"));
+        assert!(src.contains("std::env::var_os(\"HOME\")"));
+        // The needles are assembled at run time so this test's *own* literals do
+        // not satisfy the `include_str!` scan it performs (a self-referential
+        // corpus).
+        for var in ["AMOS_STATE_FILE", "HOME"] {
+            let folded = format!("std::env::var(\"{var}\")");
+            assert!(
+                !src.contains(&folded),
+                "resolve_state_file must read {var} with var_os, not var"
+            );
+        }
     }
 }
