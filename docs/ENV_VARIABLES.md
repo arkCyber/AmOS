@@ -165,10 +165,10 @@
 
 | 变量 | 类型 | 默认 | 失效语义 | 说明 |
 |------|------|------|----------|------|
-| `AMOS_APPSTORE_REGISTRY` | url | (none) | `→ empty` | App 仓库注册表 URL |
-| `AMOS_APPSTORE_CATALOG` | path | (none) | `→ no-catalog` | 本地 catalog JSON |
-| `AMOS_APPSTORE_INSTALL_DIR` | path | (none) | `→ refuse-install` | APK 安装目录 |
-| `AMOS_PWA_INDEX_DIR` | path | (none) | `→ no-pwa` | PWA 索引目录 |
+| `AMOS_APPSTORE_REGISTRY` | url | (none) | `→ empty`（空白静默 ∕ 非 Unicode 告警一次后当作未设） | App 仓库注册表 URL（未设 ⇒ 每次启动空注册表）。读取点:`crates/amos-tauri/src/appstore.rs::StoreBridge::new` ∕ `crates/amos-appstore-cli/src/lib.rs::store_path` |
+| `AMOS_APPSTORE_CATALOG` | path | (none) | `→ no-catalog`（空白静默 ∕ 非 Unicode 告警一次后当作未设） | 本地 catalog JSON（仅 `appstore-live` 特性）。读取点:`crates/amos-tauri/src/appstore.rs::provider` |
+| `AMOS_APPSTORE_INSTALL_DIR` | path | (none) | `→ refuse-install`（空白静默 ∕ 非 Unicode 告警一次后当作未设） | APK 安装目录。读取点:`crates/amos-tauri/src/appstore.rs::web_install_dir` |
+| `AMOS_PWA_INDEX_DIR` | path | (none) | `→ no-pwa`（权威读取 ∕ `var_os` 保留非 UTF-8 路径） | PWA 索引目录。读取点:`crates/amos-appstore/src/pwa.rs::index_dir_from_env`（`crates/amos-tauri/src/appstore.rs::pwa_index_dir` 委派它） |
 | `AMOS_PWA_REMOTE_ALLOW` | list | (none) | `→ refuse-remote` | 远程 PWA 清单允许的主机白名单（逗号分隔、全限定小写、无通配符；未设 = 不放行任何主机） |
 | `AMOS_EXPORT_DIR` | path | (none) | `→ refuse-export` | F-Droid 导出目录 |
 

@@ -69,27 +69,90 @@ pub struct StoreBridge {
     path: Option<PathBuf>,
 }
 
+/// The `(key, value)` pairs already reported as an unusable app-store knob, so a
+/// per-request re-read is not news twice.
+fn bad_appstore_env_seen() -> &'static std::sync::Mutex<std::collections::BTreeSet<(String, String)>>
+{
+    static SEEN: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeSet<(String, String)>>,
+    > = std::sync::OnceLock::new();
+    SEEN.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+fn bad_appstore_env_reports_for(key: &str) -> usize {
+    bad_appstore_env_seen()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .filter(|(k, _)| k == key)
+        .count()
+}
+
+/// Read an app-store path/URL knob, keeping apart the **two** env facts
+/// `std::env::var(k).ok().filter(|s| !s.is_empty())` folds into one `None`:
+///
+///  - **unset or blank** ⇒ `None` — each knob's documented `→ None`; silent.
+///  - **set, valid Unicode** ⇒ `Some(value)`.
+///  - **set, not valid Unicode** ⇒ `None`, **reported once per `(key, value)`** —
+///    the operator pinned a registry path / bundle directory / catalog URL that
+///    cannot be read, so folding it into "unset" silently makes the registry
+///    ephemeral (installed apps forgotten on restart), stops bundles from being
+///    materialized, or drops the process onto the offline demo catalog, with no
+///    line naming the variable.
+///
+/// Deduplicated because these readers run *per request* (`web_install_dir` in
+/// the `amos-app://` handler); an un-deduplicated warning would be its own
+/// defect. Pure (the raw `OsString` is injected) so the unreadable arm is
+/// reachable in a test, where a process holds one value per key at a time.
+/// (REQ-A2005 / F-SH-954)
+fn env_text(key: &str, raw: Option<std::ffi::OsString>) -> Option<String> {
+    let os = raw?;
+    match os.to_str() {
+        Some(text) if !text.is_empty() => Some(text.to_owned()),
+        Some(_) => None,
+        None => {
+            let first = bad_appstore_env_seen()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert((key.to_owned(), "<non-Unicode>".to_owned()));
+            if first {
+                tracing::warn!(
+                    env = key,
+                    "amos-tauri: an app-store knob is set but is not valid Unicode; treating it \
+                     as unset — fix or unset the variable"
+                );
+            }
+            None
+        }
+    }
+}
+
 /// Directory under which installed `tar.gz` web-bundles are unpacked, from
 /// `$AMOS_APPSTORE_INSTALL_DIR` (`None` when unset → bundles aren't materialized).
 fn web_install_dir() -> Option<PathBuf> {
-    std::env::var("AMOS_APPSTORE_INSTALL_DIR")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
+    env_text(
+        "AMOS_APPSTORE_INSTALL_DIR",
+        std::env::var_os("AMOS_APPSTORE_INSTALL_DIR"),
+    )
+    .map(PathBuf::from)
 }
 
 /// The directory holding the system **PWA index** (`apps/*.toml` + `icons/`),
 /// from `$AMOS_PWA_INDEX_DIR`.
+///
+/// Delegates to the knob's authority, [`amos_appstore::pwa::index_dir_from_env`],
+/// rather than re-reading the variable: that reader keeps a non-UTF-8 path as
+/// given (`var_os` + `PathBuf::from`), whereas a `std::env::var(..).ok()` twin
+/// folded it into "unset" and silently hid an index directory the operator
+/// *did* name.
 ///
 /// `None` means "this build ships no index directory": `amos-app://index/apps.json`
 /// then answers from the manifests embedded in the build
 /// (`amos_appstore::pwa::BUILTIN_MANIFESTS`, empty today — see `docs/pwa-index.md`),
 /// and the icon paths have nothing to serve.
 pub fn pwa_index_dir() -> Option<PathBuf> {
-    std::env::var(amos_appstore::pwa::INDEX_DIR_ENV)
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
+    amos_appstore::pwa::index_dir_from_env()
 }
 
 /// One installed app as the device-care policy needs it.
@@ -123,10 +186,10 @@ fn apply_web_dir(store: AppStore<Box<dyn StoreProvider>>) -> AppStore<Box<dyn St
 fn provider() -> Box<dyn StoreProvider> {
     #[cfg(feature = "appstore-live")]
     {
-        if let Some(url) = std::env::var("AMOS_APPSTORE_CATALOG")
-            .ok()
-            .filter(|s| !s.is_empty())
-        {
+        if let Some(url) = env_text(
+            "AMOS_APPSTORE_CATALOG",
+            std::env::var_os("AMOS_APPSTORE_CATALOG"),
+        ) {
             tracing::info!("appstore: using remote HTTP catalog {url}");
             return Box::new(HttpStoreProvider::new(url));
         }
@@ -230,10 +293,10 @@ impl StoreBridge {
     /// registry is loaded (or created) from that file and persists across app
     /// restarts; otherwise an ephemeral registry is used.
     pub fn new() -> Self {
-        match std::env::var("AMOS_APPSTORE_REGISTRY")
-            .ok()
-            .filter(|s| !s.is_empty())
-        {
+        match env_text(
+            "AMOS_APPSTORE_REGISTRY",
+            std::env::var_os("AMOS_APPSTORE_REGISTRY"),
+        ) {
             Some(p) => Self::from_store(Path::new(&p)),
             None => Self::ephemeral(),
         }
@@ -1569,5 +1632,76 @@ mod tests {
         // layer renders the same translated explanation for both.
         let e = validate_appstore_id("has space").unwrap_err();
         assert_eq!(e.code(), "amos.appstore.id_invalid");
+    }
+
+    // --- REQ-A2003 ∕ F-SH-…: the app-store knobs keep "operator set it but it is
+    // unreadable" apart from "unset". `env_text` is the shared pure seam; the
+    // index-dir knob delegates to its authority (`pwa::index_dir_from_env`).
+
+    #[test]
+    fn an_unset_appstore_knob_is_none_and_silent() {
+        let key = "TEST_APPSTORE_ENV_UNSET";
+        assert_eq!(env_text(key, None), None);
+        assert_eq!(bad_appstore_env_reports_for(key), 0);
+    }
+
+    #[test]
+    fn a_blank_appstore_knob_is_none_and_silent() {
+        // Blank is the documented `→ None`, exactly as `.filter(|s| !s.is_empty())` had it.
+        let key = "TEST_APPSTORE_ENV_BLANK";
+        assert_eq!(env_text(key, Some("".into())), None);
+        assert_eq!(bad_appstore_env_reports_for(key), 0);
+    }
+
+    #[test]
+    fn a_usable_appstore_knob_is_read_as_given() {
+        let key = "TEST_APPSTORE_ENV_OK";
+        assert_eq!(
+            env_text(key, Some("/var/lib/amos/registry.json".into())).as_deref(),
+            Some("/var/lib/amos/registry.json")
+        );
+        assert_eq!(bad_appstore_env_reports_for(key), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_unicode_appstore_knob_is_reported_not_read_as_unset() {
+        use std::os::unix::ffi::OsStringExt;
+        let key = "TEST_APPSTORE_ENV_MOJIBAKE";
+        let raw = std::ffi::OsString::from_vec(vec![0xff, 0xfe]);
+        assert_eq!(env_text(key, Some(raw)), None);
+        assert_eq!(
+            bad_appstore_env_reports_for(key),
+            1,
+            "a set-but-unreadable knob must be reported, not silently treated as unset"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_repeated_bad_appstore_knob_is_reported_once() {
+        use std::os::unix::ffi::OsStringExt;
+        let key = "TEST_APPSTORE_ENV_DEDUP";
+        for _ in 0..3 {
+            let raw = std::ffi::OsString::from_vec(vec![0xff, 0xfe]);
+            assert_eq!(env_text(key, Some(raw)), None);
+        }
+        assert_eq!(bad_appstore_env_reports_for(key), 1);
+    }
+
+    #[test]
+    fn the_pwa_index_dir_reader_delegates_to_its_authority() {
+        // Source pin: `appstore.rs` must not re-fold `AMOS_PWA_INDEX_DIR` with a
+        // `std::env::var` twin — it must call the pwa authority, whose `var_os`
+        // reader keeps a non-UTF-8 path as given.
+        let src = include_str!("appstore.rs");
+        assert!(src.contains("amos_appstore::pwa::index_dir_from_env()"));
+        // The needle is assembled at run time so this test's *own* literal does not
+        // satisfy the `include_str!` scan it performs (a self-referential corpus).
+        let folded_twin = format!("std::env::var(amos_appstore::pwa::{}", "INDEX_DIR_ENV)");
+        assert!(
+            !src.contains(&folded_twin),
+            "the index-dir knob must not be read with a folding std::env::var twin"
+        );
     }
 }
