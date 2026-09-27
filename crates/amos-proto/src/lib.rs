@@ -107,17 +107,45 @@ pub const DEFAULT_CLIENT_ID: &str = "system-ui";
 pub mod socket {
     use std::path::PathBuf;
 
+    /// The environment variable that overrides the socket path. Kept as a
+    /// const so the seam and the environment can never drift.
+    pub const SOCKET_ENV: &str = "AMOS_SOCKET";
+
     /// Default location of the amos AI daemon socket.
     ///
     /// Override at runtime with the `AMOS_SOCKET` environment variable. This
     /// matters on mobile, where the sandbox forces the socket into app-private
     /// storage rather than the global `/var/run` path.
+    ///
+    /// The knob is read as **three** facts, not two: **unset** (or blank) ⇒ the
+    /// platform default, silently; a **usable** path ⇒ that path; a value the
+    /// operator set but which cannot be read as UTF-8 ⇒ reported once, then the
+    /// default — so an unreadable override is never silently mistaken for
+    /// "unset". Every sibling reader of this same variable already reports it
+    /// (`amos-ai::resolve_socket`, `amos-translate::socket_env`); this one, the
+    /// authority both the daemon and the System UI depend on, did not.
+    /// (REQ-A2008 / F-PROTO-001)
     pub fn default_socket_path() -> PathBuf {
-        if let Ok(p) = std::env::var("AMOS_SOCKET") {
-            if !p.is_empty() {
-                return PathBuf::from(p);
+        socket_path_from(SOCKET_ENV, std::env::var_os(SOCKET_ENV))
+    }
+
+    /// Pure three-state read of the socket override (the raw `OsString` is
+    /// injected so every arm is reachable in a test).
+    pub(crate) fn socket_path_from(key: &str, raw: Option<std::ffi::OsString>) -> PathBuf {
+        if let Some(raw) = raw {
+            match raw.into_string() {
+                Ok(path) if !path.is_empty() => return PathBuf::from(path),
+                // Blank is a legitimate "unset": silent.
+                Ok(_) => {}
+                Err(_) => report_bad_socket_env(key),
             }
         }
+        platform_default_socket_path()
+    }
+
+    /// The platform's fallback socket path, used when the knob is unset (or
+    /// unreadable).
+    pub(crate) fn platform_default_socket_path() -> PathBuf {
         #[cfg(target_os = "android")]
         {
             // App-private storage on Android (must match the daemon's runtime dir).
@@ -132,6 +160,38 @@ pub mod socket {
             PathBuf::from("amos-ai.sock")
         }
     }
+
+    fn bad_socket_env_seen(
+    ) -> &'static std::sync::Mutex<std::collections::BTreeSet<(String, String)>> {
+        static SEEN: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::BTreeSet<(String, String)>>,
+        > = std::sync::OnceLock::new();
+        SEEN.get_or_init(Default::default)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bad_socket_env_reports_for(key: &str) -> usize {
+        bad_socket_env_seen()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|(k, _)| k == key)
+            .count()
+    }
+
+    fn report_bad_socket_env(key: &str) {
+        let first = bad_socket_env_seen()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert((key.to_owned(), "<non-Unicode>".to_owned()));
+        if first {
+            tracing::warn!(
+                env = key,
+                "amos-proto: the socket override is set but is not valid Unicode; falling back \
+                 to the platform default socket — fix or unset the variable"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -139,5 +199,79 @@ mod tests {
     #[test]
     fn socket_path_is_derivable() {
         let _ = crate::socket::default_socket_path();
+    }
+
+    #[cfg(unix)]
+    fn non_unicode(raw: &[u8]) -> std::ffi::OsString {
+        use std::os::unix::ffi::OsStringExt;
+        std::ffi::OsString::from_vec(raw.to_vec())
+    }
+
+    #[test]
+    fn an_unset_socket_override_is_the_platform_default_and_silent() {
+        let path = crate::socket::socket_path_from("TEST_PROTO_SOCK_UNSET", None);
+        assert_eq!(path, crate::socket::platform_default_socket_path());
+        assert_eq!(
+            crate::socket::bad_socket_env_reports_for("TEST_PROTO_SOCK_UNSET"),
+            0
+        );
+    }
+
+    #[test]
+    fn a_blank_socket_override_is_the_platform_default_and_silent() {
+        let path = crate::socket::socket_path_from("TEST_PROTO_SOCK_BLANK", Some("".into()));
+        assert_eq!(path, crate::socket::platform_default_socket_path());
+        assert_eq!(
+            crate::socket::bad_socket_env_reports_for("TEST_PROTO_SOCK_BLANK"),
+            0
+        );
+    }
+
+    #[test]
+    fn a_usable_socket_override_is_read_as_given() {
+        let raw: std::ffi::OsString = "/run/amos/translate.sock".into();
+        let path = crate::socket::socket_path_from("TEST_PROTO_SOCK_OK", Some(raw));
+        assert_eq!(path, std::path::PathBuf::from("/run/amos/translate.sock"));
+        assert_eq!(
+            crate::socket::bad_socket_env_reports_for("TEST_PROTO_SOCK_OK"),
+            0
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_unicode_socket_override_is_reported_not_read_as_unset() {
+        let key = "TEST_PROTO_SOCK_MOJIBAKE";
+        let path = crate::socket::socket_path_from(key, Some(non_unicode(b"/run/amos/\xff.sock")));
+        assert_eq!(path, crate::socket::platform_default_socket_path());
+        assert_eq!(
+            crate::socket::bad_socket_env_reports_for(key),
+            1,
+            "a set-but-unreadable AMOS_SOCKET must be reported, not silently folded into the default"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_repeated_bad_socket_override_is_reported_once() {
+        let key = "TEST_PROTO_SOCK_DEDUP";
+        let _ = crate::socket::socket_path_from(key, Some(non_unicode(b"\xfe\xff")));
+        let _ = crate::socket::socket_path_from(key, Some(non_unicode(b"\xfe\xff")));
+        assert_eq!(crate::socket::bad_socket_env_reports_for(key), 1);
+    }
+
+    #[test]
+    fn the_authority_reads_the_override_via_var_os_not_var() {
+        let src = include_str!("lib.rs");
+        assert!(src.contains("std::env::var_os(SOCKET_ENV)"));
+        // The needle is assembled at run time so this test's *own* literal does
+        // not satisfy the `include_str!` scan it performs (a self-referential
+        // corpus).
+        let folded_twin = format!("std::env::var({}{})", "\"AMOS_SOC", "KET\"");
+        assert!(
+            !src.contains(&folded_twin),
+            "default_socket_path must read the override with var_os, so a set-but-non-Unicode \
+             path is reported rather than silently treated as unset"
+        );
     }
 }
