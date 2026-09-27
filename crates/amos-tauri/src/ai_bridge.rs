@@ -204,13 +204,30 @@ pub struct AiBridge {
     active_bidi: Arc<Mutex<Option<mpsc::Sender<ClientMessage>>>>,
 }
 
+/// The environment variables read by [`repo_root`] and [`creds_path`].
+const ROOT_ENV: &str = "AMOS_ROOT";
+const CRED_ENV: &str = "AMOS_CRED_FILE";
+const HOME_ENV: &str = "HOME";
+
 /// Resolve the Amos repo root (hosts `scripts/ai-backend.sh` + the daemon bin):
 /// `AMOS_ROOT` env first, else derive from the running binary's location.
+///
+/// The knob is read as **three** facts, not two: **unset** (or blank) ⇒ the
+/// exe-derived fallback, silently; a **usable** path ⇒ that path; a value the
+/// operator set but which cannot be read as UTF-8 ⇒ reported once, then the
+/// fallback — so an unreadable override is never silently mistaken for "unset".
+/// The sibling reader in this same crate (`store.rs`, REQ-A2011) already reports
+/// an unreadable `HOME`; these did not. (REQ-A2013 / F-SH-957)
 fn repo_root() -> std::path::PathBuf {
-    if let Ok(r) = std::env::var("AMOS_ROOT") {
-        if !r.is_empty() {
-            return std::path::PathBuf::from(r);
-        }
+    repo_root_with(ROOT_ENV, std::env::var_os(ROOT_ENV))
+}
+
+/// Pure resolution of the repo root: the raw value **and** the key are injected
+/// so every arm is reachable in a test and each test can own a distinct key in
+/// the process-global warn-once table.
+fn repo_root_with(key: &str, raw: Option<std::ffi::OsString>) -> std::path::PathBuf {
+    if let Some(root) = usable_env_path(key, raw) {
+        return root;
     }
     std::env::current_exe()
         .ok()
@@ -223,15 +240,82 @@ fn repo_root() -> std::path::PathBuf {
 /// Where the cloud AI key is persisted (0600) so it never lives in the webview
 /// store and can be reused on later switches/resumes.
 fn creds_path() -> Option<std::path::PathBuf> {
-    if let Ok(f) = std::env::var("AMOS_CRED_FILE") {
-        if !f.is_empty() {
-            return Some(std::path::PathBuf::from(f));
+    creds_path_with(
+        CRED_ENV,
+        HOME_ENV,
+        std::env::var_os(CRED_ENV),
+        std::env::var_os(HOME_ENV),
+    )
+}
+
+/// Pure resolution of the credential path: `AMOS_CRED_FILE` wins, then
+/// `$HOME/.amos/ai.key`, else `None` (the reported "no credential path" case).
+/// Each knob is read as **three** facts, not two — an unset (or blank) variable
+/// is silent, a usable one is its path, and a set-but-not-UTF-8 one is reported
+/// once then treated as absent, so it is never silently mistaken for "unset"
+/// (which is what the user-visible warning would otherwise assert).
+///
+/// The key names are parameters as well as the raw values so a test can drive
+/// every arm — including the warn-once dedup table — without touching the
+/// process environment or colliding with a sibling test's key.
+fn creds_path_with(
+    file_key: &str,
+    home_key: &str,
+    file: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Option<std::path::PathBuf> {
+    if let Some(p) = usable_env_path(file_key, file) {
+        return Some(p);
+    }
+    usable_env_path(home_key, home).map(|h| h.join(".amos").join("ai.key"))
+}
+
+/// Pure three-state read of one path knob: **unset** (or blank) ⇒ `None`
+/// silently; a **usable** path ⇒ `Some`; a value that is present but cannot be
+/// read as UTF-8 ⇒ reported once, then `None`.
+fn usable_env_path(key: &str, raw: Option<std::ffi::OsString>) -> Option<std::path::PathBuf> {
+    let raw = raw?;
+    match raw.into_string() {
+        // A path with surrounding spaces is taken verbatim, but a *whitespace-only*
+        // value is a legitimate "unset": a directory literally named "   " is never
+        // intended (the sibling `webman_download::download_dir_for` trims too).
+        Ok(s) if !s.trim().is_empty() => Some(std::path::PathBuf::from(s)),
+        Ok(_) => None,
+        Err(_) => {
+            report_unusable_env_path(key);
+            None
         }
     }
-    std::env::var("HOME")
-        .ok()
-        .filter(|h| !h.is_empty())
-        .map(|h| std::path::PathBuf::from(h).join(".amos").join("ai.key"))
+}
+
+fn unusable_env_path_seen() -> &'static Mutex<std::collections::BTreeSet<(String, String)>> {
+    static SEEN: std::sync::OnceLock<Mutex<std::collections::BTreeSet<(String, String)>>> =
+        std::sync::OnceLock::new();
+    SEEN.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+fn unusable_env_path_reports_for(key: &str) -> usize {
+    unusable_env_path_seen()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .filter(|(k, _)| k == key)
+        .count()
+}
+
+fn report_unusable_env_path(key: &str) {
+    let first = unusable_env_path_seen()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert((key.to_owned(), "<non-Unicode>".to_owned()));
+    if first {
+        tracing::warn!(
+            env = key,
+            "amos-tauri: a path variable is set but is not valid Unicode; ignoring it — \
+             fix or unset the variable"
+        );
+    }
 }
 
 /// Persist the cloud API key to `path` with `0600`.
@@ -1688,5 +1772,173 @@ mod tests {
             v.get("gpu_util").is_some_and(|x| x.is_null()),
             "an uninstrumented GPU must serialise as null, not a fabricated reading: {v}"
         );
+    }
+
+    #[cfg(unix)]
+    fn non_unicode(raw: &[u8]) -> std::ffi::OsString {
+        use std::os::unix::ffi::OsStringExt;
+        std::ffi::OsString::from_vec(raw.to_vec())
+    }
+
+    #[test]
+    fn an_unset_repo_root_falls_back_silently() {
+        let _ = super::repo_root_with("TEST_ROOT_NONE", None);
+        assert_eq!(super::unusable_env_path_reports_for("TEST_ROOT_NONE"), 0);
+    }
+
+    #[test]
+    fn a_usable_repo_root_is_taken_as_given() {
+        let root = super::repo_root_with("TEST_ROOT_OK", Some("/opt/amos".into()));
+        assert_eq!(root, std::path::PathBuf::from("/opt/amos"));
+        assert_eq!(super::unusable_env_path_reports_for("TEST_ROOT_OK"), 0);
+    }
+
+    #[test]
+    fn a_blank_repo_root_falls_back_and_is_silent() {
+        let root = super::repo_root_with("TEST_ROOT_BLANK", Some("   ".into()));
+        assert_ne!(
+            root,
+            std::path::PathBuf::from("   "),
+            "a whitespace-only AMOS_ROOT must not become a directory named spaces"
+        );
+        assert_eq!(
+            super::unusable_env_path_reports_for("TEST_ROOT_BLANK"),
+            0,
+            "a blank AMOS_ROOT is a legitimate 'unset', not a reportable one"
+        );
+    }
+
+    #[test]
+    fn a_blank_cred_file_falls_through_to_home() {
+        let p = super::creds_path_with(
+            "TEST_CRED_BLANK",
+            "TEST_HOME_BLANK",
+            Some("   ".into()),
+            Some("/home/op".into()),
+        );
+        assert_eq!(
+            p,
+            Some(std::path::Path::new("/home/op").join(".amos").join("ai.key")),
+            "a whitespace-only AMOS_CRED_FILE must fall through to HOME, not become a path of spaces"
+        );
+        assert_eq!(super::unusable_env_path_reports_for("TEST_CRED_BLANK"), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_unicode_repo_root_is_reported_not_taken_as_unset() {
+        let _ = super::repo_root_with("TEST_ROOT_MOJIBAKE", Some(non_unicode(b"/opt/\xff/os")));
+        assert_eq!(
+            super::unusable_env_path_reports_for("TEST_ROOT_MOJIBAKE"),
+            1,
+            "a set-but-unreadable AMOS_ROOT must be reported, not silently treated as unset"
+        );
+    }
+
+    #[test]
+    fn an_unset_cred_file_and_home_are_none_and_silent() {
+        let p = super::creds_path_with("TEST_CRED_NONE", "TEST_HOME_NONE", None, None);
+        assert_eq!(p, None);
+        assert_eq!(super::unusable_env_path_reports_for("TEST_CRED_NONE"), 0);
+        assert_eq!(super::unusable_env_path_reports_for("TEST_HOME_NONE"), 0);
+    }
+
+    #[test]
+    fn a_usable_cred_file_wins_over_home() {
+        let p = super::creds_path_with(
+            "TEST_CRED_OK",
+            "TEST_HOME_OK",
+            Some("/run/amos/key".into()),
+            Some("/home/op".into()),
+        );
+        assert_eq!(p, Some(std::path::PathBuf::from("/run/amos/key")));
+    }
+
+    #[test]
+    fn a_usable_home_is_the_documented_key_path() {
+        let p = super::creds_path_with(
+            "TEST_CRED_HOME",
+            "TEST_HOME_OK2",
+            None,
+            Some("/home/op".into()),
+        );
+        assert_eq!(
+            p,
+            Some(
+                std::path::Path::new("/home/op")
+                    .join(".amos")
+                    .join("ai.key")
+            )
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_unicode_cred_file_is_reported_not_read_as_unset() {
+        let p = super::creds_path_with(
+            "TEST_CRED_MOJIBAKE",
+            "TEST_HOME_MOJIBAKE",
+            Some(non_unicode(b"/run/\xff.key")),
+            None,
+        );
+        assert_eq!(p, None);
+        assert_eq!(
+            super::unusable_env_path_reports_for("TEST_CRED_MOJIBAKE"),
+            1,
+            "a set-but-unreadable AMOS_CRED_FILE must be reported, not silently treated as unset"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_unicode_home_is_reported_not_read_as_none() {
+        let p = super::creds_path_with(
+            "TEST_CRED_HOME_NONE",
+            "TEST_HOME_MOJIBAKE2",
+            None,
+            Some(non_unicode(b"/home/\xfe")),
+        );
+        assert_eq!(p, None);
+        assert_eq!(
+            super::unusable_env_path_reports_for("TEST_HOME_MOJIBAKE2"),
+            1,
+            "a set-but-unreadable HOME must be reported, not silently dropped (the store crate already reports its HOME)"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_repeated_bad_path_is_reported_once() {
+        let key = "TEST_ROOT_DEDUP";
+        let _ = super::usable_env_path(key, Some(non_unicode(b"\xff\xfe")));
+        let _ = super::usable_env_path(key, Some(non_unicode(b"\xff\xfe")));
+        assert_eq!(super::unusable_env_path_reports_for(key), 1);
+    }
+
+    #[test]
+    fn the_bridge_reads_its_path_knobs_via_var_os_not_var() {
+        let src = include_str!("ai_bridge.rs");
+        for (var, konst) in [
+            ("AMOS_ROOT", "ROOT_ENV"),
+            ("AMOS_CRED_FILE", "CRED_ENV"),
+            ("HOME", "HOME_ENV"),
+        ] {
+            assert!(
+                src.contains(&format!("const {konst}: &str = \"{var}\";")),
+                "the {var} key const must exist so the seam and the environment cannot drift"
+            );
+            assert!(
+                src.contains(&format!("std::env::var_os({konst})")),
+                "{var} must be read with var_os so a set-but-non-Unicode value is reported \
+                 rather than silently treated as unset"
+            );
+            // The needle is assembled at run time so this test's *own* literal
+            // does not satisfy the `include_str!` scan it performs.
+            let folded = format!("std::env::var(\"{var}\")");
+            assert!(
+                !src.contains(&folded),
+                "the folded read of {var} must be gone"
+            );
+        }
     }
 }

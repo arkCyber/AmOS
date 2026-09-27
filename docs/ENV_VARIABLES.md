@@ -181,7 +181,7 @@
 | `AMOS_MEDIA_ROOT` | path | (none) | `→ empty` | 媒体文件根目录 |
 | `AMOS_MAIL_STORE` | path | (none) | `→ empty` | 邮件存储路径 |
 | `AMOS_FORM_FACTOR` | enum | `auto` | `→ auto` | 形态因子:`auto`/`desktop`/`mobile` |
-| `AMOS_ROOT` | path | (none) | `→ cwd` | 应用根目录 |
+| `AMOS_ROOT` | path | (none) | `→ exe-derived` | 应用根目录（`scripts/ai-backend.sh` + 守护进程 bin 所在）。未设 ∕ 纯空白 ⇒ 由可执行文件位置推导（静默）；**设了但读不回（非 Unicode）⇒ `warn!` 点名变量一次后按未设处理**（REQ-A2013 ∕ F-SH-957）。读取点:`crates/amos-tauri/src/ai_bridge.rs::repo_root` → `usable_env_path` |
 | `AMOS_DESKTOP_SHORTCUTS` | enum | `enabled` | `→ enabled` | 系统快捷键(`⌘W` / `⌘M` / `⌘H` / `⌘,`)作用于焦点窗口的开关:`enabled`(默认)/`disabled`(也接受 `shortcuts` 列表写法)。`disabled` ⇒ `DesktopShell.handleSystemShortcut` 与 `DesktopWindowKeys` 直接返回,焦点窗口仍可关,但**前端不抢键**(适合 WebView/宿主 OS 已经接管的场景,如 macOS 真机上的 `⌘H`)。**读取方是宿主**(`crates/amos-tauri/src/desktop_features.rs`,启动时解析并在 boot 日志里如实上报);UI 侧的答案缓存是 **per-WebView 的模块状态**,所以**每一个桌面壳面各自取一次**(启动器 `DesktopShell`、应用窗口 `DesktopAppWindow` —— REQ-A453 修掉的就是「只有启动器问过」⇒ 该开关在应用窗口里曾经完全不生效) —— WebView 里没有环境变量可读(REQ-A287),每个变量只管自己那一个能力,把另一个能力键写进来不会生效但在 boot 日志里有 warning | 
 | `AMOS_DOCK_CONTEXT_MENU` | enum | `enabled` | `→ enabled` | Dock 右键菜单开关:`enabled`(默认)/`disabled`(也接受 `dock-context-menu` 列表写法)。`disabled` ⇒ Dock 的 `oncontextmenu` 不弹 `DockContextMenu`(调试 / 自动化截图时用)。读取方/上报方式同上(REQ-A287) |
 | `AMOS_WEBMAN_DOWNLOAD_DIR` | path | (none) | `→ 平台 Downloads` | WebMan(浏览器)下载落盘目录覆盖。空串按**未设置**处理(不落 `""`);未设时 `dirs::download_dir()` → `$HOME/Downloads` → `temp_dir/amos-downloads`。读取点:`crates/amos-tauri/src/webman_download.rs::download_dir` |
@@ -253,7 +253,7 @@
 
 | 变量 | 类型 | 默认 | 失效语义 | 说明 |
 |------|------|------|----------|------|
-| `AMOS_CRED_FILE` | path | `~/.amos/ai.key` | `→ mkdir-p` | 云端 AI key 落盘路径(0600) |
+| `AMOS_CRED_FILE` | path | `~/.amos/ai.key` | `→ mkdir-p` | 云端 AI key 落盘路径(0600)。未设 ∕ 纯空白 ⇒ 回退 `$HOME/.amos/ai.key`（静默）；`$HOME` 也未设 ⇒ 无凭证路径（用户可见告警）；**设了但读不回（非 Unicode）⇒ `warn!` 点名变量一次后按未设处理**（REQ-A2013 ∕ F-SH-957 —— 旧读取 `if let Ok(f) = std::env::var(..)` 把此态静默折成「未设」）。读取点:`crates/amos-tauri/src/ai_bridge.rs::creds_path` → `usable_env_path` |
 
 ---
 
