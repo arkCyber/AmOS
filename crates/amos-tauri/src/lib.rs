@@ -1107,7 +1107,7 @@ pub fn run() {
                 // no effect. That is a one-word mistake an operator cannot see from the
                 // outside, so it is reported rather than left as a capability that
                 // simply never moved.
-                let stray = desktop_features::stray_vars(|k| std::env::var(k).ok());
+                let stray = desktop_features::stray_vars(desktop_features::env_knob);
                 if !stray.is_empty() {
                     tracing::warn!(
                         vars = ?stray,

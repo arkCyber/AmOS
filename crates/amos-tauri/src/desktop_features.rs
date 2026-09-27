@@ -21,7 +21,7 @@
 //!
 //! Parsing is a **pure function** ([`disabled_for`]): env-mutating tests are a race in a
 //! parallel runner, so every rule below is tested through a lookup closure, and the only
-//! non-pure code is the thin [`disabled_from_env`] wrapper.
+//! non-pure code is the thin [`env_knob`] reader every caller shares.
 
 /// Env var that switches the desktop shell's keyboard shortcuts (`⌘W`/`⌘M`/`⌘H`/`⌘,`).
 pub const SHORTCUTS_ENV: &str = "AMOS_DESKTOP_SHORTCUTS";
@@ -131,7 +131,7 @@ where
 /// Resolve every disabled capability using `lookup(env_var)`.
 ///
 /// The lookup form is what makes this testable without touching the process environment:
-/// production passes [`std::env::var`], tests pass a closure.
+/// production passes [`env_knob`], tests pass a closure.
 pub fn disabled_from<F>(lookup: F) -> Vec<&'static str>
 where
     F: Fn(&str) -> Option<String>,
@@ -143,11 +143,79 @@ where
         .collect()
 }
 
+/// What one switch's environment variable turned out to be.
+///
+/// The three states are the whole point. The previous reader was `std::env::var(..).ok()`,
+/// and `std::env::var` answers `Err` for **both** "the variable is not present" and "the
+/// variable is present but this process cannot decode it" — so
+/// `AMOS_DESKTOP_SHORTCUTS=<undecodable>` silently left the shortcuts **on** with no log
+/// line, and the operator's switch was ignored without a trace. The capability stays on in
+/// both cases (the documented default), but only one of them is somebody having set
+/// something, and that one is reported.
+#[derive(Debug, PartialEq, Eq)]
+enum Knob {
+    /// Not present at all — the documented default applies, silently.
+    Unset,
+    /// Present and readable.
+    Value(String),
+    /// Present but not valid Unicode: reported, then the documented default applies.
+    Undecodable,
+}
+
+/// The switch variables already reported as non-Unicode. [`disabled_from_env`] and the boot
+/// path's [`stray_vars`] call each read *both* variables, so a warning emitted per read
+/// would print twice per boot — log flooding is its own defect.
+fn reported_undecodable() -> &'static std::sync::Mutex<std::collections::BTreeSet<String>> {
+    static REPORTED: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeSet<String>>> =
+        std::sync::OnceLock::new();
+    REPORTED.get_or_init(Default::default)
+}
+
+/// Classify one switch variable's raw value, reporting a value this process cannot decode.
+fn classify(key: &str, raw: Option<std::ffi::OsString>) -> Knob {
+    match raw {
+        None => Knob::Unset,
+        Some(os) => match os.into_string() {
+            Ok(value) => Knob::Value(value),
+            Err(os) => {
+                let first = reported_undecodable()
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .insert(key.to_owned());
+                if first {
+                    tracing::warn!(
+                        target: "amos::desktop_features",
+                        var = key,
+                        value = %os.to_string_lossy(),
+                        "a desktop-shell switch is set but is not valid Unicode; treating it as \
+                         unset (the capability stays enabled — the documented default). Fix or \
+                         unset the variable."
+                    );
+                }
+                Knob::Undecodable
+            }
+        },
+    }
+}
+
+/// The `lookup` shape [`disabled_from`] and [`stray_vars`] take. `Unset` and `Undecodable`
+/// both resolve to the documented default; the difference is that the latter was reported.
+fn knob_value(key: &str, raw: Option<std::ffi::OsString>) -> Option<String> {
+    match classify(key, raw) {
+        Knob::Value(value) => Some(value),
+        Knob::Unset | Knob::Undecodable => None,
+    }
+}
+
+/// Read one switch from the process environment — the one production reader, so the fold
+/// above cannot creep back into the capability list or the stray-key report alone.
+pub fn env_knob(key: &str) -> Option<String> {
+    knob_value(key, std::env::var_os(key))
+}
+
 /// Resolve every disabled capability from the process environment.
 pub fn disabled_from_env() -> Vec<&'static str> {
-    // `.ok()`: a non-unicode value is "not readable" ⇒ the capability stays on
-    // (documented default), the same direction every other unreadable value takes.
-    disabled_from(|key| std::env::var(key).ok())
+    disabled_from(env_knob)
 }
 
 /// The capabilities the operator switched off with `AMOS_DESKTOP_SHORTCUTS` /
@@ -177,6 +245,67 @@ mod tests {
                 .find(|(k, _)| *k == key)
                 .map(|(_, v)| (*v).to_string())
         })
+    }
+
+    /// The switch a `.ok()` read folded away: the variable **is** set, this process just
+    /// cannot decode it. The old reader answered `None` here — the same answer as "not set
+    /// at all" — so the operator's switch was ignored and nothing was logged.
+    #[test]
+    fn a_switch_set_to_something_undecodable_is_reported_not_folded_into_unset() {
+        use std::os::unix::ffi::OsStringExt;
+        let undecodable = std::ffi::OsString::from_vec(vec![0x80, 0xfe]);
+        assert_eq!(classify(SHORTCUTS_ENV, None), Knob::Unset);
+        assert_eq!(
+            classify(SHORTCUTS_ENV, Some(undecodable.clone())),
+            Knob::Undecodable
+        );
+        // This is the distinction the fold destroyed — and it is what the report keys off.
+        assert_ne!(
+            classify(SHORTCUTS_ENV, Some(undecodable.clone())),
+            Knob::Unset
+        );
+        // A readable value is untouched …
+        assert_eq!(
+            classify(SHORTCUTS_ENV, Some("disabled".into())),
+            Knob::Value("disabled".into())
+        );
+        // … and the value seam still hands both non-value states the documented default.
+        assert_eq!(knob_value(SHORTCUTS_ENV, Some(undecodable)), None);
+        assert_eq!(knob_value(SHORTCUTS_ENV, None), None);
+        assert_eq!(
+            knob_value(SHORTCUTS_ENV, Some("disabled".into())).as_deref(),
+            Some("disabled")
+        );
+    }
+
+    /// Both switch reads must go through the one seam: `std::env::var(..).ok()` is the fold
+    /// this round removed, so it must not come back into either the capability list
+    /// ([`disabled_from_env`]) or the boot path's stray-key report (in `lib.rs`).
+    #[test]
+    fn both_switches_are_read_through_the_one_seam() {
+        // Production slice only, comments dropped: the tests below and the doc comments
+        // above legitimately *name* the removed `std::env::var(..).ok()` reader.
+        let production: String = include_str!("desktop_features.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("desktop_features.rs has a production section")
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !production.contains("std::env::var("),
+            "the switch reads must use `std::env::var_os` + `classify`, not `.ok()`"
+        );
+        assert!(
+            production.contains("std::env::var_os("),
+            "the one production reader must still exist"
+        );
+        let host = include_str!("lib.rs");
+        assert!(
+            host.contains("stray_vars(desktop_features::env_knob)"),
+            "lib.rs must resolve the stray-key report through the seam"
+        );
     }
 
     #[test]
