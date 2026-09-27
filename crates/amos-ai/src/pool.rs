@@ -26,6 +26,24 @@ use tokio::sync::Semaphore;
 /// Default generation-pool capacity — the documented `AMOS_MAX_SESSIONS` default.
 pub const DEFAULT_POOL_CAPACITY: usize = 16;
 
+/// The env key the generation-pool capacity is read from.
+const CAPACITY_ENV: &str = "AMOS_MAX_SESSIONS";
+
+fn fallback_capacity() -> NonZeroUsize {
+    NonZeroUsize::new(DEFAULT_POOL_CAPACITY).unwrap_or(NonZeroUsize::MIN)
+}
+
+/// Pure capacity resolution: unset (or blank) ⇒ the default; a usable count ⇒
+/// that count; a value set but unusable ⇒ reported once, then the default. `< 1`
+/// (a zero) falls back too — a zero-slot pool is unrepresentable. (REQ-A2000 /
+/// F-AI-062)
+fn capacity_from(key: &str, raw: Option<std::ffi::OsString>) -> NonZeroUsize {
+    crate::energy::number_from(key, raw)
+        .and_then(|n| usize::try_from(n).ok())
+        .and_then(NonZeroUsize::new)
+        .unwrap_or_else(fallback_capacity)
+}
+
 /// Why an acquire did not get a generation slot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PoolError {
@@ -102,14 +120,7 @@ impl GenerationPool {
     /// [`DEFAULT_POOL_CAPACITY`]. Values `< 1` fall back too (a zero-slot pool is
     /// unrepresentable — capacity is a `NonZeroUsize`).
     pub fn from_env() -> Self {
-        let capacity = std::env::var("AMOS_MAX_SESSIONS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .and_then(NonZeroUsize::new)
-            .unwrap_or_else(|| {
-                NonZeroUsize::new(DEFAULT_POOL_CAPACITY).unwrap_or(NonZeroUsize::MIN)
-            });
-        Self::new(capacity)
+        Self::new(capacity_from(CAPACITY_ENV, std::env::var_os(CAPACITY_ENV)))
     }
 
     /// Fixed capacity (never changes after construction).
@@ -382,6 +393,51 @@ mod tests {
         // `DEFAULT_POOL_CAPACITY` is the documented `AMOS_MAX_SESSIONS` default;
         // changing it silently would make cli.rs USAGE / the docs a lie.
         assert_eq!(DEFAULT_POOL_CAPACITY, 16);
+    }
+
+    #[test]
+    fn an_unset_capacity_is_the_default_and_silent() {
+        assert_eq!(capacity_from("TEST_POOL_CAP_UNSET", None).get(), 16);
+        assert_eq!(
+            crate::energy::bad_number_reports_for("TEST_POOL_CAP_UNSET"),
+            0
+        );
+    }
+
+    #[test]
+    fn a_usable_capacity_is_read_as_given() {
+        assert_eq!(capacity_from("TEST_POOL_CAP_OK", Some("4".into())).get(), 4);
+        assert_eq!(crate::energy::bad_number_reports_for("TEST_POOL_CAP_OK"), 0);
+    }
+
+    #[test]
+    fn a_zero_capacity_falls_back_silently() {
+        // Documented contract: `< 1` falls back (a zero-slot pool is unrepresentable).
+        assert_eq!(
+            capacity_from("TEST_POOL_CAP_ZERO", Some("0".into())).get(),
+            16
+        );
+        assert_eq!(
+            crate::energy::bad_number_reports_for("TEST_POOL_CAP_ZERO"),
+            0
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_unicode_capacity_is_reported_not_read_as_the_default() {
+        use std::os::unix::ffi::OsStringExt;
+        let key = "TEST_POOL_CAP_MOJIBAKE";
+        let raw = std::ffi::OsString::from_vec(vec![0xff, 0xfe]);
+        assert_eq!(capacity_from(key, Some(raw)).get(), 16);
+        assert_eq!(crate::energy::bad_number_reports_for(key), 1);
+    }
+
+    #[test]
+    fn a_non_numeric_capacity_is_reported_not_read_as_the_default() {
+        let key = "TEST_POOL_CAP_TEXT";
+        assert_eq!(capacity_from(key, Some("lots".into())).get(), 16);
+        assert_eq!(crate::energy::bad_number_reports_for(key), 1);
     }
 
     #[tokio::test]

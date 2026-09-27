@@ -354,6 +354,69 @@ pub(crate) fn bad_flag_reports_for(key: &str) -> usize {
         .count()
 }
 
+/// Read and parse an optional **numeric** env knob, keeping three facts apart:
+/// **unset** (silent, `None`), a **usable** number, and a value the operator set
+/// but which is unusable — either present but not valid Unicode, or not a number.
+/// Each unusable `(key, value)` is reported at WARN once per process. A *blank*
+/// value is treated as unset, silently (a blank is "nothing typed", not a typed
+/// mistake).
+///
+/// `std::env::var(..).ok().and_then(|v| v.parse().ok())` folded all three into one
+/// silent `None`, so a set-but-unreadable override was indistinguishable from an
+/// unset one — the same defect [`env_flag`] was fixed for in the bool direction.
+/// `pub(crate)` so every numeric knob in this crate shares one rule. (REQ-A2000 /
+/// F-AI-062)
+pub(crate) fn number_from(key: &str, raw: Option<std::ffi::OsString>) -> Option<u64> {
+    let raw = raw?;
+    let Some(s) = raw.to_str() else {
+        warn_once_bad_number(key, "<non-Unicode>");
+        return None;
+    };
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    match s.parse::<u64>() {
+        Ok(n) => Some(n),
+        Err(_) => {
+            warn_once_bad_number(key, s);
+            None
+        }
+    }
+}
+
+/// The `(key, value)` pairs already reported as an unusable number (see
+/// [`warn_once_bad_number`]).
+fn bad_number_seen() -> &'static Mutex<BTreeSet<(String, String)>> {
+    static SEEN: OnceLock<Mutex<BTreeSet<(String, String)>>> = OnceLock::new();
+    SEEN.get_or_init(Default::default)
+}
+
+fn warn_once_bad_number(key: &str, value: &str) {
+    let first = bad_number_seen()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert((key.to_owned(), value.to_owned()));
+    if first {
+        tracing::warn!(
+            key,
+            value,
+            "amos-ai energy: {key} is set to a value that is not a usable number — treating it \
+             as unset so the caller's documented default applies"
+        );
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn bad_number_reports_for(key: &str) -> usize {
+    bad_number_seen()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .filter(|(k, _)| k == key)
+        .count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
