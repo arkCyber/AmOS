@@ -24,7 +24,7 @@
 | `AMOS_USER_MODELS_DIR` | path | (none) | `→ ~/.amos/models` | 用户安装模型目录;解析链**第三**顺位(`{dir}/<file>`)。未设时回退 `~/.amos/models`。任一 env 值超过 `MAX_MODEL_PATH_BYTES = 4096` 或为空白 ⇒ 记 warn 并**忽略**(不截断成意外路径) |
 | `AMOS_GGML_BIN` | path | - | `→ ggml-skip` | GGML 二进制路径 |
 | `AMOS_GGML_MODEL` | path | - | `→ ggml-skip` | GGML 模型 |
-| `AMOS_GGML_STRICT` | bool | `0` | `→ best-effort` | 设为 `1` 时,真实引擎不可用即**拒绝启动**,不降级到 mock |
+| `AMOS_GGML_STRICT` | bool | `0` | `→ best-effort`（集合外值告警一次后回退） | 真实引擎不可用时是否**拒绝启动**而不降级到 mock。truthy `1`/`true`/`yes`/`on`,off `0`/`false`/`no`/`off`;未设静默;拼错 ∕ 空白 ∕ 非 Unicode 报告一次后按 best-effort(REQ-A1990) |
 | `AMOS_API_KEY` | secret | - | `→ mock` | 云端 API key(OpenAI/DeepSeek/Anthropic) |
 | `AMOS_API_ENDPOINT` | url | - | `→ mock` | OpenAI 兼容 endpoint |
 | `AMOS_HERMES_ENDPOINT` | url | - | `→ mock` | Hermes-Rust agent endpoint |
@@ -157,7 +157,7 @@
 | `AMOS_HOST_FS_ROOT` | path | (none) | `→ refuse-all` | `host_fs_*` 命令允许的根目录(启动期取一次、强校验)。未设/空 ⇒ 每个命令都 `amos.host_fs.root_not_configured`(最常见的失败,不是「路径太短」);设置了但不存在 ⇒ `root_not_found`;设置成非目录 ⇒ `root_not_a_dir` |
 | `AMOS_SCREEN_STATE_PATH` | path | (none) | `→ in-memory` | 屏幕状态文件(amoS-display) |
 | `AMOS_STATE_FILE` | path | (none) | `→ in-memory` | 通用状态文件 |
-| `AMOS_GUEST_CLIPBOARD_SOCKET` | path | (none) | `→ no-guest-link` | 容器剪贴板通道 |
+| `AMOS_GUEST_CLIPBOARD_SOCKET` | path | (none) | `→ no-guest-link`（非 Unicode 告警一次后按 inert） | 容器剪贴板通道;未设 ∕ 空白静默 inert;设了但读不回(非 Unicode)报告一次后仍 inert——状态据此区分「未设置」与「设了但读不回」(REQ-A1995) |
 
 ---
 
@@ -203,7 +203,7 @@
 | `AMOS_TIMESYNC` | bool | (未设置) | `→ off` | 是否武装周期校时(特性 `timesync`)。truthy `1`/`true`/`yes`/`on`,falsy `0`/`false`/`no`/`off`;未设与 falsy **静默** off,**两集之外的存在值** ⇒ off 且 `warn!` 一次(与 `energy::parse_flag` ∕ 播客 live 闸同一约定)。读取点:`…::decide_enabled` |
 | `AMOS_TIMESYNC_STATE` | path | `~/.amos/timesync.json` | `→ 同默认` | 上次校准偏移的落盘位置(`$HOME/.amos/timesync.json`;无 `HOME` 时 `.amos-timesync.json`),并导出给被监管的子进程。**不是**内存态。读取点:`…::default_state_file` |
 | `AMOS_TIMESYNC_INTERVAL_SECS` | int | `3600` | `→ 3600` | 两次校准的间隔(秒),默认 **1 小时**(`DEFAULT_INTERVAL`)。非数值 ∕ 非 Unicode ⇒ `warn!` 后回落 3600;`0` 被夹到下限 `1s`(**不是**回落到默认 —— 「太小」的答案是下限)。读取点:`…::decide_interval` |
-| `AMOS_NETGUARD_STATE_PATH` | path | (none) | `→ in-memory` | 网络守卫状态 |
+| `AMOS_NETGUARD_STATE_PATH` | path | (none) | `→ in-memory`（空白 ∕ 非 Unicode 告警一次后回退） | 网络守卫 armed 意图 + 声明注册表的落盘路径（未设 ⇒ 纯内存，静默；空白 ∕ 非 Unicode 报告一次）。读取点:`crates/amos-ai/src/netguard_service.rs::state_path_from_env` |
 | `AMOS_NETGUARD_ALLOW_INJECT` | bool | `0` | `→ observed-only`（集合外值告警一次后回退） | 是否允许注入 netguard 状态（未设静默；拼错 ∕ 空白 ∕ 非 Unicode 报告一次） |
 | `AMOS_SPY_IFACE` | string | (none) | `→ all-ifaces` | 抓包接口 |
 | `AMOS_SPY_LAYER3` | bool | (none) | `→ L2-default` | 抓包是否下沉到 L3(`rmnet`-style IPv4 接口);**严格读**:truthy `1`/`true`/`yes`/`on`、off `0`/`false`/`no`/`off`;未设置按 L2 处理(静默),两个集合之外的值(含空串与笔误)**按 L2 处理并 `warn!`** —— 它不只是开关,还是 L2/L3 取帧的选择,无声读成 L2 会让抓包恰好漏掉操作员要的那些包(REQ-A1903) |

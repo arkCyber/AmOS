@@ -508,12 +508,71 @@ pub fn server() -> NetGuardServiceServer<NetGuardSvc> {
     NetGuardServiceServer::new(bootstrap())
 }
 
-/// Resolve the durable state path from `AMOS_NETGUARD_STATE_PATH` (empty => none).
+/// Resolve the durable state path from `AMOS_NETGUARD_STATE_PATH`.
+///
+/// A **genuinely unset** variable is the documented in-memory default and stays
+/// silent. A value the operator *did* set that names no usable path — not valid
+/// Unicode, or blank/whitespace-only — is reported once and read as unset.
+/// `std::env::var(..).ok()` folded both into plain absence, so a state path that
+/// could not be read silently dropped the persisted armed intent and declared
+/// egress registry to memory-only, with nothing on the operator's only view of
+/// it. The sibling audit-path knob keeps the same two facts apart
+/// ([`crate::audit::trail_env`]) (REQ-A1992 / F-AI-059).
 fn state_path_from_env() -> Option<PathBuf> {
-    std::env::var(STATE_ENV)
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
+    state_path_from(STATE_ENV, std::env::var_os(STATE_ENV))
+}
+
+/// [`state_path_from_env`] with the raw value supplied by the caller, so the
+/// reading rule is testable without mutating the process environment.
+fn state_path_from(key: &str, raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let raw = raw?;
+    let s = match raw.into_string() {
+        Ok(s) => s,
+        Err(_) => {
+            warn_once_bad_state_path(key, "<non-Unicode>");
+            return None;
+        }
+    };
+    let s = s.trim();
+    if s.is_empty() {
+        warn_once_bad_state_path(key, "<blank>");
+        return None;
+    }
+    Some(PathBuf::from(s))
+}
+
+/// The `(key, reason)` pairs already reported as an unusable state path, so a
+/// reader that can run more than once does not repeat the same warning.
+fn bad_state_path_seen() -> &'static Mutex<std::collections::BTreeSet<(String, String)>> {
+    static SEEN: std::sync::OnceLock<Mutex<std::collections::BTreeSet<(String, String)>>> =
+        std::sync::OnceLock::new();
+    SEEN.get_or_init(Default::default)
+}
+
+/// Log an unusable state path at WARN, once per distinct `(key, reason)`.
+fn warn_once_bad_state_path(key: &str, why: &str) {
+    let first = bad_state_path_seen()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert((key.to_owned(), why.to_owned()));
+    if first {
+        tracing::warn!(
+            key,
+            why,
+            "amos-ai netguard: {key} names no usable state path — read as unset, so the \
+             persisted armed intent and declared egress registry stay in-memory"
+        );
+    }
+}
+
+#[cfg(test)]
+fn bad_state_path_reports_for(key: &str) -> usize {
+    bad_state_path_seen()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .filter(|(k, _)| k == key)
+        .count()
 }
 
 /// Read the persisted state (armed intent + declared registry).
@@ -724,6 +783,65 @@ mod tests {
         let raw = std::ffi::OsString::from_vec(vec![0xff, 0xfe]);
         assert!(!injection_allowed_from(K, Some(raw)));
         assert_eq!(crate::energy::bad_flag_reports_for(K), 1);
+    }
+
+    // --- REQ-A1992: the durable-state path knob keeps "unset" apart from
+    // "set but unusable", so an unreadable `AMOS_NETGUARD_STATE_PATH` cannot
+    // silently drop the persisted armed intent + declared registry to memory. ---
+
+    #[test]
+    fn an_unset_state_path_is_none_and_silent() {
+        const K: &str = "TEST_NG_STATE_UNSET";
+        assert_eq!(state_path_from(K, None), None);
+        assert_eq!(bad_state_path_reports_for(K), 0);
+    }
+
+    #[test]
+    fn a_unicode_state_path_is_read_as_given() {
+        const K: &str = "TEST_NG_STATE_OK";
+        assert_eq!(
+            state_path_from(K, Some("/data/amos/netguard.json".into())),
+            Some(PathBuf::from("/data/amos/netguard.json"))
+        );
+        assert_eq!(bad_state_path_reports_for(K), 0);
+    }
+
+    #[test]
+    fn a_blank_state_path_is_reported_not_read_as_unset() {
+        const K: &str = "TEST_NG_STATE_BLANK";
+        assert_eq!(state_path_from(K, Some("   ".into())), None);
+        assert_eq!(
+            bad_state_path_reports_for(K),
+            1,
+            "the operator blanked the setting — it is present, not absent"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_unicode_state_path_is_reported_not_read_as_unset() {
+        use std::os::unix::ffi::OsStringExt;
+        const K: &str = "TEST_NG_STATE_MOJIBAKE";
+        let raw = std::ffi::OsString::from_vec(vec![0xff, 0xfe]);
+        assert_eq!(state_path_from(K, Some(raw)), None);
+        assert_eq!(
+            bad_state_path_reports_for(K),
+            1,
+            "a set-but-unreadable path must be reported, not folded into unset"
+        );
+    }
+
+    #[test]
+    fn a_repeated_bad_state_path_is_reported_once() {
+        const K: &str = "TEST_NG_STATE_DEDUP";
+        assert_eq!(state_path_from(K, Some("".into())), None);
+        assert_eq!(bad_state_path_reports_for(K), 1);
+        assert_eq!(state_path_from(K, Some("".into())), None);
+        assert_eq!(
+            bad_state_path_reports_for(K),
+            1,
+            "the same bad value is not news twice"
+        );
     }
 
     /// A [`NetworkGuard`] spy: records how many policies it was asked to apply,
