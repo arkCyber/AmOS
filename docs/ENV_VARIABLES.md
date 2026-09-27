@@ -18,7 +18,7 @@
 | 变量 | 类型 | 默认 | 失效语义 | 说明 |
 |------|------|------|----------|------|
 | `AMOS_BACKEND` | enum | (启动探测) | `→ mock` | 推理后端选择:`mock`/`api`/`ollama`/`hermes`/`ggml`。非 mock 后端若不可达 ⇒ 记 `degraded` 而**不**假装 mock |
-| `AMOS_MODEL` | string | (后端相关) | `→ backend-default` | 模型标识(如 `gpt-4o-mini`、`deepseek-chat`) |
+| `AMOS_MODEL` | string | (后端相关) | `→ backend-default` | 模型标识(如 `gpt-4o-mini`、`deepseek-chat`)。**三态**:未设 ⇒ 各后端文档默认(静默);非空白可读值 ⇒ 逐字(空白照旧原样传给后端,不改判);**设了但读不回(非 Unicode)⇒ `warn!` 点名变量一次后取默认**(REQ-A2023 ∕ F-AI-067 —— 旧读取 `std::env::var(..).ok()` ∕ `unwrap_or_else(|_| ..)` 静默取默认)。读取点:`crates/amos-ai/src/server.rs::build_backend_from_env` → `env_knob_or_env`;`resolve_ollama_model` → `env_knob` |
 | `AMOS_MODEL_PATH` | path | - | `→ ggml-skip` | GGML 模型文件路径(模型解析链**第一**顺位:操作者覆盖) |
 | `AMOS_BUNDLE_ASSETS_DIR` | path | (none) | `→ 内置根回退` | 随镜像打包的资源根;模型解析链**第二**顺位(`{dir}/models/<file>`)。未设时回退到固定内置根 `/data/amos`、`/system/share/amos`、`/system/etc/amos` |
 | `AMOS_USER_MODELS_DIR` | path | (none) | `→ ~/.amos/models` | 用户安装模型目录;解析链**第三**顺位(`{dir}/<file>`)。未设时回退 `~/.amos/models`。任一 env 值超过 `MAX_MODEL_PATH_BYTES = 4096` 或为空白 ⇒ 记 warn 并**忽略**(不截断成意外路径) |
@@ -26,10 +26,10 @@
 | `AMOS_GGML_MODEL` | path | - | `→ ggml-skip` | GGML 模型 |
 | `AMOS_GGML_STRICT` | bool | `0` | `→ best-effort`（集合外值告警一次后回退） | 真实引擎不可用时是否**拒绝启动**而不降级到 mock。truthy `1`/`true`/`yes`/`on`,off `0`/`false`/`no`/`off`;未设静默;拼错 ∕ 空白 ∕ 非 Unicode 报告一次后按 best-effort(REQ-A1990) |
 | `AMOS_API_KEY` | secret | - | `→ mock` | 云端 API key(OpenAI/DeepSeek/Anthropic) |
-| `AMOS_API_ENDPOINT` | url | - | `→ mock` | OpenAI 兼容 endpoint |
-| `AMOS_HERMES_ENDPOINT` | url | - | `→ mock` | Hermes-Rust agent endpoint |
-| `AMOS_OLLAMA_HOST` | url | `http://localhost:11434` | `→ ollama-fail` | Ollama 服务地址 |
-| `AMOS_OLLAMA_API_KEY` | secret | - | `→ no-auth` | Ollama /v1 token 鉴权(可选) |
+| `AMOS_API_ENDPOINT` | url | - | `→ mock` | OpenAI 兼容 endpoint(api ∕ anthropic ∕ gemini 三处复用)。**三态**:未设 ⇒ 文档默认(静默);非空白可读值 ⇒ 逐字;**设了但读不回(非 Unicode)⇒ `warn!` 一次后回退**(api 走 `env_knob_or_env`,anthropic ∕ gemini 走 `env_knob_filtered_env`)。读取点:`crates/amos-ai/src/server.rs::build_backend_from_env`(REQ-A2023 ∕ F-AI-067) |
+| `AMOS_HERMES_ENDPOINT` | url | - | `→ mock` | Hermes-Rust agent endpoint。**三态**:未设 ∕ 纯空白 ⇒ 文档默认(静默);可读值 ⇒ 逐字;**设了但读不回(非 Unicode)⇒ `warn!` 一次后回退**;**且 `is_deployment_unconfigured` 把该态判为「操作者已钉住」(不再把配置过的部署误判为未配置)** —— 判据 `endpoint_is_pinned`,与取值用的 `env_knob_or_env` 刻意不同(REQ-A2023 ∕ F-AI-067) |
+| `AMOS_OLLAMA_HOST` | url | `http://localhost:11434` | `→ ollama-fail` | Ollama 服务地址。**三态**:未设 ∕ 纯空白 ⇒ 文档默认(静默);可读值 ⇒ 逐字;**设了但读不回(非 Unicode)⇒ `warn!` 一次后回退**;**且 `is_deployment_unconfigured` 把该态判为「操作者已钉住」**(判据 `endpoint_is_pinned`)。读取点:`crates/amos-ai/src/server.rs::build_backend_from_env` ∕ `resolve_ollama_model`(REQ-A2023 ∕ F-AI-067) |
+| `AMOS_OLLAMA_API_KEY` | secret | - | `→ no-auth` | Ollama /v1 token 鉴权(可选)。**三态**:未设 ∕ 空串 ⇒ 不发送(静默);可读值 ⇒ 作为 bearer;**设了但读不回(非 Unicode)⇒ `warn!` 一次后按「未设」处理**(不静默降级为匿名 —— 操作者以为已开鉴权)(REQ-A2023 ∕ F-AI-067,经 `env_knob_filtered_env`) |
 | `AMOS_GPU_LAYERS` | int | `0` | `→ cpu-only` | GGML GPU offload 层数 |
 | `AMOS_ACCEL` | enum | (SoC 自动探测) | `→ cpu-fallback` | 加速器后端:`cpu`/`nnapi`/`vulkan`/`metal`/`qnn`/`neuropilot` |
 
