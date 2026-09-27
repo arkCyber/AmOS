@@ -355,6 +355,29 @@ means in Chinese mode* are platform facts Kotlin cannot import from TypeScript, 
 `ImeOverlay.svelte`. `ImeLayoutTest`/`ImeRoutingTest` pin every value against the TS
 literals so the two cannot drift unnoticed.
 
+**The system IME offers the same one-shot Shift (REQ-A1957).** `ImeLayout.shiftAllowed`
+states the §Key behaviours rule — Shift is one-shot, means nothing in Chinese mode, and
+the arm is dropped when the mode changes — and the service consumes it: the bottom row's
+leading `⇧` chip is gated by `shiftAllowed` (disabled in Chinese mode, dimmed when
+disarmed, opaque when armed), `toggleShift()` refuses rather than arming a modifier that
+could not apply, and every letter key is cased through the pure
+`ImeLayout.shifted(ch, upper)` — the same transform as the WebView's `tap` — so the glyph
+a key **shows** and the glyph it **routes** cannot disagree. `upper` requires the letter
+page, mirroring the WebView's `!symbols`. Before this, `shiftAllowed` was documented and
+unit-tested but had **no consumer**: the system IME's English mode could not type an
+uppercase Latin letter, while the surface it mirrors could.
+
+**The system IME's digit key is an on-screen key, not the physical shortcut
+(REQ-A1965).** `ImeRouting` is a copy of the WebView's **on-screen** rule (`press` /
+`typeNonLetter`): the service's key grid is its only caller, and the service declares no
+physical-key handler — a key it does not act on is handed to the field. So its `3` key
+follows the non-letter rule (commit the in-flight code first, then type the digit
+half-width) and **not** the physical `1–9` candidate shortcut, which lives in
+`ImeOverlay.svelte`'s `onKeyDown` and has no counterpart here. Before this the table
+copied the *physical* rule into the on-screen path, so a tap on `3` while composing
+committed candidate #3 instead of typing `3` — and the candidate bar draws no number
+hints, so the pick was undiscoverable.
+
 **The entry point is inside AmOS (REQ-A1904).** The service above is only reachable
 once it is *enabled* **and** *selected*, and those are platform facts a user could
 previously change only by leaving AmOS for `设置 → 语言与输入法 → 键盘` — AmOS's own
@@ -608,15 +631,19 @@ re-asked on `visibilitychange` when the user comes back from the platform screen
   the switch writes the keyboard's preference **and follows the keyboard's own
   change**, the fuzzy controls call the same
   commands, the destructive reset asks first, and no engine ⇒ no inert controls.
-* `crates/amos-tauri/src/android_ime.rs` — **7** host tests: the wire encoder's exact
+* `crates/amos-tauri/src/android_ime.rs` — **8** host tests: the wire encoder's exact
   bytes for a composing session, the `commit`/`undo` records, the honest empty buffer,
-  a candidate containing a newline staying one record, and a key through the service
-  window encoding real candidates.
+  a candidate containing a newline staying one record, a key through the service
+  window encoding real candidates, and the wiring pins (the forget chip reads the undo
+  code alone, ⌫ deletes a code point, English mode offers the one-shot ⇧, and a digit
+  key follows the on-screen non-letter rule).
 * `android-glue/tests/.../ImeWireTest.kt` (9), `ImeLayoutTest.kt` (10),
   `ImeRoutingTest.kt` (14) — the system IME's host-JVM half: the wire decoder
   (every record, the escaping round trip, an unknown record tolerated, a null/empty
   answer meaning *unavailable*), the layout/punctuation/pager tables pinned against
   the `frontend-ts/src/lib/ime.ts` literals, and every arm of §Key behaviours
-  (space/enter commit-or-literal, backspace order, the `1–9` shortcut and its
-  off-page/digit-zero fallbacks, punctuation becoming Chinese after the commit).
+  (space/enter commit-or-literal, backspace order, a digit committing the code first
+  and being typed half-width — the *on-screen* rule the service's grid follows, not
+  the WebView's physical `1–9` shortcut, which has no counterpart in a service with
+  no physical-key path — punctuation becoming Chinese after the commit).
   Run by `make android-glue-check` (`scripts/android-glue-nv21-check.sh`).

@@ -16,6 +16,38 @@ use serde::Serialize;
 #[cfg(feature = "piper-tts")]
 use std::path::PathBuf;
 
+/// The environment variable naming the provisioned Piper voice directory.
+#[cfg(feature = "piper-tts")]
+const PIPER_MODEL_DIR_ENV: &str = "AMOS_PIPER_MODEL_DIR";
+
+/// Read the Piper voice directory from `AMOS_PIPER_MODEL_DIR`.
+///
+/// `std::env::var(..).ok()` folds **never set** together with **set but not
+/// valid Unicode** into one silent `None`. The first is the ordinary "no local
+/// voice, use the mock" case; the second is a configured-but-unreadable knob,
+/// which must be visible or the operator sees the mock and no reason why. So the
+/// two are kept apart: a non-Unicode value warns and is still treated as unset.
+///
+/// Pure (the raw `OsString` is injected) so the non-Unicode arm is reachable in a
+/// test, where a process can only hold one value per key at a time.
+///
+/// REQ-A1963 ∕ F-SH-949.
+#[cfg(feature = "piper-tts")]
+fn piper_dir_hint(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let os = raw?;
+    match os.to_str() {
+        Some(text) => Some(PathBuf::from(text)),
+        None => {
+            tracing::warn!(
+                env = PIPER_MODEL_DIR_ENV,
+                "Piper voice directory is set but not valid Unicode; treating it as unset \
+                 and using the mock voice"
+            );
+            None
+        }
+    }
+}
+
 /// Serializable synthesis result for the WebView.
 #[derive(Clone, Debug, Serialize)]
 pub struct TtsAudioPayload {
@@ -81,7 +113,7 @@ impl TtsBridge {
     /// voice is present or loading fails, so the caller keeps the mock.
     #[cfg(feature = "piper-tts")]
     fn local_piper_provider() -> Option<Arc<dyn TtsProvider>> {
-        let dir = PathBuf::from(std::env::var("AMOS_PIPER_MODEL_DIR").ok()?);
+        let dir = piper_dir_hint(std::env::var_os(PIPER_MODEL_DIR_ENV))?;
         let (onnx, voice) = amos_tts::resolve_voice(&dir)?;
         match PiperProvider::new(onnx, voice) {
             Ok(p) => {
@@ -242,5 +274,90 @@ mod tests {
                 "the system-context text cap must stay under the AI prompt cap"
             );
         }
+    }
+
+    /// A value that is set but is not valid Unicode — the third state
+    /// `std::env::var(..).ok()` folds into "unset".
+    #[cfg(all(feature = "piper-tts", unix))]
+    fn non_unicode_hint() -> std::ffi::OsString {
+        use std::os::unix::ffi::OsStringExt;
+        std::ffi::OsString::from_vec(vec![b'p', b'i', 0xff, 0xfe])
+    }
+
+    /// Counts WARN events, so an assertion is on the *observable* diagnostic and
+    /// not on a re-statement of the code. Mirrors `wm.rs::WarnProbe`.
+    #[cfg(feature = "piper-tts")]
+    struct WarnProbe(std::sync::Arc<std::sync::atomic::AtomicU64>);
+    #[cfg(feature = "piper-tts")]
+    impl tracing::Subscriber for WarnProbe {
+        fn enabled(&self, _m: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _s: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _id: &tracing::span::Id, _r: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _a: &tracing::span::Id, _b: &tracing::span::Id) {}
+        fn event(&self, ev: &tracing::Event<'_>) {
+            if ev.metadata().level() == &tracing::Level::WARN {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        fn enter(&self, _id: &tracing::span::Id) {}
+        fn exit(&self, _id: &tracing::span::Id) {}
+    }
+
+    /// Run `f` under a WARN probe and report its result plus how many WARNs it made.
+    #[cfg(feature = "piper-tts")]
+    fn warns_of<T>(f: impl FnOnce() -> T) -> (T, u64) {
+        let warns = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let out = {
+            let _probe = tracing::subscriber::set_default(WarnProbe(warns.clone()));
+            f()
+        };
+        (out, warns.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// REQ-A1963 ∕ F-SH-949: the reader used `std::env::var(..).ok()`, which folds
+    /// **never set** together with **set but not valid Unicode**. The first is the
+    /// ordinary "no local voice, use the mock" case; the second is a
+    /// configured-but-unreadable `AMOS_PIPER_MODEL_DIR`, which must not be
+    /// silently ignored — the sibling `Piper model load failed` arm already warns.
+    #[test]
+    #[cfg(all(feature = "piper-tts", unix))]
+    fn a_non_unicode_piper_dir_is_reported_not_read_as_unset() {
+        let (dir, warns) = warns_of(|| piper_dir_hint(Some(non_unicode_hint())));
+        assert_eq!(
+            dir, None,
+            "an unreadable directory cannot name a voice; the mock applies"
+        );
+        assert_eq!(
+            warns, 1,
+            "a configured-but-unreadable knob must be visible — the fold to `unset` was silent"
+        );
+    }
+
+    /// The other arm of the same rule: a genuinely unset variable is the silent case.
+    #[test]
+    #[cfg(feature = "piper-tts")]
+    fn an_unset_piper_dir_stays_silent() {
+        let (dir, warns) = warns_of(|| piper_dir_hint(None));
+        assert_eq!(dir, None);
+        assert_eq!(warns, 0, "an unset variable is not a finding");
+    }
+
+    /// A value that *is* valid Unicode is passed through untouched — even one that
+    /// names a directory with no voice files. That discovery is not this reader's
+    /// business (`resolve_voice` returns `None` on its own), and it must not turn
+    /// into a warning here.
+    #[test]
+    #[cfg(feature = "piper-tts")]
+    fn a_usable_piper_dir_passes_through_without_a_warning() {
+        let (dir, warns) = warns_of(|| piper_dir_hint(Some("/tmp/amos-piper".into())));
+        assert_eq!(
+            dir.as_deref(),
+            Some(std::path::Path::new("/tmp/amos-piper"))
+        );
+        assert_eq!(warns, 0);
     }
 }

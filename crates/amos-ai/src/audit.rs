@@ -246,6 +246,47 @@ pub fn shared_trail_config_from_values(
     })
 }
 
+/// Env key naming the explicit audit-trail path (wins over the privacy path).
+const AUDIT_PATH_ENV: &str = "AMOS_AUDIT_PATH";
+/// Env key naming the legacy privacy-state path the trail is derived from.
+const PRIVACY_PATH_ENV: &str = "AMOS_PRIVACY_PATH";
+/// Env key bounding the in-memory window.
+const AUDIT_MAX_ENTRIES_ENV: &str = "AMOS_AUDIT_MAX_ENTRIES";
+/// Env key bounding the active file before rotation.
+const AUDIT_MAX_BYTES_ENV: &str = "AMOS_AUDIT_MAX_BYTES";
+/// Env key for the number of rotated siblings kept.
+const AUDIT_KEEP_ENV: &str = "AMOS_AUDIT_KEEP";
+
+/// Read one trail knob, keeping "unset" apart from "set but unusable".
+///
+/// A **genuinely absent** variable is the documented in-memory default and stays
+/// silent. A value the operator *did* set that cannot be used — not valid Unicode,
+/// or blank/whitespace-only — is reported once, naming the variable, and read as
+/// unset. Without this, `std::env::var(..).ok()` folded both into plain absence,
+/// so an `AMOS_AUDIT_PATH` that could not be read silently dropped the durable
+/// audit trail to `<AMOS_PRIVACY_PATH>.jsonl` or to memory-only, with nothing on
+/// the operator's only view of it (REQ-A1961 / F-AI-042).
+fn trail_env(key: &'static str) -> Option<String> {
+    let raw = std::env::var_os(key)?;
+    match raw.to_str() {
+        Some(v) if !v.trim().is_empty() => Some(v.to_string()),
+        Some(_) => {
+            tracing::warn!(
+                env = key,
+                "value is blank — read as unset (the trail keeps its default)"
+            );
+            None
+        }
+        None => {
+            tracing::warn!(
+                env = key,
+                "value is not valid Unicode — read as unset (the trail keeps its default)"
+            );
+            None
+        }
+    }
+}
+
 /// Open the daemon's shared durable trail from the environment (`None` when
 /// neither `AMOS_AUDIT_PATH` nor `AMOS_PRIVACY_PATH` is set).
 ///
@@ -253,13 +294,19 @@ pub fn shared_trail_config_from_values(
 /// manager, so one `RecentTrail` read-back shows operation results *and* access
 /// decisions. A trail that cannot be opened degrades to memory-only with a
 /// warning — the daemon keeps serving, exactly like the log-file sink.
+///
+/// Only a **genuinely absent** path knob is silent — that is the documented
+/// memory-only default. A knob the operator set that is blank or not valid
+/// Unicode is reported ([`trail_env`]) rather than folded into that default, so a
+/// dropped `AMOS_AUDIT_PATH` cannot quietly turn a durable trail into an
+/// ephemeral one (REQ-A1961 / F-AI-042).
 pub fn shared_trail_from_env() -> Option<AuditFile> {
     let cfg = shared_trail_config_from_values(
-        std::env::var("AMOS_AUDIT_PATH").ok().as_deref(),
-        std::env::var("AMOS_PRIVACY_PATH").ok().as_deref(),
-        std::env::var("AMOS_AUDIT_MAX_ENTRIES").ok().as_deref(),
-        std::env::var("AMOS_AUDIT_MAX_BYTES").ok().as_deref(),
-        std::env::var("AMOS_AUDIT_KEEP").ok().as_deref(),
+        trail_env(AUDIT_PATH_ENV).as_deref(),
+        trail_env(PRIVACY_PATH_ENV).as_deref(),
+        trail_env(AUDIT_MAX_ENTRIES_ENV).as_deref(),
+        trail_env(AUDIT_MAX_BYTES_ENV).as_deref(),
+        trail_env(AUDIT_KEEP_ENV).as_deref(),
     )?;
     match AuditFile::open_rotating(&cfg.path, cfg.max_mem, cfg.max_bytes, cfg.keep) {
         Ok(file) => {
@@ -858,6 +905,173 @@ mod tests {
         let reopened = AuditFile::open(&path, 64).unwrap();
         assert_eq!(reopened.count().await, 2, "persisted, not just in memory");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- REQ-A1961 (F-AI-042): "unset" and "set but unusable" stay apart for the
+    // audit-trail knobs, so a dropped `AMOS_AUDIT_PATH` cannot silently turn a
+    // durable trail into a memory-only one. ---
+
+    const TRAIL_ENV_KEYS: [&str; 5] = [
+        AUDIT_PATH_ENV,
+        PRIVACY_PATH_ENV,
+        AUDIT_MAX_ENTRIES_ENV,
+        AUDIT_MAX_BYTES_ENV,
+        AUDIT_KEEP_ENV,
+    ];
+
+    /// Collects every WARN event's rendered fields on this thread, so an assertion
+    /// lands on the operator's only view of a dropped variable. Matching the *text*
+    /// (not a bare WARN count) keeps the probe honest if another producer ever fires
+    /// on this path — the lesson from the ASR reader's polluted count.
+    struct MsgProbe(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    struct FieldSink<'a>(&'a mut Vec<String>);
+    impl tracing::field::Visit for FieldSink<'_> {
+        fn record_debug(&mut self, _f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+            self.0.push(format!("{v:?}"));
+        }
+        fn record_str(&mut self, _f: &tracing::field::Field, v: &str) {
+            self.0.push(v.to_string());
+        }
+    }
+
+    impl tracing::Subscriber for MsgProbe {
+        fn enabled(&self, _m: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _s: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _id: &tracing::span::Id, _r: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _a: &tracing::span::Id, _b: &tracing::span::Id) {}
+        fn event(&self, ev: &tracing::Event<'_>) {
+            if ev.metadata().level() != &tracing::Level::WARN {
+                return;
+            }
+            let mut fields = Vec::new();
+            ev.record(&mut FieldSink(&mut fields));
+            self.0.lock().unwrap().push(fields.join(" "));
+        }
+        fn enter(&self, _id: &tracing::span::Id) {}
+        fn exit(&self, _id: &tracing::span::Id) {}
+    }
+
+    /// Run `f` under a WARN probe; return its result plus the WARN messages.
+    fn warns_of<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
+        let msgs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let out = {
+            let _p = tracing::subscriber::set_default(MsgProbe(msgs.clone()));
+            f()
+        };
+        let v = msgs.lock().unwrap().clone();
+        (out, v)
+    }
+
+    /// How many WARN messages name `key` (the `env = …` field and the prose both).
+    fn warns_naming(msgs: &[String], key: &str) -> usize {
+        msgs.iter().filter(|m| m.contains(key)).count()
+    }
+
+    /// Wipe the five trail knobs for the test, restoring the raw `OsString`s on drop
+    /// (so even a pre-existing non-Unicode value comes back byte-for-byte).
+    struct TrailEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl TrailEnv {
+        fn wiped() -> Self {
+            let saved = TRAIL_ENV_KEYS
+                .iter()
+                .map(|k| {
+                    let old = std::env::var_os(k);
+                    std::env::remove_var(k);
+                    (*k, old)
+                })
+                .collect();
+            Self(saved)
+        }
+    }
+    impl Drop for TrailEnv {
+        fn drop(&mut self) {
+            for (k, old) in &self.0 {
+                match old {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(audit_trail_env_lock)]
+    fn a_non_unicode_audit_path_is_reported_not_silently_read_as_unset() {
+        use std::os::unix::ffi::OsStrExt;
+        let _env = TrailEnv::wiped();
+        std::env::set_var(
+            AUDIT_PATH_ENV,
+            std::ffi::OsStr::from_bytes(b"/var/log/amos/\xff\xfe.jsonl"),
+        );
+
+        let (trail, msgs) = warns_of(shared_trail_from_env);
+
+        assert!(trail.is_none(), "no usable path ⇒ memory-only, honestly");
+        assert_eq!(
+            warns_naming(&msgs, AUDIT_PATH_ENV),
+            1,
+            "the operator set an audit path that could not be read — that must be \
+             reported, not folded into a silent unset; got {msgs:?}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(audit_trail_env_lock)]
+    fn a_blank_audit_path_is_reported_not_silently_read_as_unset() {
+        let _env = TrailEnv::wiped();
+        std::env::set_var(AUDIT_PATH_ENV, "   ");
+
+        let (trail, msgs) = warns_of(shared_trail_from_env);
+
+        assert!(trail.is_none());
+        assert_eq!(
+            warns_naming(&msgs, AUDIT_PATH_ENV),
+            1,
+            "a set-but-blank path is not the same as an unset one; got {msgs:?}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(audit_trail_env_lock)]
+    fn an_absent_audit_path_keeps_memory_only_without_a_warning() {
+        let _env = TrailEnv::wiped();
+
+        let (trail, msgs) = warns_of(shared_trail_from_env);
+
+        assert!(trail.is_none());
+        assert!(
+            msgs.is_empty(),
+            "the documented no-knobs default must stay silent; got {msgs:?}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(audit_trail_env_lock)]
+    fn a_usable_audit_path_is_adopted_without_a_warning() {
+        let _env = TrailEnv::wiped();
+        let dir = std::env::temp_dir().join(format!(
+            "amos-audit-trail-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var(AUDIT_PATH_ENV, dir.join("trail.jsonl"));
+
+        let (trail, msgs) = warns_of(shared_trail_from_env);
+
+        assert!(trail.is_some(), "a readable path is adopted");
+        assert!(msgs.is_empty(), "a usable knob must not warn; got {msgs:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

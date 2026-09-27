@@ -8,15 +8,18 @@ package com.amos.ai.glue
  * The engine (`amos-ime`) only ever sees ASCII letters: a key that is not a letter must
  * *commit the composition first* and then be inserted literally, or the symbol would
  * land **in front of** the Chinese the user typed while the code stayed composing
- * behind it. That ordering rule, the space/enter rule, the backspace order and the
- * `1–9` candidate shortcut are exactly what [decide] encodes — one function, so the
- * rule cannot depend on which key produced the keystroke (the same "both keyboards call
- * the same function" argument the WebView keyboard makes).
+ * behind it. That ordering rule, the space/enter rule and the backspace order are
+ * exactly what [decide] encodes — one function, so the rule cannot depend on which key
+ * produced the keystroke.
  *
  * This is a **platform-side copy** of the TS rule (`ImeOverlay.svelte`'s `press` /
- * `typeNonLetter`); `ImeRoutingTest.kt` pins every arm so the two cannot drift
- * silently. The engine remains the single source of truth for ranking — this object
- * only decides *where a key goes*.
+ * `typeNonLetter`), the *on-screen* half only: [decide] is called exclusively from the
+ * service's key grid, and the service declares no physical-key handler (a key it does not
+ * act on is handed to the field), so the WebView's **physical** `1–9` candidate shortcut
+ * (`onKeyDown`, `/^[1-9]$/`) has no counterpart here and must not be encoded as if it did.
+ * `ImeRoutingTest.kt` pins every arm so the two cannot drift silently. The engine
+ * remains the single source of truth for ranking — this object only decides *where a
+ * key goes*.
  */
 object ImeRouting {
 
@@ -87,22 +90,16 @@ object ImeRouting {
         // One key, two meanings, in the order a user expects: edit the pinyin first.
         KeyKind.BACKSPACE -> if (composing) Action.Backspace else Action.DeleteInField
 
-        // A digit picks the candidate on the showing page; a digit the page has no
-        // candidate for is still typed literally — but only after the code the user
-        // typed before it is committed, so the field reads `中国7` rather than `7中国`.
+        // A digit is a **non-letter** like any other, so it follows the on-screen rule:
+        // commit the in-flight code first, then type the digit, half-width (the ZH table
+        // names no digit — the "digits stay half-width in both modes" rule). It is
+        // deliberately NOT the physical `1–9` candidate shortcut (REQ-A1965): that lives
+        // in the WebView's `onKeyDown`, and this table is driven by taps only.
         //
         // The `composing && …` guard is the WebView's `composing && candidates.length
-        // > 0`, not bare `composing`: with nothing to commit there is no "first", and
-        // committing nothing would only re-read the state (the engine's `commit` is a
-        // no-op past the candidate list, so the field text is the same either way).
+        // > 0`, not bare `composing`: with nothing to commit there is no "first".
         KeyKind.DIGIT -> {
-            val n = key.ch.firstOrNull()?.minus('0') ?: 0
-            val hasCandidates = composing && candidatesOnPage > 0
-            when {
-                hasCandidates && n in 1..candidatesOnPage -> Action.Commit(n - 1)
-                hasCandidates -> Action.CommitThenInsert(key.ch)
-                else -> Action.Insert(key.ch)
-            }
+            if (composing && candidatesOnPage > 0) Action.CommitThenInsert(key.ch) else Action.Insert(key.ch)
         }
 
         // Punctuation: the Chinese glyph in Chinese mode, and never fed to the engine.

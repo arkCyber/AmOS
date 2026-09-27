@@ -259,6 +259,39 @@ fn emit(app: &AppHandle, payloads: Vec<InterpretEventPayload>) {
     }
 }
 
+/// The environment variable naming the provisioned sherpa-onnx model directory.
+#[cfg(feature = "sherpa-asr")]
+const SHERPA_MODEL_DIR_ENV: &str = "AMOS_SHERPA_MODEL_DIR";
+
+/// Read the sherpa model directory from `AMOS_SHERPA_MODEL_DIR`.
+///
+/// `std::env::var(..).ok()` folds **never set** together with **set but not
+/// valid Unicode** into one silent `None`. The first is the ordinary "not
+/// configured, use the daemon" case; the second is a configured-but-unreadable
+/// knob, which must be visible or the operator watches the daemon path run with
+/// no reason why. So the two are kept apart: a non-Unicode value warns and is
+/// still treated as unset.
+///
+/// Pure (the raw `OsString` is injected) so the non-Unicode arm is reachable in a
+/// test, where a process can only hold one value per key at a time.
+///
+/// REQ-A1963 ∕ F-SH-950.
+#[cfg(feature = "sherpa-asr")]
+fn sherpa_dir_hint(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let os = raw?;
+    match os.to_str() {
+        Some(text) => Some(PathBuf::from(text)),
+        None => {
+            tracing::warn!(
+                env = SHERPA_MODEL_DIR_ENV,
+                "sherpa model directory is set but not valid Unicode; treating it as unset \
+                 and using the daemon"
+            );
+            None
+        }
+    }
+}
+
 /// Build a composite **local sherpa ASR** + daemon-translation pipeline when the
 /// `sherpa-asr` feature is enabled and `AMOS_SHERPA_MODEL_DIR` points at a model
 /// directory with the standard sherpa files. Returns `None` (so callers fall
@@ -271,7 +304,7 @@ fn local_sherpa_pipeline(
 ) -> Option<Box<dyn Pipeline>> {
     use amos_asr::{sherpa_pipeline, SherpaOnlineRecognizerConfig};
 
-    let dir = PathBuf::from(std::env::var("AMOS_SHERPA_MODEL_DIR").ok()?);
+    let dir = sherpa_dir_hint(std::env::var_os(SHERPA_MODEL_DIR_ENV))?;
     let names = [
         "tokens.txt",
         "encoder-epoch-99-avg-1.int8.onnx",
@@ -875,5 +908,90 @@ mod tests {
             json.get("message").and_then(|m| m.as_str()).is_some(),
             "AmosError must keep the developer-facing message, not collapse it into code"
         );
+    }
+
+    /// A value that is set but is not valid Unicode — the third state
+    /// `std::env::var(..).ok()` folds into "unset".
+    #[cfg(all(feature = "sherpa-asr", unix))]
+    fn non_unicode_hint() -> std::ffi::OsString {
+        use std::os::unix::ffi::OsStringExt;
+        std::ffi::OsString::from_vec(vec![b's', b'h', 0xff, 0xfe])
+    }
+
+    /// Counts WARN events, so an assertion is on the *observable* diagnostic and
+    /// not on a re-statement of the code. Mirrors `wm.rs::WarnProbe`.
+    #[cfg(feature = "sherpa-asr")]
+    struct WarnProbe(std::sync::Arc<std::sync::atomic::AtomicU64>);
+    #[cfg(feature = "sherpa-asr")]
+    impl tracing::Subscriber for WarnProbe {
+        fn enabled(&self, _m: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _s: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _id: &tracing::span::Id, _r: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _a: &tracing::span::Id, _b: &tracing::span::Id) {}
+        fn event(&self, ev: &tracing::Event<'_>) {
+            if ev.metadata().level() == &tracing::Level::WARN {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        fn enter(&self, _id: &tracing::span::Id) {}
+        fn exit(&self, _id: &tracing::span::Id) {}
+    }
+
+    /// Run `f` under a WARN probe and report its result plus how many WARNs it made.
+    #[cfg(feature = "sherpa-asr")]
+    fn warns_of<T>(f: impl FnOnce() -> T) -> (T, u64) {
+        let warns = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let out = {
+            let _probe = tracing::subscriber::set_default(WarnProbe(warns.clone()));
+            f()
+        };
+        (out, warns.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// REQ-A1963 ∕ F-SH-950: the reader used `std::env::var(..).ok()`, which
+    /// folds **never set** together with **set but not valid Unicode**. The
+    /// first is the ordinary "not configured, use the daemon" case; the second is
+    /// a configured-but-unreadable `AMOS_SHERPA_MODEL_DIR`, which must not be
+    /// silently ignored.
+    #[test]
+    #[cfg(all(feature = "sherpa-asr", unix))]
+    fn a_non_unicode_sherpa_dir_is_reported_not_read_as_unset() {
+        let (dir, warns) = warns_of(|| sherpa_dir_hint(Some(non_unicode_hint())));
+        assert_eq!(
+            dir, None,
+            "an unreadable directory cannot name models; the daemon path applies"
+        );
+        assert_eq!(
+            warns, 1,
+            "a configured-but-unreadable knob must be visible — the fold to `unset` was silent"
+        );
+    }
+
+    /// The other arm of the same rule: a genuinely unset variable is the silent case.
+    #[test]
+    #[cfg(feature = "sherpa-asr")]
+    fn an_unset_sherpa_dir_stays_silent() {
+        let (dir, warns) = warns_of(|| sherpa_dir_hint(None));
+        assert_eq!(dir, None);
+        assert_eq!(warns, 0, "an unset variable is not a finding");
+    }
+
+    /// A value that *is* valid Unicode is passed through untouched — even one that
+    /// names a directory with no models. That discovery is not this reader's
+    /// business (the caller returns `None` on its own), and it must not turn into
+    /// a warning here.
+    #[test]
+    #[cfg(feature = "sherpa-asr")]
+    fn a_usable_sherpa_dir_passes_through_without_a_warning() {
+        let (dir, warns) = warns_of(|| sherpa_dir_hint(Some("/tmp/amos-sherpa".into())));
+        assert_eq!(
+            dir.as_deref(),
+            Some(std::path::Path::new("/tmp/amos-sherpa"))
+        );
+        assert_eq!(warns, 0);
     }
 }

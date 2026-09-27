@@ -260,14 +260,82 @@ impl Translator for TranslatorService {
     }
 }
 
+/// The `AMOS_TRANSLATE_BACKEND` tokens this reader understands.
+const KNOWN_TRANSLATE_BACKENDS: [&str; 2] = ["ollama", "mock"];
+
+/// The `AMOS_ASR_BACKEND` tokens **this** reader understands. It is the translate
+/// daemon's recognition set; `amos-ai`'s voice-input reader selects a different
+/// recognizer from the same variable, so the two do not share a vocabulary.
+const KNOWN_ASR_BACKENDS: [&str; 3] = ["mock", "whisper", "none"];
+
+/// The `(variable, value)` pairs already reported as unrecognised. A backend choice
+/// is read once per daemon start, but the helper is also reachable from tests and any
+/// future re-read, so the warning is deduped per distinct value — log flooding is its
+/// own defect.
+fn reported_backends() -> &'static std::sync::Mutex<std::collections::BTreeSet<(String, String)>> {
+    static REPORTED: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeSet<(String, String)>>,
+    > = std::sync::OnceLock::new();
+    REPORTED.get_or_init(Default::default)
+}
+
+/// Report (once per distinct value, per process) an enum-typed backend variable whose
+/// value this reader does not understand, before the caller falls back to its default.
+fn report_unrecognised_backend(var: &str, value: &str, expected: &str) {
+    let first = reported_backends()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert((var.to_owned(), value.to_owned()));
+    if first {
+        tracing::warn!(
+            env = var,
+            value,
+            "amos-translate: unrecognised backend — falling back to this daemon's documented \
+             default (expected {expected}; a truly unset variable is silent)"
+        );
+    }
+}
+
+/// Read an enum-typed backend variable, keeping three facts apart: **unset** (silent,
+/// `None`), a **known** token, and a value **outside the set** — a typo, a blank, a case
+/// variant, or a non-Unicode byte string. The last is not the same fact as "unset": it is
+/// reported once and then returned so the caller falls back to its documented default.
+/// Mirrors `amos_ai::chat_asr::ChatAsr::from_env` (the reader for the same
+/// `AMOS_ASR_BACKEND` variable); the previous `std::env::var(..).unwrap_or_else(..)` + `_`
+/// arm folded every typo into the default with no word.
+fn read_backend_env(var: &str, known: &[&str], expected: &str) -> Option<String> {
+    match std::env::var_os(var) {
+        // Truly unset — the ordinary, silent case.
+        None => None,
+        Some(raw) => match raw.to_str() {
+            Some(v) => {
+                if !known.contains(&v) {
+                    report_unrecognised_backend(var, v, expected);
+                }
+                Some(v.to_owned())
+            }
+            None => {
+                report_unrecognised_backend(var, "<non-Unicode>", expected);
+                None
+            }
+        },
+    }
+}
+
 /// Select and build the translation provider from the environment.
 ///
 ///   AMOS_TRANSLATE_BACKEND = "ollama" | "mock"   (default "ollama")
 ///   AMOS_TRANSLATE_HOST / AMOS_TRANSLATE_MODEL   (ollama)
 pub fn provider_from_env() -> Arc<dyn TranslationProvider> {
-    let kind = std::env::var("AMOS_TRANSLATE_BACKEND").unwrap_or_else(|_| "ollama".to_string());
-    match kind.as_str() {
-        "mock" => Arc::new(provider::MockProvider::default()),
+    let kind = read_backend_env(
+        "AMOS_TRANSLATE_BACKEND",
+        &KNOWN_TRANSLATE_BACKENDS,
+        "`ollama` or `mock`",
+    );
+    match kind.as_deref() {
+        Some("mock") => Arc::new(provider::MockProvider::default()),
+        // `ollama`, a genuinely unset variable, and an unrecognised value (already
+        // reported above) all select the documented default.
         _ => Arc::new(
             provider::OllamaProvider::new(
                 std::env::var("AMOS_TRANSLATE_HOST")
@@ -284,15 +352,20 @@ pub fn provider_from_env() -> Arc<dyn TranslationProvider> {
 ///   AMOS_ASR_BACKEND = "mock" | "whisper" | "none"   (default "none")
 ///   AMOS_ASR_ENDPOINT / AMOS_ASR_MODEL / AMOS_ASR_API_KEY   (whisper)
 pub fn recognizer_from_env() -> Option<Arc<dyn SpeechRecognizer>> {
-    let kind = std::env::var("AMOS_ASR_BACKEND").unwrap_or_else(|_| "none".to_string());
-    match kind.as_str() {
-        "mock" => Some(Arc::new(asr::MockRecognizer::default())),
-        "whisper" => Some(Arc::new(asr::WhisperProvider::new(
+    let kind = read_backend_env(
+        "AMOS_ASR_BACKEND",
+        &KNOWN_ASR_BACKENDS,
+        "`mock`, `whisper` or `none`",
+    );
+    match kind.as_deref() {
+        Some("mock") => Some(Arc::new(asr::MockRecognizer::default())),
+        Some("whisper") => Some(Arc::new(asr::WhisperProvider::new(
             std::env::var("AMOS_ASR_ENDPOINT")
                 .unwrap_or_else(|_| "http://localhost:11434/v1/audio/transcriptions".into()),
             std::env::var("AMOS_ASR_API_KEY").ok(),
             std::env::var("AMOS_ASR_MODEL").unwrap_or_else(|_| "whisper".into()),
         ))),
+        // `none` — and any value outside the set, already reported — disables ASR.
         _ => None,
     }
 }
@@ -541,5 +614,169 @@ mod tests {
             .into_inner();
         assert!(reply.recognized);
         assert_eq!(reply.text, "语音转写(模拟)(lang=zh,fmt=wav)");
+    }
+
+    // --- REQ-A1961 (F-TR-001): "unset" and "set but unrecognised" stay apart ---
+
+    use std::sync::Mutex;
+
+    /// Captures the `message` text of every event on this thread (via `set_default`), so
+    /// an assertion lands on the operator's only view of a discarded value rather than on
+    /// a restatement of the code.
+    #[derive(Default)]
+    struct Messages(Mutex<Vec<String>>);
+    struct MsgProbe(Arc<Messages>);
+    impl tracing::Subscriber for MsgProbe {
+        fn enabled(&self, _m: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _s: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _id: &tracing::span::Id, _r: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _a: &tracing::span::Id, _b: &tracing::span::Id) {}
+        fn event(&self, ev: &tracing::Event<'_>) {
+            let mut v = MsgVisitor(String::new());
+            ev.record(&mut v);
+            self.0 .0.lock().unwrap().push(v.0);
+        }
+        fn enter(&self, _id: &tracing::span::Id) {}
+        fn exit(&self, _id: &tracing::span::Id) {}
+    }
+    struct MsgVisitor(String);
+    impl tracing::field::Visit for MsgVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = format!("{value:?}");
+            }
+        }
+    }
+
+    /// The phrase unique to the discarded-value report.
+    const NEEDLE: &str = "unrecognised backend";
+
+    /// Run `f` under a message probe and report its result plus how many emitted messages
+    /// contain `needle`.
+    fn messages_of<T>(f: impl FnOnce() -> T, needle: &str) -> (T, usize) {
+        let msgs = Arc::new(Messages::default());
+        let out = {
+            let _probe = tracing::subscriber::set_default(MsgProbe(msgs.clone()));
+            f()
+        };
+        let n = msgs
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|m| m.contains(needle))
+            .count();
+        (out, n)
+    }
+
+    /// Save/wipe/restore environment variables for the duration of a test. Saves the raw
+    /// `OsString` so a pre-existing non-Unicode value is restored byte-for-byte.
+    struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl EnvGuard {
+        fn wipe(keys: &[&'static str]) -> Self {
+            let saved = keys
+                .iter()
+                .map(|k| (*k, std::env::var_os(k)))
+                .collect::<Vec<_>>();
+            for k in keys {
+                std::env::remove_var(k);
+            }
+            Self(saved)
+        }
+        fn set(&mut self, key: &str, value: &str) {
+            std::env::set_var(key, value);
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in &self.0 {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    const ASR_ENV_KEYS: &[&str] = &[
+        "AMOS_ASR_BACKEND",
+        "AMOS_ASR_ENDPOINT",
+        "AMOS_ASR_MODEL",
+        "AMOS_ASR_API_KEY",
+    ];
+    const TRANSLATE_ENV_KEYS: &[&str] = &[
+        "AMOS_TRANSLATE_BACKEND",
+        "AMOS_TRANSLATE_HOST",
+        "AMOS_TRANSLATE_MODEL",
+        "AMOS_TRANSLATE_API_KEY",
+    ];
+
+    #[test]
+    #[serial_test::serial(env_lock)]
+    fn an_unrecognised_asr_backend_is_reported_not_silently_folded_away() {
+        let mut env = EnvGuard::wipe(ASR_ENV_KEYS);
+        env.set("AMOS_ASR_BACKEND", "whisperr"); // a typo of `whisper`
+        let (rec, reported) = messages_of(recognizer_from_env, NEEDLE);
+        assert!(
+            rec.is_none(),
+            "an unrecognised backend falls back to the documented default (no ASR)"
+        );
+        assert_eq!(
+            reported, 1,
+            "the operator set AMOS_ASR_BACKEND and it was discarded — that must be reported"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(env_lock)]
+    fn an_unset_asr_backend_stays_silent() {
+        let _env = EnvGuard::wipe(ASR_ENV_KEYS);
+        let (rec, reported) = messages_of(recognizer_from_env, NEEDLE);
+        assert!(rec.is_none());
+        assert_eq!(reported, 0, "a genuinely unset variable is the silent case");
+    }
+
+    #[test]
+    #[serial_test::serial(env_lock)]
+    fn the_known_asr_backend_tokens_are_not_reported() {
+        let mut env = EnvGuard::wipe(ASR_ENV_KEYS);
+        env.set("AMOS_ASR_BACKEND", "mock");
+        let (rec, reported) = messages_of(recognizer_from_env, NEEDLE);
+        assert!(rec.is_some());
+        assert_eq!(reported, 0, "a known token must not be reported");
+        env.set("AMOS_ASR_BACKEND", "none");
+        let (rec, reported) = messages_of(recognizer_from_env, NEEDLE);
+        assert!(rec.is_none());
+        assert_eq!(reported, 0, "`none` is a known token, not a typo");
+    }
+
+    #[test]
+    #[serial_test::serial(env_lock)]
+    fn an_unrecognised_translate_backend_is_reported_and_falls_back_to_ollama() {
+        let mut env = EnvGuard::wipe(TRANSLATE_ENV_KEYS);
+        env.set("AMOS_TRANSLATE_BACKEND", "mockk"); // a typo of `mock`
+        let (provider, reported) = messages_of(provider_from_env, NEEDLE);
+        assert_eq!(
+            provider.metadata().model,
+            "llama3.2",
+            "an unrecognised value falls back to the documented Ollama default"
+        );
+        assert_eq!(
+            reported, 1,
+            "the operator set AMOS_TRANSLATE_BACKEND and it was discarded — that must be reported"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(env_lock)]
+    fn an_unset_translate_backend_stays_silent_and_uses_ollama() {
+        let _env = EnvGuard::wipe(TRANSLATE_ENV_KEYS);
+        let (provider, reported) = messages_of(provider_from_env, NEEDLE);
+        assert_eq!(provider.metadata().model, "llama3.2");
+        assert_eq!(reported, 0, "a genuinely unset variable is the silent case");
     }
 }

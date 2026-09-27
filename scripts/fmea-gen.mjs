@@ -1770,6 +1770,49 @@ const KNOWN_FAILURES = [
   // `InputConnection`，自动化证据是源码级接线钉，真机「在第三方 app 里对 emoji 按 ⌫」是设备验证项。
   { id: 'F-AND-024', module: 'the-system-imes-backspace-deleted-one-utf16-code-unit-not-one-character-so-a-non-bmp-glyph-was-cut-in-half-and-a-lone-high-surrogate-was-left-in-the-target-field-while-the-webview-keyboards-sibling-deletebeforecaret-was-already-fixed-to-delete-by-code-point', files: ['crates/amos-tauri/android-glue/com/amos/ai/glue/AmosImeService.kt', 'crates/amos-tauri/gen/android/app/src/main/java/com/amos/ai/glue/AmosImeService.kt', 'crates/amos-tauri/src/android_ime.rs', 'scripts/fmea-gen.mjs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md'], markers: ['REQ-A1951', 'deleteInField', 'deleteSurroundingTextInCodePoints', 'the_services_backspace_deletes_a_code_point_not_a_code_unit'], severity: 3 },
 
+  // F-AND-025（REQ-A1957，「一个声明的能力没有消费者」—— `ImeLayout.shiftAllowed` 只被它自己的测试
+  // 消费）：`ImeLayout.shiftAllowed` 逐字写着「Shift is one-shot … the key is **not offered** in
+  // Chinese mode … Mirrors the WebView rule」，`ImeLayoutTest.shiftIsOfferedOnlyInEnglishMode` 钉住该
+  // 函数自己的返回值 —— 但**没有任何代码**调它：`AmosImeService` 不画 ⇧ 键、没有 shift 状态、
+  // `renderKeys` 永远把**小写**字形交给 `ImeRouting`，于是系统输入法的英文模式**打不出大写字母**，
+  // 而它镜像的那一面（`ImeKeyboard.svelte` 的 `tap` / `upper`）可以 —— 「一个消费者只有它自己测试的
+  // 助手是声明不是功能」（F-AUD-002 家族：镜像模块的自洽测试认证的是它自己的拼写，从不是权威；
+  // 同族于 memory `project_mirror_self_consistency_test_never_checks_the_authority`）。
+  // 修法：`ImeLayout.shifted(ch, upper)`（纯，镜像 `tap` 的 `upper ? glyph.toUpperCase() : glyph`），
+  // `AmosImeService` 加 `shift` 状态 + `upper` + 底排 ⇧ chip（`isEnabled = ImeLayout.shiftAllowed(zhActive)`）
+  // + `toggleShift()`，`renderKeys` 把 `typed = ImeLayout.shifted(label, upper)` 同时用于**显示**与
+  // **路由**，切回中文时 `if (zhActive) shift = false`（WebView 的 mode-change effect）。
+  // `crates/amos-tauri/src/android_ime.rs` 的 `the_services_english_mode_offers_the_one_shot_shift`
+  // 用 `include_str!` 钉接线（chip 由 `shiftAllowed` 门控、路由走 `ImeLayout.shifted`、`typed` 是
+  // 被路由的字形、切回中文丢弃 arm）。
+  // **如实边界**：宿主 JVM 无法驱动 `InputMethodService`，自动化证据是源码级接线钉 + Kotlin 纯函数
+  // 单测；真机「选中 AmOS 输入法在第三方 app 里按 ⇧ 打大写」是设备验证项；armed 状态的可见反馈是
+  // 字母键切大写（与 WebView 一致），chip 另有 `isActivated` + alpha 表示。
+  { id: 'F-AND-025', module: 'the-system-imes-english-mode-had-no-way-to-type-an-uppercase-letter-because-imelayout-shiftallowed-documented-and-pinned-the-one-shot-shift-rule-but-no-code-consumed-it-so-the-service-drew-no-shift-key-held-no-shift-state-and-always-routed-a-lowercase-glyph-while-the-webview-keyboard-it-mirrors-could', files: ['crates/amos-tauri/android-glue/com/amos/ai/glue/AmosImeService.kt', 'crates/amos-tauri/android-glue/com/amos/ai/glue/ImeLayout.kt', 'crates/amos-tauri/gen/android/app/src/main/java/com/amos/ai/glue/AmosImeService.kt', 'crates/amos-tauri/gen/android/app/src/main/java/com/amos/ai/glue/ImeLayout.kt', 'crates/amos-tauri/android-glue/tests/com/amos/ai/glue/ImeLayoutTest.kt', 'crates/amos-tauri/src/android_ime.rs', 'docs/input-method.md', 'scripts/fmea-gen.mjs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md'], markers: ['REQ-A1957', 'ImeLayout.shifted', 'shiftAllowed', 'toggleShift', 'the_services_english_mode_offers_the_one_shot_shift'], severity: 2 },
+
+  // F-AND-026（REQ-A1965，「平台侧副本抄错了权威的那一半」）：`ImeRouting` 自称是 `ImeOverlay.svelte` 的
+  // `press` ∕ `typeNonLetter` 的「platform-side copy」，但 `KeyKind.DIGIT` 那一臂抄的是 WebView 的
+  // **物理**键盘规则（`onKeyDown` 的 `/^[1-9]$/` → 选中第 n 个候选），而 `decide` 的**唯一**调用点是
+  // 服务的**屏上**键格（`AmosImeService.kt:172`，由 145-147 ∕ 397 的点击进入），服务**没有**任何物理按键
+  // 处理（无 `onKeyDown`、无 `KeyEvent` —— 它不接的键直接交给输入框）。于是中文模式下正在拼码时点屏上
+  // `3`：屏上规则（`press` → `typeNonLetter`；docs §Key behaviours 逐字「A **digit or punctuation** key
+  // … is **committed first** and the symbol is then typed」）应是**先提交再原样输入半角 `3`**，实际却
+  // `Action.Commit(2)` 提交了第 3 个候选 —— 而候选条**不画数字提示**（`renderCandidates` 只画
+  // `candidate.text`），所以「按数字选候选」在屏上既不可发现、又与同一台设备上的 WebView 键盘不一致
+  // （同族于 memory `project_mirror_self_consistency_test_never_checks_the_authority`「镜像模块的自洽
+  // 测试认证的是它自己的拼写，从不是权威」；docs §Physical keyboard 已把 `1–9` 逐字限定为**物理**键盘）。
+  // 修法：`KeyKind.DIGIT` 改为权威的屏上规则 —— `if (composing && candidatesOnPage > 0)
+  // Action.CommitThenInsert(key.ch) else Action.Insert(key.ch)`（digit 是 non-letter，走同一规则；半角由
+  // `ZH_PUNCTUATION` 不列数字保证），`ImeRouting` 的 KDoc 如实写明本表只承载**屏上**那一半、物理 `1–9`
+  // 快捷键在 `onKeyDown`、此处不编码。
+  // `crates/amos-tauri/src/android_ime.rs` 的 `the_services_digit_key_follows_the_on_screen_non_letter_rule`
+  // 用 `include_str!` 钉接线（DIGIT 臂逐字 `CommitThenInsert(key.ch)`、表内无 `minus('0')` ∕
+  // `Action.Commit(n - 1)`、服务无 `onKeyDown` ∕ `KeyEvent`、`ImeRouting.decide(` 恰一个调用点）。
+  // **如实边界**：宿主 JVM 无法实例化 `InputMethodService`（键格分类 ∕ 点击路径不可驱动），自动化证据是
+  // 源码级接线钉 + `ImeRouting` 纯函数单测；真机「选中 AmOS 输入法、拼码中点屏上 `3`」是设备验证项；
+  // WebView 物理键盘的 `1–9` 快捷键本身正确、未动。
+  { id: 'F-AND-026', module: 'the-system-imes-on-screen-digit-key-routed-through-the-physical-1-9-candidate-shortcut-because-the-platform-side-copy-of-the-webview-rule-copied-the-wrong-half-the-on-screen-authority-press-commits-the-code-first-then-types-the-digit-while-decides-only-caller-is-the-tap-grid-and-the-service-declares-no-physical-key-handler-so-tapping-3-while-composing-committed-candidate-3-instead-of-typing-3-and-the-candidate-bar-draws-no-number-hints', files: ['crates/amos-tauri/android-glue/com/amos/ai/glue/ImeRouting.kt', 'crates/amos-tauri/gen/android/app/src/main/java/com/amos/ai/glue/ImeRouting.kt', 'crates/amos-tauri/android-glue/tests/com/amos/ai/glue/ImeRoutingTest.kt', 'crates/amos-tauri/frontend-ts/src/svelte/ImeOverlay.svelte', 'crates/amos-tauri/src/android_ime.rs', 'docs/input-method.md', 'scripts/fmea-gen.mjs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md'], markers: ['REQ-A1965', 'KeyKind.DIGIT', 'CommitThenInsert(key.ch)', 'the_services_digit_key_follows_the_on_screen_non_letter_rule'], severity: 3 },
+
   // F-DEV-166（REQ-A1905，「判据用错了权威」）：`screenshot_capture` 在**问平台能不能截图之前**
   // 就解析（并 `create_dir_all`）`~/Pictures/Screenshots`，于是它自己模块文档逐字承诺的
   // 「Other platforms return a typed refusal naming the OS」在 Android（`dirs::home_dir()` 为 `None`）
@@ -9949,6 +9992,19 @@ const KNOWN_FAILURES = [
   // `A::b`（至少一个 `::`、无 `/`、无 `.`、无 `#`、无空格）即判为条目路径并跳过；真相对链接无法匹配。
   { id: 'F-DEV-175', module: 'the-docs-link-gate-classifies-its-corpus-by-spelling-so-it-reads-a-rust-intra-doc-link-destination-as-a-relative-file-path-and-a-ledger-row-quoting-a-rust-doc-comment-verbatim-turns-self-open-into-three-phantom-broken-file-links-making-make-gated-check-fail-on-every-run-in-a-tree-that-already-built-that-way-ci-red-fix-by-scoping-the-scanner-to-skip-a-destination-that-is-wholly-a-rust-item-path-at-least-one-double-colon-and-no-slash-dot-hash-or-space-which-can-never-denote-a-file-so-no-real-relative-link-can-be-masked', files: ['scripts/docs-link-scan.mjs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md'], markers: ['REQ-A1922', 'isRustItemPath'], severity: 2 },
 
+  // F-DEV-176（REQ-A1961）—— 「系统级输入法」那一轮的门禁教训（F-DEV-163）只被修到**单条 action**：
+  // `PLATFORM_ACTIONS` 这张自撰的封闭表里，还留着第二条**看起来最像却不存在**的字面量
+  // `android.media.MediaBrowserService`（真正的 action 是 `android.media.browse.MediaBrowserService`，
+  // 类 `android.service.media.MediaBrowserService` 的 `SERVICE_INTERFACE`；android-36 的 android.jar
+  // 里没有 `android.media.MediaBrowserService` 这个类，全仓也无组件声明它）。K4 以该表为「已知 action」
+  // 的唯一真源，于是声明幻影 action 的组件会被判「正确」却收不到 intent —— 与 F-DEV-163 同形状：
+  // 门禁读的是本仓自己写下的那张表，而非平台。修法：把权威读扩到**整张表** —— 新增封闭的
+  // `ACTION_AUTHORITY`（每个 `PLATFORM_ACTIONS` 键对应一个 `Class#FIELD`）、纯函数
+  // `actionAuthorityFindings`（无权威项 ⇒ `action-not-authority-checked`；与平台值不符 ⇒
+  // `action-literal-not-on-platform`；读不回 ⇒ 跳过而非误判）、`readActionAuthority` 用
+  // `javap -constants` 重读 SDK 的 android.jar（无 SDK ⇒ 打印未运行，不假绿），并删除那条幻影键。
+  { id: 'F-DEV-176', module: 'a-self-authored-closed-platform-action-table-in-android-component-scan-mjs-still-carried-a-second-plausible-but-nonexistent-literal-android-media-mediabrowserservice-the-real-action-is-android-media-browse-mediabrowserservice-the-service-interface-of-class-android-service-media-mediabrowserservice-which-does-not-exist-as-android-media-mediabrowserservice-in-android-36-s-jar-and-no-component-declared-it-k4-uses-that-table-as-its-only-known-action-source-so-a-component-declaring-the-phantom-would-pass-yet-never-receive-an-intent-f-deV-163-s-shape-fix-widen-the-authority-read-to-the-whole-table-with-a-closed-action-authority-one-class-field-per-platform-actions-key-a-pure-action-authority-findings-and-a-javap-constants-reread-of-the-sdk-jar-that-skips-rather-than-false-greens-without-an-sdk-and-remove-the-phantom-key', files: ['scripts/android-component-scan.mjs', 'scripts/fmea-gen.mjs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md'], markers: ['REQ-A1961', 'ACTION_AUTHORITY', 'actionAuthorityFindings', 'readActionAuthority', 'action-literal-not-on-platform', 'action-not-authority-checked'], severity: 2 },
+
   // F-AI-029（REQ-A1920）—— JSON 日志的 opt-in `AMOS_LOG_JSON` 用 `match std::env::var(k).ok()` 读，
   // 把「未设」/「显式关」/「集合外拼法（enable）」/「非 Unicode」四态折成同一句沉默的 `false`；
   // 这是 F-AI-027（`let Ok(raw) = std::env::var(k) else { false }`）与 F-AI-026（`.ok()?`）**同一形状的
@@ -10170,6 +10226,17 @@ const KNOWN_FAILURES = [
   { id: 'F-SH-945', module: 'the-two-notification-producers-that-re-derive-their-app-s-whole-set-on-every-change-mailapp-and-messagesapp-wrote-writestorevalue-notif-key-others-fresh-appending-their-rows-to-the-tail-of-amos-notifications-but-the-store-s-convention-is-newest-first-addnotif-prepends-mergepushhistory-sorts-its-additions-by-time-and-prepends-and-the-timer-reminder-calendar-producers-keep-the-head-and-both-notification-centres-render-the-array-in-order-with-no-sort-at-render-so-a-new-mail-or-message-alert-rendered-below-every-older-row-of-every-other-app-often-below-the-fold-in-the-scrollable-list-and-after-req-a1940-the-over-cap-trim-decides-by-time-so-a-capped-store-s-visible-order-could-not-be-recovered-from-position-at-all-the-axis-req-a1940-s-honest-boundary-named-verbatim-fix-collect-the-rule-in-notifapp-replaceappnotifs-drop-the-app-s-old-rows-then-place-the-fresh-rows-at-the-head-sorted-by-time-desc-mirroring-mergepushhistory', files: ['crates/amos-tauri/frontend-ts/src/lib/notifApp.ts', 'crates/amos-tauri/frontend-ts/src/svelte/MailApp.svelte', 'crates/amos-tauri/frontend-ts/src/svelte/MessagesApp.svelte', 'crates/amos-tauri/frontend-ts/src/__tests__/notifAppOrder.test.ts', 'crates/amos-tauri/frontend-ts/svelte-tests/messages-notif-order.svelte.test.ts', 'scripts/fmea-gen.mjs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md'], markers: ['REQ-A1949', 'F-SH-945', 'replaceAppNotifs', 'notifAppOrder', 'messages-notif-order', 'withoutAppNotifs'], severity: 2 },
   { id: 'F-SH-946', module: 'the-read-side-guard-of-voice-memos-lib-voicememos-ts-normalizevoicememos-kept-the-tail-when-the-list-exceeds-the-cap-out-slice-out-length-vmemocap-i-e-it-kept-the-oldest-rows-and-dropped-the-newest-recordings-while-the-store-s-convention-is-newest-first-prependmemo-return-m-list-slice-0-vmemocap-prepends-and-is-used-by-the-sole-writer-voicememosapp-svelte-record-and-trim-arms-and-a-sibling-test-pins-newest-at-the-head-so-the-cap-kept-the-wrong-end-the-same-shape-normalizenotifs-had-before-req-a1940-and-the-only-wrong-direction-cap-in-src-lib-reachable-because-cloud-ts-restorestores-writes-a-backup-s-value-back-verbatim-accountpage-svelte-so-an-over-cap-store-can-exist-and-the-guard-is-used-by-two-readers-voicememosapp-svelte-and-playerapp-svelte-fix-decide-by-createdat-keep-the-newest-vmemocap-rows-mirroring-the-normalizenotifs-fix', files: ['crates/amos-tauri/frontend-ts/src/lib/voiceMemos.ts', 'crates/amos-tauri/frontend-ts/src/__tests__/voiceMemos.test.ts', 'scripts/fmea-gen.mjs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md'], markers: ['REQ-A1953', 'F-SH-946', 'out.sort((a, b) => b.createdAt - a.createdAt).slice(0, VMEMO_CAP)', 'VMEMO_CAP', 'prependMemo', 'normalizeVoiceMemos caps a pathologically large store at VMEMO_CAP (keeps newest)', 'caps by createdAt, not by array position'], severity: 2 },
   { id: 'F-SH-947', module: 'the-two-notification-producers-mail-app-and-messages-app-discarded-the-verdict-of-their-amos-notifications-write-writestorevalue-is-void-so-a-store-that-refused-the-write-setitem-throwing-quotaexceeded-made-writejson-return-false-and-dispatch-no-store-changed-event-with-nothing-on-screen-mailapp-svelte-310-messagesapp-svelte-823-and-843-the-dock-launcher-badge-silently-kept-a-stale-unread-count-and-in-real-sms-mode-a-refused-retraction-left-a-notice-claiming-a-message-the-user-can-find-nowhere-both-files-already-have-a-refusal-surface-mailapp-s-listnote-rendered-at-716-messagesapp-s-storeerr-storeerrorbar-rendered-at-1060-already-used-by-the-conv-key-and-draft-key-writes-while-alarmcore-ts-273-and-telemetryspy-ts-214-are-deliberate-and-documented-so-they-stay-out-of-scope-every-other-notif-key-producer-ospushwatcher-ostimerwatcher-remindercore-calendarcore-shortcuts-notificationcenter-phoneapp-contactsapp-already-consumes-the-verdict-this-is-the-last-sibling-of-req-a1947-f-sh-943-and-req-a1948-f-sh-944-whose-honest-boundaries-named-these-two-files-verbatim-fix-route-all-three-sites-through-writestorevaluechecked-and-fold-the-refusal-into-the-file-s-own-surface', files: ['crates/amos-tauri/frontend-ts/src/svelte/MailApp.svelte', 'crates/amos-tauri/frontend-ts/src/svelte/MessagesApp.svelte', 'crates/amos-tauri/frontend-ts/svelte-tests/mail-notif-refusal.svelte.test.ts', 'crates/amos-tauri/frontend-ts/svelte-tests/messages-notif-refusal.svelte.test.ts', 'scripts/fmea-gen.mjs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md'], markers: ['REQ-A1954', 'F-SH-947', 'common.storeWriteFailed', 'listNote', 'storeErr', 'writeStoreValueChecked', 'failWritesFor'], severity: 2 },
+  // F-AI-045（REQ-A1966）—— RAG 取回索引的**唯一**副本被就地整份重写，而这次写是非原子的：
+  // `amos-vector-db/src/index.rs::save_to` 逐字 `std::fs::write(path, self.snapshot_bytes()?)?`。
+  // 一次崩溃 ∕ 断电 ∕ 磁盘满落在 truncate 与 write 之间 ⇒ 半截快照，而 `load_bytes` 对损坏快照
+  // 是**硬拒**（0 维 ∕ 空 id ∕ 长度不符 ∕ 非有限值 ∕ 版本不符）⇒ 索引**全损**而非部分读。
+  // 同一份状态对的兄弟文件 `<base>.passages.json` 早由 `rag_service::atomic_write` 走 temp+rename，
+  // 且 `rag_service.rs` 模块文档（16-21 行）逐字承认这一不对称。既有 6 条 e2e 全是「写成了再读回来」，
+  // 没有一条问「写没写成时旧快照是否还在」。
+  // 修法：新增私有 `temp_sibling`（追加 `.tmp`，故 `<base>.idx` 暂存于 `<base>.idx.tmp`），
+  // `save_to` 先写 `<path>.tmp` 再 `rename` 就位 —— 与 `store.rs`（F-SH-940 ∕ REQ-A1944）逐字同形。
+  // 红先=把 `save_to` 还原成非原子 ⇒ 恰 2 红；NC-2=暂存后丢掉 `rename` ⇒ 另一条专用守卫红。
+  { id: 'F-AI-045', module: 'the-rag-retrieval-index-s-only-copy-is-rewritten-in-place-by-flatindex-save-to-verbatim-std-fs-write-path-self-snapshot-bytes-and-because-load-bytes-hard-rejects-a-corrupt-snapshot-zero-dim-empty-id-length-mismatch-non-finite-value-version-mismatch-a-torn-write-power-loss-full-disk-crash-between-truncate-and-write-is-a-total-loss-of-the-index-not-a-partial-read-while-the-sibling-file-of-the-same-state-pair-base-passages-json-is-already-atomic-through-rag-service-atomic-write-temp-rename-and-rag-service-s-module-doc-verbatim-admits-the-asymmetry-the-six-existing-e2e-tests-all-write-then-read-back-none-asks-whether-the-previous-snapshot-survives-a-write-that-does-not-complete-fix-a-private-temp-sibling-appending-dot-tmp-so-base-idx-stages-at-base-idx-tmp-and-save-to-writes-the-temp-then-renames-it-into-place-mirroring-store-rs-f-sh-940-req-a1944', files: ['crates/amos-vector-db/src/index.rs', 'crates/amos-vector-db/tests/index_e2e.rs', 'scripts/fmea-gen.mjs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md'], markers: ['REQ-A1966', 'F-AI-045', 'temp_sibling', 'a_save_leaves_an_open_reader_on_the_complete_previous_snapshot', 'a_save_that_cannot_stage_leaves_the_previous_snapshot_intact', 'an in-place write truncates the file under the reader; an atomic replace does not'], severity: 3 },
   // F-AI-039（REQ-A1955）—— daemon 的 TCP 共享密钥 `AMOS_TCP_TOKEN` 在 `TcpPolicy::from_env` 里用
   // `Err(_) => TcpPolicy::Open` 把「未设」与「设了但不是合法 Unicode」折成同一个沉默的 `Open`
   // —— 而 `Open` 意味着整个 loopback TCP 通道**不再认证**。空值那条路有专属 `warn!`，非 Unicode 这条
@@ -10199,6 +10266,48 @@ const KNOWN_FAILURES = [
       'a_non_unicode_form_factor_hint_is_reported_not_read_as_unset',
       'an_unset_form_factor_hint_stays_silent',
       'a_usable_form_factor_hint_passes_through_without_a_warning',
+    ],
+    severity: 2,
+  },
+  // F-WM-030（REQ-A1962）—— WebMan 下载器的 cookie jar 读入侧用 `if jar_path.exists() { match load_cookies(&jar_path) { Ok(s) => s, Err(e) => { warn!(…"cookie jar unreadable; starting empty"); CookieStore::default() } } }`
+  // 把「文件不在」（普通首启）与「文件在但读不回来」（故障）折成同一个沉默的空 jar，且把那份读不动的 `cookies.json` 留在原地；而 `save_cookies` 对**同一个**
+  // `profile.join(COOKIES_FILE)` 做 `File::create(tmp)` + `serde::json::save` + `rename(tmp, path)` 整份重写 ⇒ 下一次任意一次带 `Set-Cookie` 的响应
+  // 都会静默覆盖用户唯一的 cookie 副本（一次无声的「全站登出」，无 `.bak`、无残留）。同族于 F-SH-927（应用级共享存储读入侧）与 F-STORE-006（应用商店注册表读入侧）
+  // —— 「桥吞掉一次『读不回来』的拒绝、又留着那条路径，把下一次写武装成销毁」。
+  // 修法：`exists()` 守卫把「不在」与「在」分开，`Err` 臂调 `keep_jar_aside`（`preserve_unreadable_jar` 先 `rename` 到 `cookies.corrupt-<nonce>` 兄弟文件再空起步；两句互斥的 warn）。
+  { id: 'F-WM-030', module: 'the-webman-download-cookie-jar-read-side-folds-a-present-but-unreadable-file-into-the-same-silent-empty-store-as-a-missing-one-and-keeps-the-path-so-the-very-next-save-cookies-which-rewrites-that-same-profile-cookies-json-atomically-destroys-the-user-s-only-copy-a-silent-logout-from-every-site-with-no-backup-fix-guard-on-exists-so-absence-is-the-only-silent-state-and-on-the-error-arm-keep-the-damaged-jar-aside-by-renaming-it-to-a-corrupt-nonce-sibling-before-starting-empty-with-two-mutually-exclusive-warnings', files: ['crates/amos-tauri/src/webman_download.rs', 'crates/amos-tauri/src/webman_download_tests.rs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A1962', 'F-WM-030', 'preserve_unreadable_jar', 'keep_jar_aside', 'an_unreadable_cookie_jar_is_preserved_not_silently_overwritten', 'a_readable_cookie_jar_is_loaded_without_being_moved_aside', 'a_missing_cookie_jar_starts_empty_and_moves_nothing'], severity: 4 },
+  { id: 'F-AI-042', module: 'the-daemon-s-rotating-log-swallows-the-io-failures-of-the-middle-steps-of-the-rotation-chain-logfile-rs-rotatingfile-rotate-was-let-underscore-fs-remove-file-oldest-and-let-underscore-fs-rename-from-to-so-only-the-final-renames-question-mark-was-propagated-and-rotatingfile-had-no-health-field-at-all-teewriter-s-health-arc-sinkhealth-fed-only-the-write-path-so-a-broken-chain-left-report-write-failures-at-zero-while-rotate-still-incremented-self-rotations-the-logsinkreport-therefore-said-rotations-1-and-write-failures-0-i-e-it-rolled-and-nothing-failed-while-the-dot-k-chain-was-actually-misaligned-the-sibling-jsonlog-rs-jsonrotatingfile-rotate-already-reports-the-identical-three-step-chain-through-the-shared-json-sink-health-with-enoent-filtered-health-note-and-eprintln-verbatim-every-step-is-best-effort-but-we-must-not-swallow-it-the-operator-has-no-other-signal-one-counter-one-stderr-latch-fix-rotatingfile-gains-health-arc-sinkhealth-open-takes-health-and-both-middle-steps-filter-enoent-then-note-and-eprintln-sinkhealth-widened-to-pub-crate-to-satisfy-the-private-interfaces-lint', files: ['crates/amos-ai/src/logfile.rs', 'scripts/fmea-gen.mjs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md'], markers: ['REQ-A1960', 'F-AI-042', 'a_failed_intermediate_rotation_step_is_counted_not_swallowed', 'a_clean_rotation_whose_oldest_is_absent_is_not_a_failure', 'could not drop oldest', 'self.health.note()'], severity: 2 },
+  // F-AI-044（REQ-A1964）—— UDS peer 凭据策略的 `AMOS_UDS_PEER` 用 `match std::env::var(k).ok().as_deref() { Some("warn")…, Some("require")…, Some("enforce") ∣ None => Policy::Enforce, Some(other) => { warn!(…); Policy::Enforce } }`
+  // 读策略：`.ok()` 把「未设」（`Err(NotPresent)`）与「设了但非 Unicode」（`Err(NotUnicode)`）折成同一个 `None`，再由 `Some("enforce") ∣ None` 臂一并送入
+  // `Policy::Enforce`，无一句告警；doc 逐字自称「An unknown value is **reported** and treated as the default rather than silently changing the level」，模块 doc 逐字
+  // 「`AMOS_UDS_PEER=require` refuses. Never silent.」。但 `admits()` 里 `(Unverifiable, Require) => false` 而 `(Unverifiable, _) => true` —— 于是非 Unicode 的
+  // `require` 静默降级成 `Enforce`，内核答不出对端 uid 的连接被**放行**，而日志里没有一行提到「你设的值读不出」。这不止「配置被静默丢弃」，而是「一道安全门被静默放宽」。
+  // 修法：新增纯函数 `Policy::from_value(Option<&OsStr>)`，`from_env` 改走 `var_os`；未设直取默认（唯一静默态），`Some(other)` 照旧告警，新增 `None`（非 Unicode）臂告警一次后仍 `Policy::Enforce`。
+  // 同族于同 crate 的 F-AI-038 ∕ F-AI-031 ∕ F-AI-034 ∕ F-AI-035 ∕ F-AI-029 ∕ F-AI-026。
+  { id: 'F-AI-044', module: 'the-uds-peer-credential-policy-amos-uds-peer-is-read-with-match-std-env-var-k-ok-as-deref-some-warn-some-require-some-enforce-none-policy-enforce-some-other-warn-policy-enforce-so-varerror-notpresent-the-unset-case-and-varerror-notunicode-a-value-the-operator-did-set-are-folded-into-one-silent-policy-enforce-whose-only-log-line-lives-elsewhere-and-blames-nothing-so-an-operator-who-sets-amos-uds-peer-require-to-refuse-anything-not-provably-the-same-user-is-silently-downgraded-to-enforce-which-per-admits-unverifiable-peer-admits-a-connection-the-kernel-could-not-identify-the-dropped-value-is-never-reported-even-though-the-doc-promises-an-unknown-value-is-reported-and-the-module-doc-promises-never-silent-fix-read-via-var-os-so-absence-is-the-only-silent-state-extract-a-pure-policy-from-value-option-osstr-that-reports-once-when-to-str-fails-then-falls-through-to-the-documented-default', files: ['crates/amos-ai/src/peercred.rs', 'docs/ENV_VARIABLES.md', 'scripts/fmea-gen.mjs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md'], markers: ['REQ-A1964', 'AMOS_UDS_PEER', 'a_non_unicode_policy_is_reported_not_silently_folded_to_the_default', 'a_truly_unset_policy_is_silent_and_keeps_the_default', 'the_known_policy_tokens_are_not_reported', 'an_unknown_policy_token_is_reported_not_silently_folded_to_the_default'], severity: 4 },
+  // F-SH-949（REQ-A1963）—— `tts.rs::local_piper_provider` 用 `let dir = PathBuf::from(std::env::var("AMOS_PIPER_MODEL_DIR").ok()?);` 读本地 Piper 语音目录：
+  // `.ok()` 把「未设」（`Err(NotPresent)`，普通态：没有本地语音、用 mock）与「设了但非 Unicode」（操作者**明确配了**一个目录，却含非法字节 ⇒ 读不回）折成同一个沉默的 `None`，
+  // 无一句告警。同一个 `match` 里的另一条臂**已经**会告警（`Err(e) => warn!("tts: Piper model load failed ({e}); falling back to mock")`）—— 于是「模型加载失败」有噪音、
+  // 「你设的值根本读不出来」却完全静音：操作者看到 mock，日志里没有任何一行提到 `AMOS_PIPER_MODEL_DIR`。修法（镜像同 crate 的 `ota.rs::env_value` ∕ `wm.rs::form_factor_hint`）：
+  // 抽出纯函数 `piper_dir_hint(Option<OsString>) -> Option<PathBuf>`，`local_piper_provider` 改走 `var_os`；未设是唯一静默态，非 Unicode 告警一次后仍按未设处理。
+  { id: 'F-SH-949', module: 'the-tts-bridge-reads-the-local-piper-voice-directory-amos-piper-model-dir-with-pathbuf-from-std-env-var-ok-so-varerror-notpresent-the-ordinary-no-local-voice-use-the-mock-case-and-varerror-notunicode-a-directory-the-operator-did-set-are-folded-into-one-silent-none-while-the-sibling-arm-in-the-same-match-already-warns-tts-piper-model-load-failed-falling-back-to-mock-so-a-load-failure-is-noisy-but-a-configured-yet-unreadable-knob-is-totally-silent-the-operator-sees-the-mock-and-no-log-line-names-amos-piper-model-dir-fix-extract-a-pure-piper-dir-hint-option-osstring-that-warns-once-when-to-str-fails-then-treats-it-as-unset-and-call-it-with-var-os', files: ['crates/amos-tauri/src/tts.rs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A1963', 'F-SH-949', 'piper_dir_hint', 'a_non_unicode_piper_dir_is_reported_not_read_as_unset', 'an_unset_piper_dir_stays_silent', 'a_usable_piper_dir_passes_through_without_a_warning'], severity: 2 },
+  // F-SH-950（REQ-A1963）—— 同族的第二个（也是同轮最后一个）残留：`interpret.rs::local_sherpa_pipeline` 用
+  // `let dir = PathBuf::from(std::env::var("AMOS_SHERPA_MODEL_DIR").ok()?);` 读本地 sherpa-onnx 模型目录，同一 `.ok()?` 折法。
+  // 未设 = 普通态（未配置，回落到 daemon）；设了但非 Unicode = 操作者明确配了一个模型目录却读不回 ⇒ 静默退回 daemon，日志里只有 daemon 路径的痕迹、没有一行提到被丢弃的值。
+  // 修法同上：纯函数 `sherpa_dir_hint(Option<OsString>) -> Option<PathBuf>`，`var_os` 读取，非 Unicode 告警一次。两处与 `wm.rs::form_factor_hint`（F-WM-029）逐字同形。
+  { id: 'F-SH-950', module: 'the-interpret-bridge-reads-the-local-sherpa-onnx-model-directory-amos-sherpa-model-dir-with-pathbuf-from-std-env-var-ok-so-varerror-notpresent-the-ordinary-not-configured-use-the-daemon-case-and-varerror-notunicode-a-model-directory-the-operator-did-set-are-folded-into-one-silent-none-with-no-warning-so-an-operator-who-configured-a-model-dir-with-an-illegal-byte-in-its-name-watches-the-daemon-path-run-and-no-log-line-names-amos-sherpa-model-dir-fix-extract-a-pure-sherpa-dir-hint-option-osstring-that-warns-once-when-to-str-fails-then-treats-it-as-unset-and-call-it-with-var-os-mirroring-wm-rs-form-factor-hint-req-a1959', files: ['crates/amos-tauri/src/interpret.rs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A1963', 'F-SH-950', 'sherpa_dir_hint', 'a_non_unicode_sherpa_dir_is_reported_not_read_as_unset', 'an_unset_sherpa_dir_stays_silent', 'a_usable_sherpa_dir_passes_through_without_a_warning'], severity: 2 },
+  {
+    id: 'F-AI-046',
+    module:
+      'amos-ai / AMOS_BACKEND 的读取把「设置了但非 Unicode」折成沉默的「未设置」（REQ-A1967）',
+    files: ['crates/amos-ai/src/server.rs'],
+    markers: [
+      'REQ-A1967',
+      'F-AI-046',
+      'backend_env_raw',
+      'reported_backends_raw',
+      'a_backend_set_to_non_unicode_is_reported_not_silently_read_as_unset',
+      'every_backend_env_read_goes_through_the_one_seam',
     ],
     severity: 2,
   },

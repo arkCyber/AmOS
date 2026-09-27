@@ -163,7 +163,7 @@ impl RotatingFile {
     /// Create `cfg.dir` if needed and open the active file in append mode.
     ///
     /// `health` is the sink-wide failure cell, so a rotation-time IO error is
-    /// reported through the same counter as a write-time one (REQ-A1954).
+    /// reported through the same counter as a write-time one (REQ-A1960).
     pub(crate) fn open(cfg: &LogFileConfig, health: &Arc<SinkHealth>) -> io::Result<Self> {
         fs::create_dir_all(&cfg.dir)?;
         let path = cfg.path();
@@ -210,7 +210,7 @@ impl RotatingFile {
     /// or a broken chain — but we **MUST NOT swallow it**: the operator has no other
     /// signal. One counter, one stderr latch — the same `health.note()` contract the
     /// write path follows, and the same one `jsonlog::JsonRotatingFile::rotate` already
-    /// implements for the identical chain (REQ-A1954 / F-AI-040).
+    /// implements for the identical chain (REQ-A1960 / F-AI-042).
     fn rotate(&mut self) -> io::Result<()> {
         if self.keep == 0 {
             // Keep no history: start the active file over.
@@ -696,7 +696,7 @@ mod tests {
         }
         // Two rotation steps failed here (drop-oldest `.1`, then the final `log → .1`),
         // and each failed IO step is counted once — the same per-step accounting
-        // `jsonlog::JsonRotatingFile::rotate` uses (REQ-A1954).
+        // `jsonlog::JsonRotatingFile::rotate` uses (REQ-A1960).
         assert_eq!(
             tee.write_failures(),
             2,
@@ -751,7 +751,7 @@ mod tests {
         let after = tee.report();
         // Two steps of that rotation failed (`remove_file(.1)` and the final `log → .1`);
         // each is counted once now that the intermediate step is no longer swallowed
-        // (REQ-A1954).
+        // (REQ-A1960).
         assert_eq!(
             after.write_failures, 2,
             "each failed rotation step is counted"
@@ -765,7 +765,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// REQ-A1954 / F-AI-040 — the rotation chain's **intermediate** steps must not be
+    /// REQ-A1960 / F-AI-042 — the rotation chain's **intermediate** steps must not be
     /// swallowed. The existing test above blocks only the *final* rename (`log` → `.1`),
     /// which the `?` already propagates; the two best-effort steps before it (`remove_file`
     /// of the oldest, and each `.k` → `.k+1`) were `let _ = …`, so a broken chain left

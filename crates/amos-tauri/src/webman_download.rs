@@ -295,13 +295,25 @@ pub struct WebmanDownloads {
 
 impl WebmanDownloads {
     /// Resolve the directories and load the persisted jar. Best-effort: a jar
-    /// that cannot be read starts empty rather than failing app boot.
+    /// that cannot be read starts empty rather than failing app boot — but a jar
+    /// that is **present and unusable** is first moved aside, because the next
+    /// `save_cookies` rewrites that exact path (see [`with_dirs`]).
     pub fn boot() -> Self {
         Self::with_dirs(download_dir(), profile_dir())
     }
 
     /// Explicit-directory constructor (tests and any caller that wants a
     /// sandboxed profile).
+    ///
+    /// A **missing** jar is the ordinary first-run case and starts empty silently.
+    /// A jar that is **present but unreadable** (corrupt, truncated, or written by
+    /// an incompatible version) is moved aside to a `*.corrupt-<nonce>` sibling
+    /// before we start empty: [`save_cookies`](Self::save_cookies) rewrites this
+    /// path on every capture, so leaving the damaged bytes in place would let the
+    /// next successful save destroy the user's only copy of their cookies — a
+    /// silent logout from every site, with nothing to recover from. Same rule the
+    /// `store` / `mail` / `appstore` / `blocklist` bridges follow (REQ-A1962 /
+    /// F-WM-030).
     pub fn with_dirs(dir: PathBuf, profile: PathBuf) -> Self {
         if let Err(e) = std::fs::create_dir_all(&dir) {
             tracing::warn!(target: "amos::webman", error = %e, "could not create download directory");
@@ -309,12 +321,17 @@ impl WebmanDownloads {
         if let Err(e) = std::fs::create_dir_all(&profile) {
             tracing::warn!(target: "amos::webman", error = %e, "could not create webman profile directory");
         }
-        let cookies = match load_cookies(&profile.join(COOKIES_FILE)) {
-            Ok(store) => store,
-            Err(e) => {
-                tracing::warn!(target: "amos::webman", error = %e, "cookie jar unreadable; starting empty");
-                CookieStore::default()
+        let jar_path = profile.join(COOKIES_FILE);
+        let cookies = if jar_path.exists() {
+            match load_cookies(&jar_path) {
+                Ok(store) => store,
+                Err(e) => {
+                    keep_jar_aside(&jar_path, &e);
+                    CookieStore::default()
+                }
             }
+        } else {
+            CookieStore::default()
         };
         Self {
             dir,
@@ -930,6 +947,44 @@ fn load_cookies(path: &Path) -> Result<CookieStore, String> {
     let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let reader = BufReader::new(file);
     cookie_store::serde::json::load(reader).map_err(|e| e.to_string())
+}
+
+/// Move a cookie jar that **exists but cannot be read back** out of the way, so the
+/// next [`WebmanDownloads::save_cookies`] writes a fresh jar beside it rather than
+/// over the only copy of the user's cookies.
+///
+/// `rename` is a directory operation, so it still succeeds when the file's
+/// *contents* are unreadable. Answers `None` when there is nothing to move (no
+/// regular file) or the rename was refused (read-only directory) — the caller
+/// says which in its warning.
+fn preserve_unreadable_jar(path: &Path) -> Option<PathBuf> {
+    if !path.is_file() {
+        return None;
+    }
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let kept = path.with_extension(format!("corrupt-{nonce}"));
+    std::fs::rename(path, &kept).ok().map(|()| kept)
+}
+
+/// Log an unusable jar, keeping its bytes aside. The two warnings name *which*
+/// happened: kept under a `*.corrupt-*` sibling, or could not be moved.
+fn keep_jar_aside(path: &Path, reason: &str) {
+    match preserve_unreadable_jar(path) {
+        Some(kept) => tracing::warn!(
+            target: "amos::webman",
+            path = %path.display(),
+            kept = %kept.display(),
+            "cookie jar {reason}; kept beside the original and starting empty"
+        ),
+        None => tracing::warn!(
+            target: "amos::webman",
+            path = %path.display(),
+            "cookie jar {reason}; could not be moved aside, starting empty"
+        ),
+    }
 }
 
 /// Actually perform the transfer. Split out from the manager so it is testable

@@ -1,6 +1,7 @@
 package com.amos.ai.glue
 
 import android.annotation.SuppressLint
+import android.graphics.Typeface
 import android.inputmethodservice.InputMethodService
 import android.text.InputType
 import android.util.Log
@@ -331,6 +332,24 @@ class AmosImeService : InputMethodService() {
     private fun renderCandidates(shown: List<ImeWire.Candidate>) {
         val bar = candidateBar ?: return
         bar.removeAllViews()
+        // The in-flight pinyin, the way the WebView composer shows it
+        // (`ImeKeyboard.svelte`'s `ime-input`). The engine's `input` record was decoded by
+        // [ImeWire] but had **no consumer** in this service, so the system keyboard composed
+        // blind: the user saw candidates but never the letters they had typed, and a
+        // mistyped code was visible only through the wrong candidates. A wire field every
+        // surface but one reads is a claim, not a feature (the F-AUD-002 family). The ✕ is
+        // the WebView's clear affordance (`onclear` → `ime_clear`); the buffer is the
+        // service's own pseudo-window, so this abandons it exactly like losing the field.
+        if (snapshot?.composing == true) {
+            bar.addView(chip("✕") { clearComposition() })
+            bar.addView(
+                TextView(this).apply {
+                    text = snapshot?.input.orEmpty()
+                    typeface = Typeface.MONOSPACE
+                    setPadding(CHIP_PAD, CHIP_PAD, CHIP_PAD, CHIP_PAD)
+                },
+            )
+        }
         shown.forEachIndexed { i, candidate ->
             bar.addView(
                 TextView(this).apply {
@@ -394,7 +413,7 @@ class AmosImeService : InputMethodService() {
                             } else {
                                 label
                             }
-                        addKey(this, label) { onKey(ImeRouting.Key(kind, label)) }
+                        addKey(this, typed) { onKey(ImeRouting.Key(kind, typed)) }
                     }
                 },
             )

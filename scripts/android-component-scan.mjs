@@ -39,6 +39,17 @@
  *      the platform requires must be declared on it. `SMS_RECEIVED` without
  *      `BROADCAST_SMS` on an exported receiver is the security half of the same defect:
  *      any app could inject the broadcast.
+ *   K5 (the table's own literals): every action in `PLATFORM_ACTIONS` must be the value the
+ *      **platform** holds for it (`ACTION_AUTHORITY`'s `Class#FIELD`, read off the SDK's
+ *      `android.jar` with `javap -constants`). K4 only asks "is this action delivered to this
+ *      kind of component" and reads **this repo's own table**, so a plausible-but-wrong literal
+ *      passes it — which is exactly the F-DEV-163 defect (the IME's action written in the
+ *      package-shaped spelling `android.view.inputmethod.InputMethod`, the class name rather
+ *      than the constant's camelCase value, blessed by the table that carried the same wrong
+ *      string, and silently absent from the platform's method map on the device). K5 compares
+ *      each action to the platform, so a table that has been taught a wrong spelling — or lists
+ *      an action no platform class holds, as `android.media.MediaBrowserService` once did — goes
+ *      red. Skipped (and *said* to be skipped) where no `javap` + SDK jar resolve.
  *
  * Honest scope:
  *   * `<activity>`/`<provider>` are not judged: the Activity is machine-owned (Tauri
@@ -53,7 +64,8 @@
  *   * `PLATFORM_ACTIONS` is **closed**: an action nobody listed FAILS, because "unknown" and
  *     "misspelled" look identical from here. Extending it is a deliberate edit that records
  *     the sender permission — not a guess. `<meta-data>` names have no such table and are
- *     reported only.
+ *     reported only. `ACTION_AUTHORITY` is **closed the same way** (K5): an action in the table
+ *     with no `Class#FIELD` to check FAILS, so a new entry cannot arrive unverified.
  *
  * Usage (from the repo root):
  *   node scripts/android-component-scan.mjs              # gate
@@ -63,11 +75,15 @@
 import { readFileSync, readdirSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { homedir } from "node:os";
+import { execFileSync } from "node:child_process";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const FRAGMENT = "crates/amos-tauri/android-glue/AndroidManifest.components.xml";
 const CONF = "crates/amos-tauri/tauri.conf.json";
 const ALLOWLIST = join(root, "scripts", "android-component-allowlist.json");
+/** This file, as a finding's `file` (K5's findings are about a literal in here, not a manifest). */
+const SCAN_SELF = "scripts/android-component-scan.mjs";
 
 /** Android kinds this gate can judge, by the class a component must derive from. */
 export const SERVICE_KINDS = [
@@ -130,8 +146,13 @@ export const PLATFORM_ACTIONS = {
   "android.intent.action.MY_PACKAGE_REPLACED": { who: "receiver", sender: null },
   "android.intent.action.USER_UNLOCKED": { who: "receiver", sender: null },
   "android.net.conn.CONNECTIVITY_CHANGE": { who: "receiver", sender: null },
+  // The value of `android.service.media.MediaBrowserService.SERVICE_INTERFACE`. The table used
+  // to *also* list `android.media.MediaBrowserService` — no such class exists, no class in
+  // `android.jar` holds that literal, and nothing declared it, so it sat unused while blessing
+  // the exact trap F-DEV-163/REQ-A1897 hit on the IME action: a plausible-but-wrong literal
+  // that would let the wrong spelling pass K4. Removed; K5 now checks every key here against
+  // the platform so a wrong-but-plausible entry cannot hide in this table again.
   "android.media.browse.MediaBrowserService": { who: "service", sender: null },
-  "android.media.MediaBrowserService": { who: "service", sender: null },
   // The system input method (REQ-A1893 / docs/input-method.md §System IME). `BIND_INPUT_METHOD`
   // is what the **system** must hold to bind an IME on behalf of the app the user is typing
   // into — a signature|privileged permission no third-party app can hold, which is what keeps
@@ -152,6 +173,138 @@ export const PLATFORM_ACTIONS = {
     sender: "android.permission.BIND_INPUT_METHOD",
   },
 };
+
+/**
+ * K5's authority: for every key in `PLATFORM_ACTIONS`, the platform constant (`Class#FIELD`)
+ * whose string value it must equal. **Closed too** — an action with no entry here FAILS, so a
+ * new table entry cannot arrive without naming what proves it real.
+ *
+ * K4 asks "is this action *delivered* to this kind of component"; it reads only this repo's
+ * own table, so it blesses a plausible-but-wrong literal (the F-DEV-163 defect: the IME's
+ * action written in the package-shaped spelling `android.view.inputmethod.InputMethod` — the
+ * class name, not the constant's camelCase value — passed K4, the mirror, and every other
+ * host gate, and was silently absent from the platform's method map on the device). K5 is the
+ * authority read that closes that class: each action is compared to the value the **SDK's own**
+ * `android.jar` holds (`javap -constants`), so a pin that drifts from the platform goes red on
+ * any machine with a JDK + SDK. Where neither is resolvable K5 prints that it did not run.
+ *
+ * `android.media.browse.MediaBrowserService` is the one entry this map was written to fix: the
+ * table had *also* carried `android.media.MediaBrowserService`, a class that does not exist.
+ */
+export const ACTION_AUTHORITY = {
+  "android.telecom.InCallService": "android.telecom.InCallService#SERVICE_INTERFACE",
+  "android.telecom.CallScreeningService": "android.telecom.CallScreeningService#SERVICE_INTERFACE",
+  "android.provider.Telephony.SMS_RECEIVED": "android.provider.Telephony$Sms$Intents#SMS_RECEIVED_ACTION",
+  "android.service.notification.NotificationListenerService":
+    "android.service.notification.NotificationListenerService#SERVICE_INTERFACE",
+  "android.accessibilityservice.AccessibilityService":
+    "android.accessibilityservice.AccessibilityService#SERVICE_INTERFACE",
+  "android.app.action.DEVICE_ADMIN_ENABLED": "android.app.admin.DeviceAdminReceiver#ACTION_DEVICE_ADMIN_ENABLED",
+  "android.intent.action.BOOT_COMPLETED": "android.content.Intent#ACTION_BOOT_COMPLETED",
+  "android.intent.action.LOCKED_BOOT_COMPLETED": "android.content.Intent#ACTION_LOCKED_BOOT_COMPLETED",
+  "android.intent.action.MY_PACKAGE_REPLACED": "android.content.Intent#ACTION_MY_PACKAGE_REPLACED",
+  "android.intent.action.USER_UNLOCKED": "android.content.Intent#ACTION_USER_UNLOCKED",
+  "android.net.conn.CONNECTIVITY_CHANGE": "android.net.ConnectivityManager#CONNECTIVITY_ACTION",
+  "android.media.browse.MediaBrowserService": "android.service.media.MediaBrowserService#SERVICE_INTERFACE",
+  "android.view.InputMethod": "android.view.inputmethod.InputMethod#SERVICE_INTERFACE",
+};
+
+/**
+ * K5 findings given, per `Class#FIELD`, the value the jar actually holds. Pure — the `javap`
+ * call is the caller's, so the rule can be pinned without an SDK.
+ *
+ * `reads` maps a `Class#FIELD` ref to its platform value, or `null` when that class/field
+ * could not be read (the caller reports those separately as "unreadable", not as a mismatch —
+ * "cannot check" must never read as "wrong").
+ */
+export function actionAuthorityFindings(actions, authority, reads) {
+  const findings = [];
+  for (const action of Object.keys(actions)) {
+    const ref = authority[action];
+    if (!ref) {
+      findings.push({
+        kind: "action-not-authority-checked",
+        file: SCAN_SELF,
+        line: 1,
+        site: action,
+        detail:
+          `"${action}" is in PLATFORM_ACTIONS but has no ACTION_AUTHORITY entry, so nothing ` +
+          `proves it is a real platform literal — add the Class#FIELD it must equal.`,
+      });
+      continue;
+    }
+    const value = reads[ref];
+    if (value === undefined || value === null) continue;
+    if (value !== action) {
+      findings.push({
+        kind: "action-literal-not-on-platform",
+        file: SCAN_SELF,
+        line: 1,
+        site: action,
+        detail:
+          `"${action}" is not the value of ${ref} — the platform holds "${value}". A ` +
+          `plausible-but-wrong action reaches nothing (F-DEV-163's shape: K4 and the mirror ` +
+          `both pass it because they read this repo's own table, not the platform).`,
+      });
+    }
+  }
+  return findings;
+}
+
+/** The SDK's `platforms/<version>/android.jar` jars, highest platform first. */
+export function sdkAndroidJars(sdk) {
+  const dir = join(sdk, "platforms");
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir)
+    .filter((d) => existsSync(join(dir, d, "android.jar")))
+    .sort((a, b) => parseFloat(b.replace(/\D/g, "")) - parseFloat(a.replace(/\D/g, "")))
+    .map((d) => join(dir, d, "android.jar"));
+}
+
+/** `public static final java.lang.String NAME = "value";` lines of a `javap -constants` dump. */
+export function parseJavapConstants(text) {
+  const out = {};
+  const re = /public static final java\.lang\.String (\w+) = "([^"]*)";/g;
+  let m;
+  while ((m = re.exec(text)) !== null) out[m[1]] = m[2];
+  return out;
+}
+
+/**
+ * Read every `Class#FIELD` in `ACTION_AUTHORITY` off `javap -constants` against the SDK's
+ * `android.jar`, for K5. Returns `{ reads, unreadable, jar }`, or `null` when there is no SDK
+ * jar or no `javap` at all (K5 then did not run — the caller says so rather than passing).
+ */
+export function readActionAuthority(authority = ACTION_AUTHORITY) {
+  const sdk = process.env.ANDROID_HOME || process.env.ANDROID_SDK_ROOT || join(homedir(), "Library/Android/sdk");
+  const jars = sdkAndroidJars(sdk);
+  if (jars.length === 0) return null;
+  const javap = [
+    process.env.JAVA_HOME ? join(process.env.JAVA_HOME, "bin/javap") : null,
+    "/usr/bin/javap",
+  ].find((p) => p && existsSync(p));
+  if (!javap) return null;
+  const classes = [...new Set(Object.values(authority).map((ref) => ref.split("#")[0]))];
+  const reads = {};
+  const unreadable = [];
+  for (const cls of classes) {
+    let out;
+    try {
+      out = execFileSync(javap, ["-constants", "-classpath", jars[0], cls], { encoding: "utf8" });
+    } catch {
+      for (const ref of Object.values(authority).filter((r) => r.startsWith(`${cls}#`))) reads[ref] = null;
+      unreadable.push(cls);
+      continue;
+    }
+    const constants = parseJavapConstants(out);
+    for (const ref of Object.values(authority).filter((r) => r.startsWith(`${cls}#`))) {
+      const field = ref.split("#")[1];
+      reads[ref] = Object.prototype.hasOwnProperty.call(constants, field) ? constants[field] : null;
+      if (reads[ref] === null) unreadable.push(ref);
+    }
+  }
+  return { reads, unreadable, jar: jars[0] };
+}
 
 /** `argv[1]` names this file (so the module can also be imported by a test). */
 export function invokedDirectly(url, argv1) {
@@ -695,6 +848,80 @@ export function runSelftest() {
     checkComponentContract(componentDeclarations('<manifest><receiver android:name=".glue.X" android:exported="false" /></manifest>')).findings.length === 0,
   );
 
+  // K5 — the action table's authority read.
+  const javapDump = [
+    "Compiled from \"InputMethod.java\"",
+    "public class android.view.inputmethod.InputMethod {",
+    '  public static final java.lang.String SERVICE_INTERFACE = "android.view.InputMethod";',
+    '  public static final java.lang.String SERVICE_META_DATA = "android.view.im";',
+    "  public static final int SHOW_IMPLICIT = 0x1;",
+    "}",
+  ].join("\n");
+  const parsed = parseJavapConstants(javapDump);
+  ok("K5 reads a String constant's value", parsed.SERVICE_INTERFACE === "android.view.InputMethod");
+  ok("K5 reads every String constant in the dump", parsed.SERVICE_META_DATA === "android.view.im");
+  ok("K5 ignores a non-String constant", parsed.SHOW_IMPLICIT === undefined);
+
+  // The historical defect: the table spelled the *package-shaped* name; the platform's
+  // SERVICE_INTERFACE is the class-shaped one. A wrong-but-plausible literal must go red.
+  const imeReads = { "android.view.inputmethod.InputMethod#SERVICE_INTERFACE": "android.view.InputMethod" };
+  const imeFindings = actionAuthorityFindings(
+    { "android.view.inputmethod.InputMethod": { who: "service", sender: "android.permission.BIND_INPUT_METHOD" } },
+    { "android.view.inputmethod.InputMethod": "android.view.inputmethod.InputMethod#SERVICE_INTERFACE" },
+    imeReads,
+  );
+  ok(
+    "K5 flags an action that is not the platform's literal",
+    imeFindings.length === 1 && imeFindings[0].kind === "action-literal-not-on-platform",
+  );
+  ok(
+    "K5's mismatch finding names what the platform holds",
+    /platform holds "android\.view\.InputMethod"/.test(imeFindings[0].detail),
+  );
+  const imeCorrect = actionAuthorityFindings(
+    { "android.view.InputMethod": { who: "service", sender: "android.permission.BIND_INPUT_METHOD" } },
+    { "android.view.InputMethod": "android.view.inputmethod.InputMethod#SERVICE_INTERFACE" },
+    imeReads,
+  );
+  ok("K5 passes an action equal to the platform's literal", imeCorrect.length === 0);
+
+  // The removed shape: `android.media.MediaBrowserService` is not a class the platform has, so
+  // its ref cannot be read. That is "cannot check", reported as unreadable — never a false pass.
+  const unreadableReads = { "android.service.media.MediaBrowserService#SERVICE_INTERFACE": null };
+  const unreadableFindings = actionAuthorityFindings(
+    { "android.media.MediaBrowserService": { who: "service", sender: null } },
+    { "android.media.MediaBrowserService": "android.service.media.MediaBrowserService#SERVICE_INTERFACE" },
+    unreadableReads,
+  );
+  ok("K5 reports an unreadable authority as skipped, not as a mismatch", unreadableFindings.length === 0);
+
+  // Closedness: a new action in PLATFORM_ACTIONS with no authority entry must fail loud.
+  const closedFindings = actionAuthorityFindings(
+    { "android.intent.action.NEW_FANGLED": { who: "receiver", sender: null } },
+    {},
+    {},
+  );
+  ok(
+    "K5 fails an action in the table with no authority entry (closed table)",
+    closedFindings.length === 1 && closedFindings[0].kind === "action-not-authority-checked",
+  );
+  ok(
+    "K5's closedness finding names the missing Class#FIELD",
+    /add the Class#FIELD/.test(closedFindings[0].detail),
+  );
+  ok(
+    "K5's ACTION_AUTHORITY covers every PLATFORM_ACTIONS key",
+    Object.keys(PLATFORM_ACTIONS).every((a) => Object.prototype.hasOwnProperty.call(ACTION_AUTHORITY, a)),
+  );
+  ok(
+    "K5's ACTION_AUTHORITY names no action the table does not carry (no stale authority)",
+    Object.keys(ACTION_AUTHORITY).every((a) => Object.prototype.hasOwnProperty.call(PLATFORM_ACTIONS, a)),
+  );
+  ok(
+    "K5 does not carry the class-shaped MediaBrowser literal in the table",
+    !Object.prototype.hasOwnProperty.call(PLATFORM_ACTIONS, "android.media.MediaBrowserService"),
+  );
+
   let failed = 0;
   for (const [name, cond] of checks) {
     if (!cond) {
@@ -813,6 +1040,12 @@ function runScan() {
       detail: `${d.first} declares the same class name — the component index would check the wrong file`,
     });
   }
+  // K5 — the closed table checked against the platform, not itself (see `readActionAuthority`).
+  const authority = readActionAuthority();
+  const authorityFindings = authority
+    ? actionAuthorityFindings(PLATFORM_ACTIONS, ACTION_AUTHORITY, authority.reads)
+    : [];
+  findings.push(...authorityFindings);
   const { kept, stale } = applyAllowlist(findings, allow);
   if (process.argv.includes("--json")) {
     console.log(
@@ -827,6 +1060,9 @@ function runScan() {
           actionContracts: contract.checked,
           actionContractsReported: contract.reports,
           libraryLoads: loads.checked,
+          actionAuthorityChecked: authority ? Object.keys(ACTION_AUTHORITY).length : 0,
+          actionAuthoritySkipped: authority === null,
+          actionAuthorityJar: authority?.jar ?? null,
           findings: kept,
           stale,
         },
@@ -845,6 +1081,12 @@ function runScan() {
     );
     console.log(
       `[android-component-scan] ${loads.checked.length} System.loadLibrary call(s) name a library a workspace crate builds.`,
+    );
+    console.log(
+      authority
+        ? `[android-component-scan] ${Object.keys(ACTION_AUTHORITY).length} closed-table action(s) equal the value the platform's android.jar holds (K5, ${authority.jar}` +
+            `${authority.unreadable.length ? `; ${authority.unreadable.length} unreadable: ${authority.unreadable.join(", ")}` : ""}).`
+        : "[android-component-scan] K5 skipped: no javap + SDK android.jar resolvable on this machine, so the closed table was judged by K4 alone this run.",
     );
     for (const f of kept) {
       console.error(`[android-component-scan] FAIL — ${f.file}:${f.line} ${f.kind}: ${f.site}\n          ${f.detail}`);

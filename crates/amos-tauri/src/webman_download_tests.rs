@@ -302,6 +302,118 @@ fn session_cookies_live_in_memory_but_are_not_written_to_disk() {
     server.join().expect("server");
 }
 
+// ─── the persisted jar's read side (REQ-A1962 / F-WM-030) ─────────────────
+
+/// Any `cookies.corrupt-*` sibling under `dir` (the jar we moved aside).
+fn kept_jars(dir: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(dir)
+        .expect("read profile dir")
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("cookies.corrupt-"))
+        })
+        .collect()
+}
+
+/// A jar that is **present but unreadable** must be moved aside before the manager
+/// starts empty, because [`WebmanDownloads::save_cookies`] rewrites that exact path
+/// on the next capture — an in-place "start empty" would let one save destroy the
+/// user's only copy of their cookies.
+///
+/// Red before the fix: `with_dirs` logged and started empty while leaving the
+/// damaged bytes at `cookies.json`, so the next save overwrote them silently.
+#[test]
+fn an_unreadable_cookie_jar_is_preserved_not_silently_overwritten() {
+    let profile = tmp();
+    let downloads = tmp();
+    let jar = profile.path().join(COOKIES_FILE);
+    let damaged: &[u8] = b"{ this is not a cookie jar";
+    std::fs::write(&jar, damaged).expect("write damaged jar");
+
+    let manager =
+        WebmanDownloads::with_dirs(downloads.path().to_path_buf(), profile.path().to_path_buf());
+    assert!(
+        manager.list_cookies().is_empty(),
+        "an unreadable jar starts empty"
+    );
+
+    let kept = kept_jars(profile.path());
+    assert_eq!(
+        kept.len(),
+        1,
+        "the unreadable jar must be moved aside, not left to be overwritten"
+    );
+    assert_eq!(
+        std::fs::read(&kept[0]).expect("read kept jar"),
+        damaged,
+        "the preserved jar keeps the original bytes"
+    );
+
+    // A later capture rewrites the configured path; the preserved copy must survive.
+    manager.save_cookies();
+    assert_eq!(
+        std::fs::read(&kept[0]).expect("kept jar still there"),
+        damaged,
+        "the preserved jar must survive the next successful save"
+    );
+    assert!(
+        jar.exists(),
+        "the fresh jar lands back at the configured path"
+    );
+}
+
+/// The other direction of the same rule: a jar that parses loads **in place** and
+/// nothing is moved aside (preservation must not fire on a healthy file).
+#[test]
+fn a_readable_cookie_jar_is_loaded_without_being_moved_aside() {
+    let profile = tmp();
+    let downloads = tmp();
+    let (base, server) = spawn_server(1, |_, _| {
+        http_ok(b"x", &[("Set-Cookie", "keep=me; Path=/; Max-Age=3600")])
+    });
+    let manager =
+        WebmanDownloads::with_dirs(downloads.path().to_path_buf(), profile.path().to_path_buf());
+    let agent = manager.agent();
+    download_to_file(
+        &agent,
+        &format!("{base}/x"),
+        &downloads.path().join("x"),
+        &no_cancel(),
+        &mut |_, _| {},
+    )
+    .expect("download");
+    manager.absorb_cookies(&agent);
+    server.join().expect("server");
+
+    let reopened =
+        WebmanDownloads::with_dirs(downloads.path().to_path_buf(), profile.path().to_path_buf());
+    assert!(
+        reopened.list_cookies().iter().any(|c| c.name == "keep"),
+        "a readable jar is loaded in place"
+    );
+    assert!(
+        kept_jars(profile.path()).is_empty(),
+        "a readable jar must not be moved aside"
+    );
+}
+
+/// A **missing** jar is the ordinary first-run case: start empty, move nothing.
+#[test]
+fn a_missing_cookie_jar_starts_empty_and_moves_nothing() {
+    let profile = tmp();
+    let downloads = tmp();
+    let manager =
+        WebmanDownloads::with_dirs(downloads.path().to_path_buf(), profile.path().to_path_buf());
+    assert!(manager.list_cookies().is_empty());
+    assert!(!profile.path().join(COOKIES_FILE).exists());
+    assert!(
+        kept_jars(profile.path()).is_empty(),
+        "a first run leaves no corrupt-* sibling"
+    );
+}
+
 // ─── pure helpers ─────────────────────────────────────────────────────────
 
 #[test]

@@ -8,7 +8,7 @@
 //! flat scan is the bottleneck — never before the measurement.
 
 use std::cmp::Ordering;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -35,6 +35,15 @@ pub struct FlatIndex {
     dim: usize,
     /// Rows in insertion order (an `upsert` replaces in place).
     rows: Vec<Stored>,
+}
+
+/// `<path>` + `.tmp` as a new path — the staging sibling for [`FlatIndex::save_to`].
+/// Appends rather than replacing the extension, so `<base>.idx` stages at
+/// `<base>.idx.tmp` (never `<base>.tmp`, which could collide with a sibling file).
+fn temp_sibling(path: &Path) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(".tmp");
+    PathBuf::from(s)
 }
 
 impl FlatIndex {
@@ -215,8 +224,21 @@ impl FlatIndex {
     }
 
     /// Write [`snapshot_bytes`](Self::snapshot_bytes) to a path.
+    ///
+    /// Atomic: staged in a `<path>.tmp` sibling and `rename`d into place, so an
+    /// interrupted or failed write leaves the **previous** snapshot intact rather
+    /// than a truncated one. This file holds the only copy of the index, and
+    /// [`load_bytes`](Self::load_bytes) refuses a corrupt snapshot outright — so
+    /// a torn write is a *total* loss, not a partial read. Mirrors the temp+rename
+    /// already used by the sibling `.passages.json` of the same RAG state pair
+    /// (`rag_service::atomic_write`) and the workspace's other atomic writers.
+    /// (REQ-A1966 / F-AI-045)
     pub fn save_to(&self, path: impl AsRef<Path>) -> Result<()> {
-        std::fs::write(path, self.snapshot_bytes()?)?;
+        let path = path.as_ref();
+        let bytes = self.snapshot_bytes()?;
+        let tmp = temp_sibling(path);
+        std::fs::write(&tmp, &bytes)?;
+        std::fs::rename(&tmp, path)?;
         Ok(())
     }
 

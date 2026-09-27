@@ -766,6 +766,51 @@ enum BackendRequest {
     Unknown,
 }
 
+/// The env key that selects the inference backend (see [`build_backend_from_env`]).
+const BACKEND_ENV: &str = "AMOS_BACKEND";
+
+/// The raw `(debug-printed)` byte strings already reported as a non-Unicode
+/// `AMOS_BACKEND`. [`backend_env_raw`] runs from three startup call sites, so an
+/// un-deduplicated warning would repeat — log flooding is its own defect.
+fn reported_backends_raw() -> &'static std::sync::Mutex<std::collections::BTreeSet<String>> {
+    static REPORTED: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeSet<String>>> =
+        std::sync::OnceLock::new();
+    REPORTED.get_or_init(Default::default)
+}
+
+/// Read `AMOS_BACKEND` as the operator wrote it, keeping apart the **two** env
+/// facts `std::env::var(BACKEND_ENV).unwrap_or_default()` folds into one `""`:
+///
+///  - **absent** ⇒ `None` — the documented device default (`auto`); silent.
+///  - **set, valid Unicode** ⇒ `Some(value)`.
+///  - **set, not valid Unicode** ⇒ `None`, **warned** — the operator pinned a
+///    backend, but a value that is not a `str` can name no engine in
+///    [`classify_backend`], so folding it into "unset" runs the device default
+///    without a word. A misspelling (`AMOS_BACKEND=olama`) is refused loudly by
+///    the [`BackendRequest::Unknown`] arm, so an unreadable value must not be the
+///    *quieter* of the two. (REQ-A1967 / F-AI-046)
+fn backend_env_raw() -> Option<String> {
+    let raw = std::env::var_os(BACKEND_ENV)?;
+    match raw.to_str() {
+        Some(s) => Some(s.to_owned()),
+        None => {
+            let first = reported_backends_raw()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(format!("{raw:?}"));
+            if first {
+                tracing::warn!(
+                    env = BACKEND_ENV,
+                    value = %raw.to_string_lossy(),
+                    "amos-ai: AMOS_BACKEND is set but is not valid Unicode; treating it as unset \
+                     (the device default applies) — fix or unset the variable"
+                );
+            }
+            None
+        }
+    }
+}
+
 /// The canonical `AMOS_BACKEND` spellings that name a **real** engine. Also the
 /// set an operator is told about when their value is not recognised.
 const REAL_BACKEND_NAMES: &[&str] = &[
@@ -927,7 +972,7 @@ struct EngineState {
 impl EngineState {
     /// Capture from the environment at startup.
     fn from_env(active_backend_name: &str) -> Self {
-        let requested = std::env::var("AMOS_BACKEND").unwrap_or_default();
+        let requested = backend_env_raw().unwrap_or_default();
         Self {
             degraded: is_real_backend(&requested) && active_backend_name == "mock",
             asr: asr_label_from_env(),
@@ -987,7 +1032,7 @@ fn accel_label_for_active(active: &str) -> Option<String> {
 /// failure at **error** level and make clear the running engine is the
 /// deterministic mock — never silently pretending mock is real inference.
 async fn build_backend_from_env() -> Arc<dyn InferenceBackend> {
-    let kind_raw = std::env::var("AMOS_BACKEND").unwrap_or_default();
+    let kind_raw = backend_env_raw().unwrap_or_default();
     let request = classify_backend(&kind_raw);
 
     // `auto` / unset is the **device-default** path: this is how an image that
@@ -1261,7 +1306,7 @@ fn is_deployment_unconfigured() -> bool {
     // 1) AMOS_BACKEND set to anything but the dev defaults → "configured".
     // Same classifier as the builder and `is_real_backend`: one spelling table,
     // so "does this value name an engine?" cannot be answered three ways.
-    let backend = std::env::var("AMOS_BACKEND").unwrap_or_default();
+    let backend = backend_env_raw().unwrap_or_default();
     match classify_backend(&backend) {
         // Dev defaults / explicit "no-op" values stay subject to the model and
         // cloud-key checks below.
@@ -3034,6 +3079,136 @@ mod tests {
             "an unrecognised backend name must surface as the honest unconfigured state"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- REQ-A1963 (F-AI-043): `AMOS_BACKEND` keeps "set but unreadable" apart
+    // from "unset", so an operator who pinned a backend with a non-Unicode value
+    // is not silently served the device default. ---
+
+    /// Counts WARN events on this thread (via `set_default`), so an assertion
+    /// lands on the operator's only view of a discarded knob.
+    struct WarnProbe(std::sync::Arc<std::sync::atomic::AtomicU64>);
+    impl tracing::Subscriber for WarnProbe {
+        fn enabled(&self, _m: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _s: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _id: &tracing::span::Id, _r: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _a: &tracing::span::Id, _b: &tracing::span::Id) {}
+        fn event(&self, ev: &tracing::Event<'_>) {
+            if ev.metadata().level() == &tracing::Level::WARN {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        fn enter(&self, _id: &tracing::span::Id) {}
+        fn exit(&self, _id: &tracing::span::Id) {}
+    }
+
+    /// Run `f` under a WARN probe and report its result plus how many WARNs it
+    /// produced.
+    fn warns_of<T>(f: impl FnOnce() -> T) -> (T, u64) {
+        let warns = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let out = {
+            let _probe = tracing::subscriber::set_default(WarnProbe(warns.clone()));
+            f()
+        };
+        (out, warns.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Save/wipe/restore `AMOS_BACKEND` for one test. Saves the raw `OsString`, so
+    /// even a pre-existing non-Unicode value is restored byte-for-byte.
+    struct BackendEnv {
+        saved: Option<std::ffi::OsString>,
+    }
+    impl BackendEnv {
+        fn wipe() -> Self {
+            let saved = std::env::var_os(BACKEND_ENV);
+            std::env::remove_var(BACKEND_ENV);
+            Self { saved }
+        }
+    }
+    impl Drop for BackendEnv {
+        fn drop(&mut self) {
+            match self.saved.take() {
+                Some(s) => std::env::set_var(BACKEND_ENV, s),
+                None => std::env::remove_var(BACKEND_ENV),
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(env_lock)]
+    fn an_unset_backend_stays_silent() {
+        let _env = BackendEnv::wipe();
+        let (raw, warns) = warns_of(backend_env_raw);
+        assert_eq!(raw, None);
+        assert_eq!(
+            warns, 0,
+            "a genuinely absent AMOS_BACKEND is the documented device default, not a finding"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(env_lock)]
+    fn a_usable_backend_value_passes_through_without_a_warning() {
+        let _env = BackendEnv::wipe();
+        std::env::set_var(BACKEND_ENV, "ollama");
+        let (raw, warns) = warns_of(backend_env_raw);
+        assert_eq!(raw.as_deref(), Some("ollama"));
+        assert_eq!(warns, 0);
+    }
+
+    /// The defect this round fixes: the read folded a set-but-not-Unicode value
+    /// into "unset", so an operator who pinned `AMOS_BACKEND` with a garbage byte
+    /// got the device default with no line saying the knob was discarded — while a
+    /// mere *typo* is refused loudly by the `BackendRequest::Unknown` arm. Unix
+    /// only: env vars are byte strings there. A distinct byte string per run keeps
+    /// the once-per-value report from being deduplicated away.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(env_lock)]
+    fn a_backend_set_to_non_unicode_is_reported_not_silently_read_as_unset() {
+        use std::os::unix::ffi::OsStrExt;
+        let _env = BackendEnv::wipe();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u8)
+            .unwrap_or(1);
+        std::env::set_var(
+            BACKEND_ENV,
+            std::ffi::OsStr::from_bytes(&[0xff, 0xfe, nanos]),
+        );
+        let (raw, warns) = warns_of(backend_env_raw);
+        assert_eq!(
+            raw, None,
+            "a value that is not a `str` can name no engine, so it reads as unset"
+        );
+        assert_eq!(
+            warns, 1,
+            "the operator set AMOS_BACKEND and it was discarded — the device default runs, \
+             which must be reported, not folded into a silent unset"
+        );
+    }
+
+    /// Source pin: the three startup readers go through `backend_env_raw`, so no
+    /// call site can reintroduce the `std::env::var(..).unwrap_or_default()` fold
+    /// that would swallow a set-but-unreadable value.
+    #[test]
+    fn every_backend_env_read_goes_through_the_one_seam() {
+        const SRC: &str = include_str!("server.rs");
+        let folded = format!("std::env::var({BACKEND_ENV:?})");
+        assert!(
+            !SRC.contains(&folded),
+            "AMOS_BACKEND must be read via backend_env_raw() (var_os keeps `set` apart from \
+             `unset`); the `{folded}` fold silently drops a non-Unicode value"
+        );
+        assert!(
+            SRC.matches("backend_env_raw()").count() >= 3,
+            "EngineState::from_env, build_backend_from_env and is_deployment_unconfigured must \
+             all read through backend_env_raw()"
+        );
     }
 
     /// The builder reads `AMOS_BACKEND` **case-insensitively**

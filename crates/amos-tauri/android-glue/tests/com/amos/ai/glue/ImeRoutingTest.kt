@@ -4,6 +4,7 @@ import com.amos.ai.glue.ImeRouting.Action
 import com.amos.ai.glue.ImeRouting.Key
 import com.amos.ai.glue.ImeRouting.KeyKind
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotEquals
 import org.junit.Test
 
 /**
@@ -78,25 +79,34 @@ class ImeRoutingTest {
     }
 
     // --- digits --------------------------------------------------------------
+    //
+    // A digit key on the service's own grid is an **on-screen** key, so it follows the
+    // on-screen rule (`press` → `typeNonLetter`): commit the in-flight code first, then
+    // type the digit half-width. It is NOT the physical `1–9` candidate shortcut — that
+    // lives in `ImeOverlay.svelte`'s `onKeyDown` (`/^[1-9]$/`), and the service has no
+    // physical-key path at all (a key it does not act on is handed to the field), so the
+    // shortcut has no counterpart here.
 
     @Test
-    fun aDigitPicksTheCandidateOnThePage() {
-        assertEquals(Action.Commit(0), decide(digit("1"), composing = true, candidatesOnPage = 5))
-        assertEquals(Action.Commit(4), decide(digit("5"), composing = true, candidatesOnPage = 5))
-        assertEquals(Action.Commit(7), decide(digit("8"), composing = true, candidatesOnPage = 8))
-    }
-
-    /** `1–9` only; `0` is never a candidate shortcut (matches the WebView's `/^[1-9]$/`). */
-    @Test
-    fun zeroNeverPicksACandidate() {
+    fun anOnScreenDigitCommitsTheCodeFirstAndThenTypesHalfWidth() {
+        assertEquals(Action.CommitThenInsert("3"), decide(digit("3"), composing = true, candidatesOnPage = 5))
+        assertEquals(Action.CommitThenInsert("1"), decide(digit("1"), composing = true, candidatesOnPage = 5))
         assertEquals(Action.CommitThenInsert("0"), decide(digit("0"), composing = true, candidatesOnPage = 5))
     }
 
+    /** The digit is typed, never *picked*: `1` must not become the first candidate. */
     @Test
-    fun aDigitPastTheLastCandidateIsTypedLiterallyAfterTheCommit() {
+    fun aDigitNeverPicksACandidate() {
+        assertNotEquals(Action.Commit(0), decide(digit("1"), composing = true, candidatesOnPage = 5))
+        assertNotEquals(Action.Commit(2), decide(digit("3"), composing = true, candidatesOnPage = 5))
+    }
+
+    /** One non-letter rule: a digit and a punctuation key agree whenever the glyph is ASCII. */
+    @Test
+    fun aDigitAndAnUnmappedPunctuationKeyRouteIdentically() {
         assertEquals(
-            Action.CommitThenInsert("7"),
-            decide(digit("7"), composing = true, candidatesOnPage = 3),
+            decide(punct("3"), composing = true, candidatesOnPage = 5),
+            decide(digit("3"), composing = true, candidatesOnPage = 5),
         )
     }
 

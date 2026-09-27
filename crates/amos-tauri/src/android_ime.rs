@@ -604,6 +604,55 @@ mod tests {
         );
     }
 
+    /// The service's own digit key is an **on-screen** key, so it follows the on-screen
+    /// non-letter rule — commit the in-flight code first, then type the digit half-width —
+    /// and must **not** be the physical `1–9` candidate shortcut (REQ-A1965). The WebView's
+    /// on-screen authority (`ImeOverlay.svelte` `press`) hands a digit to `typeNonLetter`,
+    /// while `1–9` pick lives in its **physical** `onKeyDown` (`/^[1-9]$/`). The
+    /// platform-side table copied the physical rule into a table whose only caller is the
+    /// on-screen grid — the service declares no `onKeyDown`/`KeyEvent`, so a physical key
+    /// is handed straight to the field. A tap on `3` while composing therefore committed
+    /// candidate #3 instead of typing `3`, and the candidate bar draws no number hints, so
+    /// the pick was undiscoverable. A host JVM cannot instantiate an `InputMethodService`,
+    /// so the *wiring* is pinned here: the digit arm commits-then-inserts, no candidate
+    /// arithmetic survives in the table, and the service still has no physical-key path.
+    #[test]
+    fn the_services_digit_key_follows_the_on_screen_non_letter_rule() {
+        const ROUTING: &str = include_str!("../android-glue/com/amos/ai/glue/ImeRouting.kt");
+        const KOTLIN: &str = include_str!("../android-glue/com/amos/ai/glue/AmosImeService.kt");
+
+        let at = ROUTING
+            .lines()
+            .position(|l| l.contains("KeyKind.DIGIT ->"))
+            .expect("ImeRouting must have a DIGIT arm");
+        let arm: String = ROUTING
+            .lines()
+            .skip(at)
+            .take(6)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            arm.contains("Action.CommitThenInsert(key.ch)"),
+            "the on-screen digit must commit first, then type — got:\n{arm}"
+        );
+        assert!(
+            !ROUTING.contains("minus('0')") && !ROUTING.contains("Action.Commit(n - 1)"),
+            "the physical 1–9 candidate shortcut must not live in the on-screen routing table"
+        );
+
+        // The service's only key source is the on-screen grid: no physical handler exists,
+        // so `onKey` is the table's sole caller and the shortcut is unreachable anyway.
+        assert!(
+            !KOTLIN.contains("override fun onKeyDown") && !KOTLIN.contains("KeyEvent"),
+            "the service declares no physical-key path — the table is driven by taps only"
+        );
+        assert_eq!(
+            KOTLIN.matches("ImeRouting.decide(").count(),
+            1,
+            "the routing table must have exactly one call site (the on-screen `onKey`)"
+        );
+    }
+
     /// The trampolines drive the *shared* bridge under [`ANDROID_WINDOW`]; a key
     /// pressed "by the service" is therefore visible to a `snapshot` on that same
     /// window, and the encoder accepts the real engine's answer.
