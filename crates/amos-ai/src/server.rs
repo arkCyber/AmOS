@@ -811,6 +811,53 @@ fn backend_env_raw() -> Option<String> {
     }
 }
 
+/// The env key that carries the cloud API key for the `api` / `anthropic` /
+/// `gemini` backends (see [`build_backend_from_env`]).
+const API_KEY_ENV: &str = "AMOS_API_KEY";
+
+/// The raw `(debug-printed)` byte strings already reported as a non-Unicode
+/// `AMOS_API_KEY`. [`api_key_from_env`] runs from every backend build (a fresh
+/// engine per request) plus the unconfigured probe, so an un-deduplicated warning
+/// would repeat once per request — log flooding is its own defect.
+fn reported_api_keys_raw() -> &'static std::sync::Mutex<std::collections::BTreeSet<String>> {
+    static REPORTED: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeSet<String>>> =
+        std::sync::OnceLock::new();
+    REPORTED.get_or_init(Default::default)
+}
+
+/// Read `AMOS_API_KEY` keeping apart the two env facts
+/// `std::env::var(API_KEY_ENV).unwrap_or_default()` folds into one `""`:
+///
+///  - **absent** ⇒ `None` — no cloud key configured; silent.
+///  - **set, valid Unicode** ⇒ `Some(value)`.
+///  - **set, not valid Unicode** ⇒ `None`, **warned** — a value that is not a
+///    `str` cannot be used as a key, so folding it into "unset" pins the backend
+///    to no-credential with nothing on the operator's only view of it. The RAG
+///    `api` embedder reads the **same** variable through
+///    `rag_service::env_or_default`, which already reports it; the backend builder
+///    was the one reader that stayed silent (REQ-A1981 / F-AI-055).
+fn api_key_from_env() -> Option<String> {
+    let raw = std::env::var_os(API_KEY_ENV)?;
+    match raw.to_str() {
+        Some(s) => Some(s.to_owned()),
+        None => {
+            let first = reported_api_keys_raw()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(format!("{raw:?}"));
+            if first {
+                tracing::warn!(
+                    env = API_KEY_ENV,
+                    value = %raw.to_string_lossy(),
+                    "amos-ai: AMOS_API_KEY is set but is not valid Unicode; treating it as \
+                     unset (no cloud credential is sent) — fix or unset the variable"
+                );
+            }
+            None
+        }
+    }
+}
+
 /// The canonical `AMOS_BACKEND` spellings that name a **real** engine. Also the
 /// set an operator is told about when their value is not recognised.
 const REAL_BACKEND_NAMES: &[&str] = &[
@@ -872,10 +919,138 @@ fn parse_node_paths(s: &str) -> Vec<std::path::PathBuf> {
         .collect()
 }
 
+/// Env keys for the resident-DVFS bring-up block in [`serve`]. Read through
+/// [`env_knob`] so a value the process cannot read is named rather than folded
+/// into "unset".
+const DVFS_ROOT_ENV: &str = "AMOS_CPUFREQ_ROOT";
+const DVFS_NPU_MAX_KHZ_ENV: &str = "AMOS_CPUFREQ_NPU_MAX_KHZ";
+const DVFS_NPU_NODES_ENV: &str = "AMOS_CPUFREQ_NPU_NODES";
+const DVFS_CPU_KINDS_ENV: &str = "AMOS_GOVERNOR_CPU_KINDS";
+
+/// Env keys for the cloud-preset / model selection block in
+/// [`build_backend_from_env`] and its two policy helpers. Read through
+/// [`env_knob`] so a value the process cannot read is named rather than folded
+/// into "unset" — see the module note on `env_knob` for why that matters here.
+const MODEL_ENV: &str = "AMOS_MODEL";
+const OLLAMA_HOST_ENV: &str = "AMOS_OLLAMA_HOST";
+const OLLAMA_API_KEY_ENV: &str = "AMOS_OLLAMA_API_KEY";
+const HERMES_ENDPOINT_ENV: &str = "AMOS_HERMES_ENDPOINT";
+const API_ENDPOINT_ENV: &str = "AMOS_API_ENDPOINT";
+
+/// Read an operator knob as an owned `str`, keeping apart the **two** env facts
+/// `std::env::var(k).ok()` folds into one `None`:
+///
+///  - **absent** ⇒ `None` — each knob's documented `→ default`; silent.
+///  - **set, valid Unicode** ⇒ `Some(value)`. A *blank* value passes through as
+///    `Some("")`, exactly as the previous `.ok()` did: this seam reports the
+///    unreadable case, it does not re-policy the readable ones.
+///  - **set, not valid Unicode** ⇒ `None`, **warned** — the operator pinned a
+///    cpufreq root / NPU node list / kind map / model name / endpoint, but a
+///    value that is not a `str` can name no path, model or URL, so folding it
+///    into "unset" silently applies a default the operator did not choose — or,
+///    for `AMOS_CPUFREQ_ROOT`, silently disables the whole resident DVFS beat —
+///    with no line naming the variable.
+///
+/// Called once per knob at boot, so the warning is deliberately not deduplicated:
+/// a repeated warning would be its own defect, but a boot path cannot repeat.
+/// (REQ-A2004 / F-AI-064; extended to the model/endpoint knobs by REQ-A2023 /
+/// F-AI-067)
+fn env_knob(name: &str) -> Option<String> {
+    env_knob_from(name, std::env::var_os(name))
+}
+
+/// Pure core of [`env_knob`] (the raw `OsString` is injected so the unreadable
+/// arm is reachable in one test process).
+fn env_knob_from(name: &str, raw: Option<std::ffi::OsString>) -> Option<String> {
+    match raw {
+        None => None,
+        Some(os) => match os.to_str() {
+            Some(v) => Some(v.to_owned()),
+            None => {
+                report_unreadable_knob(name, &os);
+                None
+            }
+        },
+    }
+}
+
+/// The one place an unreadable knob is named: shared by [`env_knob_from`] and
+/// [`endpoint_is_pinned`], so the two cannot report the same fact two ways.
+fn report_unreadable_knob(name: &str, os: &std::ffi::OsStr) {
+    tracing::warn!(
+        env = name,
+        value = %os.to_string_lossy(),
+        "amos-ai: an operator knob is set but is not valid Unicode; treating it as unset (the \
+         documented default applies) — fix or unset the variable"
+    );
+}
+
+/// [`env_knob`] with a default for the absent/unreadable cases.
+///
+/// The *readable*-value policy is left exactly as `unwrap_or_else(|_| ..)` had
+/// it, blank included: this reports the unreadable case, it does not re-policy
+/// values the previous reader accepted.
+fn env_knob_or(name: &str, default: &str, raw: Option<std::ffi::OsString>) -> String {
+    env_knob_from(name, raw).unwrap_or_else(|| default.to_owned())
+}
+
+/// [`env_knob_or`] over the process environment.
+fn env_knob_or_env(name: &str, default: &str) -> String {
+    env_knob_or(name, default, std::env::var_os(name))
+}
+
+/// [`env_knob`] with the "blank counts as unset" policy the previous
+/// `.ok().filter(|s| !s.is_empty())` readers had — plus the unreadable report.
+fn env_knob_filtered(name: &str, raw: Option<std::ffi::OsString>) -> Option<String> {
+    env_knob_from(name, raw).filter(|s| !s.is_empty())
+}
+
+/// [`env_knob_filtered`] over the process environment.
+fn env_knob_filtered_env(name: &str) -> Option<String> {
+    env_knob_filtered(name, std::env::var_os(name))
+}
+
+/// The answer to the question [`is_deployment_unconfigured`] actually asks: *did
+/// the operator pin this endpoint away from its documented default?*
+///
+/// This is the one place where the two folded env facts must **not** collapse
+/// into the same answer, because the two call sites want different things:
+///
+///  - a builder arm wants a usable *string* — an unreadable value cannot be a
+///    URL, so [`env_knob_or`] substitutes the default and reports it;
+///  - this predicate wants a *fact about the operator* — and a set-but-unreadable
+///    value is still **set**. Counting it as "at defaults" is what made a
+///    deployment the operator had configured report itself unconfigured, so the
+///    daemon would bail to `BackendKind::Unconfigured` instead of honouring the
+///    intent it was given.
+///
+/// A blank value is not "pinned": it names nothing, so it stays the documented
+/// default, exactly as the previous `!host.trim().is_empty()` guard decided.
+fn endpoint_is_pinned(name: &str, default: &str, raw: Option<std::ffi::OsString>) -> bool {
+    match raw {
+        None => false,
+        Some(os) => match os.to_str() {
+            Some(v) => !v.trim().is_empty() && v != default,
+            None => {
+                report_unreadable_knob(name, &os);
+                true
+            }
+        },
+    }
+}
+
 /// Read an optional non-negative integer from the environment (trimmed); `None`
-/// for unset/empty/unparseable so a bad value never takes the daemon down.
+/// for unset/empty/unparseable so a bad value never takes the daemon down. A
+/// set-but-not-Unicode value is reported by [`env_knob`] rather than folded into
+/// the unset case (REQ-A2004 / F-AI-064).
 pub fn opt_env_u32(key: &str) -> Option<u32> {
-    std::env::var(key).ok().and_then(|v| parse_trimmed_u32(&v))
+    opt_env_u32_from(key, std::env::var_os(key))
+}
+
+fn opt_env_u32_from(key: &str, raw: Option<std::ffi::OsString>) -> Option<u32> {
+    env_knob_from(key, raw)
+        .as_deref()
+        .and_then(parse_trimmed_u32)
 }
 
 /// Build the daemon's system-load sampler (real `/proc` on Linux/Android) and
@@ -1181,49 +1356,42 @@ async fn build_backend_from_env() -> Arc<dyn InferenceBackend> {
                 .to_string(),
         },
         BackendRequest::Real("api") => BackendKind::Api {
-            api_key: std::env::var("AMOS_API_KEY").unwrap_or_default(),
-            endpoint: std::env::var("AMOS_API_ENDPOINT")
-                .unwrap_or_else(|_| "https://api.openai.com/v1/chat/completions".into()),
-            model: std::env::var("AMOS_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into()),
+            api_key: api_key_from_env().unwrap_or_default(),
+            endpoint: env_knob_or_env(
+                API_ENDPOINT_ENV,
+                "https://api.openai.com/v1/chat/completions",
+            ),
+            model: env_knob_or_env(MODEL_ENV, "gpt-4o-mini"),
         },
         // Real on-device / localhost engine via Ollama. When the operator does
         // not pin a model, auto-select the first model the running Ollama has
         // actually installed (so the daemon serves real tokens instead of
         // erroring on a hard-coded default that may not be pulled yet).
         BackendRequest::Real("ollama") => BackendKind::Ollama {
-            host: std::env::var("AMOS_OLLAMA_HOST")
-                .unwrap_or_else(|_| "http://localhost:11434".into()),
+            host: env_knob_or_env(OLLAMA_HOST_ENV, "http://localhost:11434"),
             model: resolve_ollama_model().await,
             // Some local Ollama builds / proxies gate `/v1` behind an API key.
-            bearer: std::env::var("AMOS_OLLAMA_API_KEY")
-                .ok()
-                .filter(|k| !k.is_empty()),
+            bearer: env_knob_filtered_env(OLLAMA_API_KEY_ENV),
         },
         BackendRequest::Real("hermes") => BackendKind::Hermes {
-            base_url: std::env::var("AMOS_HERMES_ENDPOINT")
-                .unwrap_or_else(|_| "http://127.0.0.1:11438".into()),
-            model: std::env::var("AMOS_MODEL").unwrap_or_else(|_| "hermes-rust".into()),
+            base_url: env_knob_or_env(HERMES_ENDPOINT_ENV, "http://127.0.0.1:11438"),
+            model: env_knob_or_env(MODEL_ENV, "hermes-rust"),
         },
         // Claude (Anthropic Messages, native protocol). Endpoint defaults to the
         // official API; model + key come from AMOS_MODEL / AMOS_API_KEY.
         BackendRequest::Real("anthropic") => BackendKind::Anthropic {
-            api_key: std::env::var("AMOS_API_KEY").unwrap_or_default(),
-            endpoint: std::env::var("AMOS_API_ENDPOINT")
-                .ok()
-                .filter(|s| !s.is_empty())
+            api_key: api_key_from_env().unwrap_or_default(),
+            endpoint: env_knob_filtered_env(API_ENDPOINT_ENV)
                 .unwrap_or_else(|| "https://api.anthropic.com/v1/messages".into()),
-            model: std::env::var("AMOS_MODEL")
-                .unwrap_or_else(|_| "claude-3-5-sonnet-latest".into()),
+            model: env_knob_or_env(MODEL_ENV, "claude-3-5-sonnet-latest"),
         },
         // Google Gemini native REST. AMOS_API_ENDPOINT (optional) is the v1beta
         // base URL the model id is appended to.
         BackendRequest::Real("gemini") => BackendKind::Gemini {
-            api_key: std::env::var("AMOS_API_KEY").unwrap_or_default(),
-            base: std::env::var("AMOS_API_ENDPOINT")
-                .ok()
-                .filter(|s| !s.is_empty())
+            api_key: api_key_from_env().unwrap_or_default(),
+            base: env_knob_filtered_env(API_ENDPOINT_ENV)
                 .unwrap_or_else(|| "https://generativelanguage.googleapis.com/v1beta".into()),
-            model: std::env::var("AMOS_MODEL").unwrap_or_else(|_| "gemini-2.0-flash".into()),
+            model: env_knob_or_env(MODEL_ENV, "gemini-2.0-flash"),
         },
         // An explicit `mock` — the one value that asks for the deterministic
         // engine. (`NoOp`/`Auto` never reach here: both return above.)
@@ -1324,21 +1492,22 @@ fn is_deployment_unconfigured() -> bool {
     }
 
     // 3) Cloud presets have non-default keys / endpoints → configured.
-    if std::env::var("AMOS_API_KEY")
-        .map(|s| !s.is_empty())
-        .unwrap_or(false)
-    {
+    if api_key_from_env().map(|s| !s.is_empty()).unwrap_or(false) {
         return false;
     }
-    if let Ok(host) = std::env::var("AMOS_OLLAMA_HOST") {
-        if !host.trim().is_empty() && host != "http://localhost:11434" {
-            return false;
-        }
+    if endpoint_is_pinned(
+        OLLAMA_HOST_ENV,
+        "http://localhost:11434",
+        std::env::var_os(OLLAMA_HOST_ENV),
+    ) {
+        return false;
     }
-    if let Ok(endpoint) = std::env::var("AMOS_HERMES_ENDPOINT") {
-        if !endpoint.trim().is_empty() && endpoint != "http://127.0.0.1:11438" {
-            return false;
-        }
+    if endpoint_is_pinned(
+        HERMES_ENDPOINT_ENV,
+        "http://127.0.0.1:11438",
+        std::env::var_os(HERMES_ENDPOINT_ENV),
+    ) {
+        return false;
     }
 
     // All checks fell through: deployment is unconfigured.
@@ -1370,13 +1539,12 @@ fn is_chat_model(name: &str) -> bool {
 /// reports embedding models. Resolution is time-boxed so a down Ollama cannot
 /// stall daemon startup for the full tags timeout.
 async fn resolve_ollama_model() -> String {
-    if let Ok(m) = std::env::var("AMOS_MODEL") {
+    if let Some(m) = env_knob(MODEL_ENV) {
         if !m.trim().is_empty() {
             return m;
         }
     }
-    let host =
-        std::env::var("AMOS_OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".into());
+    let host = env_knob_or_env(OLLAMA_HOST_ENV, "http://localhost:11434");
     let probe = OllamaBackend::new(host.clone(), String::new());
     let models = tokio::time::timeout(Duration::from_secs(3), probe.list_models())
         .await
@@ -2317,14 +2485,13 @@ pub async fn serve_with_sinks_full(
     // cpufreq sysfs tree (device bring-up), discover the CPU domains once and each
     // beat apply the frequency plan the ResourceGovernor decision implies — only
     // when it changed. Inert on hosts without such a root (CI/desktop unchanged).
-    let dvfs_root = std::env::var("AMOS_CPUFREQ_ROOT").ok();
+    let dvfs_root = env_knob(DVFS_ROOT_ENV);
     // Optional NPU hardware max (kHz): lets the governor's `freq_plan` emit NPU
     // ceilings (Balanced ~85% / PowerSave lower) on device; unset = no NPU cap.
-    let npu_max_khz = opt_env_u32("AMOS_CPUFREQ_NPU_MAX_KHZ");
+    let npu_max_khz = opt_env_u32(DVFS_NPU_MAX_KHZ_ENV);
     // Optional NPU devfreq max-freq node(s) to actually write (comma-separated,
     // e.g. "/sys/class/devfreq/1d84000.npu/max_freq"). Empty = only compute plans.
-    let npu_paths = std::env::var("AMOS_CPUFREQ_NPU_NODES")
-        .ok()
+    let npu_paths = env_knob(DVFS_NPU_NODES_ENV)
         .map(|v| parse_node_paths(&v))
         .unwrap_or_default();
     let mut dvfs_driver = dvfs_root.as_deref().and_then(|r| {
@@ -2338,10 +2505,7 @@ pub async fn serve_with_sinks_full(
     });
     // Device bring-up may override the kind heuristic with the real topology:
     // `AMOS_GOVERNOR_CPU_KINDS="0:Little,4:Big"` (kind case-insensitive).
-    if let (Ok(kinds_env), Some(drv)) = (
-        std::env::var("AMOS_GOVERNOR_CPU_KINDS"),
-        dvfs_driver.as_mut(),
-    ) {
+    if let (Some(kinds_env), Some(drv)) = (env_knob(DVFS_CPU_KINDS_ENV), dvfs_driver.as_mut()) {
         let kinds = parse_kinds_env(&kinds_env);
         if !kinds.is_empty() {
             tracing::info!(kinds = %kinds_env, "amos-ai dvfs kind override");
@@ -3208,6 +3372,368 @@ mod tests {
             SRC.matches("backend_env_raw()").count() >= 3,
             "EngineState::from_env, build_backend_from_env and is_deployment_unconfigured must \
              all read through backend_env_raw()"
+        );
+    }
+
+    // --- REQ-A2004 (F-AI-064): the resident-DVFS bring-up block reads four
+    // operator knobs through one seam, so a value the process cannot read is
+    // named rather than folded into "unset". ---
+
+    /// A non-Unicode `OsString` (unix only): the byte string env vars really are.
+    #[cfg(unix)]
+    fn non_unicode_knob() -> std::ffi::OsString {
+        use std::os::unix::ffi::OsStringExt;
+        std::ffi::OsString::from_vec(vec![b'/', b's', b'y', b's', 0xff, 0xfe])
+    }
+
+    #[test]
+    fn an_absent_dvfs_knob_is_silent() {
+        let (v, warns) = warns_of(|| env_knob_from("AMOS_TEST_KNOB_ABSENT", None));
+        assert_eq!(v, None);
+        assert_eq!(
+            warns, 0,
+            "a genuinely absent knob is its documented `→ default`, not a finding"
+        );
+    }
+
+    #[test]
+    fn a_usable_dvfs_knob_passes_through_without_a_warning() {
+        let (v, warns) = warns_of(|| {
+            env_knob_from(
+                "AMOS_TEST_KNOB_USABLE",
+                Some(std::ffi::OsString::from("/sys/devices/system/cpu/cpufreq")),
+            )
+        });
+        assert_eq!(v.as_deref(), Some("/sys/devices/system/cpu/cpufreq"));
+        assert_eq!(warns, 0);
+    }
+
+    /// A *blank* value is still "set": this seam reports the unreadable case, it
+    /// does not re-policy the readable ones (the previous `.ok()` passed blank
+    /// through too).
+    #[test]
+    fn a_blank_dvfs_knob_passes_through_as_set() {
+        let (v, warns) =
+            warns_of(|| env_knob_from("AMOS_TEST_KNOB_BLANK", Some(std::ffi::OsString::from(""))));
+        assert_eq!(v.as_deref(), Some(""));
+        assert_eq!(warns, 0);
+    }
+
+    /// The defect this round fixes: `.ok()` folded a set-but-not-Unicode value
+    /// into "unset", silently disabling the knob — or, for `AMOS_CPUFREQ_ROOT`,
+    /// the whole resident DVFS beat — with no line naming the variable.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_dvfs_knob_is_reported_not_read_as_absent() {
+        let (v, warns) =
+            warns_of(|| env_knob_from("AMOS_TEST_KNOB_UNREADABLE", Some(non_unicode_knob())));
+        assert_eq!(v, None, "a value that is not a `str` can name no path");
+        assert_eq!(
+            warns, 1,
+            "the operator set the knob and it was discarded — the default applies, which must be \
+             reported, not folded into a silent unset"
+        );
+    }
+
+    /// `opt_env_u32` inherits the seam, so the same class of knob read as an
+    /// integer also reports an unreadable value instead of reading it as "unset".
+    #[cfg(unix)]
+    #[test]
+    fn opt_env_u32_reports_an_unreadable_value_rather_than_reading_it_as_unset() {
+        let (v, warns) =
+            warns_of(|| opt_env_u32_from("AMOS_TEST_KNOB_U32", Some(non_unicode_knob())));
+        assert_eq!(v, None);
+        assert_eq!(warns, 1);
+    }
+
+    /// Source pin: the four bring-up readers go through `env_knob`, so no call
+    /// site can reintroduce the `std::env::var(..).ok()` fold that would swallow a
+    /// set-but-unreadable value. (`std::env::var_os` is the seam's own read.)
+    #[test]
+    fn the_dvfs_bringup_reads_every_knob_through_the_one_seam() {
+        const SRC: &str = include_str!("server.rs");
+        for name in [
+            DVFS_ROOT_ENV,
+            DVFS_NPU_MAX_KHZ_ENV,
+            DVFS_NPU_NODES_ENV,
+            DVFS_CPU_KINDS_ENV,
+        ] {
+            let folded = format!("std::env::var({name:?})");
+            assert!(
+                !SRC.contains(&folded),
+                "{name} must be read via env_knob()/opt_env_u32() (var_os keeps `set` apart from \
+                 `unset`); the `{folded}` fold silently drops a non-Unicode value"
+            );
+        }
+        assert!(
+            SRC.matches("env_knob(").count() >= 4,
+            "the DVFS bring-up block must read its knobs through env_knob()"
+        );
+    }
+
+    // --- REQ-A2023 (F-AI-067): the cloud-preset / model knobs read through the
+    // same seam, and the "did the operator pin this?" question has to answer the
+    // *opposite* way for a set-but-unreadable value. ---
+
+    #[test]
+    fn an_absent_model_knob_takes_the_documented_default_silently() {
+        let (v, warns) = warns_of(|| env_knob_or("TEST_MODEL_ABSENT", "gpt-4o-mini", None));
+        assert_eq!(v, "gpt-4o-mini");
+        assert_eq!(
+            warns, 0,
+            "a genuinely absent knob is its documented `→ default`, not a finding"
+        );
+    }
+
+    #[test]
+    fn a_usable_model_knob_passes_through_without_a_warning() {
+        let (v, warns) = warns_of(|| {
+            env_knob_or(
+                "TEST_MODEL_USABLE",
+                "gpt-4o-mini",
+                Some("hermes3:8b".into()),
+            )
+        });
+        assert_eq!(v, "hermes3:8b");
+        assert_eq!(warns, 0);
+    }
+
+    /// The readable-value policy is the previous `unwrap_or_else`'s, blank
+    /// included: this seam reports the unreadable case, it does not re-policy a
+    /// blank value into the default.
+    #[test]
+    fn a_blank_model_knob_still_passes_through_as_set() {
+        let (v, warns) =
+            warns_of(|| env_knob_or("TEST_MODEL_BLANK", "gpt-4o-mini", Some("".into())));
+        assert_eq!(v, "");
+        assert_eq!(warns, 0);
+    }
+
+    /// The defect this round fixes at the builder sites: a set-but-not-Unicode
+    /// value silently became the documented default model, with no line naming
+    /// the variable the operator had set.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_model_knob_is_reported_and_takes_the_default() {
+        let (v, warns) = warns_of(|| {
+            env_knob_or(
+                "TEST_MODEL_UNREADABLE",
+                "gpt-4o-mini",
+                Some(non_unicode_knob()),
+            )
+        });
+        assert_eq!(v, "gpt-4o-mini");
+        assert_eq!(
+            warns, 1,
+            "the operator named a model and it was discarded — the default applies, which must be \
+             reported, not folded into a silent unset"
+        );
+    }
+
+    #[test]
+    fn a_blank_bearer_is_treated_as_unset_silently() {
+        let (v, warns) = warns_of(|| env_knob_filtered("TEST_BEARER_BLANK", Some("".into())));
+        assert_eq!(v, None, "a blank bearer is the same as none, as before");
+        assert_eq!(warns, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_bearer_is_reported_and_treated_as_unset() {
+        let (v, warns) =
+            warns_of(|| env_knob_filtered("TEST_BEARER_UNREADABLE", Some(non_unicode_knob())));
+        assert_eq!(v, None);
+        assert_eq!(warns, 1);
+    }
+
+    #[test]
+    fn an_endpoint_moved_off_its_default_is_pinned() {
+        let (pinned, warns) = warns_of(|| {
+            endpoint_is_pinned(
+                "TEST_ENDPOINT_PINNED",
+                "http://localhost:11434",
+                Some("http://10.0.0.5:11434".into()),
+            )
+        });
+        assert!(
+            pinned,
+            "a non-default endpoint is the operator stating an intent"
+        );
+        assert_eq!(warns, 0);
+    }
+
+    #[test]
+    fn an_absent_blank_or_default_endpoint_is_not_pinned() {
+        assert!(!endpoint_is_pinned(
+            "TEST_ENDPOINT_ABSENT",
+            "http://localhost:11434",
+            None
+        ));
+        assert!(!endpoint_is_pinned(
+            "TEST_ENDPOINT_DEFAULT",
+            "http://localhost:11434",
+            Some("http://localhost:11434".into())
+        ));
+        assert!(
+            !endpoint_is_pinned(
+                "TEST_ENDPOINT_BLANK",
+                "http://localhost:11434",
+                Some("   ".into())
+            ),
+            "a blank value names no endpoint, so it is the documented default"
+        );
+    }
+
+    /// The behaviour fix, and the reason this predicate does not just reuse
+    /// `env_knob`: a set-but-unreadable endpoint is *set*, so a deployment the
+    /// operator configured must not report itself unconfigured (which would make
+    /// the daemon bail to `BackendKind::Unconfigured` instead of honouring the
+    /// intent it was given). The previous `if let Ok` read answered "not pinned"
+    /// — the opposite of the truth about the operator.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_endpoint_is_still_pinned_and_reported() {
+        let (pinned, warns) = warns_of(|| {
+            endpoint_is_pinned(
+                "TEST_ENDPOINT_UNREADABLE",
+                "http://localhost:11434",
+                Some(non_unicode_knob()),
+            )
+        });
+        assert!(
+            pinned,
+            "an unreadable value is still a value the operator set — folding it into \
+             \"at defaults\" is what made a configured deployment call itself unconfigured"
+        );
+        assert_eq!(warns, 1);
+    }
+
+    /// Source pin: the five cloud-preset / model knobs are read through the seam,
+    /// so no call site can reintroduce the `std::env::var(..)` fold. The needle is
+    /// assembled at run time so this assertion's own literal cannot satisfy it.
+    #[test]
+    fn the_cloud_preset_reads_every_knob_through_the_one_seam() {
+        const SRC: &str = include_str!("server.rs");
+        for name in [
+            MODEL_ENV,
+            OLLAMA_HOST_ENV,
+            OLLAMA_API_KEY_ENV,
+            HERMES_ENDPOINT_ENV,
+            API_ENDPOINT_ENV,
+        ] {
+            let folded = format!("std::env::var({name:?})");
+            assert!(
+                !SRC.contains(&folded),
+                "{name} must be read via env_knob_or_env()/env_knob_filtered_env() \
+                 (var_os keeps `set` apart from `unset`); the `{folded}` fold silently drops a \
+                 non-Unicode value"
+            );
+        }
+        assert!(
+            SRC.matches("env_knob_or_env(").count() >= 4,
+            "the default-composing builder arms must read through env_knob_or_env()"
+        );
+        assert!(
+            SRC.matches("env_knob_filtered_env(").count() >= 2,
+            "the optional-bearer arms must read through env_knob_filtered_env()"
+        );
+        assert!(
+            SRC.matches("endpoint_is_pinned(").count() >= 3,
+            "is_deployment_unconfigured must ask the pinning question through endpoint_is_pinned()"
+        );
+    }
+
+    /// Save/wipe/restore `AMOS_API_KEY` for one test. Saves the raw `OsString`, so
+    /// even a pre-existing non-Unicode value is restored byte-for-byte.
+    struct ApiKeyEnv {
+        saved: Option<std::ffi::OsString>,
+    }
+    impl ApiKeyEnv {
+        fn wipe() -> Self {
+            let saved = std::env::var_os(API_KEY_ENV);
+            std::env::remove_var(API_KEY_ENV);
+            Self { saved }
+        }
+    }
+    impl Drop for ApiKeyEnv {
+        fn drop(&mut self) {
+            match self.saved.take() {
+                Some(s) => std::env::set_var(API_KEY_ENV, s),
+                None => std::env::remove_var(API_KEY_ENV),
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(env_lock)]
+    fn an_unset_api_key_stays_silent() {
+        let _env = ApiKeyEnv::wipe();
+        let (key, warns) = warns_of(api_key_from_env);
+        assert_eq!(key, None);
+        assert_eq!(
+            warns, 0,
+            "a genuinely absent AMOS_API_KEY means no cloud credential, not a finding"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(env_lock)]
+    fn a_usable_api_key_passes_through_without_a_warning() {
+        let _env = ApiKeyEnv::wipe();
+        std::env::set_var(API_KEY_ENV, "sk-live-abc");
+        let (key, warns) = warns_of(api_key_from_env);
+        assert_eq!(key.as_deref(), Some("sk-live-abc"));
+        assert_eq!(warns, 0);
+    }
+
+    /// The defect this round fixes: the builder folded a set-but-not-Unicode
+    /// `AMOS_API_KEY` into `""` with no line saying the key was discarded — while
+    /// the RAG `api` embedder reports the **same** variable through
+    /// `rag_service::env_or_default`. Unix only: env vars are byte strings there.
+    /// A distinct byte string per run keeps the once-per-value report from being
+    /// deduplicated away.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(env_lock)]
+    fn an_api_key_set_to_non_unicode_is_reported_not_silently_read_as_unset() {
+        use std::os::unix::ffi::OsStrExt;
+        let _env = ApiKeyEnv::wipe();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u8)
+            .unwrap_or(1);
+        std::env::set_var(
+            API_KEY_ENV,
+            std::ffi::OsStr::from_bytes(&[0xff, 0xfd, nanos]),
+        );
+        let (key, warns) = warns_of(api_key_from_env);
+        assert_eq!(
+            key, None,
+            "a value that is not a `str` cannot be used as a key, so it reads as unset"
+        );
+        assert_eq!(
+            warns, 1,
+            "the operator set AMOS_API_KEY and it was discarded — the backend runs with no \
+             credential, which must be reported, not folded into a silent unset"
+        );
+    }
+
+    /// Source pin: every `AMOS_API_KEY` read goes through `api_key_from_env`, so no
+    /// call site can reintroduce the `std::env::var(..).unwrap_or_default()` /
+    /// `.map(|s| !s.is_empty())` fold that would swallow a set-but-unreadable key.
+    #[test]
+    fn every_api_key_read_goes_through_the_one_seam() {
+        const SRC: &str = include_str!("server.rs");
+        let folded = format!("std::env::var({API_KEY_ENV:?})");
+        assert!(
+            !SRC.contains(&folded),
+            "AMOS_API_KEY must be read via api_key_from_env() (var_os keeps `set` apart from \
+             `unset`); the `{folded}` fold silently drops a non-Unicode value"
+        );
+        assert!(
+            SRC.matches("api_key_from_env()").count() >= 4,
+            "the `api` / `anthropic` / `gemini` arms and is_deployment_unconfigured must all \
+             read through api_key_from_env()"
         );
     }
 
