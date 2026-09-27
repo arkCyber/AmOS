@@ -43,7 +43,7 @@
 | `AMOS_TCP_ADDR` | url | (空 ⇒ 走 UDS) | `→ refuse-start` | 真机 TCP 桥接地址(必须为环回) |
 | `AMOS_TCP_ALLOW_REMOTE` | bool | `0` | `→ refuse-non-loopback` | 设为 `1` 才允许绑定非环回地址 |
 | `AMOS_TCP_TOKEN` | secret | (空) | `→ warn-no-auth` | TCP 通道 token;空 ⇒ 启动 warn 明示"无认证",**仍服务** |
-| `AMOS_UDS_PEER` | enum | `enforce` | `→ warn` | UDS peer 凭据校验:`enforce`(默认)/`warn`/`require` |
+| `AMOS_UDS_PEER` | enum | `enforce` | `→ enforce`（集合外值告警一次后回退） | UDS peer 凭据校验:`enforce`(默认)/`warn`/`require`（未设静默；拼错 ∕ 空白 ∕ 非 Unicode 报告一次） |
 | `AMOS_MAX_SESSIONS` | int | `16` | `→ 16` | 生成准入池容量(`GenerationPool`,0 不可表示) |
 | `AMOS_GEN_POOL_WAIT_MS` | int | `0` | `→ fail-fast` | 池满时是否等待(0 = fail-fast) |
 | `AMOS_RESPONSE_CACHE` | bool | `0` | `→ disabled` | 是否启用响应缓存(进程内,重启即空) |

@@ -39,18 +39,44 @@ pub enum Policy {
     Require,
 }
 
+/// The env key that selects the unix-socket peer policy (see [`Policy::from_env`]).
+const POLICY_ENV: &str = "AMOS_UDS_PEER";
+
 impl Policy {
-    /// `AMOS_UDS_PEER` = `warn` | `enforce` (default) | `require`. An unknown value is
-    /// reported and treated as the default rather than silently changing the level.
+    /// `AMOS_UDS_PEER` = `warn` | `enforce` (default) | `require`. A value this reader
+    /// does not recognise — a typo, a blank, or a non-Unicode byte string — is
+    /// **reported** and treated as the default rather than silently changing the level.
+    /// Only a truly *unset* variable is silent.
     pub fn from_env() -> Self {
-        match std::env::var("AMOS_UDS_PEER").ok().as_deref() {
+        Self::from_value(std::env::var_os(POLICY_ENV).as_deref())
+    }
+
+    /// [`Self::from_env`] on an already-read value — the whole classification is
+    /// testable without touching the process environment.
+    fn from_value(raw: Option<&std::ffi::OsStr>) -> Self {
+        // A truly unset variable is the only silent state: the operator expressed no
+        // preference, so the documented default applies without comment. Reading via
+        // `var_os` keeps "unset" distinct from "set to a value we cannot even read".
+        let Some(raw) = raw else {
+            return Policy::Enforce;
+        };
+        match raw.to_str() {
             Some("warn") => Policy::WarnOnly,
             Some("require") => Policy::Require,
-            Some("enforce") | None => Policy::Enforce,
+            Some("enforce") => Policy::Enforce,
             Some(other) => {
                 tracing::warn!(
                     value = other,
                     "unknown AMOS_UDS_PEER (expected warn|enforce|require); using enforce"
+                );
+                Policy::Enforce
+            }
+            // `AMOS_UDS_PEER=require` with a non-Unicode byte would otherwise fold into
+            // the unset arm and silently admit unverifiable peers (see `admits`).
+            None => {
+                tracing::warn!(
+                    "unknown AMOS_UDS_PEER (value is not valid Unicode; expected \
+                     warn|enforce|require); using enforce"
                 );
                 Policy::Enforce
             }
@@ -195,6 +221,128 @@ impl PeerGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::sync::{Arc, Mutex};
+
+    /// Captures the `message` text of every event on this thread (via `set_default`),
+    /// so an assertion can land on the discarded-value report specifically rather than
+    /// on a bare WARN count.
+    #[derive(Default)]
+    struct Messages(Mutex<Vec<String>>);
+    struct MsgProbe(Arc<Messages>);
+    impl tracing::Subscriber for MsgProbe {
+        fn enabled(&self, _m: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _s: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _id: &tracing::span::Id, _r: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _a: &tracing::span::Id, _b: &tracing::span::Id) {}
+        fn event(&self, ev: &tracing::Event<'_>) {
+            let mut v = MsgVisitor(String::new());
+            ev.record(&mut v);
+            self.0 .0.lock().unwrap().push(v.0);
+        }
+        fn enter(&self, _id: &tracing::span::Id) {}
+        fn exit(&self, _id: &tracing::span::Id) {}
+    }
+    struct MsgVisitor(String);
+    impl tracing::field::Visit for MsgVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = format!("{value:?}");
+            }
+        }
+    }
+
+    /// Run `f` under a message probe and report its result plus how many emitted
+    /// messages contain `needle`.
+    fn messages_of<T>(f: impl FnOnce() -> T, needle: &str) -> (T, usize) {
+        let msgs = Arc::new(Messages::default());
+        let out = {
+            let _probe = tracing::subscriber::set_default(MsgProbe(msgs.clone()));
+            f()
+        };
+        let n = msgs
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|m| m.contains(needle))
+            .count();
+        (out, n)
+    }
+
+    // --- F-AI-044 (REQ-A1964): "unset" and "set but unreadable" stay apart ---
+
+    #[test]
+    fn a_truly_unset_policy_is_silent_and_keeps_the_default() {
+        let (policy, warned) = messages_of(|| Policy::from_value(None), "AMOS_UDS_PEER");
+        assert_eq!(
+            policy,
+            Policy::Enforce,
+            "unset keeps the documented default"
+        );
+        assert_eq!(
+            warned, 0,
+            "a truly unset variable is the ordinary, silent case"
+        );
+    }
+
+    #[test]
+    fn the_known_policy_tokens_are_not_reported() {
+        use std::ffi::OsStr;
+        for (tok, want) in [
+            ("warn", Policy::WarnOnly),
+            ("enforce", Policy::Enforce),
+            ("require", Policy::Require),
+        ] {
+            let (got, warned) = messages_of(
+                || Policy::from_value(Some(OsStr::new(tok))),
+                "AMOS_UDS_PEER",
+            );
+            assert_eq!(got, want, "{tok} selects {want:?}");
+            assert_eq!(
+                warned, 0,
+                "{tok} is a documented value and must not be reported"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_policy_token_is_reported_not_silently_folded_to_the_default() {
+        use std::ffi::OsStr;
+        let (policy, warned) = messages_of(
+            || Policy::from_value(Some(OsStr::new("yes-please"))),
+            "expected warn|enforce|require",
+        );
+        assert_eq!(policy, Policy::Enforce);
+        assert_eq!(
+            warned, 1,
+            "a typo the operator set must be reported, not silently dropped"
+        );
+    }
+
+    /// A non-Unicode `AMOS_UDS_PEER=require` must not silently become `Enforce`: the
+    /// operator asked to refuse anything not provably the same user, and `Enforce`
+    /// **admits** an unverifiable peer (see [`admits`]) — a silent security downgrade.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_unicode_policy_is_reported_not_silently_folded_to_the_default() {
+        use std::os::unix::ffi::OsStrExt;
+        let raw = std::ffi::OsStr::from_bytes(&[0xff, 0xfe]);
+        let (policy, warned) = messages_of(|| Policy::from_value(Some(raw)), "not valid Unicode");
+        assert_eq!(
+            policy,
+            Policy::Enforce,
+            "a non-Unicode value keeps the default"
+        );
+        assert_eq!(
+            warned, 1,
+            "the operator set AMOS_UDS_PEER and it was discarded — that must be reported"
+        );
+    }
 
     #[test]
     fn same_user_is_admitted_under_every_policy() {
