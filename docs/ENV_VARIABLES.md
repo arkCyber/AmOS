@@ -153,7 +153,7 @@
 | `AMOS_ANDROID_INSTALL_TIMEOUT` | duration | `180s` | `→ 180s` | APK 安装超时 |
 | `AMOS_ANDROID_LAUNCH_TIMEOUT` | duration | `30s` | `→ 30s` | APK 启动超时 |
 | `AMOS_ANDROID_LIST_TIMEOUT` | duration | `30s` | `→ 30s` | APK 列表超时 |
-| `AMOS_DEVCARE_ROOT` | path | (none) | `→ refuse-clean` | DevCare 主机根目录(root 部署时) |
+| `AMOS_DEVCARE_ROOT` | path | (none) | `→ refuse-clean` | DevCare 主机根目录(root 部署时)。**三态**:未设 ∕ 纯空白 ⇒ 静默无后端(`available:false` ∕ `backend:"none"`,诚实默认);合法路径 ⇒ `host-fs` 后端;**设了但读不回(非 Unicode)⇒ `warn!` 点名变量一次后按未设处理**(REQ-A2014 ∕ F-DEV-177 —— 旧读取 `std::env::var(ROOT_ENV).ok().filter(..)` 把此态静默折成「未设」,于是 UI 把一次**不可读**渲染成「未连接」并提示「设置 `AMOS_DEVCARE_ROOT` 指向可清理目录后可用」—— 关于用户环境的一句断言,而用户其实设过)。读取点:`crates/amos-tauri/src/devcare.rs::DevCareBridge::new` → `root_knob` |
 | `AMOS_HOST_FS_ROOT` | path | (none) | `→ refuse-all` | `host_fs_*` 命令允许的根目录(启动期取一次、强校验)。未设/空 ⇒ 每个命令都 `amos.host_fs.root_not_configured`(最常见的失败,不是「路径太短」);设置了但不存在 ⇒ `root_not_found`;设置成非目录 ⇒ `root_not_a_dir` |
 | `AMOS_SCREEN_STATE_PATH` | path | (none) | `→ in-memory` | 屏幕状态文件(amoS-display) |
 | `AMOS_STATE_FILE` | path | (none) | `→ in-memory` | 通用状态文件（`amos.*` 持久化 map）。未设或纯空白 ⇒ 回退 `$HOME/.amos/state.json`（静默）；`$HOME` 也未设 ⇒ 仅内存（文档承诺的 fallback，静默）；**设了但读不回（非 Unicode）⇒ `warn!` 点名变量一次后按未设处理**（REQ-A2011 ∕ F-SH-956 —— 旧读取 `std::env::var(..).ok()` 把此态静默折成「未设」，使整个持久 map 静默降级为内存）。读取点:`crates/amos-tauri/src/store.rs::resolve_state_file` → `usable_path` |

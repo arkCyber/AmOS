@@ -28,6 +28,10 @@
 //!   [`amos_devocare::HostFsCleanProvider`] confined to that root (desktop /
 //!   rooted device / Waydroid). A real Android `PackageManager`/`MediaStore`
 //!   backend is the next device step, not faked here.
+//! * `AMOS_DEVCARE_ROOT` set but **not readable as Unicode** → the same "no
+//!   backend" state, but *reported*: a warning naming the variable, once. The
+//!   two facts are not interchangeable — an operator who named a root must not
+//!   be told their setup is merely absent.
 //!
 //! Business logic lives in [`DevCareBridge`] methods (directly unit-tested); the
 //! `#[tauri::command]` wrappers are thin.
@@ -54,6 +58,52 @@ pub const BACKEND_NONE: &str = "none";
 pub const BACKEND_HOST_FS: &str = "host-fs";
 /// Stability key for the on-device Android backend (Kotlin `DevCareGlue`).
 pub const BACKEND_ANDROID: &str = "android";
+
+/// Three-state read of the device-care root knob.
+///
+/// Unset, or set to whitespace only, is `None` **silently** — that is the
+/// documented "no backend" state (P0-3: unobserved is reported as unknown).
+/// A value that is set but cannot be read back as Unicode is a *different*
+/// fact: it is reported once with the key named and then treated as unset.
+fn root_knob(key: &str, raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let raw = raw?;
+    match raw.into_string() {
+        Ok(s) if !s.trim().is_empty() => Some(PathBuf::from(s)),
+        Ok(_) => None,
+        Err(_) => {
+            report_unusable_root(key);
+            None
+        }
+    }
+}
+
+fn unusable_root_seen() -> &'static Mutex<std::collections::BTreeSet<(String, String)>> {
+    static SEEN: std::sync::OnceLock<Mutex<std::collections::BTreeSet<(String, String)>>> =
+        std::sync::OnceLock::new();
+    SEEN.get_or_init(|| Mutex::new(std::collections::BTreeSet::new()))
+}
+
+#[cfg(test)]
+fn unusable_root_reports_for(key: &str) -> usize {
+    unusable_root_seen()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .filter(|(seen_key, _)| seen_key == key)
+        .count()
+}
+
+fn report_unusable_root(key: &str) {
+    let mut seen = unusable_root_seen()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if seen.insert((key.to_owned(), "<non-Unicode>".to_owned())) {
+        tracing::warn!(
+            "device-care root {key} is set but is not valid Unicode; \
+             treating it as unset (no scan/clean backend)"
+        );
+    }
+}
 
 /* --------------------------- backend seams --------------------------- */
 
@@ -510,8 +560,14 @@ impl DevCareBridge {
     /// Boot from the environment: a real host-fs backend when
     /// `AMOS_DEVCARE_ROOT` is set, otherwise an honest "no backend" state.
     pub fn new() -> Self {
-        match std::env::var(ROOT_ENV).ok().filter(|s| !s.is_empty()) {
-            Some(root) => Self::with_host_root(PathBuf::from(root)),
+        Self::from_root(root_knob(ROOT_ENV, std::env::var_os(ROOT_ENV)))
+    }
+
+    /// Build from an already-resolved root setting. The environment read lives
+    /// in [`Self::new`] so this half is pure and directly testable.
+    fn from_root(root: Option<PathBuf>) -> Self {
+        match root {
+            Some(root) => Self::with_host_root(root),
             None => Self::unavailable(),
         }
     }
@@ -2584,5 +2640,92 @@ mod tests {
             "a partial read is unobserved, not a fabricated penalty"
         );
         assert!(r.findings.iter().all(|f| f.area != CareArea::Battery));
+    }
+
+    /// `OsString` holding bytes that are not valid UTF-8 (tests only).
+    #[cfg(unix)]
+    fn non_unicode_root(raw: &[u8]) -> std::ffi::OsString {
+        use std::os::unix::ffi::OsStrExt;
+        std::ffi::OsString::from(std::ffi::OsStr::from_bytes(raw))
+    }
+
+    #[test]
+    fn an_unset_root_knob_is_none_and_silent() {
+        assert_eq!(root_knob("TEST_DEVCARE_UNSET", None), None);
+        assert_eq!(unusable_root_reports_for("TEST_DEVCARE_UNSET"), 0);
+    }
+
+    #[test]
+    fn a_usable_root_knob_is_taken_as_given() {
+        let root = PathBuf::from("/srv/devcare-root");
+        assert_eq!(
+            root_knob("TEST_DEVCARE_USABLE", Some(root.clone().into_os_string())),
+            Some(root)
+        );
+        assert_eq!(unusable_root_reports_for("TEST_DEVCARE_USABLE"), 0);
+    }
+
+    #[test]
+    fn a_blank_root_knob_keeps_the_documented_no_backend_state() {
+        let blank = root_knob("TEST_DEVCARE_BLANK", Some("   ".into()));
+        assert_eq!(blank, None);
+        // The pre-fix read accepted `"   "` as a *literal relative root*, which
+        // is a directory of spaces — assert against that path, not just the name.
+        assert_ne!(blank, Some(PathBuf::from("   ")));
+        assert_eq!(unusable_root_reports_for("TEST_DEVCARE_BLANK"), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_unicode_root_knob_is_reported_not_read_as_unset() {
+        let key = "TEST_DEVCARE_NONUNICODE";
+        assert_eq!(root_knob(key, Some(non_unicode_root(b"/srv/\xff"))), None);
+        assert_eq!(
+            unusable_root_reports_for(key),
+            1,
+            "a set-but-unreadable root must be named once, not silently folded into unset"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_repeated_bad_root_is_reported_once() {
+        let key = "TEST_DEVCARE_DEDUP";
+        assert_eq!(root_knob(key, Some(non_unicode_root(b"/srv/\xfe"))), None);
+        assert_eq!(root_knob(key, Some(non_unicode_root(b"/srv/\xfe"))), None);
+        assert_eq!(unusable_root_reports_for(key), 1);
+    }
+
+    #[test]
+    fn the_bridge_builds_its_backend_from_the_root_knob() {
+        let root = PathBuf::from("/srv/devcare-host");
+        let bridged = DevCareBridge::from_root(Some(root.clone()));
+        assert!(bridged.status().available);
+        assert_eq!(
+            bridged.status().root,
+            Some(root.to_string_lossy().into_owned())
+        );
+
+        let none = DevCareBridge::from_root(None);
+        assert!(!none.status().available);
+        assert_eq!(none.status().root, None);
+    }
+
+    #[test]
+    fn the_devcare_bridge_reads_its_root_via_var_os_not_var() {
+        let src = include_str!("devcare.rs");
+        let production = src
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("production half");
+        let needle = format!("std::env::var(\"{}\")", ROOT_ENV);
+        assert!(
+            !production.contains(&needle),
+            "the root knob must not be read with the folding `std::env::var`"
+        );
+        assert!(
+            production.contains("std::env::var_os(ROOT_ENV)"),
+            "the root knob is read through var_os"
+        );
     }
 }
