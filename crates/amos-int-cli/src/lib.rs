@@ -66,16 +66,79 @@ pub struct Opts {
 
 /// Resolve the socket path: `--socket`, then `AMOS_TRANSLATE_SOCKET`, else the
 /// daemon default.
+///
+/// The knob is read as **three** facts, not two: **unset** (or blank) ⇒ the
+/// default, silently; a **usable** path ⇒ that path; a value the operator set but
+/// which cannot be read as UTF-8 ⇒ reported once, then the default — so an
+/// unreadable override is never silently mistaken for "unset". (REQ-A1999 / F-TR-006)
 pub fn resolve_socket(cli: Option<PathBuf>) -> PathBuf {
+    resolve_socket_from(KEY, cli, std::env::var_os(KEY))
+}
+
+/// The env key this CLI's socket override is read from.
+const KEY: &str = "AMOS_TRANSLATE_SOCKET";
+
+/// Pure form (all inputs injected so every arm is reachable in a test).
+fn resolve_socket_from(
+    key: &str,
+    cli: Option<PathBuf>,
+    raw: Option<std::ffi::OsString>,
+) -> PathBuf {
     if let Some(s) = cli {
         return s;
     }
-    if let Ok(p) = std::env::var("AMOS_TRANSLATE_SOCKET") {
-        if !p.is_empty() {
-            return PathBuf::from(p);
+    if let Some(p) = socket_path_from(key, raw) {
+        return p;
+    }
+    PathBuf::from(amos_translate::DEFAULT_TRANSLATE_SOCKET)
+}
+
+/// Pure three-state read of the override: unset (or blank) ⇒ `None`; a usable
+/// path ⇒ `Some`; a value set but not valid Unicode ⇒ reported once, then `None`.
+fn socket_path_from(key: &str, raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let raw = raw?;
+    match raw.into_string() {
+        Ok(s) if !s.is_empty() => Some(PathBuf::from(s)),
+        Ok(_) => None,
+        Err(_) => {
+            warn_once_bad_socket_path(key);
+            None
         }
     }
-    PathBuf::from("/tmp/amos-translate.sock")
+}
+
+/// The `(key, reason)` pairs already reported as an unusable socket override, so
+/// a repeated bad value is not news twice.
+fn bad_socket_path_seen() -> &'static std::sync::Mutex<std::collections::BTreeSet<(String, String)>>
+{
+    static SEEN: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeSet<(String, String)>>,
+    > = std::sync::OnceLock::new();
+    SEEN.get_or_init(Default::default)
+}
+
+fn warn_once_bad_socket_path(key: &str) {
+    let first = bad_socket_path_seen()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert((key.to_owned(), "non-Unicode".to_owned()));
+    if first {
+        tracing::warn!(
+            key,
+            "amos-int-cli: {key} is set but not valid Unicode — read as unset, so the daemon \
+             default socket is used"
+        );
+    }
+}
+
+#[cfg(test)]
+fn bad_socket_path_reports_for(key: &str) -> usize {
+    bad_socket_path_seen()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .filter(|(k, _)| k == key)
+        .count()
 }
 
 /// Parse CLI args (manual, no clap dependency).
@@ -253,6 +316,59 @@ pub async fn run(opts: Opts) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use amos_int::{InterpretationOutput, MockPipeline};
+
+    #[test]
+    fn a_cli_socket_wins_over_the_knob_and_the_default() {
+        assert_eq!(
+            resolve_socket_from(
+                "TEST_INTCLI_SOCK_CLI",
+                Some(PathBuf::from("/cli.sock")),
+                None
+            ),
+            PathBuf::from("/cli.sock")
+        );
+        assert_eq!(
+            resolve_socket_from(
+                "TEST_INTCLI_SOCK_CLI",
+                Some(PathBuf::from("/cli.sock")),
+                Some("/env.sock".into())
+            ),
+            PathBuf::from("/cli.sock")
+        );
+    }
+
+    #[test]
+    fn an_unset_socket_knob_is_the_daemon_default_and_silent() {
+        let key = "TEST_INTCLI_SOCK_UNSET";
+        assert_eq!(
+            resolve_socket_from(key, None, None),
+            PathBuf::from(amos_translate::DEFAULT_TRANSLATE_SOCKET)
+        );
+        assert_eq!(bad_socket_path_reports_for(key), 0);
+    }
+
+    #[test]
+    fn a_blank_socket_knob_is_the_daemon_default_and_silent() {
+        let key = "TEST_INTCLI_SOCK_BLANK";
+        assert_eq!(
+            resolve_socket_from(key, None, Some("".into())),
+            PathBuf::from(amos_translate::DEFAULT_TRANSLATE_SOCKET)
+        );
+        assert_eq!(bad_socket_path_reports_for(key), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_unicode_socket_knob_is_reported_not_folded_into_the_default() {
+        use std::os::unix::ffi::OsStringExt;
+        let key = "TEST_INTCLI_SOCK_MOJIBAKE";
+        let raw = std::ffi::OsString::from_vec(vec![0xff, 0xfe]);
+        assert_eq!(
+            resolve_socket_from(key, None, Some(raw)),
+            PathBuf::from(amos_translate::DEFAULT_TRANSLATE_SOCKET)
+        );
+        assert_eq!(bad_socket_path_reports_for(key), 1);
+    }
 
     fn fresh() -> (Session, mpsc::Receiver<InterpretationOutput>) {
         let cfg = SessionConfig::one_way("en", "zh");

@@ -39,7 +39,7 @@
 
 | 变量 | 类型 | 默认 | 失效语义 | 说明 |
 |------|------|------|----------|------|
-| `AMOS_SOCKET` | path | `/tmp/amos-ai.sock` | `→ default-path` | UDS socket 路径 |
+| `AMOS_SOCKET` | path | `/tmp/amos-ai.sock` | `→ default-path`（空白静默 ∕ 非 Unicode 告警一次后回退） | UDS socket 路径（未设 ⇒ 共享默认，静默）。读取点:`crates/amos-ai/src/lib.rs::resolve_socket` |
 | `AMOS_TCP_ADDR` | url | (空 ⇒ 走 UDS) | `→ refuse-start` | 真机 TCP 桥接地址(必须为环回) |
 | `AMOS_TCP_ALLOW_REMOTE` | bool | `0` | `→ refuse-non-loopback` | 设为 `1` 才允许绑定非环回地址 |
 | `AMOS_TCP_TOKEN` | secret | (空) | `→ warn-no-auth` | TCP 通道 token;空 ⇒ 启动 warn 明示"无认证",**仍服务** |
@@ -106,7 +106,7 @@
 
 | 变量 | 类型 | 默认 | 失效语义 | 说明 |
 |------|------|------|----------|------|
-| `AMOS_TRANSLATE_SOCKET` | path | `/tmp/amos-translate.sock` | `→ default` | 翻译 daemon UDS 路径 |
+| `AMOS_TRANSLATE_SOCKET` | path | `/tmp/amos-translate.sock` | `→ default`（空白静默 ∕ 非 Unicode 告警一次后回退） | 翻译 daemon UDS 路径（未设 ⇒ 默认，静默）。读取点:`crates/amos-int-cli/src/lib.rs::resolve_socket` ∕ `crates/amos-translate/src/lib.rs::socket_env` |
 | `AMOS_TRANSLATE_BACKEND` | enum | `mock` | `→ mock` | 翻译后端选择 |
 | `AMOS_TRANSLATE_HOST` | url | (none) | `→ backend-default` | 翻译 API 地址 |
 | `AMOS_TRANSLATE_MODEL` | string | (none) | `→ backend-default` | 翻译模型 |

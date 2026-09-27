@@ -81,14 +81,64 @@ pub mod telemetry_spy_capture;
 
 use std::path::PathBuf;
 
-/// `AMOS_SOCKET` env var wins; otherwise fall back to the shared default.
+/// Resolve the UDS path this daemon binds: `AMOS_SOCKET`, else the shared
+/// default.
+///
+/// The knob is read as **three** facts, not two: **unset** ⇒ the default,
+/// silently; a **usable** path ⇒ that path; a value the operator set but which
+/// cannot be read as UTF-8 ⇒ reported once, then the default — so an unreadable
+/// override is never silently mistaken for "unset". (REQ-A1999 / F-AI-061)
 pub fn resolve_socket() -> PathBuf {
-    if let Ok(p) = std::env::var("AMOS_SOCKET") {
-        if !p.is_empty() {
-            return PathBuf::from(p);
+    socket_path_from("AMOS_SOCKET", std::env::var_os("AMOS_SOCKET"))
+        .unwrap_or_else(amos_proto::socket::default_socket_path)
+}
+
+/// Pure three-state read of a socket-path override (the raw `OsString` is
+/// injected so every arm is reachable in a test).
+fn socket_path_from(key: &str, raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let raw = raw?;
+    match raw.into_string() {
+        Ok(s) if !s.is_empty() => Some(PathBuf::from(s)),
+        Ok(_) => None,
+        Err(_) => {
+            warn_once_bad_socket_path(key);
+            None
         }
     }
-    amos_proto::socket::default_socket_path()
+}
+
+/// The `(key, reason)` pairs already reported as an unusable socket override, so
+/// a repeated bad value is not news twice.
+fn bad_socket_path_seen() -> &'static std::sync::Mutex<std::collections::BTreeSet<(String, String)>>
+{
+    static SEEN: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeSet<(String, String)>>,
+    > = std::sync::OnceLock::new();
+    SEEN.get_or_init(Default::default)
+}
+
+fn warn_once_bad_socket_path(key: &str) {
+    let first = bad_socket_path_seen()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert((key.to_owned(), "non-Unicode".to_owned()));
+    if first {
+        tracing::warn!(
+            key,
+            "amos-ai: {key} is set but not valid Unicode — read as unset, so the shared socket \
+             default is used"
+        );
+    }
+}
+
+#[cfg(test)]
+fn bad_socket_path_reports_for(key: &str) -> usize {
+    bad_socket_path_seen()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .filter(|(k, _)| k == key)
+        .count()
 }
 
 /// The tracing filter directive the daemon starts with.
@@ -123,5 +173,50 @@ mod tests {
         // Blank values are "unset", not a filter that silences everything.
         assert_eq!(log_filter_from(Some("   "), Some("warn")), "warn");
         assert_eq!(log_filter_from(Some(""), None), "info");
+    }
+
+    #[test]
+    fn an_unset_socket_knob_is_the_default_and_silent() {
+        assert_eq!(socket_path_from("TEST_AI_SOCK_UNSET", None), None);
+        assert_eq!(bad_socket_path_reports_for("TEST_AI_SOCK_UNSET"), 0);
+    }
+
+    #[test]
+    fn a_usable_socket_knob_is_read_as_given() {
+        assert_eq!(
+            socket_path_from("TEST_AI_SOCK_OK", Some("/run/amos/ai.sock".into())),
+            Some(PathBuf::from("/run/amos/ai.sock"))
+        );
+        assert_eq!(bad_socket_path_reports_for("TEST_AI_SOCK_OK"), 0);
+    }
+
+    #[test]
+    fn a_blank_socket_knob_is_the_default_and_silent() {
+        assert_eq!(
+            socket_path_from("TEST_AI_SOCK_BLANK", Some("".into())),
+            None
+        );
+        assert_eq!(bad_socket_path_reports_for("TEST_AI_SOCK_BLANK"), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_unicode_socket_knob_is_reported_not_read_as_unset() {
+        use std::os::unix::ffi::OsStringExt;
+        let raw = std::ffi::OsString::from_vec(vec![0xff, 0xfe]);
+        assert_eq!(socket_path_from("TEST_AI_SOCK_MOJIBAKE", Some(raw)), None);
+        assert_eq!(bad_socket_path_reports_for("TEST_AI_SOCK_MOJIBAKE"), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_repeated_bad_socket_knob_is_reported_once() {
+        use std::os::unix::ffi::OsStringExt;
+        let key = "TEST_AI_SOCK_DEDUP";
+        for _ in 0..3 {
+            let raw = std::ffi::OsString::from_vec(vec![0xff, 0xfe]);
+            assert_eq!(socket_path_from(key, Some(raw)), None);
+        }
+        assert_eq!(bad_socket_path_reports_for(key), 1);
     }
 }

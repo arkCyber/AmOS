@@ -19,3 +19,4 @@ amos-int.workspace = true
 amos-translate = { path = "../amos-translate" }
 tokio.workspace = true
 anyhow.workspace = true
+tracing.workspace = true
