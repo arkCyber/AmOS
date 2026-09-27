@@ -284,11 +284,11 @@
 | 变量 | 类型 | 默认 | 失效语义 | 说明 |
 |------|------|------|----------|------|
 | `AMOS_PODCAST_LIVE` | bool | (未设置) | `→ offline-mock` | 真实 HTTP 抓取的**显式 opt-in**,且**只在** `podcast-live` 特性构建里被读取(默认构建忽略它,故默认 UI 构建触不到网络)。truthy 集**恰好**是 `1`/`true`/`yes`/`on`(大小写无关、前后空白 trim)、off 集是 `0`/`false`/`no`/`off`;未设置与两个集合内的值都静默,**存在但两个集合之外**的值(笔误 `enable`/`2`、空串或全空白、非 Unicode)一律**不 arm 且 `warn!`** —— 打错字或写 `false` 都不会意外把真实网络打开(REQ-A1906)。读取点:`crates/amos-tauri/src/podcast.rs::provider()` |
-| `AMOS_PODCAST_DIR` | path | (未设置) | `→ 内存态` | 把该进程的**四个** store 同置此目录。未设置且无逐 store 覆盖 ⇒ 全部 store 只在内存(不写用户磁盘,除非被要求)。读取点:`amos-podcast/src/manager.rs::PodcastPaths::from_env`(经 `pick` 闭包读取,故本表由 REQ-A1906 补登记) |
-| `AMOS_PODCAST_SUBSCRIPTIONS` | path | (未设置) | `→ ${AMOS_PODCAST_DIR}/subscriptions.json` | 订阅 store 的逐文件路径覆盖(优先于 `AMOS_PODCAST_DIR`) |
-| `AMOS_PODCAST_LIBRARY` | path | (未设置) | `→ ${AMOS_PODCAST_DIR}/library.json` | 剧集库 store 的逐文件路径覆盖 |
-| `AMOS_PODCAST_PROGRESS` | path | (未设置) | `→ ${AMOS_PODCAST_DIR}/progress.json` | 播放进度 store 的逐文件路径覆盖 |
-| `AMOS_PODCAST_DOWNLOADS` | path | (未设置) | `→ ${AMOS_PODCAST_DIR}/downloads.json` | 下载登记 store 的逐文件路径覆盖 |
+| `AMOS_PODCAST_DIR` | path | (未设置) | `→ 内存态` | 把该进程的**四个** store 同置此目录。**三态**:未设 ∕ 纯空白 ⇒ 静默「纯内存存储」(不写用户磁盘,诚实默认);合法目录 ⇒ 四个 store 落在其中;**设了但读不回(非 Unicode)⇒ `warn!` 点名变量一次后按未设处理**(REQ-A2022 ∕ F-SH-958 —— 旧读取 `std::env::var("AMOS_PODCAST_DIR").ok().filter(..)` 把此态静默折成「未设」,于是操作者指向真实目录却看到四个 store 退回纯内存、重启即失,日志零行)。读取点:`crates/amos-podcast/src/manager.rs::PodcastPaths::from_env` → `path_knob`(Tauri 桥 `amos-tauri/src/podcast.rs::store_dir` 与 CLI `amos-podcast-cli/src/lib.rs::store_dir` 的 `--dir` 回退都委托同一缝) |
+| `AMOS_PODCAST_SUBSCRIPTIONS` | path | (未设置) | `→ ${AMOS_PODCAST_DIR}/subscriptions.json` | 订阅 store 的逐文件路径覆盖(优先于 `AMOS_PODCAST_DIR`)(三态读取,经 `path_knob`; |)
+| `AMOS_PODCAST_LIBRARY` | path | (未设置) | `→ ${AMOS_PODCAST_DIR}/library.json` | 剧集库 store 的逐文件路径覆盖(三态读取,经 `path_knob`; |)
+| `AMOS_PODCAST_PROGRESS` | path | (未设置) | `→ ${AMOS_PODCAST_DIR}/progress.json` | 播放进度 store 的逐文件路径覆盖(三态读取,经 `path_knob`; |)
+| `AMOS_PODCAST_DOWNLOADS` | path | (未设置) | `→ ${AMOS_PODCAST_DIR}/downloads.json` | 下载登记 store 的逐文件路径覆盖(三态读取,经 `path_knob`; |)
 
 ---
 
