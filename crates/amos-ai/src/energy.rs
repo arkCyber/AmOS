@@ -290,10 +290,21 @@ fn parse_flag(key: &str, raw: Option<&str>) -> Option<bool> {
 /// but not valid Unicode is reported once. `std::env::var(..).ok()` mapped both
 /// to the same silent `None`, so a mojibake value read as "not set" (REQ-A1920).
 ///
-/// `pub(crate)` so the other flag readers in this crate — the JSON-log opt-in in
-/// particular — share this one rule rather than keeping their own copy of it.
+/// `pub(crate)` so the other flag readers in this crate — the JSON-log opt-in, the
+/// telemetry-spy and netguard feed gates — share this one rule rather than keeping
+/// their own copy of it.
 pub(crate) fn env_flag(key: &str) -> Option<bool> {
-    let raw = std::env::var_os(key)?;
+    flag_from_os(key, std::env::var_os(key))
+}
+
+/// [`env_flag`] with the raw value supplied by the caller, so a reader can be
+/// exercised on a value without mutating the process environment (one value per key
+/// per process). Absent is the only silent state; a value present but not valid
+/// Unicode is reported once. The `key` is a parameter — as in [`parse_flag`] — so a
+/// caller's own rule stays testable, and one gate does not need the process env to
+/// pin how it reads one.
+pub(crate) fn flag_from_os(key: &str, raw: Option<std::ffi::OsString>) -> Option<bool> {
+    let raw = raw?;
     let Some(raw) = raw.to_str() else {
         warn_once_bad_flag(key, "<non-Unicode>");
         return None;
@@ -334,7 +345,7 @@ fn warn_once_bad_flag(key: &str, value: &str) {
 /// depending on suite scheduling (measured) — and a flaky honesty test is worse
 /// than none. The `warn!` is the single statement inside the `if first` branch.
 #[cfg(test)]
-fn bad_flag_reports_for(key: &str) -> usize {
+pub(crate) fn bad_flag_reports_for(key: &str) -> usize {
     bad_flag_seen()
         .lock()
         .unwrap_or_else(|p| p.into_inner())

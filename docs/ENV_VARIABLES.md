@@ -204,11 +204,11 @@
 | `AMOS_TIMESYNC_STATE` | path | `~/.amos/timesync.json` | `→ 同默认` | 上次校准偏移的落盘位置(`$HOME/.amos/timesync.json`;无 `HOME` 时 `.amos-timesync.json`),并导出给被监管的子进程。**不是**内存态。读取点:`…::default_state_file` |
 | `AMOS_TIMESYNC_INTERVAL_SECS` | int | `3600` | `→ 3600` | 两次校准的间隔(秒),默认 **1 小时**(`DEFAULT_INTERVAL`)。非数值 ∕ 非 Unicode ⇒ `warn!` 后回落 3600;`0` 被夹到下限 `1s`(**不是**回落到默认 —— 「太小」的答案是下限)。读取点:`…::decide_interval` |
 | `AMOS_NETGUARD_STATE_PATH` | path | (none) | `→ in-memory` | 网络守卫状态 |
-| `AMOS_NETGUARD_ALLOW_INJECT` | bool | `0` | `→ observed-only` | 是否允许注入 netguard 状态 |
+| `AMOS_NETGUARD_ALLOW_INJECT` | bool | `0` | `→ observed-only`（集合外值告警一次后回退） | 是否允许注入 netguard 状态（未设静默；拼错 ∕ 空白 ∕ 非 Unicode 报告一次） |
 | `AMOS_SPY_IFACE` | string | (none) | `→ all-ifaces` | 抓包接口 |
 | `AMOS_SPY_LAYER3` | bool | (none) | `→ L2-default` | 抓包是否下沉到 L3(`rmnet`-style IPv4 接口);**严格读**:truthy `1`/`true`/`yes`/`on`、off `0`/`false`/`no`/`off`;未设置按 L2 处理(静默),两个集合之外的值(含空串与笔误)**按 L2 处理并 `warn!`** —— 它不只是开关,还是 L2/L3 取帧的选择,无声读成 L2 会让抓包恰好漏掉操作员要的那些包(REQ-A1903) |
 | `AMOS_SPY_IDS` | string | (none) | `→ match-nothing` | 间谍关注 ID 列表(逗号分隔) |
-| `AMOS_SPY_ALLOW_INJECT` | bool | `0` | `→ observed-only` | 是否允许注入遥测事件 |
+| `AMOS_SPY_ALLOW_INJECT` | bool | `0` | `→ observed-only`（集合外值告警一次后回退） | 是否允许注入遥测事件（未设静默；拼错 ∕ 空白 ∕ 非 Unicode 报告一次） |
 
 ---
 

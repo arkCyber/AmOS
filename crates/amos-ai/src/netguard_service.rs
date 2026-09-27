@@ -459,9 +459,19 @@ fn event_from_req(req: NoteEgressRequest) -> EgressEvent {
     }
 }
 
-/// Parse the opt-in feed env flag. Only `"1"` or `"true"` enables it.
+/// Parse the opt-in feed env flag. Only a truthy token enables it; unset is
+/// silent. A value the operator *did* set that names neither side (a typo, blank,
+/// or a value that is not valid Unicode) is **reported once** and read as off —
+/// the same rule the crate's other bool flags follow, so a mistyped gate cannot be
+/// silently inert ([`crate::energy::flag_from_os`]).
 fn injection_env_allowed() -> bool {
-    matches!(std::env::var(INJECT_ENV).as_deref(), Ok("1") | Ok("true"))
+    injection_allowed_from(INJECT_ENV, std::env::var_os(INJECT_ENV))
+}
+
+/// [`injection_env_allowed`] with the raw value supplied by the caller, so the
+/// reading rule is testable without mutating the process environment.
+fn injection_allowed_from(key: &str, raw: Option<std::ffi::OsString>) -> bool {
+    crate::energy::flag_from_os(key, raw).unwrap_or(false)
 }
 
 /// Build the guard the daemon mounts: honor the env-gated feed flag and re-hydrate
@@ -666,6 +676,55 @@ mod tests {
     use super::*;
     use amos_network_guard::audit::{EgressEvent, EgressKind};
     use amos_network_guard::policy::Policy;
+
+    // --- REQ-A1971: the feed gate reads through the crate's one flag rule ---
+
+    #[test]
+    fn an_unset_feed_gate_is_off_and_silent() {
+        assert!(!injection_allowed_from("TEST_NG_INJECT_UNSET", None));
+        assert_eq!(
+            crate::energy::bad_flag_reports_for("TEST_NG_INJECT_UNSET"),
+            0
+        );
+    }
+
+    #[test]
+    fn a_recognised_token_is_read_without_a_warning() {
+        for (i, t) in ["1", "true", "yes", "on"].into_iter().enumerate() {
+            let k = format!("TEST_NG_INJECT_TRUE_{i}");
+            assert!(injection_allowed_from(&k, Some(t.into())), "{t} must arm");
+            assert_eq!(crate::energy::bad_flag_reports_for(&k), 0);
+        }
+        for (i, t) in ["0", "false", "no", "off"].into_iter().enumerate() {
+            let k = format!("TEST_NG_INJECT_FALSE_{i}");
+            assert!(
+                !injection_allowed_from(&k, Some(t.into())),
+                "{t} must not arm"
+            );
+            assert_eq!(crate::energy::bad_flag_reports_for(&k), 0);
+        }
+    }
+
+    #[test]
+    fn a_set_but_unrecognised_value_is_reported_not_read_as_unset() {
+        const K: &str = "TEST_NG_INJECT_TYPO";
+        assert!(!injection_allowed_from(K, Some("enable".into())));
+        assert_eq!(
+            crate::energy::bad_flag_reports_for(K),
+            1,
+            "the operator set the gate and it was discarded — that must be reported"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_set_but_non_unicode_value_is_reported_not_read_as_unset() {
+        use std::os::unix::ffi::OsStringExt;
+        const K: &str = "TEST_NG_INJECT_MOJIBAKE";
+        let raw = std::ffi::OsString::from_vec(vec![0xff, 0xfe]);
+        assert!(!injection_allowed_from(K, Some(raw)));
+        assert_eq!(crate::energy::bad_flag_reports_for(K), 1);
+    }
 
     /// A [`NetworkGuard`] spy: records how many policies it was asked to apply,
     /// whether it was flushed, and whether it claims to enforce. Lets a test see
