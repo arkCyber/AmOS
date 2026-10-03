@@ -1864,6 +1864,7 @@ export const zh = {
   "settings.passcodeOff": "未启用",
   "settings.icloudRow": "iCloud",
   "settings.ai": "AI 与智能",
+  "settings.backup": "备份与恢复",
   "settings.privacy": "隐私与安全性",
   "settings.about": "关于本机",
   "settings.diagnostics": "系统监控与开发者",
@@ -2193,6 +2194,9 @@ export const zh = {
   "ime.shift": "大写",
   "ime.lastCommitted": "已提交「{word}」",
   "ime.forget": "忘记该词",
+  "ime.persistFailuresTitle": "学习器落盘失败",
+  "ime.persistFailuresValue": "{n} 次",
+  "ime.persistFailuresHint": "已学词暂时只在内存里：AMOS-IME 桥的 amos-ime.json 无法写入。请检查文件路径与权限，重启后会自动恢复落盘。",
   "ime.fuzzy.z_zh": "z = zh",
   "ime.fuzzy.c_ch": "c = ch",
   "ime.fuzzy.s_sh": "s = sh",
@@ -3378,6 +3382,13 @@ export const zh = {
   "drag.dropOn": "松手交给「{app}」",
   "drag.rejectSameApp": "这是它原本所在的应用",
   "drag.rejectUnsupported": "此应用不能接收",
+  "backup.title": "备份与恢复",
+  "backup.hint": "创建本地数据备份或从之前的备份恢复。",
+  "backup.backup_now": "立即备份",
+  "backup.restore": "从备份恢复",
+  "backup.in_progress": "正在处理…",
+  "backup.entries": "个条目",
+  "backup.entries_restored": "个条目已恢复",
 };
 
 /** Canonical set of translatable keys (derived from zh, the base dictionary). */

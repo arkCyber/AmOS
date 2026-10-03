@@ -187,6 +187,14 @@ struct ImeInner {
     windows: HashMap<String, WindowSession>,
     /// Monotonic counter behind [`WindowSession::touched`] (deterministic LRU).
     seq: u64,
+    /// **Cumulative** count of profile-flush failures, surfaced as a field on
+    /// [`ImeStateOut`] so the operator can see that the learner is in-memory only
+    /// (the same observability rule the on-disk log sink makes visible — REQ-A87
+    /// / F-IME-032). It is on `ImeInner` rather than `ImeBridge` so reads inside
+    /// `state_of` (which already holds the lock) do not have to re-acquire it,
+    /// and writes from `persist()` (which is the *only* mutator) are the same
+    /// ordering story as the engine it serialises behind. Zero on a fresh boot.
+    persist_failures: AtomicU64,
 }
 
 struct WindowSession {
@@ -231,6 +239,14 @@ pub struct ImeStateOut {
     /// (the keyboard offers "forget this word" only while this is set — undoing a
     /// sentence composition would be a button that does nothing).
     pub last_pick_code: Option<String>,
+    /// **Cumulative** count of profile-flush failures since this bridge booted
+    /// (REQ-A2091 / F-IME-032). `0` means every persist attempt since boot landed;
+    /// a non-zero value is the learner being in-memory only and the operator
+    /// has not been told — the same honesty rule the on-disk log sink pays for
+    /// (`logfile.rs::LogSinkReport.lost_bytes`). Frontend renders this as a
+    /// health-readout line in Settings, so a stuck `amos-ime.json` is visible
+    /// rather than a word that "the keyboard forgot".
+    pub persist_failures: u64,
 }
 
 /// Reply of `ime_commit`: what was inserted (if anything) + the new session state.
@@ -333,7 +349,15 @@ fn keep_profile_aside(path: &Path, reason: &str) {
 /// the 联想 suggestions for what *this* window has committed. One index space
 /// either way, so the keyboard's pager and its commit index mean exactly one thing
 /// (the suggestion carries `"predict"` so the UI can label it).
-fn state_of(session: &WindowSession, core: &PinyinCore) -> ImeStateOut {
+///
+/// `persist_failures` is a snapshot of the bridge's cumulative profile-flush
+/// failure count (REQ-A2091 / F-IME-032). It is read **before** the borrow on
+/// `inner` ends — `state_of` is the one place the field flows onto the wire, and
+/// routing the value through the call instead of borrowing the whole `ImeInner`
+/// keeps the lock window as small as it was before the counter existed (the
+/// earlier shape only held `session` and `core` while the bridge was already
+/// inside the call).
+fn state_of(persist_failures: u64, session: &WindowSession, core: &PinyinCore) -> ImeStateOut {
     let input = &session.input;
     let candidates = if input.is_composing() {
         input
@@ -365,6 +389,7 @@ fn state_of(session: &WindowSession, core: &PinyinCore) -> ImeStateOut {
         learned_pending: core.learned_pending(),
         last_committed: input.last_committed().map(str::to_string),
         last_pick_code: session.last_pick_code.clone(),
+        persist_failures,
     }
 }
 
@@ -451,6 +476,7 @@ impl ImeBridge {
                 path: None,
                 windows: HashMap::new(),
                 seq: 0,
+                persist_failures: AtomicU64::new(0),
             })),
         }
     }
@@ -496,8 +522,14 @@ impl ImeBridge {
     pub fn snapshot(&self, window: &str) -> ImeStateOut {
         let mut inner = self.lock();
         let core = Arc::clone(&inner.core);
+        // The counter is read before the mutable borrow on `session` starts, so the
+        // compiler's NLL checker sees a clean serial pair of borrows rather than
+        // the two overlapping it would reject (an `AtomicU64::load` is a `&self`
+        // call on the field, which keeps `inner` borrowed for the rest of the
+        // expression).
+        let persist_failures = inner.persist_failures.load(Ordering::Relaxed);
         let session = inner.session(window);
-        state_of(session, &core)
+        state_of(persist_failures, session, &core)
     }
 
     /// Feed one tap's worth of characters into `window`'s buffer (only ASCII
@@ -516,6 +548,10 @@ impl ImeBridge {
     pub fn key(&self, window: &str, ch: &str) -> ImeStateOut {
         let mut inner = self.lock();
         let core = Arc::clone(&inner.core);
+        // Counter read before the mutable borrow on `session` starts; the
+        // persist-failures count is a snapshot of the bridge's lifetime
+        // observability, not of this call.
+        let persist_failures = inner.persist_failures.load(Ordering::Relaxed);
         let session = inner.session(window);
         let before = session.input.input().len();
         if before >= MAX_INPUT_CHARS {
@@ -529,7 +565,7 @@ impl ImeBridge {
                 cap = MAX_INPUT_CHARS,
                 "IME buffer at cap — refusing further letters for this window"
             );
-            return state_of(session, &core);
+            return state_of(persist_failures, session, &core);
         }
         // Take only the letters that fit (the JS side already enforces
         // MAX_KEY_CHARS, but a leftover in-flight caller could still exceed).
@@ -543,7 +579,7 @@ impl ImeBridge {
         if accepted > 0 {
             session.last_pick_code = None;
         }
-        state_of(session, &core)
+        state_of(persist_failures, session, &core)
     }
 
     /// Drop one buffered character from `window`. Not persisted (same reason as
@@ -551,18 +587,20 @@ impl ImeBridge {
     pub fn backspace(&self, window: &str) -> ImeStateOut {
         let mut inner = self.lock();
         let core = Arc::clone(&inner.core);
+        let persist_failures = inner.persist_failures.load(Ordering::Relaxed);
         let session = inner.session(window);
         session.input.backspace();
-        state_of(session, &core)
+        state_of(persist_failures, session, &core)
     }
 
     /// Abandon `window`'s in-flight buffer. Not persisted.
     pub fn clear(&self, window: &str) -> ImeStateOut {
         let mut inner = self.lock();
         let core = Arc::clone(&inner.core);
+        let persist_failures = inner.persist_failures.load(Ordering::Relaxed);
         let session = inner.session(window);
         session.input.clear();
-        state_of(session, &core)
+        state_of(persist_failures, session, &core)
     }
 
     /// Commit candidate `index` **in `window`**: the inserted text (or `None` for an
@@ -579,6 +617,7 @@ impl ImeBridge {
         let (committed, state) = {
             let mut inner = self.lock();
             let core = Arc::clone(&inner.core);
+            let persist_failures = inner.persist_failures.load(Ordering::Relaxed);
             let session = inner.session(window);
             if session.input.is_composing() {
                 // The code and the candidate *kind* must be read **before** the
@@ -600,13 +639,13 @@ impl ImeBridge {
                 } else {
                     None
                 };
-                (committed, state_of(session, &core))
+                (committed, state_of(persist_failures, session, &core))
             } else {
                 let committed = session.input.commit_prediction(index, CANDIDATE_LIMIT);
                 // A suggestion carries no pinyin code, so there is nothing the
                 // learner could have learned and nothing "forget" could undo.
                 session.last_pick_code = None;
-                (committed, state_of(session, &core))
+                (committed, state_of(persist_failures, session, &core))
             }
         };
         if committed.is_some() {
@@ -623,12 +662,13 @@ impl ImeBridge {
         let state = {
             let mut inner = self.lock();
             let core = Arc::clone(&inner.core);
+            let persist_failures = inner.persist_failures.load(Ordering::Relaxed);
             let session = inner.session(window);
             if let Some(code) = session.last_pick_code.take() {
                 session.input.forget(&code);
             }
             session.input.clear_hint();
-            state_of(session, &core)
+            state_of(persist_failures, session, &core)
         };
         self.persist();
         state
@@ -686,8 +726,12 @@ impl ImeBridge {
                 "fuzzy preferences changed — in-flight compositions abandoned"
             );
         }
+        // Read the counter **after** the `values_mut` borrow ends (the loop has
+        // already drained into `abandoned`) and **before** `inner.session(window)`
+        // opens the next mutable borrow. NLL keeps these serial.
+        let persist_failures = inner.persist_failures.load(Ordering::Relaxed);
         let session = inner.session(window);
-        state_of(session, &core)
+        state_of(persist_failures, session, &core)
     }
 
     /// Forget **everything** the learner knows (all pins and counters) and flush.
@@ -699,8 +743,9 @@ impl ImeBridge {
             // `import_l0` replaces the whole L0 layer, so an empty snapshot is the
             // engine's own "forget all" — no per-code loop that could miss one.
             core.import_l0(&L0Data::default());
+            let persist_failures = inner.persist_failures.load(Ordering::Relaxed);
             let session = inner.session(window);
-            state_of(session, &core)
+            state_of(persist_failures, session, &core)
         };
         self.persist();
         state
@@ -719,7 +764,19 @@ impl ImeBridge {
     }
 
     /// Flush the profile atomically (temp file + rename). Best-effort: a failure is
-    /// logged, never reported as a failed keystroke/commit.
+    /// logged, never reported as a failed keystroke/commit. The **cumulative**
+    /// failure count, however, is surfaced on [`ImeStateOut`] (REQ-A2091 /
+    /// F-IME-032) so the operator can see the learner is in-memory only — a
+    /// silent loss of the user's pinned words would be exactly the honesty
+    /// boundary P0-3 forbids.
+    ///
+    /// The counter is incremented on **any** of the four stages a profile write
+    /// can fail at: serialization, parent-dir creation, temp-file write, or
+    /// rename. The `create_dir_all` failure does not return early — the write
+    /// below will fail with the same cause and that one *is* counted — so the
+    /// two calls are kept distinct on the trace side (different warning
+    /// sentences) and merged on the counter side (one operator-visible failure,
+    /// not two, when the cause is the same).
     fn persist(&self) {
         let (path, profile) = {
             let inner = self.lock();
@@ -733,6 +790,7 @@ impl ImeBridge {
             Ok(payload) => payload,
             Err(e) => {
                 tracing::warn!(target: "amos::ime", error = %e, "IME profile serialize failed");
+                self.bump_persist_failures();
                 return;
             }
         };
@@ -752,12 +810,37 @@ impl ImeBridge {
         if let Err(e) = std::fs::write(&tmp, payload.as_bytes()) {
             tracing::warn!(target: "amos::ime", error = %e, "IME profile write failed");
             remove_staging(&tmp);
+            self.bump_persist_failures();
             return;
         }
         if let Err(e) = std::fs::rename(&tmp, &path) {
             tracing::warn!(target: "amos::ime", error = %e, "IME profile rename failed");
             remove_staging(&tmp);
+            self.bump_persist_failures();
         }
+    }
+
+    /// Increment the cumulative persist-failure counter by one.
+    ///
+    /// `Ordering::Relaxed` is the right ordering: the counter is an observability
+    /// field (the next `state_of` reads the latest value), and `persist()` is the
+    /// only mutator. Nothing else in the bridge synchronises against this
+    /// counter, so a stronger ordering would pay for no correctness.
+    ///
+    /// `pub(crate)` so the unit tests can drive the counter without staging a
+    /// real `amos-ime.json` write failure (a `#[cfg(test)]` accessor would do
+    /// the same, but the wire shape — that the counter is the one the user
+    /// sees — is the same one this exposes).
+    pub(crate) fn bump_persist_failures(&self) {
+        let inner = self.lock();
+        inner.persist_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The cumulative count of profile-flush failures since boot. `0` when every
+    /// persist since boot landed; the operator-visible truth is "the in-memory
+    /// learner has been written N times less than it should have been".
+    pub fn persist_failures(&self) -> u64 {
+        self.lock().persist_failures.load(Ordering::Relaxed)
     }
 }
 
@@ -1104,7 +1187,6 @@ fn call_system_ime_glue(member: &str) -> Result<String, String> {
 pub(crate) fn ask_the_platform_for_system_ime() -> Result<String, String> {
     Err(host_without_ime_glue())
 }
-
 #[cfg(not(feature = "android"))]
 pub(crate) fn ask_the_platform_to_show_ime_picker() -> Result<String, String> {
     Err(host_without_ime_glue())
@@ -1114,6 +1196,10 @@ pub(crate) fn ask_the_platform_to_show_ime_picker() -> Result<String, String> {
 pub(crate) fn ask_the_platform_for_ime_settings() -> Result<String, String> {
     Err(host_without_ime_glue())
 }
+
+// REQ-A2090 / F-IME-031: host builds (macOS / Linux desktop) have no Android
+// glue to ask; we **always** answer with the explicit reason string instead of
+// panic'ing or folding to an empty `reason`.
 
 #[cfg(not(feature = "android"))]
 fn host_without_ime_glue() -> String {
@@ -2301,6 +2387,165 @@ mod tests {
             };
             assert_eq!(err.code, expected, "for {refused:?}");
         }
+    }
+
+    /// The host/desktop build (a `cargo test` on macOS, an `amos-tauri` binary without
+    /// the `android` feature) cannot ask the platform — there is no `Context`, no
+    /// `InputMethodManager`, no glue class on any loader. The command must answer the
+    /// honest `available: false` shape with a **non-empty, human-readable `reason`**
+    /// the UI renders verbatim (`ImePage.svelte`'s `ime.systemUnavailableHint` is
+    /// `t(..., { reason: sys.reason })` — a folded `""` would render the "why" sentence
+    /// blank, telling the operator "this build cannot ask" without the **what**).
+    ///
+    /// Folding "the host has no glue" into a silent `available: false, reason: ""`
+    /// would be the same shape as the "platform was never asked" reply — the
+    /// `nfc_status` family paid for that one (REQ-A775 / F-AND-007). Pinned here so a
+    /// `host_without_ime_glue` rewrite cannot collapse into a constant empty string.
+    #[cfg(not(feature = "android"))]
+    #[test]
+    fn host_build_answers_unavailable_not_a_panic() {
+        // The `status` command path: `ime_system_status` is a thin wrapper over
+        // `system_ime_status_from(ask_the_platform_for_system_ime())`. The ask side
+        // answers the `host_without_ime_glue` string on a host build.
+        let raw = ask_the_platform_for_system_ime().expect_err("host build has no glue");
+        assert!(
+            !raw.is_empty(),
+            "the host reason must not be folded to \"\" (would render the UI sentence blank)"
+        );
+        assert!(
+            raw.contains("host") || raw.contains("desktop") || raw.contains("Android"),
+            "the host reason must name the platform it could not reach, got: {raw:?}"
+        );
+
+        let status = system_ime_status_from(Err(raw.clone()));
+        assert!(!status.available);
+        assert_eq!(
+            status.reason, raw,
+            "the command's reason must round-trip through system_ime_status_from verbatim"
+        );
+        assert_eq!(
+            (status.enabled, status.selected, status.current_id),
+            (None, None, None),
+            "the three facts must be None, not false — nothing was asked"
+        );
+
+        // The two launchers (`ime_system_open_picker` / `ime_system_open_settings`) also
+        // hit the same no-glue path. The chain is `ask_…().map_err(glue_unavailable)?`,
+        // which is a `Result<_, AmosError>` flow — the host reason rides in the
+        // `AmosError`'s message, the **code** must be `ImeSystemGlueUnavailable` so the
+        // UI picks the right sentence (`spacesFailure` / F-SH-577 family). Replicated
+        // here directly rather than going through the `tauri::command` wrapper so the
+        // test does not need a `tauri::test` harness.
+        let glue_err = glue_unavailable(
+            ask_the_platform_to_show_ime_picker().expect_err("host build has no glue"),
+        );
+        assert_eq!(glue_err.code, ErrorCode::ImeSystemGlueUnavailable);
+        assert!(
+            !glue_err.message.is_empty(),
+            "the refusal's own sentence must be rendered to the operator, not folded to \"\""
+        );
+        let glue_err = glue_unavailable(
+            ask_the_platform_for_ime_settings().expect_err("host build has no glue"),
+        );
+        assert_eq!(glue_err.code, ErrorCode::ImeSystemGlueUnavailable);
+        assert!(!glue_err.message.is_empty());
+    }
+
+    /// The persist-failure counter is the only path between "I lost the
+    /// user's pinned words" and "the operator sees the loss". The wire shape is
+    /// `ImeStateOut.persist_failures: u64`, and the contract is: starts at `0`,
+    /// increments by exactly one per failed `persist()`, and **never**
+    /// increments on a successful persist (so a healthy daemon answers `0`
+    /// forever, not a flapping number).
+    ///
+    /// `bump_persist_failures` is the only mutator; `persist_failures` is the
+    /// only reader. The negative controls below prove the wire value tracks the
+    /// counter rather than being hard-coded — folding either into a constant
+    /// would make this test catch it (the `nfc_status` family paid for the
+    /// `Option` shape; this one pays for the `u64` shape, REQ-A2091 / F-IME-032).
+    #[test]
+    fn persist_failures_starts_at_zero_and_increments_exactly_per_call() {
+        let bridge = ImeBridge::boot();
+        assert_eq!(
+            bridge.persist_failures(),
+            0,
+            "a fresh bridge must start at zero — any other value would lie about lost pins"
+        );
+        assert_eq!(
+            bridge.snapshot(MAIN).persist_failures,
+            0,
+            "the wire field is the same counter, not a folded constant"
+        );
+
+        bridge.bump_persist_failures();
+        assert_eq!(bridge.persist_failures(), 1);
+        assert_eq!(bridge.snapshot(MAIN).persist_failures, 1);
+
+        bridge.bump_persist_failures();
+        bridge.bump_persist_failures();
+        assert_eq!(bridge.persist_failures(), 3);
+        assert_eq!(
+            bridge.snapshot(MAIN).persist_failures,
+            3,
+            "every command must see the cumulative count, not a per-call value"
+        );
+    }
+
+    /// A `commit` that lands (a real dictionary pick) persists the profile; on a
+    /// healthy disk the counter does **not** move. The bridge here is a
+    /// `boot()` with no `configure(path)` — `persist()` is then a no-op that
+    /// returns early, so neither the success path nor the failure path
+    /// fires. The counter is the value that matters: it must stay at `0`
+    /// through a normal commit cycle, so a noisy test cannot turn green by
+    /// accidentally counting a healthy write.
+    #[test]
+    fn persist_failures_does_not_increment_on_a_successful_commit() {
+        let bridge = ImeBridge::boot();
+        // A real commit on a healthy engine…
+        bridge.key(MAIN, "zhongguo");
+        let out = bridge.commit(MAIN, 0);
+        assert_eq!(out.committed.as_deref(), Some("中国"));
+        // …must not move the counter (persist() is a no-op when no path was
+        // configured, but neither path is a failure — the counter is the
+        // observability story, not the persist-attempt story).
+        assert_eq!(bridge.persist_failures(), 0);
+        assert_eq!(bridge.snapshot(MAIN).persist_failures, 0);
+    }
+
+    /// Real on-disk failure path: configure the bridge at a path whose
+    /// **parent directory** does not exist and is on a read-only mount we
+    /// cannot create. The same shape as `logfile.rs`'s "Is a directory"
+    /// failure — every stage of `persist()` will return an `io::Error`, so
+    /// the counter increments. The negative control is the healthy
+    /// `persist_failures_does_not_increment_on_a_successful_commit` above.
+    #[cfg(unix)]
+    #[test]
+    fn persist_failures_increments_on_a_real_write_failure() {
+        let dir = temp_dir("persistfail");
+        // `/dev/null/<x>` is a path whose parent exists but is a char device, so
+        // `create_dir_all` fails with `NotADirectory` — exactly the kind of
+        // failure the bridge should surface, not silently swallow.
+        let path = std::path::PathBuf::from("/dev/null").join(format!("amos-ime-{dir:?}.json"));
+        let bridge = ImeBridge::boot();
+        bridge.configure(path.clone());
+
+        let before = bridge.persist_failures();
+        bridge.key(MAIN, "wo");
+        let _ = bridge.commit(MAIN, 0);
+        let after = bridge.persist_failures();
+
+        assert!(
+            after > before,
+            "a commit on an unwritable profile must surface as a persist failure \
+             (before={before}, after={after}, path={path:?})"
+        );
+        assert_eq!(
+            bridge.snapshot(MAIN).persist_failures,
+            after,
+            "the wire field is the cumulative count, not the per-commit count"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Tiny helpers for the fixtures above, so a repeated literal cannot drift from the

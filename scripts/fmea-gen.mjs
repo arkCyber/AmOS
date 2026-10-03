@@ -939,6 +939,12 @@ const KNOWN_FAILURES = [
   { id: 'F-IME-003', module: 'amos-tauri', files: ['crates/amos-tauri/src/ime.rs'], markers: ['PREDICT_KIND', 'predictions'], severity: 3 },
   { id: 'F-IME-004', module: 'amos-ime', files: ['crates/amos-ime/src/engine.rs', 'crates/amos-tauri/src/ime.rs'], markers: ['commit_prediction', 'record_commit'], severity: 3 },
   { id: 'F-IME-005', module: 'amos-ime', files: ['crates/amos-ime/Cargo.toml'], markers: ['predict', 'trigrams'], severity: 2 },
+  // REQ-A2090: 主机构建（非 Android 桌面）调用 `system_ime_status` / 系统选窗时**不能**因为缺 Android glue 而 panic —— 必须返回 available:false + 原因串,沿用航天「无 Glue 不假装」原则。
+  { id: 'F-IME-031', module: 'amos-tauri', files: ['crates/amos-tauri/src/ime.rs'], markers: ['host_without_ime_glue', 'glue_unavailable', 'available: false'], severity: 4 },
+  // REQ-A2091: IME 持久化（amos-ime.json）失败必须可观察 —— 不再静默折叠"未保存"，累积计数经 `ImeStateOut.persist_failures` 跨线投递,前端 Settings 显示红字 + 提示。
+  { id: 'F-IME-032', module: 'amos-tauri', files: ['crates/amos-tauri/src/ime.rs', 'crates/amos-tauri/frontend-ts/src/svelte/settings/ImePage.svelte'], markers: ['persist_failures', 'bump_persist_failures', 'settings-ime-persist-failures'], severity: 4 },
+  // REQ-A2092: 联想上下文（recent: [Option<String>;2]）必须 per-session —— A 的提交不能让 B 的预测器开口说话（“一条红线”测试 reddens-if-broken）。
+  { id: 'F-IME-033', module: 'amos-ime', files: ['crates/amos-ime/src/engine.rs'], markers: ['one_windows_commit_never_becomes_another_windows_context', 'recent', 'record_commit'], severity: 3 },
 
   // 桌面壳 chrome (前端): 模块契约与"可用性=真行为"
   { id: 'F-SH-001', module: 'frontend', files: ['crates/amos-tauri/frontend-ts/src/svelte/modules/ControlCenterButton.svelte', 'crates/amos-tauri/frontend-ts/src/svelte/modules/ChromeIconButton.svelte'], markers: ['disabled', 'aria-disabled'], severity: 2 },

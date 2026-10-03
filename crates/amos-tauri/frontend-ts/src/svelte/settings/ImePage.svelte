@@ -284,6 +284,25 @@
       </span>
       <span class="text-[13px] opacity-60">{t("ime.learned", { n: learned })}</span>
     </div>
+    {#if engine.persist_failures > 0}
+      <!-- Persist failures are the only path between "I lost the user's pinned
+           words" and "the operator sees the loss" (REQ-A2091 / F-IME-032).
+           The block is rendered *only* when the count is non-zero — a healthy
+           daemon answers 0 forever, and a healthy UI must not alarm users into
+           a fix that is already in place. The `data-testid` is what the
+           `svelte-tests` regression tests pin, mirroring the `persist_failures`
+           field on the wire. -->
+      <div class={ROW} data-testid="settings-ime-persist-failures">
+        <span class={LABEL}>{t("ime.persistFailuresTitle")}</span>
+        <span class="text-[13px] text-red-600 dark:text-red-400">
+          {t("ime.persistFailuresValue", { n: engine.persist_failures })}
+        </span>
+      </div>
+      <div class={SUB}></div>
+      <div class="px-4 pb-3">
+        <p class={HINT}>{t("ime.persistFailuresHint")}</p>
+      </div>
+    {/if}
     <div class={SUB}></div>
     <div class={ROW}>
       <span class={LABEL}>{t("ime.clearLearning")}</span>

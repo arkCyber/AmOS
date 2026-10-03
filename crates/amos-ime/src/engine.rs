@@ -952,4 +952,104 @@ mod tests {
         assert_eq!(heads.len(), 4);
         assert!(heads.iter().all(|h| h.is_some()), "{heads:?}");
     }
+
+    // ---- per-session context isolation (REQ-A2092) -------------------------
+    //
+    // Each `PinyinInput` keeps its own `recent: [Option<String>; 2]` (the
+    // suggestion context, oldest first). A commit in window A **must not**
+    // become window B's `recent[1]`. This is the negative control that
+    // distinguishes the per-window context from the shared learner: the same
+    // shape (`Arc<PinyinCore>` shared, two `PinyinInput`s around it) but the
+    // vector of what's recently been written goes through different memory.
+
+    #[test]
+    fn one_windows_commit_never_becomes_another_windows_context() {
+        let core = Arc::new(PinyinCore::new(FuzzyPrefs::strict()));
+        let mut a = PinyinInput::with_core(Arc::clone(&core));
+        let b = PinyinInput::with_core(Arc::clone(&core));
+
+        // Window A builds real context: 我 + 的 → the prediction list is
+        // non-empty (国家 / 生活 / 工作 / 社会).
+        a.type_str("wo");
+        assert_eq!(a.commit(0).as_deref(), Some("我"));
+        a.type_str("de");
+        assert_eq!(a.commit(0).as_deref(), Some("的"));
+        assert!(
+            !a.predictions(MAX_CANDIDATES).is_empty(),
+            "sanity: A has 2 words of context"
+        );
+
+        // Window B has its own (still-empty) context before A's next action.
+        assert_eq!(b.last_committed(), None);
+        assert!(b.predictions(MAX_CANDIDATES).is_empty());
+
+        // A commits one more word — this **must not** leak into B's `recent`.
+        a.type_str("wo");
+        assert_eq!(a.commit(0).as_deref(), Some("我"));
+        assert_eq!(
+            b.predictions(MAX_CANDIDATES),
+            Vec::<String>::new(),
+            "B's context is its own; A's commit must not appear here"
+        );
+        assert_eq!(b.last_committed(), None);
+        assert_eq!(
+            a.last_committed(),
+            Some("我"),
+            "A's own hint is independent of B's session"
+        );
+    }
+
+    /// Disjoint red axes for the negative control above: even the *core-wide*
+    /// learner counts (a shared lookup) must not reach across windows to
+    /// override a window's local context.
+    #[test]
+    fn a_commit_in_b_does_not_change_as_predicted_a_continues() {
+        let core = Arc::new(PinyinCore::new(FuzzyPrefs::strict()));
+        let mut a = PinyinInput::with_core(Arc::clone(&core));
+        let mut b = PinyinInput::with_core(Arc::clone(&core));
+
+        // Pin "时" in window A so the learner is non-trivial.
+        learn(&mut a, "shi", "时");
+        // Window B has zero context and must not gain any from A's commits.
+        assert_eq!(b.last_committed(), None);
+        assert!(b.predictions(MAX_CANDIDATES).is_empty());
+
+        // A more commits in A; B is untouched.
+        a.type_str("wo");
+        a.commit(0);
+        a.type_str("de");
+        a.commit(0);
+
+        assert_eq!(b.last_committed(), None);
+        assert!(
+            b.predictions(MAX_CANDIDATES).is_empty(),
+            "B's context window never saw A's words"
+        );
+
+        // And the inverse: B builds its own context independently. After
+        // `women + de` both A's and B's contexts are non-empty (A: 我/的,
+        // B: 我们/的) but they remain independent — A's recent is not B's
+        // recent.
+        b.type_str("women");
+        assert_eq!(b.commit(0).as_deref(), Some("我们"));
+        b.type_str("de");
+        assert_eq!(b.commit(0).as_deref(), Some("的"));
+        assert!(
+            !b.predictions(MAX_CANDIDATES).is_empty(),
+            "B has its own two words of context"
+        );
+        assert!(
+            !a.predictions(MAX_CANDIDATES).is_empty(),
+            "A also has two words of context"
+        );
+        // The whole point: the contexts are different words, even when both lists
+        // happen to be non-empty. Reading one window's `recent` out of band
+        // must not give you another's.
+        assert_eq!(a.last_committed(), Some("的"), "A's last commit is A's own");
+        assert_eq!(
+            b.last_committed(),
+            Some("的"),
+            "B's last commit is B's own — and same word, separate memory"
+        );
+    }
 }

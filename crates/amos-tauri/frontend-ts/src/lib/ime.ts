@@ -143,6 +143,15 @@ export interface ImeState {
   last_committed: string | null;
   /** Code of the last **dictionary** commit, while undoing it is possible. */
   last_pick_code: string | null;
+  /**
+   * Cumulative count of profile-flush failures since the bridge booted
+   * (REQ-A2091 / F-IME-032). `0` means every persist since boot landed; a
+   * non-zero value is the learner being in-memory only and the operator has
+   * not been told. Frontend renders this as a health-readout line in
+   * Settings, so a stuck `amos-ime.json` is visible rather than a word that
+   * "the keyboard forgot".
+   */
+  persist_failures: number;
 }
 
 /** Reply of `ime_commit` (mirror of `amos_tauri::ime::ImeCommitOut`). */
