@@ -328,10 +328,11 @@ pub fn resolve_sherpa_model_dir() -> Option<std::path::PathBuf> {
     if let Some(dir) = bounded_env_dir("AMOS_SHERPA_MODEL_DIR") {
         candidates.push(dir);
     }
-    for env_key in ["AMOS_BUNDLE_RES_DIR", "AMOS_BUNDLE_MODELS_DIR"] {
-        if let Some(root) = bounded_env_dir(env_key) {
-            candidates.push(root.join("sherpa"));
-        }
+    if let Some(root) = bounded_env_dir("AMOS_BUNDLE_RES_DIR") {
+        candidates.push(root.join("sherpa"));
+    }
+    if let Some(root) = bounded_env_dir("AMOS_BUNDLE_MODELS_DIR") {
+        candidates.push(root.join("sherpa"));
     }
     candidates.extend(BUNDLED_SHERPA_DIRS.iter().map(std::path::PathBuf::from));
 

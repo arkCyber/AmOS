@@ -653,6 +653,43 @@ const KNOWN_FAILURES = [
   // 才采用，否则回落裸 IP —— 两侧都不丢。
   { id: 'F-SPY-001', module: 'amos-telemetry-spy', files: ['crates/amos-telemetry-spy/src/packet.rs'], markers: ['REQ-A586', '0x0800 | 0x86dd'], severity: 3 },
 
+  // REQ-A2102: amos-telemetry-spy test coverage round — 19 new tests across 7 source files.
+  { id: 'F-SPY-002', module: 'amos-telemetry-spy', files: ['crates/amos-telemetry-spy/src/error.rs'], markers: ['REQ-A2102', 'error_display_and_source'], severity: 2 },
+  { id: 'F-SPY-003', module: 'amos-telemetry-spy', files: ['crates/amos-telemetry-spy/src/packet.rs'], markers: ['REQ-A2102', 'tcp_with_options'], severity: 3 },
+  { id: 'F-SPY-004', module: 'amos-telemetry-spy', files: ['crates/amos-telemetry-spy/src/packet.rs'], markers: ['REQ-A2102', 'tcp_data_off'], severity: 3 },
+  { id: 'F-SPY-005', module: 'amos-telemetry-spy', files: ['crates/amos-telemetry-spy/src/packet.rs'], markers: ['REQ-A2102', 'udp_short'], severity: 3 },
+  { id: 'F-SPY-006', module: 'amos-telemetry-spy', files: ['crates/amos-telemetry-spy/src/packet.rs'], markers: ['ipv6_with_extension_headers'], severity: 3 },
+  { id: 'F-SPY-007', module: 'amos-telemetry-spy', files: ['crates/amos-telemetry-spy/src/packet.rs'], markers: ['REQ-A2102', 'ipv6_short'], severity: 3 },
+  { id: 'F-SPY-008', module: 'amos-telemetry-spy', files: ['crates/amos-telemetry-spy/src/packet.rs'], markers: ['REQ-A2102', 'l4_icmp'], severity: 2 },
+  { id: 'F-SPY-009', module: 'amos-telemetry-spy', files: ['crates/amos-telemetry-spy/src/packet.rs'], markers: ['decode_ip_unknown_version'], severity: 2 },
+  { id: 'F-SPY-010', module: 'amos-telemetry-spy', files: ['crates/amos-telemetry-spy/src/packet.rs'], markers: ['REQ-A2102', 'looks_like_ip'], severity: 2 },
+  { id: 'F-SPY-011', module: 'amos-telemetry-spy', files: ['crates/amos-telemetry-spy/src/scanner.rs'], markers: ['REQ-A2102', 'confidence_for'], severity: 2 },
+  { id: 'F-SPY-012', module: 'amos-telemetry-spy', files: ['crates/amos-telemetry-spy/src/scanner.rs'], markers: ['REQ-A2102', 'count_occurrences'], severity: 2 },
+  { id: 'F-SPY-013', module: 'amos-telemetry-spy', files: ['crates/amos-telemetry-spy/src/scanner.rs'], markers: ['REQ-A2102', 'scan_payload_empty'], severity: 1 },
+  { id: 'F-SPY-014', module: 'amos-telemetry-spy', files: ['crates/amos-telemetry-spy/src/signal.rs'], markers: ['REQ-A2102', 'identifier_evidence'], severity: 2 },
+  { id: 'F-SPY-015', module: 'amos-telemetry-spy', files: ['crates/amos-telemetry-spy/src/signal.rs'], markers: ['REQ-A2102', 'as_str'], severity: 2 },
+  { id: 'F-SPY-016', module: 'amos-telemetry-spy', files: ['crates/amos-telemetry-spy/src/identifier.rs'], markers: ['REQ-A2102', 'kind_as_str'], severity: 1 },
+  { id: 'F-SPY-017', module: 'amos-telemetry-spy', files: ['crates/amos-telemetry-spy/src/identity.rs'], markers: ['static_identity_new_is_empty'], severity: 2 },
+  { id: 'F-SPY-018', module: 'amos-telemetry-spy', files: ['crates/amos-telemetry-spy/src/analyze.rs'], markers: ['REQ-A2102', 'tcp_frame_through'], severity: 3 },
+  { id: 'F-SPY-019', module: 'amos-telemetry-spy', files: ['crates/amos-telemetry-spy/src/analyze.rs'], markers: ['REQ-A2102', 'ipv6_through'], severity: 3 },
+
+  // REQ-A2103: amos-applife test coverage round — 8 new tests across 3 source files.
+  { id: 'F-APL-001', module: 'amos-applife', files: ['crates/amos-applife/src/error.rs'], markers: ['REQ-A2103', 'error_display_and_source'], severity: 2 },
+  { id: 'F-APL-002', module: 'amos-applife', files: ['crates/amos-applife/src/error.rs'], markers: ['REQ-A2103', 'error_equality'], severity: 1 },
+  { id: 'F-APL-003', module: 'amos-applife', files: ['crates/amos-applife/src/manager.rs'], markers: ['REQ-A2103', 'all_transition_methods_on_unknown_id'], severity: 2 },
+  { id: 'F-APL-004', module: 'amos-applife', files: ['crates/amos-applife/src/manager.rs'], markers: ['REQ-A2103', 'freeze_thaw_from_non_standard'], severity: 1 },
+  { id: 'F-APL-005', module: 'amos-applife', files: ['crates/amos-applife/src/manager.rs'], markers: ['REQ-A2103', 'reclaim_mixed_cached_and_background_ordering'], severity: 2 },
+  { id: 'F-APL-006', module: 'amos-applife', files: ['crates/amos-applife/src/manager.rs'], markers: ['REQ-A2103', 'reclaim_with_limited_budget'], severity: 2 },
+  { id: 'F-APL-007', module: 'amos-applife', files: ['crates/amos-applife/src/spec.rs'], markers: ['REQ-A2103', 'app_id_edge_cases'], severity: 1 },
+
+  // REQ-A2104: amos-timesync test coverage round — 8 new tests across 4 source files.
+  { id: 'F-TS-001', module: 'amos-timesync', files: ['crates/amos-timesync/src/error.rs'], markers: ['REQ-A2104', 'error_display_and_source'], severity: 2 },
+  { id: 'F-TS-002', module: 'amos-timesync', files: ['crates/amos-timesync/src/error.rs'], markers: ['REQ-A2104', 'error_equality'], severity: 1 },
+  { id: 'F-TS-003', module: 'amos-timesync', files: ['crates/amos-timesync/src/clock.rs'], markers: ['REQ-A2104', 'apply_offset_values'], severity: 1 },
+  { id: 'F-TS-004', module: 'amos-timesync', files: ['crates/amos-timesync/src/clock.rs'], markers: ['REQ-A2104', 'persist_without_state_file'], severity: 1 },
+  { id: 'F-TS-005', module: 'amos-timesync', files: ['crates/amos-timesync/src/timekeeper.rs'], markers: ['REQ-A2104', 'timekeeper_construction'], severity: 1 },
+  { id: 'F-TS-006', module: 'amos-timesync', files: ['crates/amos-timesync/src/time_source.rs'], markers: ['REQ-A2104', 'host_clock_and_mock_sequence'], severity: 1 },
+
   // REQ-A583: 向量检索的真正防线建在错误的门口。`amos-vector-db` 的 README 与 crate 文档都承诺
   // 「非有限向量（NaN/inf）在**插入时**就被拒 —— 这防止的失效模式是一个相似度分悄悄变成 `NaN`
   // 并把一切都排到最前」。而 `FlatIndex::add`/`upsert` 只调 `validate_dim`（只查长度），
@@ -2070,6 +2107,14 @@ const KNOWN_FAILURES = [
   // F-ASR-002: 模型目录在、encoder 文件缺 ⇒ 静默退回 mock。缓解:`resolve_sherpa_model_dir`
   // 对缺 token 的目录返回 `None`(诚实 "not staged"),显式 `sherpa` 请求绝不降级为 mock。
   { id: 'F-ASR-002', module: 'amos-ai', files: ['crates/amos-ai/src/chat_asr.rs'], markers: ['resolve_sherpa_model_dir', 'resolve_returns_none_for_missing_or_tokenless_dirs'], severity: 3 },
+  // F-ASR-003: AsrPipeline translate/synthesize delegate success path untested.
+  { id: 'F-ASR-003', module: 'amos-asr', files: ['crates/amos-asr/src/pipeline.rs'], markers: ['AsrPipelineBuilder', 'with_translate', 'MockPipeline'], severity: 3 },
+  // F-ASR-004: Whitespace-only utterance produces ghost AsrEvent::Final.
+  { id: 'F-ASR-004', module: 'amos-asr', files: ['crates/amos-asr/src/pipeline.rs'], markers: ['feed_audio_suppresses_whitespace_final', 'end_of_utterance_suppresses_whitespace_only'], severity: 3 },
+  // F-ASR-005: feed_audio yields no events but audio clock advances when push_samples returns None.
+  { id: 'F-ASR-005', module: 'amos-asr', files: ['crates/amos-asr/src/pipeline.rs'], markers: ['feed_audio_no_hypothesis_change_returns_empty'], severity: 2 },
+  // F-ASR-006: PipelineInfo returns wrong provider/tts fields.
+  { id: 'F-ASR-006', module: 'amos-asr', files: ['crates/amos-asr/src/pipeline.rs'], markers: ['info_reflects_asr_pipeline'], severity: 2 },
 
   // Gap 4 — default AI backend (crates/amos-ai/src/{bundled_model.rs,inference/real.rs}).
   // F-AI-016: 守护进程默认 mock,而运维以为跑的是真 AI。缓解:未配置部署解析到
@@ -9986,6 +10031,11 @@ const KNOWN_FAILURES = [
   // 文档配方隐形。修法：新增共享渲染器 `operator_line(alert, note)`（紧邻 `StdoutChannel::line`，
   // 两生产者同流不可形状不同），`operator_fallback` 改调它。
   { id: 'F-NOT-006', module: 'the-stderr-transport-documents-a-jq-fromjson-recipe-while-send-prints-a-plain-text-line-and-drops-the-alerts-structured-labels-that-every-sibling-transport-ships-so-an-operator-piping-the-live-stream-to-a-collector-gets-nothing-and-cannot-tell-no-alerts-from-a-broken-filter-fix-collect-the-rendering-into-a-pure-stdoutchannel-line-seam-mirroring-webhookchannel-body-returning-serde-json-to-string-of-the-alert-so-severity-id-message-and-labels-all-survive-and-the-dispatchers-own-last-resort-operator-line-on-that-same-stream-was-still-plain-text-so-the-very-line-production-uses-when-a-webhook-is-configured-but-unreachable-was-invisible-to-the-documented-filter-and-dropped-its-labels-too-fix-route-both-producers-through-one-shared-operator-line-renderer-beside-stdoutchannel-line', files: ['crates/amos-notifier/src/stdout.rs', 'crates/amos-notifier/src/dispatcher.rs', 'crates/amos-notifier/examples/alert_to_stderr.rs', 'crates/amos-notifier/examples/alert_fallback_line.rs', 'crates/amos-notifier/README.md', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A1908', 'a_stderr_line_is_one_json_object_an_operator_can_pipe_through_jq', 'StdoutChannel::line', 'the_dispatcher_fallback_line_is_json_too', 'the_operator_fallback_writes_the_shared_json_line', 'operator_line'], severity: 2 },
+  // F-NOT-007（REQ-A2098，amos-tauri notifier_status Dispatcher manage 缺失）：
+  // `get_notifier_status` 依赖的 `Dispatcher` 从未被 Tauri app 管理。模块头说明需要
+  // `.manage()` 但 lib.rs manage 链中没有调它。修复：在 manage 链中添加
+  // `.manage(Dispatcher::builder().with_stderr_fallback(false).build())`。
+  { id: 'F-NOT-007', module: 'amos-tauri-notifier-status-unmanaged-dispatcher', files: ['crates/amos-tauri/src/notifier_status.rs', 'crates/amos-tauri/src/lib.rs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A2098', 'get_notifier_status_works_with_managed_dispatcher', 'Dispatcher::builder', 'F-NOT-007'], severity: 2 },
   // F-SH-926（REQ-A1917）—— 分享面板的空状态提示按「快捷指令半边为空」判定，而内置的
   // 备忘录 ∕ 邮件目标对每种可分享类型都恒在（`builtinTargetsFor` 对面板能开的每种负载非空），
   // 于是默认配置下「还没有快捷指令…」正好画在两个可用目标行下面。修法：判据改
@@ -10453,6 +10503,14 @@ const KNOWN_FAILURES = [
   //   + 去重表 `unusable_root_seen()` ∕ `report_unusable_root`；`new()` 收敛为 `var_os`；
   //   抽出纯的 `DevCareBridge::from_root(Option<PathBuf>)` 使「设置 → 后端」可直接单测。
   { id: 'F-DEV-177', module: 'the-device-care-root-knob-crates-amos-tauri-src-devcare-rs-devcarebridge-new-uses-match-std-env-var-root-env-ok-filter-s-is-empty-so-result-ok-folds-err-notpresent-a-legit-no-backend-honest-default-together-with-err-notunicode-set-but-unreadable-into-one-silent-none-the-whole-device-care-backend-then-silently-becomes-not-connected-and-the-ui-tells-the-user-to-set-amos-devcare-root-to-a-cleanable-dir-a-claim-about-their-environment-that-is-false-because-they-did-set-it-tell-the-module-doc-devcare-rs-24-lists-only-unset-as-the-cause-of-that-state-and-the-none-has-a-second-source-the-21st-form-same-variable-two-readers-one-reports-does-not-apply-here-since-amos-devcare-root-has-only-this-one-reader-fix-a-pure-root-knob-key-raw-option-osstring-seam-unset-or-blank-silent-none-a-readable-value-some-a-non-unicode-value-reported-once-deduped-by-key-then-none-plus-a-from-root-option-pathbuf-half-so-the-setting-to-backend-step-is-directly-unit-testable-and-blank-is-no-longer-accepted-as-a-literal-relative-root', files: ['crates/amos-tauri/src/devcare.rs', 'docs/ENV_VARIABLES.md', 'scripts/fmea-gen.mjs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md'], markers: ['REQ-A2014', 'F-DEV-177', 'AMOS_DEVCARE_ROOT', 'root_knob', 'report_unusable_root', 'unusable_root_reports_for', 'from_root', 'a_non_unicode_root_knob_is_reported_not_read_as_unset', 'a_repeated_bad_root_is_reported_once', 'the_devcare_bridge_reads_its_root_via_var_os_not_var'], severity: 3 },
+  // REQ-A2109 / F-DEV-178: env-doc-gen.mjs::collectForwardingHelpers.consider 的 regex 只认 `env::var(...)` 不认 `std::env::var(...)` ——
+  //   `bounded_env_dir(key: &str)`（`crates/amos-ai/src/chat_asr.rs:294`，函数体内 `std::env::var_os(key)?`）不被识别为 forwarding helper ⇒
+  //   通过它读的两枚 env var（`AMOS_BUNDLE_RES_DIR` / `AMOS_BUNDLE_MODELS_DIR`，`chat_asr.rs:331`）不入库存 ⇒ `node scripts/env-doc-gen.mjs --check`
+  //   报 `lists ENVs not used in code` ⇒ CI 红了每个 commit。同族于 F-DEV-147 / F-DEV-163 / F-DEV-175 / F-DEV-176 的「门禁的判据不读它本该读的那个事实」。
+  //   修法两缝：(a) `consider` regex 加 `(?:std::)?` 前缀，认带 `std::` 的 helper 形态（与 `scripts/env-doc-scan.mjs` 一直认 `std::env::var` 一致）；
+  //   (b) `chat_asr.rs::resolve_sherpa_model_dir` 把 `for env_key in [...]` 拆成两个 `if let Some(root) = bounded_env_dir("…")` 直调，语义与原 for 循环
+  //   一一对应（顺序无关的两条 if）。`scripts/env-doc-allowlist.json` 新增 `AMOS_TEST_HANDOVER` / `AMOS_TEST_KNOB` 两条 audit-only 字段。
+  { id: 'F-DEV-178', module: 'env-doc-gen-mjs-collectforwardinghelpers-consider-regex-does-not-recognize-std-env-var-prefix-so-bounded-env-dir-key-str-crates-amos-ai-src-chat-asr-rs-294-with-body-std-env-var-os-key-is-not-seen-as-a-forwarding-helper-and-the-two-env-vars-it-reads-amos-bundle-res-dir-and-amos-bundle-models-dir-via-the-for-env-key-in-array-iteration-on-line-331-never-enter-the-inventory-so-node-scripts-env-doc-gen-mjs-check-reports-lists-envs-not-used-in-code-and-ci-goes-red-every-commit-with-the-same-shape-as-f-dev-147-f-dev-163-f-dev-175-f-dev-176-gate-corpus-defined-by-naming-convention-is-blind-outside-it-fix-two-stitches-consider-regex-prefix-std-to-recognize-the-helper-form-already-recognized-by-env-doc-scan-mjs-and-split-the-for-env-key-in-array-iteration-into-two-if-let-some-root-bounded-env-dir-calls-so-the-tool-sees-the-call-sites-directly-and-the-audit-only-amos-test-handover-and-amos-test-knob-shell-loop-variable-names-from-the-recent-audit-report-go-into-env-doc-allowlist-json-same-family-as-amos-test-amos-test-amos-test-dedup-knob-amos-window-state', files: ['scripts/env-doc-gen.mjs', 'crates/amos-ai/src/chat_asr.rs', 'scripts/env-doc-allowlist.json', 'docs/ENV_VARIABLES.md', 'scripts/fmea-gen.mjs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md'], markers: ['REQ-A2109', 'F-DEV-178', 'AMOS_BUNDLE_RES_DIR', 'AMOS_BUNDLE_MODELS_DIR', 'AMOS_TEST_HANDOVER', 'AMOS_TEST_KNOB', 'bounded_env_dir', 'resolve_sherpa_model_dir', 'collectForwardingHelpers', 'consider', 'env-doc-gen', 'env-doc-scan'], severity: 2 },
   // REQ-A2022 / F-SH-958：podcast 的存储路径旋钮在**三处读者**上同形折叠 ——
   //   `crates/amos-podcast/src/manager.rs::PodcastPaths::from_env` 逐字
   //   `std::env::var("AMOS_PODCAST_DIR").ok().filter(|s| !s.is_empty())`，
@@ -10480,6 +10538,17 @@ const KNOWN_FAILURES = [
   //   （设了但读不回 ⇒ warn! 后 true = 操作者钉过），与取值用的 env_knob_or 刻意分成两个函数。
   //   红先 76/3 → 79/0（全库 514/0）；NC-1（判定臂重折）恰 1 红，NC-2（空白臂过宽告警）恰 2 红，不相交。
   { id: 'F-AI-067', module: 'the-five-cloud-preset-and-model-knobs-in-crates-amos-ai-src-server-rs-are-still-read-through-a-fold-build-backend-from-env-s-six-arms-verbatim-model-std-env-var-amos-model-unwrap-or-else-gpt-4o-mini-endpoint-std-env-var-amos-api-endpoint-bearer-std-env-var-amos-ollama-api-key-ok-filter-and-resolve-ollama-model-plus-is-deployment-unconfigured-each-if-let-ok-so-result-ok-folds-genuinely-unset-blank-and-set-but-unreadable-non-unicode-into-one-silent-default-two-tier-consequence-a-the-wrong-value-a-non-unicode-amos-model-or-amos-ollama-host-silently-becomes-the-documented-default-so-the-daemon-runs-a-different-backend-than-configured-with-zero-log-lines-and-b-the-wrong-judgement-which-is-the-real-behavioural-defect-is-deployment-unconfigured-doc-verbatim-any-single-operator-pinned-knob-means-the-deployment-knows-what-it-wants-and-we-honour-that-yet-a-set-but-unreadable-endpoint-is-still-a-value-the-operator-set-and-if-let-ok-judges-it-at-defaults-so-a-configured-deployment-calls-itself-unconfigured-and-bails-to-backendkind-unconfigured-tell-the-22nd-form-same-file-asymmetry-and-the-21st-form-same-variable-multiple-readers-converging-inside-one-function-amos-backend-already-goes-through-backend-env-raw-two-adjacent-endpoints-still-fold-and-amos-model-has-five-folding-readers-in-this-file-fix-reuse-the-existing-env-knob-seam-add-combinators-env-knob-or-env-knob-or-env-env-knob-filtered-env-knob-filtered-env-and-answer-the-third-state-differently-per-call-site-add-endpoint-is-pinned-name-default-raw-bool-set-but-unreadable-warns-then-true-i-e-the-operator-did-pin-it-deliberately-a-separate-function-from-the-value-taking-env-knob-or-one-env-fact-two-different-questions-two-different-answers', files: ['crates/amos-ai/src/server.rs', 'docs/ENV_VARIABLES.md', 'scripts/fmea-gen.mjs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md'], markers: ['REQ-A2023', 'F-AI-067', 'endpoint_is_pinned', 'env_knob_or', 'env_knob_filtered', 'env_knob_filtered_env', 'report_unreadable_knob', 'an_unreadable_endpoint_is_still_pinned_and_reported', 'an_unreadable_model_knob_is_reported_and_takes_the_default', 'the_cloud_preset_reads_every_knob_through_the_one_seam'], severity: 3 },
+  // F-AI-073（REQ-A2106）：告警链缺少隐私拒绝、网络守卫事件和遥测间谍命中三个域的告警规则。
+  // 修前：`alerts.rs` 的 `Observations` 仅覆盖 breaker/pool/log/degraded/throttled/dvfs 7 个字段，
+  // 但未覆盖隐私（PrivacyManager.denied）、网络守卫（NetGuardSvc.events）、遥测间谍
+  // （TelemetrySpySvc.emitted）。守护进程可能在积极拒绝隐私访问、记录出口事件或检测命中，
+  // 却报告一个空的告警列表。修法：PrivacyManager 新增 `denied` 计数器 + `denied_handle()`；
+  // NetGuardSvc 新增 `events` 计数器 + `events_handle()` + `server_for()` 工厂；
+  // TelemetrySpySvc 新增 `emitted_handle()`；AiAgentService 新增 3 个
+  // `Option<Arc<AtomicU64>>` 字段 + 设置器 + `alerts_now()` 读取；`Observations`
+  // 新增 3 个字段 + 3 条 Warn 规则。单元测试 6 例（各规则激活 + 健康沉默 + 详情数字 +
+  // 稳定排序）。
+  { id: 'F-AI-073', module: 'alert-chain-missing-three-domains-privacy-denials-netguard-events-telemetry-spy-hits', files: ['crates/amos-ai/src/alerts.rs', 'crates/amos-ai/src/privacy.rs', 'crates/amos-ai/src/netguard_service.rs', 'crates/amos-ai/src/telemetry_spy_service.rs', 'crates/amos-ai/src/server.rs', 'scripts/fmea-gen.mjs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md'], markers: ['REQ-A2106', 'F-AI-073', 'privacy_denials', 'netguard_events', 'telemetry_spy_hits', 'denied_handle', 'events_handle', 'emitted_handle'], severity: 2 },
   // F-WM-032（REQ-A2044，桌面壳两个开关的 `.ok()` 折叠：`var(..).ok()` 把「未设」与「设了读不回」折成
   // 一个静默默认）。修前（逐字）：`desktop_features.rs::disabled_from_env` 的 `disabled_from(|key| var(key).ok())`
   // 与 `lib.rs` 的 `stray_vars(|k| var(k).ok())`。为何是缺陷：非 Unicode 的 `AMOS_DESKTOP_SHORTCUTS=disabled`
@@ -10489,6 +10558,99 @@ const KNOWN_FAILURES = [
   // 修前红（生产片仍含 `std::env::var(`）；修后 `desktop_features` 10/0、全库 1220/0。NC-1（classify 重折）恰 1 红、
   // NC-2（入口重折）恰 1 红，不相交。
   { id: 'F-WM-032', module: 'the-two-desktop-shell-switches-in-desktop-features-rs-amos-desktop-shortcuts-and-amos-dock-context-menu-each-read-through-std-env-var-ok-so-a-value-the-operator-set-but-this-process-cannot-decode-not-valid-unicode-folds-into-the-same-silent-default-as-one-that-was-never-set-leaving-the-capability-on-with-no-log-line-the-same-fold-appeared-at-two-production-read-sites-disabled-from-env-and-lib-rs-s-stray-vars-closure', files: ['crates/amos-tauri/src/desktop_features.rs', 'crates/amos-tauri/src/lib.rs', 'docs/ENV_VARIABLES.md', 'scripts/fmea-gen.mjs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md'], markers: ['REQ-A2044', 'Knob::Undecodable', 'env_knob', 'a_switch_set_to_something_undecodable_is_reported_not_folded_into_unset'], severity: 2 },
+
+  // ── F-SH-978: ffmpeg_in_path PATH folding (REQ-A2070) ────────────────────
+  { id: 'F-SH-978', module: 'screen-record-ffmpeg-path-is-var-not-var-os-path-list-knob', files: ['crates/amos-tauri/src/screen_record.rs', 'docs/ENV_VARIABLES.md', 'scripts/fmea-gen.mjs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md'], markers: ['REQ-A2070', 'ffmpeg_in_path', 'F-SH-978', 'a_non_unicode_path_dir_is_reported_not_folded_into_not_found'], severity: 2 },
+  // ── F-SH-979: menu.rs unreachable!() panic (REQ-A2099) ───────────────────
+  { id: 'F-SH-979', module: 'menu-on-menu-event-unreachable-panics-on-programming-error', files: ['crates/amos-tauri/src/menu.rs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A2099', 'F-SH-979', 'on_menu_event', 'unhandled RUST_HANDLED menu item'], severity: 2 },
+  // ── F-BKP-001/002（REQ-A2107）：本地备份归档的边界把值裁成键名 + BackupPage 是桩。
+  // 修前（逐字）：`backup.rs::backup_restore` 返 `Result<Vec<String>, String>` 且
+  // `Ok(data.entries.keys().cloned().collect())`（丢值）；`BackupPage.svelte` 的
+  // `handleBackup` 写死两条空存储、`handleRestore` 用 `archiveB64: ""`。
+  // 修法：`BackupRestoreResult`（每条的**值**）+ `lib/backupArchive.ts` 纯缝 + 重写的页面。
+  { id: 'F-BKP-001', module: 'backup-restore-command-returns-only-key-names-dropping-the-store-values', files: ['crates/amos-tauri/src/backup.rs', 'crates/amos-tauri/frontend-ts/src/lib/backupArchive.ts', 'crates/amos-tauri/frontend-ts/src/svelte/settings/BackupPage.svelte', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A2107', 'F-BKP-001', 'BackupRestoreResult', 'restore_returns_the_values_not_just_the_keys', 'MAX_BACKUP_B64_BYTES'], severity: 4 },
+  { id: 'F-BKP-002', module: 'backup-page-backup-and-restore-are-stubs-hardcoded-empty-entries-and-empty-archive', files: ['crates/amos-tauri/frontend-ts/src/svelte/settings/BackupPage.svelte', 'crates/amos-tauri/frontend-ts/src/lib/backupArchive.ts', 'crates/amos-tauri/frontend-ts/src/__tests__/backupArchive.test.ts', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A2107', 'F-BKP-002', 'collectStores', 'planRestore'], severity: 3 },
+
+	  // ── F-SH-980: From<amos_web3::error::Error> conversion (REQ-A561) ──────
+	  { id: 'F-SH-980', module: 'from-amos-web3-error-to-error-conversion-in-identity-error-rs', files: ['crates/amos-identity/src/error.rs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A561', 'F-SH-980', 'from_web3_error_wraps_message', 'Error::Web3'], severity: 2 },
+	  // ── F-SH-981: parse_did_key payload/multicodec validation (REQ-A561) ──────
+	  { id: 'F-SH-981', module: 'parse-did-key-multicodec-and-pubkey-length-validation', files: ['crates/amos-identity/src/did.rs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A561', 'F-SH-981', 'payload_too_short_for_multicodec_is_invalid', 'secp_did_with_wrong_pubkey_length_is_invalid', 'wrong_length_rejected'], severity: 3 },
+	  // ── F-SH-982: Keystore from_sealed plaintext validation (REQ-A561) ─────────
+	  { id: 'F-SH-982', module: 'keystore-from-sealed-adversarial-plaintext-validation', files: ['crates/amos-identity/src/keystore.rs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A561', 'F-SH-982', 'from_sealed_wrong_magic_is_invalid', 'from_sealed_non_utf8_alias_is_invalid', 'from_sealed_truncated_key_record_is_invalid', 'from_sealed_unknown_curve_tag_is_invalid'], severity: 3 },
+	  // ── F-SH-983: Keystore take_len_prefixed edge cases (REQ-A561) ────────────
+	  { id: 'F-SH-983', module: 'keystore-take-len-prefixed-truncated-prefix-and-length-exceeds-data', files: ['crates/amos-identity/src/keystore.rs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A561', 'F-SH-983', 'take_len_prefixed_truncated_prefix_is_err', 'take_len_prefixed_length_exceeds_data_is_err'], severity: 3 },
+	  // ── F-SH-984: verify_statement malformed DID fail-closed (REQ-A561) ──────
+	  { id: 'F-SH-984', module: 'verify-statement-malformed-did-fails-closed', files: ['crates/amos-identity/src/sign.rs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A561', 'F-SH-984', 'verify_statement_malformed_did_returns_false', 'fail-closed'], severity: 4 },
+	  // ── F-SH-985: verify_typed_data wrong-curve/malformed DID (REQ-A561) ──────
+	  { id: 'F-SH-985', module: 'verify-typed-data-wrong-curve-ed25519-did-and-malformed-did-rejected', files: ['crates/amos-identity/src/sign.rs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A561', 'F-SH-985', 'verify_typed_data_ed25519_did_returns_false', 'verify_typed_data_malformed_did_returns_false'], severity: 3 },
+	  // ── F-SH-986: verify_secp256k1 invalid SEC1 pubkey (REQ-A561) ────────────
+	  { id: 'F-SH-986', module: 'verify-secp256k1-invalid-sec1-compressed-pubkey', files: ['crates/amos-identity/src/sign.rs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A561', 'F-SH-986', 'verify_secp256k1_invalid_pubkey_returns_false'], severity: 4 },
+	  // ── F-SH-987: StatementSignature::to_hex format regression (REQ-A561) ────
+	  { id: 'F-SH-987', module: 'statement-signature-to-hex-format-regression', files: ['crates/amos-identity/src/sign.rs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A561', 'F-SH-987', 'signature_to_hex_format', 'encode_hex0x'], severity: 2 },
+
+	  // ── F-SH-1000..F-SH-1010: amos-web3 test coverage (REQ-A2100) ────────
+
+	  // ── F-SH-1011..F-SH-1023: amos-network-guard test coverage (REQ-A2101) ──
+	  { id: 'F-SH-1011', module: 'destination-matches-cross-type-rejection', files: ['crates/amos-network-guard/src/policy.rs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A2101', 'F-SH-1011', 'destination_matches_domain_to_ip_is_false', 'destination_matches_ip_to_domain_is_false', 'destination_matches_ip_to_tls_sni_is_false', 'destination_matches_tls_sni_to_ip_is_false'], severity: 2 },
+	  { id: 'F-SH-1012', module: 'ruleset-default-effect', files: ['crates/amos-network-guard/src/policy.rs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A2101', 'F-SH-1012', 'ruleset_default_allow_effect', 'ruleset_default_block_effect', 'ruleset_no_default_effect', 'ruleset_default_blocked_on_empty'], severity: 2 },
+	  { id: 'F-SH-1013', module: 'ruleset-with-default-construction', files: ['crates/amos-network-guard/src/policy.rs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A2101', 'F-SH-1013', 'ruleset_with_default_and_rules'], severity: 2 },
+	  { id: 'F-SH-1014', module: 'normalize-domain-and-domain-matches-edge-cases', files: ['crates/amos-network-guard/src/policy.rs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A2101', 'F-SH-1014', 'normalize_domain_edge_cases', 'domain_matches_edge_cases'], severity: 2 },
+	  { id: 'F-SH-1015', module: 'is-valid-egress-host-more-edges', files: ['crates/amos-network-guard/src/policy.rs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A2101', 'F-SH-1015', 'is_valid_egress_host_more_edges'], severity: 2 },
+	  { id: 'F-SH-1016', module: 'policy-non-domain-skip-validation', files: ['crates/amos-network-guard/src/policy.rs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A2101', 'F-SH-1016', 'policy_non_domain_skip_validation'], severity: 2 },
+	  { id: 'F-SH-1017', module: 'egress-event-dns-constructor', files: ['crates/amos-network-guard/src/audit.rs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A2101', 'F-SH-1017', 'egress_event_dns_constructor'], severity: 1 },
+	  { id: 'F-SH-1018', module: 'fresh-egress-counter-returns-zero', files: ['crates/amos-network-guard/src/audit.rs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A2101', 'F-SH-1018', 'fresh_egress_counter_returns_zero'], severity: 1 },
+	  { id: 'F-SH-1019', module: 'top-domains-zero-and-overflow', files: ['crates/amos-network-guard/src/audit.rs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A2101', 'F-SH-1019', 'top_domains_zero_and_overflow'], severity: 1 },
+	  { id: 'F-SH-1020', module: 'error-display-and-source', files: ['crates/amos-network-guard/src/error.rs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A2101', 'F-SH-1020', 'error_display_and_source'], severity: 1 },
+	  { id: 'F-SH-1021', module: 'mock-apply-empty-and-flush-empty', files: ['crates/amos-network-guard/src/guard.rs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A2101', 'F-SH-1021', 'mock_apply_empty_and_flush_empty'], severity: 1 },
+	  // ── F-SH-1024: shell refusal reports land only in console, never the ledger (REQ-A2108) ──
+	  { id: 'F-SH-1024', module: 'shell-refusal-reported-only-to-console-not-the-ledger', files: ['crates/amos-tauri/frontend-ts/src/lib/shellRefusal.ts', 'crates/amos-tauri/frontend-ts/scripts/console-refusal-scan.mjs', 'crates/amos-tauri/frontend-ts/src/lib/wm.ts', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A2108', 'ledgerRefusal', 'console-refusal-scan', 'F-SH-1024'], severity: 2 },
+		  { id: 'F-SH-1022', module: 'per-app-menu-registry', files: ['crates/amos-tauri/frontend-ts/src/lib/appMenus.ts', 'crates/amos-tauri/frontend-ts/src/__tests__/appMenus.test.ts', 'crates/amos-tauri/frontend-ts/src/svelte/modules/TopbarMainMenu.svelte', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A2105', 'F-SH-1022', 'appMenusFor', 'hasAppMenus', 'APP_MENUS'], severity: 2 },
+	  { id: 'F-SH-1000', module: 'decode-hex-uppercase-0x-prefix', files: ['crates/amos-web3/src/bytes.rs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A2100', 'F-SH-1000', 'decode_hex_uppercase_0x_prefix'], severity: 1 },
+	  { id: 'F-SH-1001', module: 'error-rs-display-equality-error-trait', files: ['crates/amos-web3/src/error.rs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A2100', 'F-SH-1001', 'error_display_messages', 'error_equality', 'error_is_std_error'], severity: 1 },
+	  { id: 'F-SH-1002', module: 'recover-from-prehash-error-branches', files: ['crates/amos-web3/src/secp.rs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A2100', 'F-SH-1002', 'recover_from_prehash_rejects_bad_v', 'recover_from_prehash_rejects_invalid_scalar_r'], severity: 2 },
+	  { id: 'F-SH-1003', module: 'from-value-rejection-paths', files: ['crates/amos-web3/src/eip712.rs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A2100', 'F-SH-1003', 'from_value_rejects_non_object', 'from_value_rejects_missing_message', 'from_value_rejects_non_object_domain', 'from_value_rejects_non_array_types_x'], severity: 2 },
+	  { id: 'F-SH-1004', module: 'encode-type-edge-cases', files: ['crates/amos-web3/src/eip712.rs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A2100', 'F-SH-1004', 'encode_type_single_field_struct', 'encode_type_with_array_reference_to_struct'], severity: 2 },
+	  { id: 'F-SH-1005', module: 'encode-data-missing-field', files: ['crates/amos-web3/src/eip712.rs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A2100', 'F-SH-1005', 'encode_data_missing_field'], severity: 2 },
+	  { id: 'F-SH-1006', module: 'word-bytes-and-bytes-n', files: ['crates/amos-web3/src/eip712.rs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A2100', 'F-SH-1006', 'word_bytes_dynamic', 'word_bytes32_fixed'], severity: 2 },
+	  { id: 'F-SH-1007', module: 'primitive-word-address-length-and-unsupported-type', files: ['crates/amos-web3/src/eip712.rs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A2100', 'F-SH-1007', 'primitive_word_address_wrong_length', 'primitive_word_unsupported_type'], severity: 2 },
+	  { id: 'F-SH-1008', module: 'parse-width-invalid-values-and-encode-uint-overflow', files: ['crates/amos-web3/src/eip712.rs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A2100', 'F-SH-1008', 'parse_width_rejects_invalid_values', 'encode_uint_overflow_rejected_direct'], severity: 2 },
+	  { id: 'F-SH-1009', module: 'domain-separator-missing-eip712-domain', files: ['crates/amos-web3/src/eip712.rs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A2100', 'F-SH-1009', 'domain_separator_missing_eip712_domain'], severity: 2 },
+	  { id: 'F-SH-1010', module: 'encode-int-hex-and-collect-deps-dangling-ref', files: ['crates/amos-web3/src/eip712.rs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md', 'scripts/fmea-gen.mjs'], markers: ['REQ-A2100', 'F-SH-1010', 'encode_int_via_hex_string', 'collect_deps_dangling_type_reference'], severity: 2 },
+
+  // ── F-CFG-004: config layer path overrides folding (REQ-A2043) ────────────
+  { id: 'F-CFG-004', module: 'config-layer-path-overrides-folding-in-layer-rs', files: ['crates/amos-config/src/layer.rs', 'docs/ENV_VARIABLES.md', 'scripts/fmea-gen.mjs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md'], markers: ['REQ-A2043', 'path_knob', 'layer.rs', 'F-CFG-004'], severity: 3 },
+
+  // ── F-TR-005: translate socket path folding (REQ-A1996) ──────────────────
+  { id: 'F-TR-005', module: 'translate-socket-path-folding-in-resolve-socket-path', files: ['crates/amos-translate/src/lib.rs', 'docs/ENV_VARIABLES.md', 'scripts/fmea-gen.mjs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md'], markers: ['REQ-A1996', 'resolve_socket_path', 'usable_path', 'F-TR-005'], severity: 3 },
+
+  // ── F-SH-959: AMOS_HOST_FS_ROOT non-Unicode "not set" (REQ-A2049) ────────
+  { id: 'F-SH-959', module: 'host-fs-root-from-env-var-not-var-os', files: ['crates/amos-tauri/src/host_fs.rs', 'docs/ENV_VARIABLES.md', 'scripts/fmea-gen.mjs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md'], markers: ['REQ-A2049', 'resolve_root_from_env', 'path_knob', 'F-SH-959'], severity: 2 },
+
+  // ── F-SH-964: AMOS_MEDIA_ROOT non-Unicode → mock media (REQ-A2053) ──────
+  { id: 'F-SH-964', module: 'media-root-from-env-var-not-var-os-leads-to-mock', files: ['crates/amos-tauri/src/media.rs', 'docs/ENV_VARIABLES.md', 'scripts/fmea-gen.mjs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md'], markers: ['REQ-A2053', 'media_root_from', 'F-SH-964'], severity: 2 },
+
+  // ── F-SH-327: FilesApp rejection prompt clears file listing ──────────────
+  { id: 'F-SH-327', module: 'files-app-rejection-prompt-fixed-by-sibling-round', files: ['crates/amos-tauri/frontend-ts/src/svelte/FilesApp.svelte', 'scripts/fmea-gen.mjs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'CHANGELOG.md'], markers: ['F-SH-327', 'hostErr', 'F-SH-347'], severity: 3 },
+
+  // ── 并发水位标记行（prose-only IDs added for fmea-gen inventory completeness）─
+  { id: 'F-DEV-156', module: 'concurrent-watermark-replaced-by-f-dev-158', files: ['docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'scripts/fmea-gen.mjs'], markers: ['F-DEV-156', 'F-DEV-158'], severity: 3 },
+  { id: 'F-SH-251', module: 'concurrent-watermark', files: ['docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'scripts/fmea-gen.mjs'], markers: ['F-SH-251'], severity: 1 },
+  { id: 'F-SH-284', module: 'concurrent-watermark', files: ['docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'scripts/fmea-gen.mjs'], markers: ['F-SH-284'], severity: 1 },
+  { id: 'F-SH-328', module: 'concurrent-watermark', files: ['docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'scripts/fmea-gen.mjs'], markers: ['F-SH-328'], severity: 1 },
+  { id: 'F-SH-348', module: 'concurrent-watermark', files: ['docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'scripts/fmea-gen.mjs'], markers: ['F-SH-348'], severity: 2 },
+  { id: 'F-SH-377', module: 'concurrent-watermark', files: ['docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'scripts/fmea-gen.mjs'], markers: ['F-SH-377'], severity: 2 },
+  { id: 'F-SH-643', module: 'concurrent-watermark', files: ['docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'scripts/fmea-gen.mjs'], markers: ['F-SH-643'], severity: 2 },
+  { id: 'F-SH-734', module: 'concurrent-watermark', files: ['docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'scripts/fmea-gen.mjs'], markers: ['F-SH-734'], severity: 2 },
+  { id: 'F-SH-827', module: 'concurrent-watermark', files: ['docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'scripts/fmea-gen.mjs'], markers: ['F-SH-827'], severity: 2 },
+  { id: 'F-SH-842', module: 'concurrent-watermark', files: ['docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'scripts/fmea-gen.mjs'], markers: ['F-SH-842'], severity: 2 },
+  { id: 'F-TEL-043', module: 'concurrent-watermark', files: ['docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md', 'scripts/fmea-gen.mjs'], markers: ['F-TEL-043'], severity: 1 },
+
+  // ── F-TST-001 to F-TST-005: test coverage enhancements (Phase 5, 2026-10-04)
+  { id: 'F-TST-001', module: 'amos-ime-missing-integration-tests', files: ['crates/amos-ime/tests/full_ime_pipeline.rs', 'scripts/fmea-gen.mjs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md'], markers: ['REQ-A2093', 'F-TST-001'], severity: 2 },
+  { id: 'F-TST-002', module: 'amos-blocklist-missing-integration-tests', files: ['crates/amos-blocklist/tests/blocklist_persistence.rs', 'scripts/fmea-gen.mjs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md'], markers: ['REQ-A2094', 'F-TST-002'], severity: 2 },
+  { id: 'F-TST-003', module: 'amos-clipboard-missing-transport-integration-tests', files: ['crates/amos-clipboard/tests/agent_transport_integration.rs', 'scripts/fmea-gen.mjs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md'], markers: ['REQ-A2095', 'F-TST-003'], severity: 2 },
+  { id: 'F-TST-004', module: 'amos-jni-missing-any-tests', files: ['crates/amos-jni/tests/smoke.rs', 'crates/amos-jni/src/lib.rs', 'scripts/fmea-gen.mjs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md'], markers: ['REQ-A2096', 'F-TST-004'], severity: 3 },
+  { id: 'F-TST-005', module: 'rust-coverage-missing-enforcement-gate', files: ['scripts/rust-coverage-gate.mjs', 'scripts/fmea-gen.mjs', 'docs/FMEA.md', 'docs/TRACEABILITY_MATRIX.md'], markers: ['REQ-A2097', 'F-TST-005'], severity: 2 },
 ];
 
 /**

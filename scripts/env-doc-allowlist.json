@@ -30,5 +30,45 @@
   {
     "name": "AMOS_THEME_CHANGED_EVENT",
     "reason": "Not a knob at all: it is the TypeScript event-name constant quoted out of source in docs/FINAL_CODE_AUDIT_2026_SEP17.md (a code block showing `new CustomEvent(AMOS_THEME_CHANGED_EVENT, …)`). The constant lives in crates/amos-tauri/frontend-ts/src/svelte/ui-events.ts and is imported by theme.svelte.ts; the scanner is right that it is never read as configuration (a bare identifier, not a quoted env lookup), so the doc's quote is the only reason it looks like one."
+  },
+  {
+    "name": "AMOS_ACCEL_ENV",
+    "reason": "Not a knob: it is the Rust constant identifier quoted verbatim by the audit ledgers (docs/FMEA.md F-AI-071 / docs/TRACEABILITY_MATRIX.md REQ-A2050) as evidence of the pre-fix read site. The constant lives in crates/amos-ai/src/accelerator.rs and its VALUE is the real knob `AMOS_ACCEL`, which the scanner already verifies as honored."
+  },
+  {
+    "name": "AMOS_SOC_VENDOR_ENV",
+    "reason": "Same shape as AMOS_ACCEL_ENV: the Rust constant identifier in crates/amos-ai/src/accelerator.rs whose value is the real, scanner-verified knob `AMOS_SOC_VENDOR`. The audit ledgers quote the identifier itself, so only the doc spelling trips the gate."
+  },
+  {
+    "name": "AMOS_GPU_LAYERS_ENV",
+    "reason": "Same shape as AMOS_ACCEL_ENV: the Rust constant identifier in crates/amos-ai/src/accelerator.rs whose value is the real, scanner-verified knob `AMOS_GPU_LAYERS`. The audit ledgers quote the identifier itself, so only the doc spelling trips the gate."
+  },
+  {
+    "name": "AMOS_GOVERNOR_",
+    "reason": "A truncated fragment, not a variable name (same shape as AMOS_SESSION_): the REQ-A2029 ledger row writes `AMOS_GOVERNOR_*` as a family shorthand for the governor knobs — `AMOS_GOVERNOR_CPU_KINDS` (crates/amos-ai/src/server.rs:921) and `AMOS_GOVERNOR_MEMORY_PRESSURE` / `AMOS_GOVERNOR_MAINTENANCE` (server.rs:2471-2472, via `env_governor_flag`) — each of which is honored and scanner-verified under its full name. The trailing-underscore token only exists because ENV_RE stops at the `*`; no operator can set `AMOS_GOVERNOR_` itself."
+  },
+  {
+    "name": "AMOS_TEST",
+    "reason": "A truncated fragment, not a variable name (same shape as AMOS_GOVERNOR_ / AMOS_SESSION_): the REQ-A1970 ledger row (docs/TRACEABILITY_MATRIX.md, F-AI-047) records a **historical fix** by quoting the pre-fix Rust literal `\"AMOS_TEST_DEDUP_KNOB\"` — the test-knob name that was `crates/amos-ai/src/security.rs`'s test-only duplicate key. The token appears in prose describing what was **renamed away** (test knobs must not take the `AMOS_` prefix, since `scripts/env-doc-gen.mjs` treats any `crates/` `\"AMOS_*\"` literal as a declared operator variable). No operator can set `AMOS_TEST`; it is the fragment ENV_RE extracts from the quoted literal, not a read site."
+  },
+  {
+    "name": "AMOS_TEST_",
+    "reason": "A truncated fragment, not a variable name — ENV_RE stops at the backtick in the REQ-A1970 prose `\"AMOS_TEST<backtick>-prefixed` (docs/TRACEABILITY_MATRIX.md), which describes the **convention** that test knobs avoid the `AMOS_` prefix. Same family as AMOS_TEST / AMOS_SESSION_ / AMOS_GOVERNOR_; no operator can set it."
+  },
+  {
+    "name": "AMOS_TEST_DEDUP_KNOB",
+    "reason": "Not a knob — a **historical Rust test literal quoted in prose**. The REQ-A1970 ledger row (F-AI-047) records the fix that renamed `crates/amos-ai/src/security.rs`'s test-only duplicate key from `AMOS_TEST_DEDUP_KNOB` to `TEST_DEDUP_KNOB` / `TEST_NON_UNICODE_KNOB`, because `scripts/env-doc-gen.mjs` treats any `crates/` `\"AMOS_*\"` literal as a declared variable and the repo convention is that test knobs carry no `AMOS_` prefix. The current code has zero occurrences; only the ledger's record of the rename names it. Allow-listed so the fix's own honest-boundary note stays legible."
+  },
+  {
+    "name": "AMOS_WINDOW_STATE",
+    "reason": "Not a knob — a **ledger spelling of the window-geometry state file**, quoted in prose. The REQ-A1938 row (docs/TRACEABILITY_MATRIX.md, F-SH-936) writes `AMOS_WINDOW_STATE ∕ app-data 目录下的 amos.window-state.json` as an alternative shorthand while describing where the geometry file lives. `crates/amos-tauri/src/window_state.rs` reads **no env var at all**: the path comes from `app.path().app_data_dir()` (`fn path_from_app`, window_state.rs:151), and the file is `amos.window-state.json`. Not documented in docs/ENV_VARIABLES.md because it is not a variable; no operator can set it."
+  },
+  {
+    "name": "AMOS_TEST_HANDOVER",
+    "reason": "Not a knob — a **shell-loop variable in an audit command string**, quoted verbatim in `.audit_gaps_2026_10.md` (a root-level doc scanned by env-doc-scan as DOC_FILES). The loop iterates `AMOS_TEST_ AMOS_TEST_DEDUP_KNOB AMOS_WINDOW_STATE AMOS_TEST_HANDOVER` as a bare shell variable name; `AMOS_TEST_HANDOVER` has zero read sites in any code, scripts, or production doc. Audit-only artifact, never an operator knob."
+  },
+  {
+    "name": "AMOS_TEST_KNOB",
+    "reason": "Not a knob — a **shell-loop variable in an audit command string**, quoted verbatim in `.audit_gaps_2026_10.md` and `amuse-report-2026-10-09-00-27-25.md`. The loop iterates `AMOS_TEST_ AMOS_TEST_DEDUP_KNOB AMOS_WINDOW_STATE AMOS_TEST_HANDOVER AMOS_TEST_KNOB` as a bare shell variable; `AMOS_TEST_KNOB` has zero read sites in any code, scripts, or production doc. Audit-only artifact, never an operator knob."
   }
 ]

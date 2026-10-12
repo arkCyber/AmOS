@@ -123,7 +123,7 @@ function collectForwardingHelpers(text) {
     if (open !== -1 && (semi === -1 || open < semi)) body = fnBodyAt(text, bodyStart);
     else if (semi !== -1) body = text.slice(bodyStart, semi);
     if (!body) return;
-    if (params.some(p => new RegExp(`env::var(?:_os)?\\s*\\(\\s*${p}\\b`).test(body))) {
+    if (params.some(p => new RegExp(`(?:std::)?env::var(?:_os)?\\s*\\(\\s*${p}\\b`).test(body))) {
       names.add(name);
     }
   };
