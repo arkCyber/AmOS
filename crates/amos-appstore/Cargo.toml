@@ -16,7 +16,7 @@ serde_json = "1"
 tokio.workspace = true
 async-trait = "0.1"
 thiserror = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 ed25519-dalek = "2"
 # Install rollback / uninstall cleanup: a bundle that could not be removed (while the
 # registry says otherwise) is reported instead of being hidden behind the success path.
