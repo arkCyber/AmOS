@@ -13,6 +13,6 @@ path = "src/lib.rs"
 [dependencies]
 # The whole point of this crate: every Android provider in the workspace shares one
 # implementation of the two device-proven rules (see `src/lib.rs`).
-jni = "0.21"
+jni = "0.22"
 # A failed `exception_clear` must be reported, not swallowed (the discard gate).
 tracing.workspace = true
