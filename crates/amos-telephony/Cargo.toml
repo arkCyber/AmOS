@@ -14,7 +14,7 @@ path = "src/lib.rs"
 tokio.workspace = true
 tokio-stream.workspace = true
 async-trait = "0.1"
-thiserror = "1"
+thiserror = "2"
 # A demo call that never connects must not leave the UI on "dialing" with no trace:
 # the one documented (ignorable) failure is matched explicitly, the rest are reported.
 tracing.workspace = true

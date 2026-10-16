@@ -6,7 +6,7 @@ description = "AmOS device-care (手机管家) domain core: junk scan/clean, saf
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-thiserror = "1"
+thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
