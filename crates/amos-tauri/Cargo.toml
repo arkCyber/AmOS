@@ -213,7 +213,7 @@ tempfile = "3"
 # Serializes tests that mutate process-global state (env vars, lazy statics).
 # host_fs::tests swaps `AMOS_HOST_FS_ROOT` between cases via RAII; `cargo test`
 # runs tests on multiple threads by default and `std::env::set_var` is racy.
-serial_test = "3"
+serial_test = "4"
 # `tauri::test::{mock_app, mock_builder, mock_context}` — the only way to drive
 # `dock_badge::apply()` through its **production** path (the ledger it writes, the
 # `dock-badge-changed` emit, the empty-label collapse) without a real window.
