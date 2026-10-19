@@ -131,4 +131,4 @@ tracing-subscriber.workspace = true
 # `is_deployment_unconfigured` tests share `std::env` (process-wide); concurrent
 # threads would race on the env values. `#[serial]` on those tests serialises
 # them. Used only inside the daemon's test module.
-serial_test = "3"
+serial_test = "4"
