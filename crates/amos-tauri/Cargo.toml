@@ -103,7 +103,7 @@ portable-pty = { version = "0.8", optional = true }
 notify = "6"
 notify-debouncer-mini = "0.4"
 # dirs: home dir / XDG paths used by wine.rs and linux_apps.rs (both desktop-only modules).
-dirs = "5.0"
+dirs = "7.0"
 # WebMan browser download pipeline (src/webman_download.rs): the real streaming
 # HTTP client. `ureq` is the same blocking client amos-appstore / amos-ai /
 # amos-translate already use; the `cookies` feature turns its Agent into a real,
