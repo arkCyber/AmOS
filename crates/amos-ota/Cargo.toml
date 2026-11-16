@@ -19,7 +19,7 @@ thiserror = "1"
 # scheme `amos-appstore` / `amos-identity` already use, so no new algorithm and
 # no new dependency edge in the lock file. The core is still I/O-free; this is
 # pure computation over bytes the caller supplies.
-ed25519-dalek = "2"
+ed25519-dalek = "3"
 
 [dev-dependencies]
 serde_json = "1"
