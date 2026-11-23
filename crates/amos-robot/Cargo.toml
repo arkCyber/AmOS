@@ -28,7 +28,7 @@ tracing.workspace = true
 # workspace-friendly choice (no_std friendly, `SmallRng` is a tiny PCG); we never
 # read the system clock inside the algorithms — every random decision is reproducible
 # from a seed a test can pin.
-rand = { version = "0.8", default-features = false, features = ["small_rng"] }
+rand = { version = "0.10", default-features = false, features = ["small_rng"] }
 # The `RobotHal` trait in amos-link uses #[async_trait]; the driver implementations here
 # do the same so the trait-object dispatch stays a single shape across the workspace.
 async-trait = { workspace = true }
